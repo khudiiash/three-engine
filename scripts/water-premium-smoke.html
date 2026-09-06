@@ -160,6 +160,21 @@ try {
    };
    await renderer.computeAsync(sim.init);
    await run(150);                              // 2.5 s: waves up, foam gathered
+   // ?crate=1: a red 1 m cube floating half-submerged (the user's crate), shot from
+   // a steep angle with the surface and then without it — the reference for what
+   // the submerged half must look like through the water.
+   if (argument('crate', '0') === '1') {
+     const crate = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardNodeMaterial({ color: '#ff1a10', roughness: .6 }));
+     crate.position.set(-.8, 0, .8); crate.rotation.y = .5; crate.castShadow = true; scene.add(crate);
+     for (const fn of engine._tickers) fn();
+     pose([-2.6, 4.2, 3.4], [-.8, -.3, .8]);
+     await shoot('crate-surface');
+     sim.mesh.visible = false; await shoot('crate-no-surface'); sim.mesh.visible = true;
+     pose([-.8, 3.5, 2.6], [-.8, -.5, .8]);
+     await shoot('crate-steep');
+     sim.mesh.visible = false; await shoot('crate-steep-no-surface'); sim.mesh.visible = true;
+     log('crate shots done'); throw new Error('crate: stop');
+   }
 
 
    // ── THE LOOK: foam from above at 45°, and the caustics from under ──────

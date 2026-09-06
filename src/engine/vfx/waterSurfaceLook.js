@@ -1,12 +1,15 @@
-import { Object3D, Vector3 } from 'three/webgpu';
+import { DepthTexture, HalfFloatType, Matrix4, Object3D, Plane, RenderTarget, Vector3, Vector4, WebGPUCoordinateSystem } from 'three/webgpu';
 import {
   cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraViewMatrix, float, linearDepth, materialAttenuationColor, materialAttenuationDistance, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
-  positionViewDirection, positionWorld, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
+  positionViewDirection, positionWorld, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4,
 } from 'three/tsl';
 import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
 import { seaShadingSlopeNode } from './waterSpectrum.js';
 
-const _eye = new Vector3(), _origin = new Vector3(), _up = new Vector3();
+const _eye = new Vector3(), _origin = new Vector3(), _up = new Vector3(), _down = new Vector3();
+const _plane = new Plane(), _clip = new Vector4(), _q = new Vector4();
+/** A 1×1 target whose textures stand in until the first refraction render. */
+const _placeholder = new RenderTarget(1, 1, { type: HalfFloatType, depthTexture: new DepthTexture(1, 1) });
 /** Recursion guard: a mirror must not render itself. */
 let reflecting = false;
 
@@ -51,6 +54,9 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     giWater: material.userData.giWater,
   };
   let node = null, disposed = false, rearms = 0;
+  const refractionTargets = new WeakMap(), refractionCameras = new WeakMap();
+  const refractionColour = texture(_placeholder.texture), refractionDepth = texture(_placeholder.depthTexture);
+  const refractionInverseViewProjection = uniform(new Matrix4());
 
   /** Is the eye on the +Y side of the water's own surface plane? Scale-free. */
   const eyeAbove = (camera) => {
@@ -95,7 +101,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     const original = base.updateBefore.bind(base);
     base.updateBefore = (frame) => {
       update();
-      if (disposed || gain.value === 0 || engine?.renderSuspended) return;
+      if (disposed || engine?.renderSuspended) return;
       if (reflecting) return false;
       reflecting = true;
       // ── A MIRROR MUST NOT REFLECT ITSELF, AND ITS RAY TRAVELS IN AIR ────
@@ -121,12 +127,86 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       const nested = globalThis.__giNestedRender;
       globalThis.__giNestedRender = true;
       mesh.visible = false;
-      for (const s of slots) s.uniforms.active.value = 0;
-      try { return original(frame); } finally {
+      try {
+        // The other half first, with the medium ARMED: what is seen through
+        // the surface crosses the water.
+        renderRefraction(frame, above);
+        if (gain.value === 0) return;
+        for (const s of slots) s.uniforms.active.value = 0;
+        return original(frame);
+      } finally {
         reflecting = false;
         mesh.visible = body;
         for (let i = 0; i < slots.length; i++) slots[i].uniforms.active.value = armed[i];
         globalThis.__giNestedRender = nested;
+      }
+    };
+
+    // ── THE REFRACTION PASS: THE OTHER HALF OF THE SCENE, BY CONSTRUCTION ─
+    //
+    // Screen-space refraction reads the framebuffer at a displaced pixel, and
+    // the framebuffer near a floating crate holds the crate's faces ABOVE the
+    // water — painted onto the surface around it however exact the ray: "the
+    // copy's still there, just fully bright red now" (user, 2026-09-06, the
+    // sixth report). No depth trick recovers the floor behind those faces;
+    // only a render that never drew them does. So, like the mirror, the
+    // surface renders the scene clipped to the half the eye is NOT in — the
+    // same camera, its projection's near plane made oblique at the surface
+    // (Lengyel), half resolution — and reads that. Nothing above the water can
+    // be sampled from above, nothing below from below; and the pass's own
+    // depth is the column to the first thing behind each pixel, which is the
+    // straw's break at the waterline without a post chain.
+    //
+    // ⚠ A VIRTUAL CAMERA, NOT THE REAL ONE: three keeps one render list per
+    // (scene, camera), and a nested render through the same camera re-inits
+    // the list the outer transparent pass is walking ("Cannot destructure
+    // property 'object' of 'renderList[i]'"). The clone carries the real
+    // camera's world pose and its projection with the oblique near plane; the
+    // shadow maps are not re-rendered for it (three keys that per frame).
+    const renderRefraction = (frame, above) => {
+      const { scene, camera, renderer } = frame;
+      let rt = refractionTargets.get(camera), vc = refractionCameras.get(camera);
+      if (!rt) { rt = new RenderTarget(1, 1, { type: HalfFloatType, depthTexture: new DepthTexture(1, 1) }); rt.texture.generateMipmaps = false; refractionTargets.set(camera, rt); }
+      if (!vc) { vc = camera.clone(); vc.matrixAutoUpdate = false; vc.matrixWorldAutoUpdate = false; refractionCameras.set(camera, vc); }
+      vc.coordinateSystem = camera.coordinateSystem; vc.near = camera.near; vc.far = camera.far;
+      vc.matrixWorld.copy(camera.matrixWorld); vc.matrixWorldInverse.copy(camera.matrixWorldInverse);
+      vc.projectionMatrix.copy(camera.projectionMatrix);
+      const current = renderer.getRenderTarget();
+      const w = Math.max(1, Math.round((current ? current.width : renderer.domElement.width) * .5));
+      const h = Math.max(1, Math.round((current ? current.height : renderer.domElement.height) * .5));
+      if (rt.width !== w || rt.height !== h) rt.setSize(w, h);
+      // The surface plane in camera space, its normal INTO the half being kept.
+      mesh.updateWorldMatrix(true, false);
+      mesh.getWorldPosition(_origin);
+      _up.set(0, 1, 0).transformDirection(mesh.matrixWorld).normalize();
+      _down.copy(_up).negate();
+      _plane.setFromNormalAndCoplanarPoint(above ? _down : _up, _origin);
+      _plane.applyMatrix4(vc.matrixWorldInverse);
+      _clip.set(_plane.normal.x, _plane.normal.y, _plane.normal.z, _plane.constant);
+      const e = vc.projectionMatrix.elements;
+      _q.x = (Math.sign(_clip.x) + e[8]) / e[0];
+      _q.y = (Math.sign(_clip.y) + e[9]) / e[5];
+      _q.z = -1;
+      _q.w = (1 + e[10]) / e[14];
+      _clip.multiplyScalar(1 / _clip.dot(_q));
+      e[2] = _clip.x; e[6] = _clip.y;
+      e[10] = renderer.coordinateSystem === WebGPUCoordinateSystem ? _clip.z : _clip.z + 1;
+      e[14] = _clip.w;
+      vc.projectionMatrixInverse.copy(vc.projectionMatrix).invert();
+      refractionInverseViewProjection.value.copy(vc.projectionMatrix).multiply(vc.matrixWorldInverse).invert();
+      refractionColour.value = rt.texture;
+      refractionDepth.value = rt.depthTexture;
+      const currentMRT = renderer.getMRT(), currentAutoClear = renderer.autoClear;
+      renderer.setMRT(null);
+      renderer.setRenderTarget(rt);
+      renderer.autoClear = true;
+      const previousName = scene.name;
+      scene.name = (scene.name || 'Scene') + ' [ Water refraction ]';
+      try { renderer.render(scene, vc); } finally {
+        scene.name = previousName;
+        renderer.setMRT(currentMRT);
+        renderer.setRenderTarget(current);
+        renderer.autoClear = currentAutoClear;
       }
     };
 
@@ -265,30 +345,27 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       const tFloor = u.waterDepth.div(bentLocal.y.negate().max(1e-4));
       const tX = u.halfExtent.x.sub(positionLocal.x.mul(bentLocal.x.sign())).div(bentLocal.x.abs().max(1e-5));
       const tZ = u.halfExtent.z.sub(positionLocal.z.mul(bentLocal.z.sign())).div(bentLocal.z.abs().max(1e-5));
-      let column = tFloor.min(tX).min(tZ).max(0).min(u.waterDepth.mul(u.waveScale.y).mul(3));
+      let column = select(fromBelow, float(BLIND_REFRACTION_METRES), tFloor.min(tX).min(tZ).max(0).min(u.waterDepth.mul(u.waveScale.y).mul(3)));
       // ── THE STRAW IN THE GLASS: THE OBJECT BEHIND THE PIXEL SETS THE COLUMN ─
       //
       // An object crossing the surface must appear BROKEN at the waterline: the
       // offset is the water between the surface and the object — nothing at
-      // the waterline, the whole column at the floor. With a published scene
-      // pass (the post chain's depth — the shared viewport depth is the one
-      // that broke pipelines), the column is the distance from this pixel to
-      // the opaque scene behind it, no more than the floor's. Without one, a
-      // metre of water: the floor still bends, an object stays near itself.
-      const sceneDepth = engine?.scenePass?.getTexture?.("depth") ?? null;
-      if (sceneDepth) {
-        const behind = linearDepth(texture(sceneDepth, screenUV)).sub(linearDepth()).mul(cameraFar.sub(cameraNear)).max(0);
-        column = column.min(behind);
-      } else {
-        column = column.min(float(BLIND_REFRACTION_METRES));
-      }
+      // the waterline, the whole column at the floor. The refraction pass's
+      // own depth, unprojected through the oblique matrix it was rendered
+      // with, is the first thing behind this pixel; the column stops there.
+      const ownUv = screenUV;
+      const ownNdc = vec4(ownUv.x.mul(2).sub(1), ownUv.y.oneMinus().mul(2).sub(1), refractionDepth.sample(ownUv).x, 1);
+      const behindH = refractionInverseViewProjection.mul(ownNdc);
+      const behind = behindH.xyz.div(behindH.w).sub(positionWorld).length();
+      column = column.min(behind);
       // `transmission` still scales the travel — the dial that reads as
-      // "refraction". From below there is no column: the pixel behind.
-      const travel = select(fromBelow, float(0), column.mul(through));
+      // "refraction". From below the other half is the air: what stands
+      // above the surface, displaced by the exit angle, no further than it is.
+      const travel = column.mul(through);
       const exit = positionWorld.add(bentWorld.mul(travel));
       const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(exit, 1)));
       const ndc = clip.xy.div(clip.w).add(1).mul(.5);
-      const refractedUv = vec2(ndc.x, ndc.y.oneMinus()).clamp(.001, .999); // three's own transmission coords (webgpu)
+      const refractedUv = vec2(ndc.x, ndc.y.oneMinus()).clamp(.001, .999);
       // ⚠ THE MATERIAL'S OWN ATTENUATION, exactly as three's `volumeAttenuation`
       // read it: colour^(travel / distance), none at an infinite distance. Every
       // water in practice wears the AUTHORED material, whose distance is
@@ -298,16 +375,10 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // user, 2026-09-06). The depth of the water is the MEDIUM's job.
       const beer = select(materialAttenuationDistance.greaterThan(0),
         vec3(materialAttenuationColor).max(1e-4).log().mul(travel.div(materialAttenuationDistance)).exp(), vec3(1));
-      // ⚠ NOT TINTED BY THE WATER'S COLOUR. three's transmission multiplied the
-      // sample by the material's diffuse colour — a flat teal filter with
-      // almost no red in it, so a red crate's submerged half came through
-      // nearly black: the "incorrect reflection" hanging under the cube
-      // (user, 2026-09-06, five reports; it was never a reflection — a mirror
-      // can only add light, and the block was darker than the floor). Water is
-      // clear at its surface; its colour is absorption over DISTANCE, which
-      // the medium already applies per pixel along the real path. Only the
-      // interface's Fresnel and the material's own attenuation remain.
-      const refracted = viewportTexture(refractedUv).rgb.mul(beer).mul(fresnel.oneMinus());
+      // Not tinted by the water's colour: the interface is clear, the medium
+      // colours the path (a flat teal filter made a red crate's submerged half
+      // near-black — the "incorrect reflection" of five reports).
+      const refracted = refractionColour.sample(refractedUv).rgb.mul(beer).mul(fresnel.oneMinus());
       // What three's `mix(diffuse, backdrop, transmission)` left of the
       // diffuse — the stylized, less-than-clear water — stays on the colour.
       material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(1), foam);

@@ -180,9 +180,30 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     filter with almost no red. The interface is clear now — Fresnel and the
     material's own attenuation only; the water's colour is the MEDIUM's
     absorption over the real path. Diagnose a dark ghost by its SIGN first.
+28. SCREEN-SPACE REFRACTION CANNOT BE SAVED BY A DEPTH TEST. The framebuffer
+    near a floating crate holds the crate's faces ABOVE the water, and a
+    displaced sample reads them onto the surface around it however exact the
+    ray ("the copy's still there, just fully bright red now" — the sixth
+    report). Rejecting them still leaves nothing to show where the floor
+    behind them should be. Only a render that never drew them does: the
+    surface now renders its own REFRACTION PASS, like the mirror — the scene
+    clipped to the half the eye is NOT in by an oblique near plane
+    (Lengyel), half resolution, the medium armed — and its depth is the
+    column to the first thing behind each pixel (the straw's break, no post
+    chain needed). ⚠ Through a VIRTUAL camera: three keeps one render list
+    per (scene, camera), and a nested render through the real camera
+    re-inits the list the outer transparent pass is walking ("Cannot
+    destructure property 'object' of 'renderList[i]'"). Receipt:
+    `smoke:water-premium ?crate=1` (a half-submerged red cube shot with and
+    without the surface; calm: `&waveHeight=.02&choppiness=.2`).
 
 ## Open
 
+- The refraction pass is a second scene render per water surface per camera
+  (half resolution), beside the mirror's: two nested renders per frame. A
+  big scene with an ocean pays draw calls twice more; a shared pass for
+  several surfaces, or skipping it when nothing crosses the waterline, is
+  the saving if it shows in `profile.frameStats`.
 - The medium's shafts are lit by the caustic map only: an object's shadow
   (the sun's shadow map) does not cut the beams under it. One shadow tap per
   few shaft taps would, at a cost to the fog node every material carries.
@@ -195,6 +216,7 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
 ## Harness
 
 `npm run smoke:water-premium` (`?scales=5,60,500`, `?shape=sphere|cylinder|
-cone|capsule&fill=.75`, `?shaftMip=N`), `smoke:water-surface`,
+cone|capsule&fill=.75`, `?shaftMip=N`, `?crate=1` — the floating crate seen
+through the surface, with and without it), `smoke:water-surface`,
 `smoke:water-spectrum`, `smoke:water-props`, `smoke:water-rate`,
 `scripts/water-bindings-smoke.html?msaa=1`, `npm run test:water`.
