@@ -200,6 +200,23 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     `smoke:water-premium ?crate=1` (a half-submerged red cube shot with and
     without the surface; calm: `&waveHeight=.02&choppiness=.2`).
 
+29. The crate painted onto the water behind itself was the REFRACTION SAMPLE
+    (the framebuffer at the displaced pixel holds the crate's above-water
+    faces), never the mirror — it vanishes at grazing angles, which a mirror
+    image would not. Fixed with a DEPTH TEST: the water copies the viewport's
+    opaque depth before it draws, unprojects what sits at the refracted pixel,
+    and reads straight through the pixel if that stands above the lid's
+    plane; the same depth bounds the column (the straw). ⚠ three's
+    `viewportDepthTexture` decides a depth texture's sample count from the
+    target CURRENT at build or first bind, so a compile path with another
+    target current binds a single-sample 1×1 to a multisampled declaration
+    ("Sample count (1) … doesn't match expectation"). A texture carrying its
+    own `renderTarget.samples` is read from that everywhere: one per render
+    target, pinned at creation, chosen by `updateReference`, keyed by the
+    EFFECTIVE target (`_getFrameBufferTarget()` for a multisampled canvas,
+    where `getRenderTarget()` is null and `currentSamples` 0 — the copy's
+    source has 4). Receipts: MSAA and plain bindings smokes clean, `?crate=1`.
+
 ## Open
 
 - The refraction pass is a second scene render per water surface per camera
