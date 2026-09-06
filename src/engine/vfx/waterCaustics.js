@@ -74,10 +74,17 @@ export function waterCausticGainLocalNode(P, slot, level = 0) {
   // and `d` below simply stops accumulating at the volume's own depth.
   const depth = local.y.negate().toVar();
   const d = depth.min(s.half.y).toVar();
-  const inside = waterInsideNode(vec4(s.shape), s.half, local);
   // The map is in FLOOR parameterization, so follow this point's own beam DOWN
   // to where the splat recorded it rather than walking back up to the surface.
   const rise = s.flatRay.y.negate().max(.05);
+  // ...but the beam must have ENTERED through the water: walked back UP to the
+  // rest surface, its origin has to lie inside the lid's outline. A wall's
+  // upper reaches on the up-sun side are lit by beams that came in over the
+  // rim, through air — no lens, gain 1 — and reading the map for them found
+  // its clipped border instead ("black stripes flickering on the pool walls").
+  const origin = vec2(local.x.sub(s.flatRay.x.mul(d).div(rise)), local.z.sub(s.flatRay.z.mul(d).div(rise)));
+  const inside = waterInsideNode(vec4(s.shape), s.half, local)
+    .and(waterRimDistanceNode(vec4(s.shape), s.half, origin.x, origin.y).greaterThan(0));
   const remaining = s.half.y.sub(d).max(0).div(rise);
   const sample = vec2(
     local.x.add(s.flatRay.x.mul(remaining)),
@@ -147,12 +154,14 @@ export function waterCausticAboveNode(P, slot) {
   const s = slot.uniforms;
   const local = s.inverse.mul(vec4(P, 1)).xyz.toVar();
   const height = local.y.toVar();
-  const inside = waterRimDistanceNode(vec4(s.shape), s.half, local.x, local.z).greaterThan(0).and(height.greaterThan(0));
-  // Back down the reflected beam to the surface it left.
+  // Back down the reflected beam to the surface it left — and that point, not
+  // the receiver, is what must lie on the water: a wall beside the pool is lit
+  // by the mirrored sun wherever its beam meets the surface inside the outline.
   const ray = vec3(s.mirrorRay).toVar();            // LOCAL units, pointing down
   const climb = ray.y.negate().max(.05);
   const surfaceX = local.x.add(ray.x.mul(height).div(climb));
   const surfaceZ = local.z.add(ray.z.mul(height).div(climb));
+  const inside = waterRimDistanceNode(vec4(s.shape), s.half, surfaceX, surfaceZ).greaterThan(0).and(height.greaterThan(0));
   // ...and from there down the FLAT refracted ray, because that is the
   // parameterization the map is stored in.
   const rise = s.flatRay.y.negate().max(.05);

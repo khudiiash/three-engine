@@ -443,7 +443,13 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
       const alpha = renderer.getClearAlpha();
       renderer.getClearColor(previousClear);
       renderer.setRenderTarget(slot.causticTarget);
-      renderer.setClearColor(0x000000, 1);
+      // ⚠ NEUTRAL, NOT BLACK. A texel no beam lands on — the map's border on
+      // the up-sun side, where beams from the rim land outside the window and
+      // are clipped — must read "no focusing" (1), or a receiver whose walk
+      // down its beam ends there gets a DARKENING that changes with every
+      // frame's clip: "black stripes quickly flickering all over the pool
+      // walls" (user, 2026-09-06, underwater screenshot).
+      renderer.setClearColor(0xffffff, 1);
       renderer.render(scene, camera);
       renderer.setClearColor(previousClear, alpha);
       renderer.setRenderTarget(target);

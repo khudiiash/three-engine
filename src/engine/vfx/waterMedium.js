@@ -150,7 +150,7 @@ const SHAFT_TAPS = 24;
 /** The mip the shafts read the caustic map at — 1024 >> 4 = 64 texels across
  *  the pool. A beam is a low-frequency thing; the filaments underneath it are
  *  what the taps could not resolve. */
-const SHAFT_MIP = 4;
+const SHAFT_MIP = 5;
 /**
  * ══ WHAT MAKES A SHAFT LOOK LIKE A SHAFT ═══════════════════════════════════
  *
@@ -208,9 +208,12 @@ function shaftNode(slot, segment, tau, sigma) {
   const total = vec3(0).toVar();
   // The sun's path to a point at depth d is d over the refracted ray's slant.
   const slant = float(1).div(vec3(slot.uniforms.toSunRefracted).y.max(.25));
+  // `__waterShaftMip` is the harness's dial for the sweep in
+  // scripts/water-premium-smoke.html; the shipped value is SHAFT_MIP.
+  const mip = Number.isFinite(globalThis.__waterShaftMip) ? globalThis.__waterShaftMip : SHAFT_MIP;
   for (let i = 0; i < SHAFT_TAPS; i++) {
     const k = float(i).add(jitter).div(SHAFT_TAPS);
-    const beam = waterCausticGainLocalNode(segment.at(k), slot, SHAFT_MIP).sub(1).max(0);
+    const beam = waterCausticGainLocalNode(segment.at(k), slot, mip).sub(1).max(0);
     const depth = mix(segment.near, segment.far, k);
     const reach = sigma.mul(depth).mul(slant).negate().exp();
     total.addAssign(tau.mul(k).negate().exp().mul(reach).mul(beam));

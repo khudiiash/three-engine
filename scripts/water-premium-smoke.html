@@ -40,6 +40,9 @@ const AUTO = argument('auto', '1') !== '0';
 // to ?fill= of its height (the unit primitive: radius .5; height 1, capsule 2).
 const SHAPE = argument('shape', 'box'), FILL = Number(argument('fill', SHAPE === 'box' ? '1' : '.75'));
 const SHAPE_HEIGHT = SHAPE === 'capsule' ? 2 : 1;
+// ?shaftMip=N reads the caustic map for the god rays at that mip (the sweep
+// behind waterMedium.js's SHAFT_MIP).
+if (argument('shaftMip', null) != null) globalThis.__waterShaftMip = Number(argument('shaftMip', '4'));
 try {
  const adapter = await navigator.gpu.requestAdapter();
  const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
@@ -234,6 +237,69 @@ try {
      await shoot('shape-side');
      pose([0, 1.3 * S, .001], [0, 0, 0]);
      await shoot('shape-top');
+   }
+
+   // ── GOD RAYS: bright looking up, faint looking down, and STEADY ────────
+   //
+   // "God rays underwater … not very accurate, flickery" (user, 2026-09-06).
+   // The shaft term ALONE: everything but a black probe is hidden, the eye is
+   // under water looking up / across / down at the probe, and the frame with
+   // the caustic lens on minus the frame with it off is the in-scatter the
+   // lens modulates — the god rays and nothing else. Three properties:
+   // (a) forward-peaked (Henyey–Greenstein: looking up toward the sun ≫ down),
+   // (b) no pixel grain (jittered taps over a mipped map, not noise),
+   // (c) no faster than the waves: the change over 0.2 s is a fraction of
+   //     the term itself.
+   if (S <= 20) {
+     const luma = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
+     const shaftOf = (on, off) => { const out = new Float32Array(W * H); for (let i = 0; i < W * H; i++) out[i] = Math.max(0, luma(on, i * 4) - luma(off, i * 4)); return out; };
+     const stats = (img) => {
+       let mean = 0, grain = 0, count = 0;
+       for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+         const i = y * W + x, around = (img[i - 1] + img[i + 1] + img[i - W] + img[i + W]) / 4;
+         mean += img[i]; grain += Math.abs(img[i] - around); count++;
+       }
+       return { mean: mean / count, grain: grain / count };
+     };
+     const diff = (a, b) => { let d = 0; for (let i = 0; i < a.length; i++) d += Math.abs(a[i] - b[i]); return d / a.length; };
+     // The water stays visible — its slot follows the lid's visibility and a
+     // hidden lid is a silent medium; the probe sits in front of it anyway.
+     const shown = []; scene.traverse((o) => { if (o.isMesh && o.visible && o !== sim.mesh && o !== sim.skirtMesh) { shown.push(o); o.visible = false; } });
+     const probe = new THREE.Mesh(new THREE.PlaneGeometry(3 * S, 3 * S), new THREE.MeshBasicNodeMaterial({ color: '#000000', side: THREE.DoubleSide }));
+     scene.add(probe);
+     const views = {
+       up: { eye: [0, -DEPTH + .4, 0], at: [.25, 0, .1], probe: [0, -.03, 0], rot: [Math.PI / 2, 0, 0] },
+       side: { eye: [-2.2, -DEPTH + 1.2, 0], at: [2, -DEPTH + 1.2, 0], probe: [2.4, -DEPTH / 2, 0], rot: [0, -Math.PI / 2, 0] },
+       down: { eye: [0, -.5, 0], at: [.25, -DEPTH, .1], probe: [0, -DEPTH + .03, 0], rot: [-Math.PI / 2, 0, 0] },
+     };
+     const rows = {};
+     const lensOn = async (on) => { const p = { ...props, causticIntensity: on ? props.causticIntensity : 0 }; sim.update(p); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); };
+     for (const [name, v] of Object.entries(views)) {
+       probe.position.set(...v.probe); probe.rotation.set(...v.rot); pose(v.eye, v.at);
+       await lensOn(true); const a = await shoot(`shaft-${name}`);
+       await lensOn(false); const off = await shoot(`shaft-${name}-off`);
+       await lensOn(true); await run(1); const a1 = await shoot(`shaft-${name}-1f`);
+       await run(11); const b = await shoot(`shaft-${name}-0.2s`);
+       const sa = shaftOf(a, off), sa1 = shaftOf(a1, off), sb = shaftOf(b, off);
+       // Motion is a change that accumulates over frames; flicker is a change
+       // that does not: one frame's change against a twelfth of 0.2 s's.
+       rows[name] = { ...stats(sa), change: diff(sa, sb), flicker: diff(sa, sa1) / Math.max(1e-3, diff(sa, sb) / 12) };
+     }
+     scene.remove(probe); for (const o of shown) o.visible = true; await lensOn(true);
+     const phase = `${(rows.up.mean / Math.max(.01, rows.side.mean)).toFixed(2)} : 1 : ${(rows.down.mean / Math.max(.01, rows.side.mean)).toFixed(2)}`;
+     log(`god rays (the shaft term alone, 8-bit luma): looking up ${rows.up.mean.toFixed(2)}, across ${rows.side.mean.toFixed(2)}, down ${rows.down.mean.toFixed(2)} → phase ${phase}`);
+     log(`god rays: grain (|pixel − 4 neighbours|) up ${rows.up.grain.toFixed(3)} across ${rows.side.grain.toFixed(3)} · motion over 0.2 s up ${(rows.up.change / Math.max(.01, rows.up.mean) * 100).toFixed(0)}% across ${(rows.side.change / Math.max(.01, rows.side.mean) * 100).toFixed(0)}% of the term · flicker (one frame's change against a twelfth of 0.2 s's) up ${rows.up.flicker.toFixed(2)} across ${rows.side.flicker.toFixed(2)}`);
+     // The caustic map's border: no beam lands there, and it must be NEUTRAL.
+     {
+       const R = slot.causticTarget.width, px = await renderer.readRenderTargetPixelsAsync(slot.causticTarget, 0, 0, R, R);
+       let borderMin = Infinity, interior = 0, n = 0;
+       for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) { const v = px[(y * R + x) * 4]; if (x < 2 || y < 2 || x >= R - 2 || y >= R - 2) borderMin = Math.min(borderMin, v); else { interior += v; n++; } }
+       log(`caustic map border: minimum ${borderMin.toFixed(3)} against an interior mean of ${(interior / n).toFixed(3)} (an uncovered texel reads 1: no lens, no darkening)`);
+       if (!(borderMin > .5)) throw new Error(`the map's border is dark: ${borderMin}`);
+     }
+     if (!(rows.up.mean > 1.5 * rows.side.mean && rows.up.mean > 1.5 * rows.down.mean)) throw new Error(`the shafts are not forward-peaked: ${phase}`);
+     if (!(rows.up.grain < .15 * rows.up.mean + .5)) throw new Error(`the shafts are grainy: ${rows.up.grain} on a mean of ${rows.up.mean}`);
+     if (!(rows.up.flicker < 3 && rows.side.flicker < 3)) throw new Error(`the shafts flicker: one frame changes ${rows.up.flicker.toFixed(2)}× / ${rows.side.flicker.toFixed(2)}× what smooth motion would`);
    }
 
    // ── THE RINGS HAVE NO CRACKS ───────────────────────────────────────────
