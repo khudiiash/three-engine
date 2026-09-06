@@ -6,10 +6,12 @@ import {
 /**
  * ══ WHAT A WATER SURFACE ADDS ON TOP OF BEING A MIRROR ═════════════════════
  *
- * Foam, fine-scale normals and subsurface scattering. All of them land on the
- * material slots `waterSurfaceLook.js` owns, which is why they are composed
- * there — three has exactly one `emissiveNode` and two modules writing it would
- * silently clobber each other.
+ * Foam and subsurface scattering. Both land on material slots
+ * `waterSurfaceLook.js` owns, which is why they are composed there — three has
+ * exactly one `emissiveNode` and two modules writing it would silently clobber
+ * each other. The fine-scale NORMAL used to live here too, as the slope of a
+ * value-noise field; it is the spectral sea's derivative cascades now
+ * (`waterSpectrum.js#seaShadingSlopeNode`) — real waves, not noise.
  *
  * ⚠ THESE READ THE SOLVER, NOT A SLOT. The engine-owned slots exist for
  * consumers that must not rebuild when a water surface changes (the medium,
@@ -50,7 +52,6 @@ const cellular = Fn(([p, time]) => {
 });
 const ANGLES = [.0, 1.1, 2.3, 3.9, 5.1, 2.7, 4.4, .6];
 const SPEEDS = [.11, -.19, .31, -.43, .23, -.37, .53, -.29];
-const MAX_DETAIL_OCTAVES = 8;
 
 /** Fixed four octaves, each rotated so the lattice never lines up with itself.
  *  Used where the fractal is a breakup mask and its shape is not authored. */
@@ -68,53 +69,10 @@ function fbm(p, time, drift = 1) {
 }
 
 /**
- * The AUTHORED ladder: `waveOctaves` gates how many are live and `waveGain` is
- * the amplitude ratio between them, normalized so the total never moves.
- *
- * ⭐ THIS is where those two controls do visible work. On the HEIGHT field they
- * almost cannot: a 128² grid over ten metres has 7.6 cm cells, so every octave
- * past the fourth is at or below Nyquist and is faded out — "changing detail
- * octaves or octave falloff change nothing" (user, 2026-09-06) was the grid
- * saying so. Sub-cell structure exists only in the normal, so the ladder has to
- * reach the normal.
- *
- * ⭐ **AND IT IS BAND-LIMITED TO WHOEVER IS SAMPLING IT.** `cutoff` is a
- * wavelength in WORLD metres below which octaves fade out, exactly like
- * `waterWaves.js`'s `bandGain` on the height field. A fragment shader can leave
- * it unset — pixels are dense — but the caustic pass evaluates this once per
- * grid vertex, and an octave finer than the vertex spacing does not come back
- * as detail there: it comes back as an unrelated random slope at every vertex,
- * which the rasterizer turns into a floor full of thin random scratches ("too
- * low poly and unrealistic", user 2026-09-06). Fading those octaves makes the
- * lens as smooth as the grid that samples it, and the filaments that are left
- * are the ones a lens that size can actually make.
- */
-const DETAIL_SCALE = 2.2;          // base octave ≈ 0.45 m
-const DETAIL_STEP = .05;
-function authoredFbm(p, time, u, cutoff = null) {
-  let sum = float(0), weight = float(0), amplitude = float(1), scale = float(1);
-  let wavelength = 1 / DETAIL_SCALE;
-  for (let i = 0; i < MAX_DETAIL_OCTAVES; i++) {
-    const c = Math.cos(ANGLES[i]), s = Math.sin(ANGLES[i]);
-    let live = u.waveOctaves.sub(i).clamp(0, 1);
-    if (cutoff) live = live.mul(float(2 * wavelength).div(cutoff.max(1e-4)).sub(1).clamp(0, 1));
-    const share = amplitude.mul(live);
-    const q = vec2(p.x.mul(c).sub(p.y.mul(s)), p.x.mul(s).add(p.y.mul(c))).mul(scale)
-      .add(time.mul(SPEEDS[i]));
-    sum = sum.add(valueNoise(q).mul(share));
-    weight = weight.add(share);
-    amplitude = amplitude.mul(u.waveGain);
-    scale = scale.mul(2.07);
-    wavelength /= 2.07;
-  }
-  return sum.div(weight.max(.02));
-}
-
-/**
  * ⭐ **THE DETAIL RUNS ON THE WAVES' CLOCK, NOT ON THE WALL.**
  *
  * `simTime` is elapsed seconds. The swell multiplies it by `waveSpeed`
- * (`waterWaves.js`'s `evaluate`) and the fine detail did not, so the two were
+ * (the spectral sea's clock) and the fine detail did not, so the two were
  * only ever coincidentally in step: set the waves slow and the detail — and the
  * caustic lens it bends, and the god rays that lens makes — kept scrolling at
  * the same fixed rate. Measured with the waves STOPPED, where the answer has to
@@ -194,28 +152,35 @@ function waterFoamBody(u) {
   const v = amount.mul(patch.mul(.5).add(.75)).clamp(0, 1).toVar();
 
   // ── THE NETWORK ────────────────────────────────────────────────────────
-  // Two scales of cell boundary: metre-scale cells and the smaller cells
-  // inside them, the lines thickening as the foam gets denser. Their
-  // brightness is broken up by a fine fractal so no filament is uniform.
-  const lineWidth = mix(float(.05), float(.24), v);
-  const coarse = cellular(p.mul(1.15), drift), fine = cellular(p.mul(3.7), drift.mul(1.3));
-  const webA = coarse.y.sub(coarse.x).smoothstep(float(0), lineWidth).oneMinus();
-  const webB = fine.y.sub(fine.x).smoothstep(float(0), lineWidth.mul(.85)).oneMinus();
-  const grain = fbm(p.mul(9), clock, 2).mul(.7).add(.5);
-  const network = webA.max(webB.mul(.75)).mul(grain).toVar();
+  //
+  // ⛔ A CELL BOUNDARY DRAWN AS A THIN HARD LINE IS A VORONOI DIAGRAM, NOT
+  // FOAM — "the foam patterns look quite weird" (user, 2026-09-06, with a
+  // screenshot of exactly that: crisp polygons and a sky of white dots). What
+  // the photograph has is WIDE, SOFT filaments whose density varies along
+  // their length, joining irregular blobs rather than polygons. So the lattice
+  // is DOMAIN-WARPED by a low-frequency fractal before the cells are found
+  // (no straight edges, no regular polygons), the filament is a soft falloff
+  // of the edge distance a few times wider than before, and a fine fractal
+  // rides along it so it thins and thickens like a real strand.
+  const warp = vec2(fbm(p.mul(.35).add(vec2(3.1, 7.7)), clock, .5), fbm(p.mul(.35).add(vec2(-5.3, 2.9)), clock, .5)).sub(.5).mul(1.6);
+  const q = p.add(warp);
+  const lineWidth = mix(float(.2), float(.55), v);
+  const coarse = cellular(q.mul(.9), drift), fine = cellular(q.mul(2.6).add(warp.mul(1.5)), drift.mul(1.3));
+  const filament = (cells, width) => cells.y.sub(cells.x).div(width).clamp(0, 1).oneMinus().pow(1.6);
+  const grain = fbm(p.mul(6), clock, 2).mul(.9).add(.35);
+  const network = filament(coarse, lineWidth).mul(.95).add(filament(fine, lineWidth.mul(.9)).mul(.6)).clamp(0, 1).mul(grain).toVar();
 
   // ── THE SHEET ──────────────────────────────────────────────────────────
-  // White, with holes of two sizes where the water shows through, and a
-  // fine texture so it never reads as a flat fill.
-  const holesA = cellular(p.mul(7), drift.mul(1.7)).x.smoothstep(.16, .42).oneMinus();
-  const holesB = cellular(p.mul(17), drift.mul(2.3)).x.smoothstep(.12, .34).oneMinus();
-  const sheet = float(.92).add(grain.mul(.16)).sub(holesA.mul(.55)).sub(holesB.mul(.3)).clamp(0, 1);
+  // White, with warped holes of two sizes where the water shows through, and
+  // a fine texture so it never reads as a flat fill.
+  const holesA = cellular(q.mul(5), drift.mul(1.7)).x.smoothstep(.2, .5).oneMinus();
+  const holesB = cellular(q.mul(13), drift.mul(2.3)).x.smoothstep(.14, .38).oneMinus();
+  const sheet = float(.9).add(grain.mul(.15)).sub(holesA.mul(.45)).sub(holesB.mul(.25)).clamp(0, 1);
 
-  // ── THE BUBBLES ────────────────────────────────────────────────────────
-  // Single specks, 2–3 cm across, on a lattice most of whose cells are empty.
-  const dots = cellular(p.mul(22), drift.mul(.8)).x.smoothstep(.14, .3).oneMinus();
-  const sparse = valueNoise(p.mul(6).add(drift)).smoothstep(.45, .7);
-  const specks = dots.mul(sparse);
+  // ── THE FLECKS ─────────────────────────────────────────────────────────
+  // The last of a patch: soft irregular flecks from a fractal threshold —
+  // never round dots, which read as stars on the water.
+  const specks = fbm(p.mul(11), clock, 1.5).smoothstep(.6, .78).mul(fbm(p.mul(2.5), clock, .8).smoothstep(.4, .7));
 
   const sheetMask = v.smoothstep(.5, .82);
   const webMask = v.smoothstep(.05, .38);
@@ -223,59 +188,6 @@ function waterFoamBody(u) {
   const foam = sheetMask.mul(sheet).max(webMask.mul(network)).max(speckMask.mul(specks)).clamp(0, 1);
   return foam.mul(u.foam.smoothstep(0, .15));
 }
-
-/**
- * ══ FINE SURFACE DETAIL — THE SLOPE OF A NOISE FIELD ═══════════════════════
- *
- * A 128² grid over ten metres cannot hold a wave finer than ~20 cm, and real
- * water is full of structure well below that. Geometry cannot get there; a
- * NORMAL can, and this is the difference between water and a corrugated sheet.
- *
- * ⛔ **IT MUST BE NOISE, NOT A SUM OF SINES.** The first version added six
- * directional sinusoids with fixed headings, and a handful of plane waves
- * summed together is a periodic lattice — on screen, a regular cross-hatch of
- * dots: "those surface detail looks like dotted noise. Incorrect" (user,
- * 2026-09-06). Picking cleverer angles cannot fix it; the interference of N
- * pure frequencies is always periodic. A fractal surface needs a fractal.
- *
- * These are forward differences of the authored FBM — three evaluations instead
- * of one, which is the honest price of a derivative value noise will not give
- * in closed form.
- *
- * ⚠ AND IT FADES WITH DISTANCE. Detail finer than a pixel aliases, and analytic
- * noise has no mip chain to fall back on, so far water would shimmer exactly
- * where a real sea goes smooth and specular. In world metres, so a pond and a
- * lake behave the same.
- */
-export function waterDetailSlopeNode(u) {
-  return Fn(() => {
-    const distance = positionWorld.sub(cameraPosition).length();
-    return waterDetailSlopeAt(worldXZ(u), u).mul(distance.smoothstep(40, 8));
-  })();
-}
-
-/**
- * The same slopes at an ARBITRARY world XZ, with no distance fade — for the
- * caustic pass, which evaluates them per grid vertex in a pass that has no
- * fragment and no camera. `cutoff` (world metres) fades out the octaves that
- * grid cannot carry; see `authoredFbm`.
- *
- * ⭐ THE CAUSTIC LENS NEEDS THIS. It used to refract through the solver's
- * geometric normals alone, so on any gentle swell there was nothing to focus:
- * `causticIntensity` scaled a lens that did not exist — "as well as caustics
- * intensity, nothing changes" (user, 2026-09-06). Real caustics come from
- * exactly the fine structure the grid cannot hold, which is why they have to be
- * bent by the same detail the surface is shaded with. Same field, one lens.
- */
-export function waterDetailSlopeAt(world, u, cutoff = null) {
-  const p = world.mul(DETAIL_SCALE);
-  const clock = waveClock(u);
-  const here = authoredFbm(p, clock, u, cutoff).toVar();
-  const along = authoredFbm(p.add(vec2(DETAIL_STEP, 0)), clock, u, cutoff);
-  const across = authoredFbm(p.add(vec2(0, DETAIL_STEP)), clock, u, cutoff);
-  return vec2(along.sub(here), across.sub(here)).div(DETAIL_STEP).mul(u.surfaceDetail.mul(.22));
-}
-
 
 /**
  * ══ SUBSURFACE SCATTERING — THE GLOW THROUGH A CREST ═══════════════════════

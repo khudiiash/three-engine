@@ -1,9 +1,9 @@
 import * as THREE from "three/webgpu";
 import {
-  Fn, If, float, int, ivec2, vec2, vec4, uniform, instanceIndex, textureLoad, textureStore,
-  workgroupArray, workgroupBarrier, localId, workgroupId, select, atan,
+  Fn, If, float, int, ivec2, vec2, vec4, uniform, instanceIndex, texture, textureLoad, textureStore, storageTexture,
+  workgroupArray, workgroupBarrier, localId, workgroupId, select, atan, cameraPosition, positionWorld, mix,
 } from "three/tsl";
-import { GRAVITY, cascadeBands, cascadeScales, expectedVariance, gaussianNoise, seaSettings } from "./waterSpectrumCPU.js";
+import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
 import { releaseComputeNodes } from "../../modules/gi/releaseCompute.js";
 
 /**
@@ -40,11 +40,38 @@ import { releaseComputeNodes } from "../../modules/gi/releaseCompute.js";
  * compile. An ARRAY count is a dispatch size and adds no return.
  */
 export const SEA_SIZE = 256;
-const LOG2 = Math.log2(SEA_SIZE);
-const HALF = SEA_SIZE / 2;
+/** How much sea a build quality buys: cascades × resolution. One model, sized
+ *  to the device — a phone runs two 128² cascades of the same spectrum. */
+export function seaQuality(quality = "high") {
+  return { low: { size: 128, cascadeCount: 2 }, medium: { size: 128, cascadeCount: 3 } }[quality] ?? { size: SEA_SIZE, cascadeCount: 3 };
+}
+/** Babylon's LOD scale: a cascade fades out of the shading normal past
+ *  LOD_SCALE × L metres from the eye, where its texels are under a pixel. */
+export const LOD_SCALE = 7.13;
+/**
+ * ⛔ NO PER-CASCADE FOAM MEMORY, AND NO PER-CASCADE JACOBIAN. Babylon keeps a
+ * "turbulence" memory of each cascade's own Jacobian and sums them. A fine
+ * cascade's own horizontal gradient is large (it scales with k²·h), so on any
+ * choppy sea it "folds" at the centimetre scale constantly — while the
+ * COMPOSED surface does nothing of the kind — and the sum whited out the
+ * whole pool. The fold test belongs to the sum of the cascades' gradients,
+ * taken where the surface is composed (`seaJacobianAt`, in the solver's
+ * surface kernel), and the memory belongs to the solver's persistent foam
+ * field, which already spreads and dissolves a wake's foam. So the maps carry
+ * the ingredients: derivatives (Dyx, Dyz, λDxx, λDzz) and, in
+ * displacement.w, λDxz.
+ */
 
-function storageMap(size, { half = false, mips = false, name = "" } = {}) {
-  const t = new THREE.StorageTexture(size, size);
+/**
+ * ⚠ THE TWO OUTPUT MAPS ARE TEXTURE ARRAYS, ONE LAYER PER CASCADE — because
+ * the water FRAGMENT binds them, and it already binds the medium's four slot
+ * maps, the depth texture, the mirror, the transmission target, the shadow
+ * maps, GI's and the environment: three separate derivative textures took it
+ * to **18 sampled textures against the portable 16** and the water's pipeline
+ * refused to build in the editor. One array is one binding.
+ */
+function storageMap(size, { half = false, mips = false, name = "", layers = 0 } = {}) {
+  const t = layers ? new THREE.StorageArrayTexture(size, size, layers) : new THREE.StorageTexture(size, size);
   t.type = half ? THREE.HalfFloatType : THREE.FloatType;
   t.format = THREE.RGBAFormat;
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
@@ -94,6 +121,9 @@ const spectrumNode = (kx, kz, k, u) => {
   let s = float(0);
   for (const pars of u.spectra) s = s.add(jonswapNode(omega, u.depth, u.peakOmega, pars).mul(directionNode(theta, omega, u.peakOmega, pars)));
   s = s.mul(select(k.greaterThan(u.kPeak), k.div(u.kPeak).pow(u.tilt), float(1)));
+  // Short waves (k > 4·kp, blended over an octave) scale with `rippleStrength`.
+  const short = k.div(u.kPeak).sub(2).div(4).clamp(0, 1);
+  s = s.mul(float(1).add(u.ripple.sub(1).mul(short.mul(short).mul(float(3).sub(short.mul(2))))));
   s = s.mul(k.div(u.kMax).pow(4).negate().exp());
   return s.mul(frequencyDerivativeNode(k, u.depth).abs()).div(k);
 };
@@ -104,9 +134,10 @@ const cmul = (a, b) => vec2(a.x.mul(b.x).sub(a.y.mul(b.y)), a.x.mul(b.y).add(a.y
  * One in-place radix-2 transform over every row (or column) of two packed
  * maps, unnormalized, positive exponent. Bit reversal happens on the load.
  */
-function fftKernel(srcA, srcB, dstA, dstB, horizontal) {
+function fftKernel(srcA, srcB, dstA, dstB, horizontal, size) {
+  const LOG2 = Math.log2(size), HALF = size / 2;
   return Fn(() => {
-    const shA = workgroupArray("vec4", SEA_SIZE), shB = workgroupArray("vec4", SEA_SIZE);
+    const shA = workgroupArray("vec4", size), shB = workgroupArray("vec4", size);
     const t = localId.x.toInt().toVar();
     const line = workgroupId.x.toInt().toVar();
     const coord = (i) => (horizontal ? ivec2(i, line) : ivec2(line, i));
@@ -139,15 +170,14 @@ function fftKernel(srcA, srcB, dstA, dstB, horizontal) {
     textureStore(dstA, coord(i1), shA.element(i1));
     textureStore(dstB, coord(i0), shB.element(i0));
     textureStore(dstB, coord(i1), shB.element(i1));
-  })().compute([SEA_SIZE, 1, 1], [HALF, 1, 1]);
+  })().compute([size, 1, 1], [HALF, 1, 1]);
 }
 
 /**
  * The sea: `configure(props, depthMetres)` re-realizes the spectrum,
  * `tick(renderer, dt, time)` advances it. `cascades[i]` exposes the maps.
  */
-export function createWaterSpectrum({ cascadeCount = 3, seed = 1337 } = {}) {
-  const size = SEA_SIZE;
+export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 1337 } = {}) {
   const noiseData = gaussianNoise(size, seed);
   const noise = new THREE.DataTexture(noiseData, size, size, THREE.RGFormat, THREE.FloatType);
   noise.minFilter = noise.magFilter = THREE.NearestFilter;
@@ -155,24 +185,24 @@ export function createWaterSpectrum({ cascadeCount = 3, seed = 1337 } = {}) {
 
   const u = {
     time: uniform(0), dt: uniform(0), lambda: uniform(.35),
-    depth: uniform(20), peakOmega: uniform(1), kPeak: uniform(1), kMax: uniform(10), tilt: uniform(0),
+    depth: uniform(20), peakOmega: uniform(1), kPeak: uniform(1), kMax: uniform(10), tilt: uniform(0), ripple: uniform(1),
     spectra: [0, 1].map(() => ({ scale: uniform(1), angle: uniform(0), spreadBlend: uniform(1), swell: uniform(.3), gamma: uniform(3.3) })),
   };
   const index = instanceIndex.toInt();
   const px = index.mod(size), py = index.div(size);
   const texel = ivec2(px, py);
   const sign = select(px.add(py).bitAnd(int(1)).equal(int(1)), float(-1), float(1));
+  const displacement = storageMap(size, { half: true, mips: true, layers: cascadeCount, name: "sea displacement" });
+  const derivatives = storageMap(size, { half: true, mips: true, layers: cascadeCount, name: "sea derivatives" });
 
   const cascades = Array.from({ length: cascadeCount }, (_, i) => {
-    const c = { dk: uniform(1), cutLow: uniform(0), cutHigh: uniform(9999), amplitude: uniform(0), L: 1 };
+    const c = { dk: uniform(1), cutLow: uniform(0), cutHigh: uniform(9999), amplitude: uniform(0), invL: uniform(1), L: 1 };
     const h0k = storageMap(size, { name: `sea ${i} h0k` });
     const h0 = storageMap(size, { name: `sea ${i} h0` });
     const wavesData = storageMap(size, { name: `sea ${i} waves` });
     const A = storageMap(size, { name: `sea ${i} A` }), B = storageMap(size, { name: `sea ${i} B` });
     const A2 = storageMap(size, { name: `sea ${i} A2` }), B2 = storageMap(size, { name: `sea ${i} B2` });
-    const displacement = storageMap(size, { half: true, mips: true, name: `sea ${i} displacement` });
-    const derivatives = storageMap(size, { half: true, mips: true, name: `sea ${i} derivatives` });
-    const turbulence = storageMap(size, { half: true, name: `sea ${i} turbulence` });
+    const layer = int(i);
 
     const initial = Fn(() => {
       const kx = px.toFloat().sub(size / 2).mul(c.dk), kz = py.toFloat().sub(size / 2).mul(c.dk);
@@ -206,34 +236,26 @@ export function createWaterSpectrum({ cascadeCount = 3, seed = 1337 } = {}) {
       textureStore(A, texel, vec4(Dx.x.sub(Dz.y), Dx.y.add(Dz.x), Dy.x.sub(Dzdx.y), Dy.y.add(Dzdx.x)));
       textureStore(B, texel, vec4(Dydx.x.sub(Dydz.y), Dydx.y.add(Dydz.x), Dxdx.x.sub(Dzdz.y), Dxdx.y.add(Dzdz.x)));
     })().compute(size * size);
-    const fftRows = fftKernel(A, B, A2, B2, true);
-    const fftCols = fftKernel(A2, B2, A, B, false);
+    const fftRows = fftKernel(A, B, A2, B2, true, size);
+    const fftCols = fftKernel(A2, B2, A, B, false, size);
     const merge = Fn(() => {
       const a = textureLoad(A, texel).mul(sign).toVar(), b = textureLoad(B, texel).mul(sign).toVar();
       const Dx = a.x, Dz = a.y, Dy = a.z, Dxz = a.w, Dyx = b.x, Dyz = b.y, Dxx = b.z, Dzz = b.w;
-      const J = u.lambda.mul(Dxx).add(1).mul(u.lambda.mul(Dzz).add(1)).sub(u.lambda.mul(u.lambda).mul(Dxz).mul(Dxz)).toVar();
-      // The foam memory: pulled down to J the moment the surface folds, then
-      // recovering at 0.5/s — Babylon's `wavesTexturesMerger.wgsl`.
-      const previous = textureLoad(turbulence, texel).x;
-      const turb = previous.add(u.dt.mul(.5).div(J.max(.5))).min(J);
-      textureStore(displacement, texel, vec4(u.lambda.mul(Dx), Dy, u.lambda.mul(Dz), turb));
-      textureStore(derivatives, texel, vec4(Dyx, Dyz, Dxx.mul(u.lambda), Dzz.mul(u.lambda)));
+      storageTexture(displacement).depth(layer).store(texel, vec4(u.lambda.mul(Dx), Dy, u.lambda.mul(Dz), u.lambda.mul(Dxz)));
+      storageTexture(derivatives).depth(layer).store(texel, vec4(Dyx, Dyz, Dxx.mul(u.lambda), Dzz.mul(u.lambda)));
     })().compute(size * size);
-    // The memory lives in `displacement.w` for consumers and is copied to its
-    // own map so `merge` can read last frame's without reading what it writes.
-    const remember = Fn(() => {
-      textureStore(turbulence, texel, vec4(textureLoad(displacement, texel).w, 0, 0, 0));
-    })().compute(size * size);
-    const reset = Fn(() => { textureStore(turbulence, texel, vec4(1, 0, 0, 0)); })().compute(size * size);
-    for (const [k, node] of Object.entries({ initial, conjugate, evolve, fftRows, fftCols, merge, remember, reset })) node.__giPassName = `sea${i}.${k}`;
-    return { index: i, uniforms: c, get L() { return c.L; }, displacement, derivatives, turbulence,
-      textures: [h0k, h0, wavesData, A, B, A2, B2, displacement, derivatives, turbulence],
-      kernels: { initial, conjugate, evolve, fftRows, fftCols, merge, remember, reset } };
+    for (const [k, node] of Object.entries({ initial, conjugate, evolve, fftRows, fftCols, merge })) node.__giPassName = `sea${i}.${k}`;
+    return { index: i, uniforms: c, get L() { return c.L; },
+      textures: [h0k, h0, wavesData, A, B, A2, B2],
+      kernels: { initial, conjugate, evolve, fftRows, fftCols, merge } };
   });
 
-  let settings = null, dirty = true, started = false;
+  let settings = null, dirty = true;
   const spectrum = {
-    size, cascades, uniforms: u, noise,
+    size, cascades, uniforms: u, noise, displacement, derivatives,
+    // Bound ONCE per consumer graph and shared: the texture node is what a
+    // material or kernel binds; a cascade is a LAYER of it.
+    nodes: { displacement: texture(displacement), derivatives: texture(derivatives) },
     get settings() { return settings; },
     amplitude: 0,
     /** Re-realize the spectrum from the component's wave fields. */
@@ -242,38 +264,159 @@ export function createWaterSpectrum({ cascadeCount = 3, seed = 1337 } = {}) {
       const bands = cascadeBands(cascadeScales(settings.waveLength, cascadeCount));
       // The expected variance is an integral over k; a 64² estimate of it is
       // within a few percent of the 256² one and a hundred times cheaper.
-      const variance = expectedVariance(64, bands, settings);
+      const { variance, gradient } = spectrumMoments(64, bands, settings);
       spectrum.amplitude = variance > 0 ? settings.sigma / Math.sqrt(variance) : 0;
+      // `choppiness`, capped where the surface would fold (`foldingLimit`).
+      settings.lambda = Math.min(settings.lambda, foldingLimit(spectrum.amplitude, gradient));
       u.lambda.value = settings.lambda; u.depth.value = settings.depth;
       u.peakOmega.value = settings.peakOmega; u.kPeak.value = settings.kPeak; u.kMax.value = settings.kMax; u.tilt.value = settings.tilt;
+      u.ripple.value = settings.ripple;
       settings.spectra.forEach((pars, i) => { const s = u.spectra[i]; s.scale.value = pars.scale; s.angle.value = pars.angle; s.spreadBlend.value = pars.spreadBlend; s.swell.value = pars.swell; s.gamma.value = pars.gamma; });
       bands.forEach((band, i) => {
         const c = cascades[i].uniforms;
-        c.L = band.L; c.dk.value = 2 * Math.PI / band.L; c.cutLow.value = band.cutLow; c.cutHigh.value = band.cutHigh;
-        c.amplitude.value = spectrum.amplitude * (i ? settings.ripple : 1);
+        c.L = band.L; c.invL.value = 1 / band.L; c.dk.value = 2 * Math.PI / band.L; c.cutLow.value = band.cutLow; c.cutHigh.value = band.cutHigh;
+        c.amplitude.value = spectrum.amplitude;
       });
       dirty = true;
       return settings;
     },
+    /** The sea carries no memory of its own (the solver's foam field does);
+     *  a restart re-realizes nothing. Kept so the solver may call it. */
+    restart() {},
     /** The dispatches for this frame, in order; `renderer.compute(...)` them. */
     passes(dt, time) {
       const queue = [];
       if (!settings) return queue;
-      if (!started) { for (const c of cascades) queue.push(c.kernels.reset); started = true; }
       if (dirty) { for (const c of cascades) queue.push(c.kernels.initial, c.kernels.conjugate); dirty = false; }
       u.time.value = time * settings.timeScale; u.dt.value = Math.min(.5, Math.max(0, dt));
-      for (const c of cascades) queue.push(c.kernels.evolve, c.kernels.fftRows, c.kernels.fftCols, c.kernels.merge, c.kernels.remember);
+      for (const c of cascades) queue.push(c.kernels.evolve, c.kernels.fftRows, c.kernels.fftCols, c.kernels.merge);
       return queue;
     },
     tick(renderer, dt, time) {
       const queue = spectrum.passes(dt, time);
       if (queue.length && renderer?.isWebGPURenderer) renderer.compute(queue);
     },
+    /**
+     * The displacement maps of the cascades that carry height, copied to the
+     * CPU for buoyancy — Babylon's `_getDisplacementMap`. Asynchronous and a
+     * frame or two behind, which no floating body can see; kept as HALVES and
+     * converted at the sample (`sampleDisplacement`), never as a whole map.
+     */
+    async readback(renderer, count = 2) {
+      if (!renderer?.backend?.copyTextureToBuffer || !settings) return null;
+      const maps = await Promise.all(cascades.slice(0, count).map((c, i) => renderer.backend.copyTextureToBuffer(displacement, 0, 0, size, size, i)));
+      return { cascades: maps.map((map, i) => ({ size, L: cascades[i].L, displacement: map })) };
+    },
     dispose(renderer) {
       releaseComputeNodes(renderer, cascades.flatMap((c) => Object.values(c.kernels)));
       for (const c of cascades) for (const t of c.textures) t.dispose();
-      noise.dispose();
+      displacement.dispose(); derivatives.dispose(); noise.dispose();
     },
   };
   return spectrum;
+}
+
+// ── SAMPLING THE SEA, IN TSL ─────────────────────────────────────────────────
+//
+// `world` is a vec2 in WORLD metres (a water's local XZ times its scale, so the
+// tiling is in metres whatever the box). `lods` are per-cascade mip levels for
+// a compute stage that has no screen derivatives — a vertex spacing coarser
+// than a cascade's texel must read a coarser level or it aliases; a fragment
+// passes null and lets the hardware pick.
+
+/** Σ displacement (x, y, z, world metres) over the cascades, and in `.w` the
+ *  Σ of λ·Dxz — the cross term the Jacobian of the composed surface needs. */
+// ⚠ HALF A TEXEL, AND IT IS NOT A DETAIL. The transform puts sample i at
+// x = i·L/N, but a sampler puts texel i's CENTRE at (i + ½)/N — so `x/L`
+// alone reads every cascade half a texel early, and the coarse cascade's
+// band reaches waves only 2.7 texels long, where half a texel is most of a
+// wave. The CPU (`sampleDisplacement`) follows the transform; so must this,
+// or buoyancy floats on a sea the eye does not see.
+const texelCentre = (spectrum) => .5 / spectrum.size;
+export function seaDisplacementAt(spectrum, world, lods = null) {
+  let sum = vec4(0);
+  spectrum.cascades.forEach((c, i) => {
+    const uv = world.mul(c.uniforms.invL).add(texelCentre(spectrum));
+    let s = spectrum.nodes.displacement.sample(uv).depth(i);
+    if (lods) s = s.level(lods[i]);
+    sum = sum.add(s);
+  });
+  return sum;
+}
+/**
+ * ⭐ THE JACOBIAN OF THE COMPOSED SURFACE: J = (1 + Σλ·Dxx)(1 + Σλ·Dzz) −
+ * (Σλ·Dxz)², summed over the cascades BEFORE the product — the horizontal
+ * displacement gradient of the surface the eye sees, not of any one layer.
+ * Below zero the surface has folded over itself; that is what foam is made
+ * of, and `seaFoamNode` turns its deficit into a source for the foam field.
+ * `crossSum` is `seaDisplacementAt(...).w`, already sampled by the caller.
+ */
+export function seaJacobianAt(spectrum, world, crossSum, lods = null) {
+  let dxx = float(0), dzz = float(0);
+  spectrum.cascades.forEach((c, i) => {
+    const uv = world.mul(c.uniforms.invL).add(texelCentre(spectrum));
+    let s = spectrum.nodes.derivatives.sample(uv).depth(i);
+    if (lods) s = s.level(lods[i]);
+    dxx = dxx.add(s.z); dzz = dzz.add(s.w);
+  });
+  return dxx.add(1).mul(dzz.add(1)).sub(crossSum.mul(crossSum));
+}
+/**
+ * The sea's slope (dy/dx, dy/dz, world) from the derivative cascades —
+ * Babylon's `slope = (d.x/(1+d.z), d.y/(1+d.w))`, the horizontal displacement
+ * folded into the denominator. `weights[i]` fades a cascade (distance LOD,
+ * `surfaceDetail`); `lods` as above.
+ */
+export function seaSlopeAt(spectrum, world, { lods = null, weights = null } = {}) {
+  let d = vec4(0);
+  spectrum.cascades.forEach((c, i) => {
+    const uv = world.mul(c.uniforms.invL).add(texelCentre(spectrum));
+    let s = spectrum.nodes.derivatives.sample(uv).depth(i);
+    if (lods) s = s.level(lods[i]);
+    if (weights) s = s.mul(weights[i]);
+    d = d.add(s);
+  });
+  return vec2(d.x.div(d.z.add(1)), d.y.div(d.w.add(1)));
+}
+/**
+ * Jacobian foam on the COMPOSED surface: `foam` sets how far into folding a
+ * crest has to be. J is 1 on flat water and crosses 0 as the surface folds;
+ * at `foam` 1 a crest past J = 0.4 (well into breaking) counts, at 0.25 it
+ * takes J < −0.3 — folded right over. This is a SOURCE for the persistent
+ * foam field (gridSimulation), which is what gives a fold's foam its life
+ * after the crest has moved on.
+ */
+export function seaFoamNode(jacobian, foam) {
+  return float(1).sub(jacobian).sub(mix(float(1.3), float(.6), foam)).div(.3).clamp(0, 1);
+}
+/**
+ * The per-pixel shading slope: every cascade with Babylon's distance fade
+ * (min(LOD_SCALE × L / viewDist, 1) — a cascade drops out of the normal as its
+ * texels fall under a pixel). This is what replaced the value-noise "detail
+ * normal": real waves, at every scale the spectrum carries, band-limited by
+ * the hardware mip chain.
+ *
+ * `surfaceDetail` is the SUB-VERTEX part of that slope: the difference between
+ * the cascades at full resolution and the same cascades at the mip the mesh's
+ * vertices sample (`vertexLods`, the solver's `seaLod`). At 0 the pixel normal
+ * carries exactly what the geometry does; at 2 the structure finer than a
+ * vertex is doubled. Defined this way it works at any peak wavelength — as
+ * "the weight of the finest cascade" it scaled a cascade that, on a short
+ * peak, carries nothing ("DEAD surfaceDetail", the property sweep, 2026-09-06).
+ */
+export function seaShadingSlopeNode(spectrum, world, surfaceDetail, vertexLods = null) {
+  const viewDist = positionWorld.sub(cameraPosition).length();
+  let d = vec4(0);
+  spectrum.cascades.forEach((c, i) => {
+    const uv = world.mul(c.uniforms.invL).add(texelCentre(spectrum));
+    const fade = float(1).div(c.uniforms.invL).mul(LOD_SCALE).div(viewDist.max(1e-3)).min(1);
+    const full = spectrum.nodes.derivatives.sample(uv).depth(i);
+    let s = full;
+    if (vertexLods) {
+      const coarse = spectrum.nodes.derivatives.sample(uv).depth(i).level(vertexLods[i]);
+      s = coarse.add(full.sub(coarse).mul(surfaceDetail));
+    }
+    d = d.add(s.mul(fade));
+  });
+  return vec2(d.x.div(d.z.add(1)), d.y.div(d.w.add(1)));
 }

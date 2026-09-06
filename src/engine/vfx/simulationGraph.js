@@ -15,9 +15,10 @@ export function simulationNodeTypes(kind) {
       select("fabric", "Fabric", "cotton", ["cotton", "silk", "canvas"]),
       { key: "sceneCollision", label: "Scene colliders", type: "boolean", default: true },
       number("collisionRadius", "Contact thickness", .03, .001, 1, .005), number("friction", "Contact friction", .2, 0, 1, .01)]
-    : [number("waveSpeed", "Wave speed", 2, 0, 100), number("amplitude", "Initial ripple height", 0, 0, 10, .05),
-      number("waveHeight", "Continuous wave height", .15, 0, 5, .05), number("waveLength", "Wave length", 4, .1, 100),
-      number("waveOctaves", "Detail octaves", 4, 1, 8, 1), number("waveGain", "Octave falloff", .5, .2, .9, .05),
+    : [select("seaState", "Sea state", "custom", ["custom", "pool", "pond", "lake", "ocean"]),
+      number("waveSpeed", "Wave speed (x real time)", 1, 0, 100), number("amplitude", "Initial ripple height", 0, 0, 10, .05),
+      number("waveHeight", "Wave height (m)", .15, 0, 5, .05), number("waveLength", "Peak wavelength (m)", 4, .1, 1000),
+      number("waveOctaves", "Short-wave octaves", 4, 1, 8, 1), number("waveGain", "Spectral tilt", .5, .2, .9, .05),
       number("waveDirection", "Wave direction (degrees)", 0, -180, 180, 1), number("choppiness", "Choppiness", .35, 0, 1, .01), number("rippleStrength", "Ripple strength", .6, 0, 2, .01), number("surfaceDetail", "Surface detail (normals)", .6, 0, 2, .05), { key: "caustics", label: "Caustics", type: "boolean", default: true }, number("causticIntensity", "Caustic intensity", 1, 0, 3, .05)])];
   return {
     grid: { label: "Grid", category: "emitter", inputs: [input("width"), input("height"), input("resolution")], outputs: output("grid"), params: [

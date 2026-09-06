@@ -1,9 +1,10 @@
 import { Object3D, Vector3 } from 'three/webgpu';
 import {
-  cameraViewMatrix, float, materialColor, mix, modelNormalMatrix, normalMap, normalView,
-  positionViewDirection, reflector, screenUV, transformDirection, uniform, vec3,
+  cameraViewMatrix, float, materialColor, mix, modelNormalMatrix, normalLocal, normalView, positionLocal,
+  positionViewDirection, reflector, screenUV, transformDirection, transformNormalToView, uniform, vec2, vec3,
 } from 'three/tsl';
-import { waterDetailSlopeNode, waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
+import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
+import { seaShadingSlopeNode } from './waterSpectrum.js';
 
 const _eye = new Vector3(), _origin = new Vector3(), _up = new Vector3();
 /** Recursion guard: a mirror must not render itself. */
@@ -133,13 +134,26 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     // there and a NORMAL can — which then feeds the Fresnel, the mirror's
     // distortion and the specular glitter at once, because all three read the
     // shading normal. This is "add those smaller details onto normal map".
-    if (u) {
+    if (u && simulation?.spectrum) {
+      // ── THE SEA'S SLOPE, PER PIXEL, FROM THE DERIVATIVE CASCADES ─────────
+      //
+      // The mesh normal carries only the ripple field (gridSimulation's
+      // surface kernel); the sea is added here from the same derivative maps
+      // the caustic lens reads, with their hardware mip chains — real waves
+      // at every scale the spectrum holds, where the value-noise "detail
+      // normal" used to be. Babylon's distance fade drops each cascade as its
+      // texels fall under a pixel. Composed in LOCAL space against the
+      // interpolated geometric normal and taken to view space from there, so
+      // no tangent frame has to be guessed on an anisotropically scaled box.
+      //
       // ⚠ AND STYLIZED WATER HAS ALMOST NONE OF IT. Sub-pixel glitter is the
       // single strongest cue that a surface is photographic; a cel-shaded pond
-      // reads as cel-shaded largely by not having it. This is the half of
-      // `style` that is actually visible from across the room.
-      const slope = waterDetailSlopeNode(u).mul(mix(float(1), float(.12), u.stylized));
-      material.normalNode = normalMap(vec3(slope.x.negate(), slope.y.negate(), 1).normalize().mul(.5).add(.5));
+      // reads as cel-shaded largely by not having it.
+      const world = vec2(positionLocal.x.mul(u.waveScale.x), positionLocal.z.mul(u.waveScale.z));
+      const slope = seaShadingSlopeNode(simulation.spectrum, world, u.surfaceDetail, u.seaLod).mul(mix(float(1), float(.12), u.stylized));
+      const local = vec2(slope.x.mul(u.waveScale.x).div(u.waveScale.y), slope.y.mul(u.waveScale.z).div(u.waveScale.y));
+      const perturbed = normalLocal.add(vec3(local.x.negate().mul(normalLocal.y), 0, local.y.negate().mul(normalLocal.y))).normalize();
+      material.normalNode = transformNormalToView(perturbed);
     }
     const fresnel = float(1).sub(normalView.dot(positionViewDirection).abs()).clamp(0, 1).pow(5).mul(.97963).add(.02037);
     // ⚠ FROM THE CAPTURE, NOT FROM THE MATERIAL — this function writes

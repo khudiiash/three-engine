@@ -2,7 +2,7 @@
 import * as THREE from 'three/webgpu';
 import {Fn,texture,uv as uvNode} from 'three/tsl';
 import {createGridSimulation} from '/src/engine/vfx/gridSimulation.js';
-import {waterWaveHeight} from '/src/engine/vfx/waterWaves.js';
+import {realizeSea,sampleDisplacement} from '/src/engine/vfx/waterSpectrumCPU.js';
 import {waterSlotPool} from '/src/engine/vfx/waterSlots.js';
 import {installWaterCausticLight,updateWaterSlot} from '/src/engine/vfx/waterCaustics.js';
 import {installWaterMedium,waterCrossedLengthNode} from '/src/engine/vfx/waterMedium.js';
@@ -20,6 +20,8 @@ try{
  const pool=waterSlotPool(engine);engine.waterSlots=pool;
  const owner={};const slot=pool.claim(owner);check(!!slot,'water slot claimed from the engine pool');
  const sim=createGridSimulation('water',p,{waterSlot:slot});scene.add(sim.mesh);
+ // Every cascade at mip 0, so the vertex reads the same texel the CPU does.
+ sim.seaLodOverride=0;
  installWaterCausticLight(engine);
  installWaterMedium(engine);
  const floor=new THREE.Mesh(new THREE.PlaneGeometry(10,10),new THREE.MeshStandardNodeMaterial({color:'#777777',roughness:1}));
@@ -34,11 +36,29 @@ try{
  // ── THE VOLUME ────────────────────────────────────────────────────────────
  const data=new Float32Array(await renderer.getArrayBufferAsync(sim.mesh.geometry.attributes.position));
  const ws=sim.uniforms.waveScale.value;
- // Both live clamps, exactly as `waterPhysics.js` reads them: the base
- // wavelength's Nyquist clamp AND the per-band cutoff.
- const live={...p,waveLength:sim.uniforms.waveLength.value,waveCutoff:sim.uniforms.waveCutoff.value};
- let error=0;for(let i=0;i<sim.count*4;i+=4)error=Math.max(error,Math.abs(data[i+1]-waterWaveHeight(data[i]*ws.x,data[i+2]*ws.z,sim.uniforms.simTime.value,live)/ws.y));
- check(error<.00002,'GPU waves match CPU buoyancy query '+error);
+ // The vertex's REST position addresses the cascades; the GPU vertex is rest
+ // plus the sea's displacement in x, y AND z. The CPU realizes the same sea
+ // (same seed, amplitude, depth and clock) and the two must agree at every
+ // vertex to half-float precision.
+ const cpu=realizeSea({size:sim.spectrum.size,props:p,depth:sim.spectrum.settings.depth,time:sim.uniforms.simTime.value,amplitude:sim.spectrum.amplitude,lambda:sim.spectrum.settings.lambda,cascadeCount:sim.spectrum.cascades.length});
+ // ...and, to split "the maps differ" from "the kernel samples them
+ // differently", the GPU's OWN maps read back and sampled the CPU way.
+ const own={cascades:await Promise.all(sim.spectrum.cascades.map(async(c,i)=>({size:sim.spectrum.size,L:c.L,displacement:await renderer.backend.copyTextureToBuffer(sim.spectrum.displacement,0,0,sim.spectrum.size,sim.spectrum.size,i)})))};
+ const nn=sim.resolution,dxl=p.width/(nn-1),dyl=p.height/(nn-1);
+ const errors3=[0,0,0],ownErrors=[0,0,0];let worstAt=null,worst=0;
+ for(let iz=0;iz<nn;iz++)for(let ix=0;ix<nn;ix++){const i=(iz*nn+ix)*4,rx=ix*dxl-p.width/2,rz=iz*dyl-p.height/2;
+  const s=[0,0,0],o=[0,0,0];
+  for(const c of cpu.cascades){const d=sampleDisplacement(c.displacement,c.size,c.L,rx*ws.x,rz*ws.z);s[0]+=d[0];s[1]+=d[1];s[2]+=d[2];}
+  for(const c of own.cascades){const d=sampleDisplacement(c.displacement,c.size,c.L,rx*ws.x,rz*ws.z);o[0]+=d[0];o[1]+=d[1];o[2]+=d[2];}
+  const e=[Math.abs(data[i]-(rx+s[0]/ws.x)),Math.abs(data[i+1]-s[1]/ws.y),Math.abs(data[i+2]-(rz+s[2]/ws.z))];
+  const eo=[Math.abs(data[i]-(rx+o[0]/ws.x)),Math.abs(data[i+1]-o[1]/ws.y),Math.abs(data[i+2]-(rz+o[2]/ws.z))];
+  for(let c=0;c<3;c++){errors3[c]=Math.max(errors3[c],e[c]);ownErrors[c]=Math.max(ownErrors[c],eo[c]);}
+  const m=Math.max(...e);if(m>worst){worst=m;worstAt={ix,iz,gpu:[data[i],data[i+1],data[i+2]],cpu:[rx+s[0]/ws.x,s[1]/ws.y,rz+s[2]/ws.z],own:[rx+o[0]/ws.x,o[1]/ws.y,rz+o[2]/ws.z]};}}
+ console.log('WATER: vertex vs CPU spec, max error per axis',JSON.stringify(errors3.map(v=>+v.toFixed(4))),'| vs GPU own maps',JSON.stringify(ownErrors.map(v=>+v.toFixed(4))));
+ console.log('WATER: worst vertex',JSON.stringify(worstAt));
+ console.log('WATER: settings',JSON.stringify({time:sim.uniforms.simTime.value,timeScale:sim.spectrum.settings.timeScale,depth:sim.spectrum.settings.depth,amplitude:sim.spectrum.amplitude,L:sim.spectrum.cascades.map(c=>+c.L.toFixed(2)),lod:sim.uniforms.seaLod.map(l=>l.value)}));
+ const error=Math.max(...errors3);
+ check(error<.003,'GPU sea matches the CPU specification at every vertex '+error);
  check(sim.vertexCount>sim.count,'the water body carries skirt vertices '+sim.vertexCount);
  let deepest=0,rimMatches=0;
  for(let i=sim.count*4;i<sim.vertexCount*4;i+=4)deepest=Math.min(deepest,data[i+1]);
@@ -60,7 +80,7 @@ try{
  // readback path.
  {
   const quad=new THREE.Mesh(new THREE.PlaneGeometry(2,2),new THREE.MeshBasicNodeMaterial());
-  quad.material.colorNode=texture(slot.caustic,uvNode()).mul(1/8);quad.material.fog=false;
+  quad.material.colorNode=texture(slot.caustic,uvNode()).depth(slot.index).mul(1/8);quad.material.fog=false;
   const flat=new THREE.Scene();flat.add(quad);
   const ortho=new THREE.OrthographicCamera(-1,1,1,-1,0,1);ortho.position.z=.5;
   renderer.setRenderTarget(target);await renderer.render(flat,ortho);

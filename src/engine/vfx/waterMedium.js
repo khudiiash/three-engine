@@ -88,7 +88,7 @@ export function waterSegmentNode(slot) {
   If(flat1.greaterThanEqual(flat0), () => {
     const entry = a.add(d.mul(flat0.clamp(0, 1))).toVar();
     const uv = vec2(entry.x.div(half.x.mul(2)).add(.5), entry.z.div(half.z.mul(2)).add(.5)).clamp(.001, .999);
-    top.assign(slot.nodes.surface.sample(uv).level(0).x);
+    top.assign(slot.nodes.surface.sample(uv).depth(slot.index).level(0).x);
   });
   clipSlab(t0, t1, a.y, d.y, top.sub(half.y), top);
   // The parameter is normalized along the same segment in both spaces, so the

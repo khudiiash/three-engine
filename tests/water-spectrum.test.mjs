@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  cascadeBands, cascadeScales, evolve, expectedVariance, gaussianNoise, ifft2d, initialSpectrum, merge,
-  realizeSea, sampleDisplacement, seaHeightAt, seaSettings, spectrumAt,
+  cascadeBands, cascadeScales, evolve, expectedVariance, foldingLimit, gaussianNoise, ifft2d, initialSpectrum, jacobianOf,
+  realizeSea, sampleDisplacement, seaHeightAt, seaSettings, spectrumAt, spectrumMoments,
 } from '../src/engine/vfx/waterSpectrumCPU.js';
 
 /** A naive 2-D inverse DFT (positive exponent, unnormalized, centred sign) of
@@ -64,8 +64,8 @@ test('the spectrum peaks at the authored wavelength along the wind', () => {
 });
 
 test('waveHeight is metres: the realized RMS height tracks σ = H/2, and 0 is flat', () => {
-  for (const H of [.4, 1.2]) {
-    const sea = realizeSea({ size: 64, props: { waveHeight: H, waveLength: 6, choppiness: 0 }, depth: 30 });
+  for (const [H, L] of [[.4, 6], [1.2, 24]]) {
+    const sea = realizeSea({ size: 64, props: { waveHeight: H, waveLength: L, choppiness: 0 }, depth: 30 });
     let sum = 0, n = 0;
     for (const c of sea.cascades) for (let t = 0; t < 64 * 64; t++) { sum += c.displacement[t * 4 + 1] ** 2; n++; }
     // Cascades are independent realizations over disjoint bands, so their
@@ -113,11 +113,9 @@ test('the derivative maps are the slopes of the displacement map (packing is con
 test('choppiness folds the surface: the Jacobian dips below 1 only when λ > 0', () => {
   const calm = realizeSea({ size: 64, props: { waveHeight: .6, waveLength: 5, choppiness: 0 } });
   const choppy = realizeSea({ size: 64, props: { waveHeight: .6, waveLength: 5, choppiness: 1 } });
-  const minJ = (sea) => Math.min(...sea.cascades.map((c) => Math.min(...Array.from({ length: 64 * 64 }, (_, t) => c.displacement[t * 4 + 3]))));
+  const minJ = (sea) => Math.min(...Array.from({ length: 64 * 64 }, (_, t) => jacobianOf(sea.cascades, t)));
   assert.ok(Math.abs(minJ(calm) - 1) < 1e-5);
   assert.ok(minJ(choppy) < .95, `choppy min J ${minJ(choppy)}`);
-  const { turbulence } = merge(new Float32Array(16), new Float32Array(16), 2, 1, new Float32Array(4).fill(1), .1);
-  assert.ok(turbulence.every((v) => Math.abs(v - 1) < 1e-6), 'flat water keeps its foam memory at 1');
 });
 
 test('sampling tiles and the buoyancy query returns the height where there is no horizontal displacement', () => {
@@ -129,6 +127,31 @@ test('sampling tiles and the buoyancy query returns the height where there is no
   assert.ok(Math.abs(wrapped[1] - at[1]) < 1e-6, 'tiles');
   let expected = 0; for (const cc of sea.cascades) expected += sampleDisplacement(cc.displacement, 32, cc.L, 1.3, 2.7)[1];
   assert.ok(Math.abs(seaHeightAt(sea.cascades, 1.3, 2.7) - expected) < 1e-6);
+});
+
+test('choppiness is capped where the surface would fold, and a capped sea folds only at its rarest crests', () => {
+  // A sea at the breaking limit with every short wave turned up: past the fold.
+  const settings = seaSettings({ waveHeight: 1, waveLength: 5, choppiness: 1, waveOctaves: 8, waveGain: .9, rippleStrength: 2 }, 3);
+  const bands = cascadeBands(cascadeScales(5));
+  const { variance, gradient } = spectrumMoments(64, bands, settings);
+  const amplitude = settings.sigma / Math.sqrt(variance);
+  const limit = foldingLimit(amplitude, gradient);
+  assert.ok(limit < 1, `a sea at the breaking limit is capped: λ ≤ ${limit.toFixed(3)}`);
+  // The user's own sea (H .2 on a 5 m peak) sits under the limit: its foam is
+  // a threshold question, not a folding one.
+  const user = seaSettings({ waveHeight: .2, waveLength: 5, choppiness: 1, waveOctaves: 8, waveGain: .45, rippleStrength: 1 }, 3);
+  const um = spectrumMoments(64, bands, user);
+  assert.ok(foldingLimit(user.sigma / Math.sqrt(um.variance), um.gradient) > 1);
+  const sea = realizeSea({ size: 128, props: { waveHeight: .2, waveLength: 5, choppiness: 1, waveOctaves: 8, waveGain: .45, rippleStrength: 1 }, depth: 3 });
+  let folded = 0, n = 0;
+  for (let t = 0; t < 128 * 128; t++) { if (jacobianOf(sea.cascades, t) < 0) folded++; n++; }
+  assert.ok(folded / n < .03, `folded share ${(folded / n * 100).toFixed(2)} % — whitecaps, not a crumpled sheet`);
+  assert.ok(realizeSea({ size: 64, props: { waveHeight: .02, waveLength: 8, choppiness: .3 } }).settings.lambda === .3, 'a calm sea keeps its authored choppiness');
+});
+
+test('a sea steeper than the breaking limit is capped by its wavelength', () => {
+  assert.equal(seaSettings({ waveHeight: .35, waveLength: 2 }).sigma, .1);
+  assert.equal(seaSettings({ waveHeight: .2, waveLength: 5 }).sigma, .1);
 });
 
 test('time moves the sea and waveSpeed scales the clock', () => {

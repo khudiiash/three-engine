@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { float, mix, normalWorld, positionWorld, select, vec2, vec3, vec4 } from 'three/tsl';
-import { waterSlotPool } from './waterSlots.js';
+import { CAUSTIC_RESOLUTION, CAUSTIC_WINDOW_METRES, waterSlotPool } from './waterSlots.js';
 
 const registered = new WeakSet();
 
@@ -83,11 +83,11 @@ export function waterCausticGainLocalNode(P, slot, level = 0) {
     local.x.add(s.flatRay.x.mul(remaining)),
     local.z.add(s.flatRay.z.mul(remaining)),
   );
-  const uv = vec2(sample.x.div(s.half.x.mul(2)).add(.5), sample.y.div(s.half.z.mul(2)).add(.5));
+  const { uv, edge } = causticWindowUv(sample, s);
   // `level` is the mip the caller wants: 0 for a receiver, which needs every
   // filament, and a coarse one for the light shafts, which are integrating
   // along the beam and cannot afford the variance. See `causticTarget`.
-  const floorFocus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).level(level).x;
+  const floorFocus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).depth(slot.index).level(level).x;
   // The map is measured AT the floor. A receiver higher in the column has had
   // less distance over which to focus, so the compression is interpolated
   // toward 1 at the surface rather than stamped at full strength on everything
@@ -107,8 +107,20 @@ export function waterCausticGainLocalNode(P, slot, level = 0) {
   // all": at 0 the expression is exactly 1, so the caustic disappears without a
   // branch anywhere in any consumer, and above 1 it exaggerates the lens around
   // the same neutral point rather than scaling the light itself.
-  const gain = float(1).add(focus.sub(1).mul(s.strength)).clamp(0, MAX_GAIN);
+  const gain = float(1).add(focus.sub(1).mul(s.strength).mul(edge)).clamp(0, MAX_GAIN);
   return select(inside, gain, float(1));
+}
+
+/**
+ * Where a landing point falls in the caustic WINDOW (see `waterSlots.js`'s
+ * `causticCenter`), and how close to its rim: the gain fades to 1 over the
+ * outer tenth so the window has no visible border as the camera moves.
+ */
+function causticWindowUv(sample, s) {
+  const rel = sample.sub(vec2(s.causticCenter)).div(vec2(s.causticHalf).mul(2)).toVar();
+  const uv = rel.add(.5);
+  const edge = float(.5).sub(rel.abs().max(rel.abs().yx).x).mul(10).clamp(0, 1);
+  return { uv, edge };
 }
 
 /**
@@ -146,14 +158,13 @@ export function waterCausticAboveNode(P, slot) {
   // parameterization the map is stored in.
   const rise = s.flatRay.y.negate().max(.05);
   const reach = s.half.y.div(rise);
-  const uv = vec2(surfaceX.add(s.flatRay.x.mul(reach)).div(s.half.x.mul(2)).add(.5),
-    surfaceZ.add(s.flatRay.z.mul(reach)).div(s.half.z.mul(2)).add(.5));
-  const focus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).level(0).x;
+  const { uv, edge } = causticWindowUv(vec2(surfaceX.add(s.flatRay.x.mul(reach)), surfaceZ.add(s.flatRay.z.mul(reach))), s);
+  const focus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).depth(slot.index).level(0).x;
   // The pattern softens with distance from the surface, as a real one does —
   // over the volume's own depth, so it is scale-free like everything else here.
   const spread = height.div(s.half.y.max(.001)).clamp(0, 1);
   const lens = mix(focus, float(1), spread.smoothstep(0, 1.5));
-  return select(inside, lens.mul(s.strength).clamp(0, MAX_GAIN), float(0));
+  return select(inside, lens.mul(s.strength).mul(edge).clamp(0, MAX_GAIN), float(0));
 }
 
 export class WaterCausticLight extends THREE.Light {
@@ -253,7 +264,7 @@ export function removeWaterCausticLight(engine) {
  * Per-frame slot upkeep for one water surface: the matrices the kernel and
  * every consumer read, the optical constants, and the sun the lens is aimed at.
  */
-const scatterSource = new THREE.Color(), up0 = new THREE.Vector3();
+const scatterSource = new THREE.Color(), up0 = new THREE.Vector3(), _eye = new THREE.Vector3();
 /** How far a refracted ray may walk before it exits, in world metres. Small on
  *  purpose: past a few tens of centimetres the screen-space sample leaves the
  *  water's own silhouette and starts drawing the bank. */
@@ -285,6 +296,21 @@ export function updateWaterSlot({ engine, slot, kernel, mesh, simulation, props 
   const scale = Math.max(1e-4, axisX.length(), axisY.length(), axisZ.length());
   simulation.uniforms.refraction.value = REFRACTION_METRES * (simulation.uniforms.transmission.value ?? 1) / scale;
   s.half.value.set(simulation.extent.halfX, Math.max(.01, simulation.extent.depth), simulation.extent.halfZ);
+  // ── THE CAUSTIC WINDOW FOLLOWS THE CAMERA, SNAPPED TO ITS TEXELS ────────
+  //
+  // Half-size: the pool, or `CAUSTIC_WINDOW_METRES` across, whichever is
+  // smaller — in local units per axis, because the box is anisotropic.
+  // Centre: the camera's local XZ, kept inside the pool so the window never
+  // hangs over the rim, then rounded to a whole texel so a moving camera
+  // slides the window in steps the pattern cannot see.
+  const wx = Math.min(s.half.value.x, CAUSTIC_WINDOW_METRES / 2 / Math.max(1e-4, axisX.length()));
+  const wz = Math.min(s.half.value.z, CAUSTIC_WINDOW_METRES / 2 / Math.max(1e-4, axisZ.length()));
+  s.causticHalf.value.set(Math.max(1e-4, wx), Math.max(1e-4, wz));
+  const eye = engine?.camera ? engine.camera.getWorldPosition(_eye).applyMatrix4(s.inverse.value) : _eye.set(0, 0, 0);
+  const tx = 2 * wx / CAUSTIC_RESOLUTION, tz = 2 * wz / CAUSTIC_RESOLUTION;
+  const cx = Math.max(-(s.half.value.x - wx), Math.min(s.half.value.x - wx, eye.x));
+  const cz = Math.max(-(s.half.value.z - wz), Math.min(s.half.value.z - wz, eye.z));
+  s.causticCenter.value.set(Math.round(cx / tx) * tx, Math.round(cz / tz) * tz);
   const absorption = Math.max(0, Number(simulation.uniforms.absorption.value ?? .2));
   s.absorption.value = absorption;
   // ── `absorption` IS THE EXTINCTION; `deepColor` IS ONLY ITS HUE ──────────

@@ -6,6 +6,7 @@ import { evaluateSimulationGraph, setSimulationGraphProp } from "./simulationGra
 import { bindVfxAsset } from "./vfxAsset.js";
 import { BackSide, FrontSide, Matrix4, Vector3 } from "three/webgpu";
 import { waterAutoResolution } from "./waterVolume.js";
+import { seaQuality } from "./waterSpectrum.js";
 
 const _cameraWorld = new Vector3(), _waterInverse = new Matrix4();
 import { ParticleColliderField } from "../particleColliders.js";
@@ -110,7 +111,9 @@ export class GridSimulationComponent extends Component {
     // kernel that writes into it. A scene past `MAX_WATER_SLOTS` surfaces gets
     // no slot: it still simulates and renders, it just does not light or fog.
     if (this.constructor.type === "water") this.waterSlot = this.entity.engine.waterSlots?.claim(this) ?? null;
-    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, anchorEngine: this.entity.engine, waterSlot: this.waterSlot });
+    // One sea model, sized to the tier the scene ships at.
+    const quality = this.entity.engine?.project?.settings?.build?.quality ?? this.entity.engine?.projectSettings?.build?.quality ?? "high";
+    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality) });
     this.simulation.mesh.userData.entityId = this.entity.id;
     this.entity.object3D.add(this.simulation.mesh);
     this.syncAppearance();

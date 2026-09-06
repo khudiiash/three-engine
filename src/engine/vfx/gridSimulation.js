@@ -1,7 +1,8 @@
 import * as THREE from "three/webgpu";
-import { Fn, If, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec3, vec4, mix, positionLocal, Loop, dot, normalMap,textureStore,ivec2 } from "three/tsl";
+import { Fn, If, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, ivec2 } from "three/tsl";
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
-import { waterFieldSteepness, waterWaveHeightNode } from "./waterWaves.js";
+import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt } from "./waterSpectrum.js";
+import { GRAVITY } from "./waterSpectrumCPU.js";
 import { waterExtinction, waterSaturation } from "./waterVolume.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
 import { projectClothMeshContact, projectClothClosedContact } from "./clothMeshContact.js";
@@ -23,9 +24,17 @@ export function gridConfig(props = {}) {
  * uses the damped wave equation, not a volumetric liquid solver. All neighbor
  * reads are from a separate buffer: no cross-workgroup read/write races.
  * Largest compute graph binds four storage buffers, within portable WebGPU. */
-export function createGridSimulation(kind, props = {}, { colliderField = null, meshColliderField = null, colliderEntityId = null, material: sourceMaterial = null, sourceGeometry = null, anchorEngine = null, waterSlot = null } = {}) {
+export function createGridSimulation(kind, props = {}, { colliderField = null, meshColliderField = null, colliderEntityId = null, material: sourceMaterial = null, sourceGeometry = null, anchorEngine = null, waterSlot = null, spectrum: givenSpectrum = null, seaQuality = null } = {}) {
   if (kind === "cloth" && !sourceMaterial) throw new Error("Cloth requires the existing plane material.");
   const { resolution: n, width, height } = gridConfig(props);
+  // ── THE SEA IS A SEPARATE FIELD, TILING IN WORLD METRES ───────────────────
+  //
+  // The spectral cascades (`waterSpectrum.js`) do not know how big this box
+  // is: they tile in metres and the surface kernel samples them at its own
+  // vertices' world positions. A harness that builds a solver directly gets
+  // one of its own; the component may hand one in.
+  const ownsSpectrum = kind === "water" && !givenSpectrum;
+  const spectrum = kind === "water" ? (givenSpectrum ?? createWaterSpectrum(seaQuality ?? {})) : null;
   const count = n * n, dx = width / (n - 1), dy = height / (n - 1);
   // ── THE WATER BODY IS A BOX, AND THESE ARE THE VERTICES THAT CLOSE IT ─────
   //
@@ -82,7 +91,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const u = { damping: uniform(.99), gravity: uniform(9.81), wind: uniform(1), stiffness: uniform(.9), speed: uniform(2), amplitude: uniform(.3) };
   Object.assign(u, {
     shear: uniform(1), bend: uniform(.1), gust: uniform(0), gustFrequency: uniform(1), simTime: uniform(0), pin: uniform(0),
-    waveHeight: uniform(0), waveLength: uniform(4), waveCos: uniform(1), waveSin: uniform(0), waveCutoff: uniform(0),
+    waveHeight: uniform(0), waveLength: uniform(4), waveCos: uniform(1), waveSin: uniform(0),
+    // Per-cascade mip the surface kernel reads the sea at — the level whose
+    // texel is no finer than this grid's cell. See `tick`.
+    seaLod: [uniform(0), uniform(0), uniform(0)],
     waveOctaves: uniform(4), waveGain: uniform(.5), surfaceDetail: uniform(.6),
     choppiness: uniform(.35), rippleStrength: uniform(.25),
     color: uniform(new THREE.Color()), deepColor: uniform(new THREE.Color()), waterDepth: uniform(2), absorption: uniform(0), saturation: uniform(.35),
@@ -95,7 +107,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // World metres per local unit, published every tick from the mesh matrix.
     waveScale: uniform(new THREE.Vector3(1, 1, 1)),
     rippleLimit: uniform(1), viscosity: uniform(.02), rippleSpeed: uniform(2), roughness: uniform(.12),
-    foamDecay: uniform(.99), foamRate: uniform(.05), foamAmbient: uniform(.05), foamSpread: uniform(0),
+    foamDecay: uniform(.99), foamRate: uniform(.05), foamSpread: uniform(0),
   });
   const simulationWorld = uniform(new THREE.Matrix4()), simulationInverse = uniform(new THREE.Matrix4());
   const anchorRows = Array.from({length:MAX_CLOTH_ANCHORS},()=>new THREE.Vector4(0,0,0,-1));
@@ -375,35 +387,44 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     });
     scratch.element(index).assign(vec4(simulationInverse.mul(vec4(point, 1)).xyz, 0));
   })().compute(count) : null;
-  // The wave overlay is evaluated consistently for vertices and finite-difference
-  // normals. It adds directional continuous waves over the simulated ripple field.
-  // ── WAVES ARE IN METRES, NOT IN THE MESH'S UNITS ──────────────────────────
+  // ── THE SEA IS SAMPLED IN WORLD METRES; THE RIPPLES ARE LOCAL ─────────────
   //
-  // The wave field used to be evaluated on LOCAL coordinates, so its character
-  // was a property of the mesh's scale rather than of the water. A box scaled
-  // 40x turned `waveLength 0.5` into a 20 m swell and `waveHeight 0.15` into a
-  // metre and a half of it — and a 20 m swell has no caustics worth the name,
-  // which is most of why a large pool looked like slow syrup with a few streaks
-  // across it (user, 2026-09-05). Authoring the same numbers on a small pool
-  // and a lake gave two unrelated results.
-  //
-  // Evaluated in world metres and converted back, `waveLength 0.5` is half a
-  // metre of ripple wherever it is used, and the caustics that come off it are
-  // the same ripple's caustics at any size.
+  // The vertex's rest XZ in world metres addresses the spectral cascades,
+  // which tile in metres whatever the box's size; the displacement comes back
+  // in metres and is converted into the mesh's own anisotropic units. The
+  // horizontal displacement is real: a crest moves toward its own front, which
+  // is what makes it sharp and a trough broad — a heightfield of sines cannot
+  // do that, and it was most of why the old surface read as corrugated card.
+  const seaAt = (p) => seaDisplacementAt(spectrum, vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z)), u.seaLod);
   const surfacePosition = (i) => {
     const p = positions.element(i).xyz;
     if (kind !== "water") return p;
-    const wave = waterWaveHeightNode(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z), u.simTime, u).div(u.waveScale.y);
-    return vec3(p.x, p.y.add(wave), p.z);
+    const d = seaAt(p);
+    return vec3(p.x.add(d.x.div(u.waveScale.x)), p.y.add(d.y.div(u.waveScale.y)), p.z.add(d.z.div(u.waveScale.z)));
   };
   const heightfieldVertex = () => {
-    const l = surfacePosition(y.mul(n).add(x.sub(1).max(0)));
-    const r = surfacePosition(y.mul(n).add(x.add(1).min(n - 1)));
-    const t = surfacePosition(y.sub(1).max(0).mul(n).add(x));
-    const b = surfacePosition(y.add(1).min(n - 1).mul(n).add(x));
-    const normal=r.sub(l).cross(t.sub(b)).normalize();
-    const point=surfacePosition(index);
-    normals.element(index).assign(normal);
+    const at = (ix, iy) => iy.mul(n).add(ix);
+    const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(n - 1), y);
+    const north = at(x, y.sub(1).max(0)), south = at(x, y.add(1).min(n - 1));
+    if (kind !== "water") {
+      const l = positions.element(west).xyz, r = positions.element(east).xyz, t = positions.element(north).xyz, b = positions.element(south).xyz;
+      normals.element(index).assign(r.sub(l).cross(t.sub(b)).normalize());
+      output.element(index).assign(positions.element(index).xyz);
+      return;
+    }
+    const p = positions.element(index).xyz.toVar();
+    const world = vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z));
+    const sea = seaDisplacementAt(spectrum, world, u.seaLod).toVar();
+    const point = vec3(p.x.add(sea.x.div(u.waveScale.x)), p.y.add(sea.y.div(u.waveScale.y)), p.z.add(sea.z.div(u.waveScale.z))).toVar();
+    // The RIPPLE field's slope, local units, from the rest-spaced neighbours.
+    // The mesh normal carries ONLY this: the sea's slope is added per pixel
+    // from the derivative cascades (`waterSurfaceLook.js`), where it has a
+    // mip chain and cannot alias, and the caustic lens adds it at its own
+    // beam spacing (`waterSlots.js`). One field, read at three resolutions.
+    const rippleX = positions.element(east).y.sub(positions.element(west).y).div(2 * dx);
+    const rippleZ = positions.element(south).y.sub(positions.element(north).y).div(2 * dy);
+    const rippleNormal = vec3(rippleX.negate(), 1, rippleZ.negate()).normalize();
+    normals.element(index).assign(rippleNormal);
     output.element(index).assign(point);
     if (foamOut) {
       // ── FOAM IS MEASURED AGAINST THE FIELD'S OWN STEEPNESS ───────────────
@@ -423,43 +444,26 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // `2πH/L` — and then a lone swell crest scores zero while a place where
       // two trains cross scores one. That IS the wave-collision term; it needs
       // no special case, because superposition is what makes the steep spot.
+      // ── FOAM: THE SEA'S JACOBIAN, THE RIPPLES' CHURN, ONE VALUE ──────────
+      //
+      // Babylon's foam is a MEMORY of the Jacobian of the horizontal
+      // displacement — where the surface folded over itself, and how long ago
+      // — summed over the cascades and read here from `displacement.w`. That
+      // is the wave-driven half: breaking crests and the streaks they leave,
+      // from the geometry that actually broke, not from a threshold on a
+      // slope. The ripple field's own churn (a body slamming in, a crater's
+      // steep rim) is the other half and lives in `positions.w`, spreading and
+      // decaying as a field. `waterFoam.js` says what a value DRAWS.
+      const jacobian = seaJacobianAt(spectrum, world, sea.w, u.seaLod);
+      const jacobianFoam = seaFoamNode(jacobian, u.foam);
       const rise = u.waveScale.y;
-      const cellWorld = float(dx).mul(u.waveScale.x).max(1e-4);
-      const gx = r.y.sub(l.y).mul(rise).div(cellWorld.mul(2));
-      const gz = b.y.sub(t.y).mul(rise).div(cellWorld.mul(2));
-      const steep = gx.mul(gx).add(gz.mul(gz)).sqrt();
-      // ── `foam` MOVES THE THRESHOLD, WHICH IS WHY IT IS A REAL CONTROL ───
-      //
-      // Scaling the OUTPUT can only dim foam that already exists, so on gentle
-      // water — where nothing is near breaking — turning it up did nothing at
-      // all. Moving the threshold means "how much of this surface counts as
-      // foamy": at 1 anything above two-thirds of the field's own steepness
-      // goes white, at 0.25 only genuine breaking does. Physically honest at
-      // the low end, and it can still give a stormy sea on a calm swell, which
-      // is what "we should be just configuring how much foam appears" asks for.
-      const ratio = steep.div(u.foamAmbient).toVar();
-      // ⚠ AT `foam` 1 THE THRESHOLD IS NOT "EVERYTHING". It used to reach 0.7x
-      // the ambient steepness, which is more than half the surface at every
-      // instant — the whole pool went white the moment the dial was turned up
-      // ("it is not realistic", user 2026-09-06). Foam is what BREAKING water
-      // leaves, so even at full strength only the steepest fraction of the
-      // field entrains it; the amount then comes from how long it persists.
-      const crossing = ratio.smoothstep(mix(float(2.6), float(.9), u.foam), mix(float(3.4), float(1.6), u.foam)).toVar();
-      // Superposition also builds crests taller than any single band can reach,
-      // so height above the field's own amplitude is the same evidence again.
-      const peak = point.y.mul(rise).div(u.waveHeight.max(1e-3)).smoothstep(.85, 1.4);
-      // ...and the ripple field's vertical speed, which is what a body slamming
-      // in produces before the splash has any shape at all.
+      const steepWorld = vec2(rippleX.mul(rise).div(u.waveScale.x), rippleZ.mul(rise).div(u.waveScale.z)).length();
       const churn = positions.element(index).y.sub(previous.element(index).y).mul(rise).div(h).abs();
-      // ── RATES, PER SECOND, CHOSEN BY WHAT THEY SETTLE TO ─────────────────
-      //
-      // `foamRate` is the frame's dt, so these are per-second rates against a
-      // 3.5 s e-folding decay, and the equilibrium of a sustained source is
-      // 3.5x its rate. A spot that is permanently steep therefore settles at
-      // 0.5 — the edge of a sheet, mostly network — rather than saturating,
-      // which is what kept the whole pool white at `foam` 1. A splash is the
-      // one thing that lays a SHEET, and it does so in a fifth of a second.
-      const source = crossing.mul(.14).add(crossing.mul(peak).mul(.12)).add(churn.smoothstep(.12, 1).mul(3.5));
+      // Per-second rates against a 3.5 s e-folding decay: a splash or a
+      // breaking crest lays a SHEET in a fifth of a second; a steep crater
+      // rim settles at a network. The sea's folds feed the SAME field, so
+      // their foam spreads, persists and dissolves exactly like a wake's.
+      const source = steepWorld.smoothstep(.35, .8).mul(.14).add(churn.smoothstep(.12, 1).mul(3.5)).add(jacobianFoam.mul(3));
       // ── FOAM SPREADS, AND THE NEIGHBOURS ARE READ FROM `scratch` ────────
       //
       // A patch of foam widens and softens as it ages; without that a splash
@@ -470,16 +474,19 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // the threads that are writing their own. `u.foamSpread` is a physical
       // diffusivity converted to this grid's cells per tick, so a pond and a
       // lake spread foam at the same metres per second.
-      const at = (ix, iy) => iy.mul(n).add(ix);
-      const around = scratch.element(at(x.sub(1).max(0), y)).w.add(scratch.element(at(x.add(1).min(n - 1), y)).w)
-        .add(scratch.element(at(x, y.sub(1).max(0))).w).add(scratch.element(at(x, y.add(1).min(n - 1))).w).mul(.25);
+      const around = scratch.element(west).w.add(scratch.element(east).w).add(scratch.element(north).w).add(scratch.element(south).w).mul(.25);
       const own = positions.element(index).w;
       const spread = mix(own, around, u.foamSpread);
       const carried = spread.mul(u.foamDecay).add(source.mul(u.foamRate)).clamp(0, 1).toVar();
       positions.element(index).w.assign(carried);
       foamOut.element(index).assign(carried);
     }
-    if(waterSurfaceTexture)textureStore(waterSurfaceTexture,ivec2(x,y),vec4(point.y,normal));
+    // The slot's copy of the surface: the FULL height (the medium clips its
+    // rays against it), the RIPPLE normal's x and z (the caustic lens adds
+    // the sea and rebuilds y) and the ripple's own height (the caustic beam
+    // starts from the sea's smooth displacement plus this — see
+    // `waterSlots.js` for why it must not start from the bilinear height).
+    if (waterSurfaceTexture) textureStore(waterSurfaceTexture, ivec2(x, y), vec4(point.y, rippleNormal.x, rippleNormal.z, p.y));
   };
   // The skirt's own vertices. Reads only `positions` (committed by the previous
   // dispatch) and the depth uniform, so nothing here races the solver.
@@ -675,13 +682,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     : null;
   // The caustic half is a DRAW, not a dispatch — see `createWaterCausticPass`.
   const causticPass = kind === "water" && waterSlot
-    ? createWaterCausticPass({ slot: waterSlot, surfaceTexture: waterSurfaceTexture, resolution: n, width, height, uniforms: u })
+    ? createWaterCausticPass({ slot: waterSlot, surfaceTexture: waterSurfaceTexture, resolution: n, width, height, uniforms: u, spectrum })
     : null;
   const steps = kind === "cloth" ? [integrate, solveA, solveB, solveA, solveB, solveA, solveB, solveA, solveB, commit] : [integrate, commit];
   if (collide) steps.push(collide);
   if (collideEdges) steps.push(collideEdges, commit, collideEdges, commit, collide);
   if (pinEntities) steps.push(pinEntities);
   let initialized = false, accumulator = 0, elapsed = 0;
+  // The sea's settings and its CPU copy (for buoyancy), see `tick`.
+  let lastProps = props, configuredDepth = 0, seaSample = null, seaReadbackPending = false, seaFrame = 0;
   const updateBounds = () => {
     // GPU positions cannot be read synchronously by the culler/GI tracker.
     // Cover the maximum ballistic excursion, including completely unpinned cloth.
@@ -777,8 +786,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       material.attenuationColor.copy(u.deepColor.value);
       material.attenuationDistance = u.absorption.value > 0 ? 1 / u.absorption.value : 1e6;
     }
-    u.speed.value = finite(p.waveSpeed, 2, 0, 100);
+    // ⚠ 1, NOT 2: the sea's dispersion is physical now, so this is a
+    // multiplier on the clock and 1 is real time.
+    u.speed.value = finite(p.waveSpeed, 1, 0, 100);
     u.amplitude.value = finite(p.amplitude, .3, 0, 10);
+    if (spectrum) {
+      lastProps = p;
+      configuredDepth = Math.max(.05, u.waterDepth.value * u.waveScale.value.y);
+      spectrum.configure(p, configuredDepth);
+    }
     // ⚠ IN THE VOLUME'S OWN UNITS, NOT IN CELLS. Sixteen cells was the whole
     // bound, and cells are a fixed fraction of the grid: at 512² a 3 m deep
     // pool's sixteen cells are 9 cm, which would have capped every splash the
@@ -794,7 +810,12 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     updateBounds();
   };
   update(props);
-  return { mesh, skirtMesh, skirtMaterial, positions, count, resolution: n, vertexCount: total, init, surface, steps, uniforms: u,waterSurfaceTexture,slotKernel,causticPass,
+  const simulation = { mesh, skirtMesh, skirtMaterial, positions, count, resolution: n, vertexCount: total, init, surface, steps, uniforms: u,waterSurfaceTexture,slotKernel,causticPass,
+    spectrum,
+    /** The sea as the CPU last saw it — `waterPhysics.js` floats bodies on this. */
+    get seaSample() { return seaSample; },
+    /** Harness aid: force every cascade to mip 0 for a bit-level parity check. */
+    seaLodOverride: null,
     // The local water box, for buoyancy, the caustic lookup and the medium.
     extent: { halfX: width / 2, halfZ: height / 2, get depth() { return u.waterDepth.value; } },
     update,
@@ -866,7 +887,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       pendingImpulses.push([x,z,span,Math.max(-1,Math.min(1,capped))]);
       return true;
     },
-    restart() { initialized = false; accumulator = 0; elapsed = 0; u.simTime.value = 0; pendingImpulses.length=0; updateBounds(); },
+    restart() { initialized = false; accumulator = 0; elapsed = 0; u.simTime.value = 0; pendingImpulses.length=0; spectrum?.restart(); updateBounds(); },
     tick(renderer, dt) {
       if (!renderer?.isWebGPURenderer) return;
       const queue = [];
@@ -882,19 +903,24 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // floor, so asking for finer detail gives the finest detail this
         // resolution HAS rather than a broken version of what was asked for.
         const cell = Math.max(dx * u.waveScale.value.x, dy * u.waveScale.value.z);
-        u.waveLength.value = Math.max(authoredWaveLength, cell * 3);
-        // ...and the same limit for every BAND built out of it — see
-        // `waterWaves.js`'s `bandGain`. The clamp above only ever protected the
-        // base wavelength; the wind-ripple bands are twenty times finer and
-        // were aliasing on every pool anyone has ever authored.
-        u.waveCutoff.value = cell * 3;
-        // The swell's base band advances as `speed·waveLength/2π` world metres
-        // a second (see `waterWaves.js`'s `evaluate`). The solver runs in LOCAL
-        // units, so that is the number to hand it — floored, because a pool
-        // authored with a very short wavelength still needs its wakes to move,
-        // and CFL-clamped in the kernel because the grid has the final say.
+        // The ripple solver runs at the swell's PHYSICAL phase speed — the
+        // deep-water c = sqrt(g·λp/2π) of the peak wave, times the authored
+        // time scale — so a wake and a crest cross the pool together. Local
+        // units, floored so a still pool still carries its wakes, CFL-clamped
+        // in the kernel because the grid has the final say.
         const horizontal = Math.max(1e-4, Math.max(u.waveScale.value.x, u.waveScale.value.z));
-        u.rippleSpeed.value = Math.max(.35, u.speed.value * u.waveLength.value / (Math.PI * 2)) / horizontal;
+        const peakSpeed = Math.sqrt(GRAVITY * (spectrum?.settings?.waveLength ?? u.waveLength.value) / (2 * Math.PI));
+        u.rippleSpeed.value = Math.max(.35, Math.max(.05, u.speed.value) * peakSpeed) / horizontal;
+        // Each cascade is read at the mip whose texel is no finer than this
+        // grid's cell, so a coarse mesh over a big lake samples a smooth sea
+        // instead of aliasing the capillary cascade into spikes.
+        if (spectrum) spectrum.cascades.forEach((c, i) => {
+          u.seaLod[i].value = simulation.seaLodOverride ?? Math.max(0, Math.log2(Math.max(1, cell / (c.L / spectrum.size))));
+        });
+        // The box's depth in metres reaches the spectrum (the TMA shallow-water
+        // correction); re-realize it when that has really changed.
+        const depthWorld = Math.max(.05, u.waterDepth.value * u.waveScale.value.y);
+        if (spectrum && Math.abs(depthWorld - configuredDepth) > .2 * configuredDepth) { configuredDepth = depthWorld; spectrum.configure(lastProps, depthWorld); }
         // Foam accumulates per TICK (the surface kernel runs once a frame, not
         // once a substep), so its rates are the frame's — otherwise a fast
         // machine foams differently from a slow one.
@@ -908,12 +934,6 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // 0.015 m²/s of spread, in cells per tick — bounded well inside the
         // four-neighbour blend's stability.
         u.foamSpread.value = Math.min(.5, .015 * delta / Math.max(1e-6, cell * cell));
-        // What "steep" means for THIS water, exactly — bands, Nyquist fade and
-        // ripple control included. The foam threshold is a multiple of it.
-        u.foamAmbient.value = Math.max(1e-4, waterFieldSteepness(
-          { waveHeight: u.waveHeight.value, waveLength: authoredWaveLength, rippleStrength: u.rippleStrength.value,
-            waveOctaves: u.waveOctaves.value, waveGain: u.waveGain.value },
-          u.waveCutoff.value));
       }
       if(kind === "cloth") anchorCount.value=resolveClothAnchors(authoredAnchors,anchorEngine,simulationInverse.value,n,anchorRows);
       if (colliderField) {
@@ -950,11 +970,24 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         globalThis.__giNestedRender = true;
         try { causticPass.render(renderer); } finally { globalThis.__giNestedRender = nested; }
       }
+      // The sea advances before the surface reads it.
+      if (spectrum) queue.push(...spectrum.passes(delta, elapsed));
       queue.push(surface);
       if (slotKernel) queue.push(...slotKernel.compute);
       renderer.compute(queue);
+      // ── THE SEA, FOR THE CPU ──────────────────────────────────────────────
+      //
+      // Buoyancy floats on the sea the eye sees: the cascades that carry
+      // height are copied back every other frame (Babylon's method), a frame
+      // or two behind, which nothing floating can notice. Until the first copy
+      // lands the sea is flat to the physics.
+      if (spectrum && !seaReadbackPending && (seaFrame++ & 1) === 0) {
+        seaReadbackPending = true;
+        spectrum.readback(renderer).then((sample) => { if (sample) seaSample = sample; }).catch(() => {}).finally(() => { seaReadbackPending = false; });
+      }
     },
     dispose(renderer) {
+      if (ownsSpectrum) spectrum.dispose(renderer);
       mesh.removeFromParent(); if (ownsMaterial) material.dispose();
       skirtMesh?.removeFromParent(); skirtMaterial?.dispose(); skirtGeometry?.dispose();
       causticPass?.dispose();
@@ -965,4 +998,5 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       releaseStorageAttributes(renderer, [positions.value, previous.value, scratch.value, normalAttribute, positionAttribute, foamAttribute].filter(Boolean));
     },
   };
+  return simulation;
 }

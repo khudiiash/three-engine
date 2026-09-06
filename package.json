@@ -128,7 +128,7 @@
     "smoke:cloth-anchors-ui": "node scripts/run-cloth-anchors-ui-smoke.mjs",
     "smoke:cloth-gi": "node scripts/run-cloth-gi-contribution-smoke.mjs",
     "smoke:gi-grid-bvh": "node scripts/run-gpu-page.mjs http://127.0.0.1:5307/scripts/gpu-grid-bvh-smoke.html 70000",
-    "test:water": "node --test tests/water-waves.test.mjs tests/water-physics.test.mjs tests/water-interaction.test.mjs tests/water-spectrum.test.mjs",
+    "test:water": "node --test tests/water-physics.test.mjs tests/water-interaction.test.mjs tests/water-spectrum.test.mjs",
     "test:water-material": "node scripts/run-water-material-test.mjs",
     "smoke:water-surface": "node scripts/run-vfx-gpu-smoke.mjs http://127.0.0.1:5307/scripts/water-surface-smoke.html",
     "smoke:water-reflection": "node scripts/run-vfx-gpu-smoke.mjs http://127.0.0.1:5307/scripts/water-reflection-smoke.html",

@@ -37,9 +37,10 @@ try {
 
  const N = SEA_SIZE;
  const halves = (px) => { const out = new Float32Array(px.length); for (let i = 0; i < px.length; i++) out[i] = THREE.DataUtils.fromHalfFloat(px[i]); return out; };
- const read = async (tex) => halves(await renderer.backend.copyTextureToBuffer(tex, 0, 0, N, N));
+ const read = async (tex, layer = 0) => halves(await renderer.backend.copyTextureToBuffer(tex, 0, 0, N, N, layer));
 
- const cpu = realizeSea({ size: N, props, depth: DEPTH, time, amplitude: spectrum.amplitude });
+ const cpu = realizeSea({ size: N, props, depth: DEPTH, time, amplitude: spectrum.amplitude, lambda: spectrum.settings.lambda });
+ log('choppiness authored', props.choppiness, 'effective (folding limit)', spectrum.settings.lambda.toFixed(3));
  const canvas = document.createElement('canvas'); canvas.width = N; canvas.height = N;
  const ctx = canvas.getContext('2d');
  const dump = (label, pick, scale) => {
@@ -51,7 +52,7 @@ try {
  let worst = 0;
  for (let i = 0; i < spectrum.cascades.length; i++) {
    const c = spectrum.cascades[i], ref = cpu.cascades[i];
-   const disp = await read(c.displacement), deriv = await read(c.derivatives);
+   const disp = await read(spectrum.displacement, i), deriv = await read(spectrum.derivatives, i);
    const compare = (name, gpu, exp, channels) => {
      let maxDiff = 0, rms = 0, scale = 0;
      for (let t = 0; t < N * N; t++) for (const ch of channels) {
@@ -80,15 +81,11 @@ try {
      for (let t = 0; t < N * N; t++) { const d = Math.abs(h0[t * 4] - ref.h0[t * 4]); if (d > big) { big = d; at = t; } }
      log(`cascade 2 worst h0 texel ${at % N},${Math.floor(at / N)}: gpu ${h0[at * 4].toExponential(3)} cpu ${ref.h0[at * 4].toExponential(3)}`);
    }
-   // The Jacobian memory after five frames: min over the map says whether
-   // choppiness folds anything at this sea state.
-   let minJ = Infinity, minTurb = Infinity;
-   for (let t = 0; t < N * N; t++) { minJ = Math.min(minJ, ref.displacement[t * 4 + 3]); minTurb = Math.min(minTurb, disp[t * 4 + 3]); }
-   log(`cascade ${i} min J ${minJ.toFixed(3)} (cpu), min foam memory ${minTurb.toFixed(3)} (gpu)`);
+   compare('cross term', disp, ref.displacement, [3]);
    const amp = 1 / Math.max(1e-6, Math.max(...Array.from({ length: N * N }, (_, t) => Math.abs(disp[t * 4 + 1]))));
    dump(`cascade${i}-height`, (t) => [disp[t * 4 + 1] * 127 * amp, disp[t * 4 + 1] * 127 * amp, disp[t * 4 + 1] * 127 * amp], 1);
    dump(`cascade${i}-slopes`, (t) => [deriv[t * 4] * 200, deriv[t * 4 + 1] * 200, 0], 1);
-   dump(`cascade${i}-foam`, (t) => [(disp[t * 4 + 3] - 1) * 200, (disp[t * 4 + 3] - 1) * 200, (disp[t * 4 + 3] - 1) * 200], 1);
+   dump(`cascade${i}-cross`, (t) => [disp[t * 4 + 3] * 200, disp[t * 4 + 3] * 200, disp[t * 4 + 3] * 200], 1);
  }
  // The whole update, timed: thirty frames of every cascade.
  const t0 = performance.now();

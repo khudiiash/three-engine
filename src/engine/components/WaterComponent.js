@@ -3,7 +3,8 @@ import { installWaterMedium } from "../vfx/waterMedium.js";
 import { installWaterCausticLight, removeWaterCausticLight } from "../vfx/waterCaustics.js";
 import { waterSlotPool } from "../vfx/waterSlots.js";
 import { GridSimulationComponent, gridSchema } from "../vfx/GridSimulationComponent.js";
-import { simulationNodeTypes, simulationNodeDefaults } from "../vfx/simulationGraph.js";
+import { simulationNodeTypes, simulationNodeDefaults, setSimulationGraphProp } from "../vfx/simulationGraph.js";
+import { SEA_STATES, SEA_STATE_FIELDS } from "../vfx/waterSpectrumCPU.js";
 
 /** GPU water VOLUME. The wave heightfield is its lid; the body below it is real
  * — it displaces rigid bodies, absorbs the light that crosses it and refracts
@@ -70,6 +71,24 @@ export class WaterComponent extends GridSimulationComponent {
     if (!engine.waterSurfaces?.size) { engine._waterMedium?.dispose(); removeWaterCausticLight(engine); }
   }
   applyBuoyancy(physics, dt) { this.waterPhysics?.step(physics, dt); }
+  /**
+   * ── `seaState`: A POOL AND AN OCEAN ARE ONE CLICK APART ──────────────────
+   *
+   * A preset writes the wave fields (`SEA_STATES`) and nothing else; the
+   * fields stay editable, and editing one turns the preset back to `custom`
+   * so the dropdown never claims a state the water is not in.
+   */
+  onPropChanged(key) {
+    const state = this.props.seaState;
+    const write = (k, v) => { this.props[k] = v; if (this.props.graph && !this.props.asset) this.props.graph = setSimulationGraphProp("water", this.props.graph, k, v); };
+    if (key === "seaState" && state && state !== "custom") {
+      const preset = SEA_STATES[state];
+      if (preset) for (const [k, v] of Object.entries(preset)) write(k, v);
+    } else if (SEA_STATE_FIELDS.includes(key) && state && state !== "custom" && SEA_STATES[state]?.[key] !== this.props[key]) {
+      write("seaState", "custom");
+    }
+    super.onPropChanged(key);
+  }
   /** What the underwater medium and the GI caustic term read: the live volume,
    *  or null while this surface is not contributing anything. */
   mediumVolume() {
@@ -78,6 +97,6 @@ export class WaterComponent extends GridSimulationComponent {
   }
   getSurfaceHeight(x, z) {
     if(!this.simulation)return null;
-    return queryWaterSurface(this.simulation.mesh,this.resolvedProps,this.simulation.uniforms?.simTime?.value??0,{x,y:0,z})?.height??null;
+    return queryWaterSurface(this.simulation.mesh,this.resolvedProps,this.simulation.uniforms?.simTime?.value??0,{x,y:0,z},this.simulation.seaSample??null)?.height??null;
   }
 }

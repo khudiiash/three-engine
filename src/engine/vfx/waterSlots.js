@@ -1,6 +1,6 @@
 import * as THREE from "three/webgpu";
-import { Fn, dFdx, dFdy, float, instanceIndex, ivec2, refract, texture, textureStore, uniform, uv as uvAttribute, varying, vec2, vec3, vec4 } from "three/tsl";
-import { waterDetailSlopeAt } from "./waterFoam.js";
+import { Fn, dFdx, dFdy, float, instanceIndex, int, ivec2, refract, storageTexture, texture, uniform, uv as uvAttribute, varying, vec2, vec3, vec4 } from "three/tsl";
+import { seaDisplacementAt, seaSlopeAt } from "./waterSpectrum.js";
 
 /**
  * ══ THE WATER SLOT POOL — WHY THE BINDINGS ARE ENGINE-OWNED ════════════════
@@ -29,12 +29,14 @@ import { waterDetailSlopeAt } from "./waterFoam.js";
  */
 
 export const MAX_WATER_SLOTS = 2;
+/** The caustic map's world footprint around the camera; see `causticCenter`. */
+export const CAUSTIC_WINDOW_METRES = 16;
 // The medium's copy of the surface: what the underwater view clips against.
 const SLOT_RESOLUTION = 512;
 // The reference projects caustics at 1024 for a two-unit pool; the filaments
 // are only ever as thin as this map and as the lens feeding it. A 60 m lake
 // gets 6 cm texels here, which is about as fine as its lens can focus anyway.
-const CAUSTIC_RESOLUTION = 1024;
+export const CAUSTIC_RESOLUTION = 1024;
 /**
  * ⭐ **THE CAUSTIC GRID IS ITS OWN RESOLUTION, NOT THE SOLVER'S.**
  *
@@ -49,7 +51,7 @@ const CAUSTIC_RESOLUTION = 1024;
  *
  * 512² beams whatever the solver's grid, reading the solver's surface
  * bilinearly and bending by detail band-limited to THIS spacing (see
- * `waterDetailSlopeAt`'s `cutoff`). A quarter of a million vertices in one
+ * `seaSlopeAt`'s per-cascade mips). A quarter of a million vertices in one
  * draw is nothing; a lens made of aliasing was the whole problem.
  */
 const CAUSTIC_GRID = 512;
@@ -75,22 +77,35 @@ const IOR = 1 / 1.333;
  * the floor reads level 0, from the same texture and the same pass. The blur
  * also slows what they show: the fine structure is what moved fastest.
  */
+/**
+ * ⚠ THE DRAW TARGET HAS NO MIPS; THE ARRAY IT IS COPIED INTO HAS THEM.
+ *
+ * Every consumer binds ONE caustic array and ONE surface array for BOTH
+ * slots (a slot is a layer), because a water's fragment stage was binding
+ * the medium's four slot maps beside its own mirror, transmission target,
+ * depth texture, shadow maps, GI and the sea's derivatives — and the sea's
+ * arrival took it past the portable sixteen ("The number of sampled textures
+ * (17) in the Fragment stage exceeds the maximum per-stage limit (16)", live
+ * editor 2026-09-06). Two bindings where there were four. The rasterized
+ * caustic draw still lands in a plain per-slot target and is copied into its
+ * layer; three regenerates the array's mips after the copy.
+ */
 function causticTarget(index) {
   const target = new THREE.RenderTarget(CAUSTIC_RESOLUTION, CAUSTIC_RESOLUTION, {
     type: THREE.HalfFloatType, format: THREE.RGBAFormat,
-    minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter,
-    generateMipmaps: true,
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
     depthBuffer: false, stencilBuffer: false,
   });
-  target.texture.name = `Water slot ${index} caustics`;
+  target.texture.name = `Water slot ${index} caustic draw`;
   return target;
 }
-
-function storageTexture(name) {
-  const map = new THREE.StorageTexture(SLOT_RESOLUTION, SLOT_RESOLUTION);
+function storageArray(size, layers, { mips = false, name = "" } = {}) {
+  const map = new THREE.StorageArrayTexture(size, size, layers);
   map.type = THREE.HalfFloatType;
   map.format = THREE.RGBAFormat;
-  map.minFilter = map.magFilter = THREE.LinearFilter;
+  map.magFilter = THREE.LinearFilter;
+  map.minFilter = mips ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
+  map.generateMipmaps = mips;
   map.name = name;
   return map;
 }
@@ -99,10 +114,11 @@ function createSlot(index) {
   return {
     index,
     owner: null,
-    // (height, normal.xyz) in the water's local space — the medium's top face.
-    surface: storageTexture(`Water slot ${index} surface`),
-    // The caustic lens at the volume floor. A RENDER TARGET, not a storage
-    // texture: the refracted grid is drawn into it (see `createWaterCausticPass`).
+    // (height, ripple normal x, ripple normal z, ripple height) in the water's
+    // local space — layer `index` of the pool's surface array, see below.
+    surface: null,
+    // The caustic lens at the volume floor: drawn into this target (see
+    // `createWaterCausticPass`) and copied into layer `index` of the array.
     causticTarget: causticTarget(index),
     uniforms: {
       inverse: uniform(new THREE.Matrix4()),
@@ -137,6 +153,17 @@ function createSlot(index) {
       absorption: uniform(.2),
       strength: uniform(0),
       active: uniform(0),
+      // ── THE CAUSTIC WINDOW ──────────────────────────────────────────────
+      //
+      // The map does not cover the whole footprint: it covers a square of
+      // `CAUSTIC_WINDOW_METRES` around the camera (or the whole pool, when
+      // that is smaller), in LOCAL units, snapped to its own texels so moving
+      // the camera never shimmers the pattern. That is what makes the caustics
+      // the same at any size of water: a 60 m lake gets the same 3 cm texels
+      // and 6 cm beams a pool does, where the eye actually is, instead of one
+      // 6 cm texel per 60 m. Consumers fade to a gain of 1 at its edge.
+      causticCenter: uniform(new THREE.Vector2(0, 0)),
+      causticHalf: uniform(new THREE.Vector2(1, 1)),
     },
     // Bound once by every consumer; the sampler nodes are shared so a graph
     // that reads two slots still binds two textures, not four.
@@ -149,10 +176,12 @@ function createSlot(index) {
 export function waterSlotPool(engine) {
   if (engine.waterSlots) return engine.waterSlots;
   const slots = Array.from({ length: MAX_WATER_SLOTS }, (_, i) => createSlot(i));
-  for (const slot of slots) {
-    slot.caustic = slot.causticTarget.texture;
-    slot.nodes = { surface: texture(slot.surface), caustic: texture(slot.caustic) };
-  }
+  const surfaces = storageArray(SLOT_RESOLUTION, MAX_WATER_SLOTS, { name: "Water slot surfaces" });
+  const caustics = storageArray(CAUSTIC_RESOLUTION, MAX_WATER_SLOTS, { mips: true, name: "Water slot caustics" });
+  // ONE node per array, shared by every slot: a consumer sampling both slots
+  // binds two textures, not four, and selects the slot as a layer.
+  const nodes = { surface: texture(surfaces), caustic: texture(caustics) };
+  for (const slot of slots) { slot.surface = surfaces; slot.caustic = caustics; slot.nodes = nodes; }
   engine.waterSlots = {
     slots,
     claim(owner) {
@@ -198,7 +227,7 @@ export function createWaterSlotKernel({ slot, surfaceTexture, resolution }) {
     const i = instanceIndex.toInt().toVar();
     const px = i.mod(SLOT_RESOLUTION).toVar(), py = i.div(SLOT_RESOLUTION).toVar();
     const at = vec2(px.toFloat().add(.5).div(SLOT_RESOLUTION), py.toFloat().add(.5).div(SLOT_RESOLUTION));
-    textureStore(slot.surface, ivec2(px, py), texture(surfaceTexture, toSource(at)).level(0));
+    storageTexture(slot.surface).depth(int(slot.index)).store(ivec2(px, py), texture(surfaceTexture, toSource(at)).level(0));
   })().compute(SLOT_RESOLUTION * SLOT_RESOLUTION);
   resolve.__giPassName = "waterSlotSurface";
   return { compute: [resolve], uniforms: c, toSource };
@@ -234,7 +263,7 @@ export function createWaterSlotKernel({ slot, surfaceTexture, resolution }) {
  * THE MAP IS IN FLOOR PARAMETERIZATION - a receiver samples where its own beam
  * LANDS, not where it entered. See `waterCausticGainNode`.
  */
-export function createWaterCausticPass({ slot, surfaceTexture, resolution, width, height, uniforms = null }) {
+export function createWaterCausticPass({ slot, surfaceTexture, resolution, width, height, uniforms = null, spectrum = null }) {
   const n = CAUSTIC_GRID;
   const u = slot.uniforms;
   const c = {
@@ -254,7 +283,12 @@ export function createWaterCausticPass({ slot, surfaceTexture, resolution, width
 
   const at = uvAttribute();
   const texel = 1 / resolution;
-  const sampleAt = (dx, dy) => texture(surfaceTexture, toSource(at.add(vec2(dx * texel, dy * texel)))).level(0);
+  // The vertex's place in the SOLVER's uv is where the window puts it, not
+  // where the plane's own uv does: the window is a sub-rectangle of the pool.
+  const center = vec2(u.causticCenter), half2 = vec2(u.causticHalf);
+  const windowUv = vec2(center.x.div(width), center.y.div(height)).add(.5)
+    .add(at.sub(.5).mul(vec2(half2.x.mul(2 / width), half2.y.mul(2 / height))));
+  const sampleAt = (dx, dy) => texture(surfaceTexture, toSource(windowUv.add(vec2(dx * texel, dy * texel)))).level(0);
   const info = sampleAt(0, 0);
   /**
    * ⭐ **THE LENS READS A LOW-PASSED NORMAL, AND THAT IS NOT A CHEAT.**
@@ -276,42 +310,65 @@ export function createWaterCausticPass({ slot, surfaceTexture, resolution, width
    * than aiming it.
    */
   const LENS_CELLS = 2.5;
-  const lensNormal = sampleAt(0, 0).yzw.mul(2)
-    .add(sampleAt(LENS_CELLS, 0).yzw).add(sampleAt(-LENS_CELLS, 0).yzw)
-    .add(sampleAt(0, LENS_CELLS).yzw).add(sampleAt(0, -LENS_CELLS).yzw)
+  // The surface map carries the ripple normal's x and z; y is rebuilt.
+  const lensXZ = sampleAt(0, 0).yz.mul(2)
+    .add(sampleAt(LENS_CELLS, 0).yz).add(sampleAt(-LENS_CELLS, 0).yz)
+    .add(sampleAt(0, LENS_CELLS).yz).add(sampleAt(0, -LENS_CELLS).yz)
     .div(6);
+  const lensNormal = vec3(lensXZ.x, float(1).sub(lensXZ.dot(lensXZ)).max(0).sqrt(), lensXZ.y);
   const half = vec3(u.half);
-  const rest = vec3(at.x.sub(.5).mul(width), 0, at.y.sub(.5).mul(height));
+  const rest = vec3(center.x.add(at.x.sub(.5).mul(half2.x.mul(2))), 0, center.y.add(at.y.sub(.5).mul(half2.y.mul(2))));
   // Where this sample's beam lands, and where it WOULD have landed through a
   // flat surface. The ratio of those two footprints is the whole effect.
   // ⭐ BENT BY THE FINE DETAIL TOO, not only by the grid. See
-  // `waterDetailSlopeAt`: a lens made of the solver's normals alone cannot
+  // `seaSlopeAt`: a lens made of the solver's normals alone cannot
   // focus anything a gentle swell does not already focus, and real caustics are
   // made by exactly the structure the grid cannot hold.
   //
-  // ⚠ INSIDE AN `Fn`, and it has to be: `waterDetailSlopeAt` declares variables,
+  // ⚠ INSIDE AN `Fn`, and it has to be: `seaSlopeAt` declares variables,
   // and this pass builds its vertex graph at construction time where there is
   // no builder stack — "No stack defined for assign operation". Anything that
   // declares belongs in one of these, which is the second time that has caught
   // me in this file's neighbourhood.
   //
-  // ⭐ AND BAND-LIMITED TO THIS GRID. `cutoff` is three vertex spacings in
-  // world metres: octaves finer than that are faded out of the lens rather
-  // than sampled as noise. What survives is exactly the structure this many
-  // beams can resolve into filaments.
-  const spacing = Math.max(width, height) / (n - 1);
-  const localNormal = uniforms
+  // ⭐ THE SEA'S SLOPE COMES FROM THE DERIVATIVE CASCADES AT THE BEAM'S OWN
+  // MIP. The solver's surface map carries the RIPPLE normal only; the sea is
+  // added here from the same derivative textures the shading reads, each
+  // cascade at the mip whose texel matches the beam spacing — or the physical
+  // floor below, whichever is coarser. Structure of wavelength λ comes to a
+  // focus at a distance that shrinks with λ², so the finest ripples focus
+  // centimetres under the surface and are a blur again by the time the beam
+  // reaches a floor metres down; `0.08·√depth` is that scale (14 cm over a
+  // 3 m pool), and without it a floor was a marble of centimetre threads.
+  // Real waves through a mip chain: nothing here can alias.
+  const lens = { lods: [uniform(0), uniform(0), uniform(0)] };
+  const localNormal = uniforms && spectrum
     ? Fn(() => {
         const world = vec2(rest.x.mul(uniforms.waveScale.x), rest.z.mul(uniforms.waveScale.z));
-        const cutoff = uniforms.waveScale.x.max(uniforms.waveScale.z).mul(spacing * 3);
-        const slope = waterDetailSlopeAt(world, uniforms, cutoff);
-        const n = vec3(lensNormal);
-        return vec3(n.x.sub(slope.x), n.y, n.z.sub(slope.y)).normalize();
+        const slope = seaSlopeAt(spectrum, world, { lods: lens.lods });
+        // World slope → local: the box is anisotropic (see gridSimulation).
+        const local = vec2(slope.x.mul(uniforms.waveScale.x).div(uniforms.waveScale.y), slope.y.mul(uniforms.waveScale.z).div(uniforms.waveScale.y));
+        const nrm = vec3(lensNormal);
+        return vec3(nrm.x.sub(local.x.mul(nrm.y)), nrm.y, nrm.z.sub(local.y.mul(nrm.y))).normalize();
       })()
     : vec3(lensNormal);
   const worldNormal = c.normalMatrix.mul(localNormal).normalize();
   const ray = c.toLocal.mul(refract(c.sun, worldNormal, IOR));
-  const displaced = vec3(rest.x, info.x, rest.z);
+  // ── THE BEAM STARTS ON THE SMOOTH SEA, NOT ON THE BILINEAR MAP ─────────
+  //
+  // Focus is a second derivative of where beams land. A height read from the
+  // solver's surface map is bilinear — continuous, with a kink at every cell
+  // edge — and the kinks came through the rasterizer as a floor tiled in
+  // solver-cell-sized blocks (visible on a 60 m lake, 12 cm cells). The sea
+  // part of the height is sampled from the cascades themselves, at the
+  // lens's own mips, and only the ripple height (zero except near a wake)
+  // comes from the map.
+  const seaHere = uniforms && spectrum
+    ? Fn(() => seaDisplacementAt(spectrum, vec2(rest.x.mul(uniforms.waveScale.x), rest.z.mul(uniforms.waveScale.z)), lens.lods))()
+    : null;
+  const displaced = seaHere
+    ? vec3(rest.x.add(seaHere.x.div(uniforms.waveScale.x)), info.w.add(seaHere.y.div(uniforms.waveScale.y)), rest.z.add(seaHere.z.div(uniforms.waveScale.z)))
+    : vec3(rest.x, info.x, rest.z);
   const hit = half.y.negate().sub(displaced.y).div(ray.y.min(-.05)).max(0);
   const landed = vec3(displaced.x.add(ray.x.mul(hit)), half.y.negate(), displaced.z.add(ray.z.mul(hit)));
   const flat = vec3(u.flatRay);
@@ -320,9 +377,9 @@ export function createWaterCausticPass({ slot, surfaceTexture, resolution, width
 
   const newPos = varying(landed, "waterCausticNew");
   const oldPos = varying(reference, "waterCausticOld");
-  // Draw in the floor's own space: the map covers the volume footprint exactly,
-  // so a landing point maps straight to NDC.
-  material.vertexNode = vec4(landed.x.div(half.x), landed.z.div(half.z).negate(), 0, 1);
+  // Draw in the WINDOW's own space: the map covers it exactly, so a landing
+  // point maps straight to NDC and a beam landing outside it is clipped.
+  material.vertexNode = vec4(landed.x.sub(center.x).div(half2.x), landed.z.sub(center.y).div(half2.y).negate(), 0, 1);
   material.colorNode = Fn(() => {
     const oldArea = dFdx(oldPos).length().mul(dFdy(oldPos).length());
     const newArea = dFdx(newPos).length().mul(dFdy(newPos).length());
@@ -334,12 +391,19 @@ export function createWaterCausticPass({ slot, surfaceTexture, resolution, width
   const scene = new THREE.Scene();
   scene.add(mesh);
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-  const previousClear = new THREE.Color();
+  const previousClear = new THREE.Color(), layer = new THREE.Vector3(0, 0, slot.index);
   return {
     uniforms: c,
     /** One small draw per visible water surface, before the frame's own render. */
     render(renderer) {
       if (!renderer?.isWebGPURenderer) return;
+      if (uniforms && spectrum) {
+        const ws = uniforms.waveScale.value;
+        const spacing = Math.max(u.causticHalf.value.x * ws.x, u.causticHalf.value.y * ws.z) * 2 / (n - 1);
+        const floorScale = .04 * Math.sqrt(Math.max(.01, u.half.value.y * ws.y));
+        const coarsest = Math.max(spacing, floorScale);
+        spectrum.cascades.forEach((c, i) => { lens.lods[i].value = Math.max(0, Math.log2(Math.max(1, coarsest / (c.L / spectrum.size)))); });
+      }
       const target = renderer.getRenderTarget();
       const alpha = renderer.getClearAlpha();
       renderer.getClearColor(previousClear);
@@ -348,6 +412,8 @@ export function createWaterCausticPass({ slot, surfaceTexture, resolution, width
       renderer.render(scene, camera);
       renderer.setClearColor(previousClear, alpha);
       renderer.setRenderTarget(target);
+      // Into the slot's layer of the shared array; the mips follow.
+      renderer.copyTextureToTexture(slot.causticTarget.texture, slot.caustic, null, layer);
     },
     dispose() { geometry.dispose(); material.dispose(); scene.remove(mesh); },
   };

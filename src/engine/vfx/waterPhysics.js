@@ -1,5 +1,5 @@
 import { Quaternion, Vector3 } from 'three/webgpu';
-import { waterWaveHeight } from './waterWaves.js';
+import { seaHeightAt } from './waterSpectrumCPU.js';
 import { waterSurfaceFrame, waterVolumeExtent } from './waterVolume.js';
 
 /**
@@ -51,14 +51,17 @@ export const WATER_CONSTANTS = Object.freeze({ waterDensity:1000, fluidDrag:3, a
 const IMPACT_TIME=.12;
 const finite=(v,d,min=0,max=1e6)=>Number.isFinite(Number(v))?Math.min(max,Math.max(min,Number(v))):d;
 
-/** Analytic continuous surface query over the shared water volume
- * (`waterVolume.js`); optional GPU disturbance ripples are not synchronously
- * read back. Coordinates and returned heights are world-space.
+/** Surface query over the shared water volume (`waterVolume.js`), on the
+ * SEA THE EYE SEES: `sea` is the spectral cascades' displacement read back
+ * from the GPU (`gridSimulation`'s `seaSample`), sampled with Babylon's
+ * inverse-displacement iteration. Without one the sea is flat. The GPU
+ * disturbance ripples are not read back. Coordinates and returned heights are
+ * world-space.
  *
  * The tilt guard and the local→world height conversion both live in
- * `waterSurfaceFrame` now — see its header for the scale-vs-tilt confusion that
+ * `waterSurfaceFrame` — see its header for the scale-vs-tilt confusion that
  * used to turn every scaled-up water plane's buoyancy off without a word. */
-export function createWaterSurfaceQuery(mesh, props, time) {
+export function createWaterSurfaceQuery(mesh, props, time, sea = null) {
   const frame=waterSurfaceFrame(mesh);
   if(!frame.horizontal) return () => null;
   const extent=waterVolumeExtent(props);
@@ -68,12 +71,12 @@ export function createWaterSurfaceQuery(mesh, props, time) {
   return (point) => {
   const world=new Vector3(point.x,point.y,point.z),local=world.clone().applyMatrix4(frame.inverse);
   if(Math.abs(local.x)>extent.halfX || Math.abs(local.z)>extent.halfZ) return null;
-  const height=waterWaveHeight(local.x*frame.scale.x,local.z*frame.scale.z,time,props)/frame.scale.y;
+  const height=sea?.cascades?.length?seaHeightAt(sea.cascades,local.x*frame.scale.x,local.z*frame.scale.z)/frame.scale.y:0;
   const worldHeight=world.y+(height-local.y)*frame.rise;
   return {height:worldHeight,bottom:worldHeight-extent.depth*Math.abs(frame.rise),localX:local.x,localZ:local.z};
   };
 }
-export const queryWaterSurface=(mesh,props,time,point)=>createWaterSurfaceQuery(mesh,props,time)(point);
+export const queryWaterSurface=(mesh,props,time,point,sea=null)=>createWaterSurfaceQuery(mesh,props,time,sea)(point);
 
 function localBounds(collider) {
   const shape=collider.shape;
@@ -134,16 +137,9 @@ export class WaterPhysics {
     for(let e=c.entity;e;e=e.parent)if(e.enabled===false)return;
     this.time+=dt;
     const mesh=c.simulation.mesh,time=c.simulation.uniforms?.simTime?.value??this.time;
-    // ⚠ THE LIVE WAVELENGTH, NOT THE AUTHORED ONE. The solver clamps it to its
-    // own grid's Nyquist limit (see `gridSimulation.js`'s tick); reading the
-    // authored number here would float bodies on a wave the water does not have.
-    const live=c.simulation.uniforms?.waveLength?.value;
-    if(Number.isFinite(live))p.waveLength=live;
-    // Same reason for the band cutoff: the solver fades out every wave band its
-    // grid cannot carry, and a body has to float on the surface that is there.
-    const cutoff=c.simulation.uniforms?.waveCutoff?.value;
-    if(Number.isFinite(cutoff))p.waveCutoff=cutoff;
-    const query=createWaterSurfaceQuery(mesh,p,time);
+    // The sea as the GPU last handed it back — the surface the eye sees, a
+    // frame or two ago. Flat until the first copy lands.
+    const query=createWaterSurfaceQuery(mesh,p,time,c.simulation.seaSample??null);
     const density=finite(p.waterDensity,1000,.01),drag=finite(p.fluidDrag,3,0,100),angular=finite(p.angularDrag,2,0,100);
     const gravity=new Vector3(...physics.gravity);
     let displaced=0,bodies=0;

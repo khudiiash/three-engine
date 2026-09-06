@@ -28,6 +28,24 @@
  */
 export const GRAVITY = 9.81;
 
+/**
+ * ══ SEA STATES — ONE SYSTEM, A POOL OR AN OCEAN ════════════════════════════
+ *
+ * "We don't do solely an ocean or solely a small smooth pool. We need to be
+ * able to configure both" (user, 2026-09-06). Both ARE the same spectrum at
+ * different settings, and these are the settings. A preset writes the wave
+ * fields and nothing else; the fields stay editable, and editing one turns
+ * the preset back to `custom`. `waveHeight: 0` is a perfectly smooth pool
+ * with nothing but the interactive ripples on it.
+ */
+export const SEA_STATE_FIELDS = ["waveHeight", "waveLength", "choppiness", "rippleStrength", "waveOctaves", "waveGain", "waveSpeed"];
+export const SEA_STATES = Object.freeze({
+  pool:  { waveHeight: .02, waveLength: 1.5, choppiness: .2, rippleStrength: .5, waveOctaves: 5, waveGain: .5, waveSpeed: 1 },
+  pond:  { waveHeight: .06, waveLength: 3,   choppiness: .3, rippleStrength: .7, waveOctaves: 6, waveGain: .5, waveSpeed: 1 },
+  lake:  { waveHeight: .25, waveLength: 8,   choppiness: .5, rippleStrength: 1,  waveOctaves: 7, waveGain: .5, waveSpeed: 1 },
+  ocean: { waveHeight: 1.2, waveLength: 60,  choppiness: .9, rippleStrength: 1,  waveOctaves: 8, waveGain: .55, waveSpeed: 1 },
+});
+
 // ── SEA STATE FROM THE COMPONENT'S FIELDS ────────────────────────────────────
 //
 // No new knobs. The fields the component has always had are re-mapped onto the
@@ -51,7 +69,11 @@ export function seaSettings(props = {}, depthMetres = 20) {
   const gain = finite(props.waveGain, .5, .2, .9);
   const kp = 2 * Math.PI / waveLength;
   return {
-    sigma: waveHeight / 2,
+    // ⚠ CAPPED AT THE BREAKING LIMIT. A wave steeper than about Hs/λ = 0.1
+    // does not exist — it breaks — and a heightfield asked for one folds into
+    // spikes (the property sweep's `waveHeight .35` on a 2 m peak was a
+    // mountain range). The spectrum's height is bounded by its wavelength.
+    sigma: Math.min(waveHeight / 2, .05 * waveLength),
     waveLength,
     peakOmega: Math.sqrt(GRAVITY * kp),
     kPeak: kp,
@@ -142,6 +164,13 @@ export function spectrumAt(kx, kz, settings) {
   let s = 0;
   for (const pars of settings.spectra) s += jonswap(omega, GRAVITY, depth, peakOmega, pars) * directionSpectrum(theta, omega, peakOmega, pars);
   if (k > kPeak) s *= Math.pow(k / kPeak, tilt);
+  // `rippleStrength` scales the SHORT waves — everything more than four times
+  // shorter than the peak, blended in over an octave. Not "the fine cascades":
+  // with a short peak wavelength the coarse cascade already holds waves down
+  // to a few centimetres and the fine ones carry nothing, and the control
+  // scaled nothing ("DEAD rippleStrength", the property sweep, 2026-09-06).
+  const short = Math.min(1, Math.max(0, (k / kPeak - 2) / 4));
+  s *= 1 + (ripple - 1) * short * short * (3 - 2 * short);
   s *= Math.exp(-((k / kMax) ** 4));
   return s * Math.abs(frequencyDerivative(k, GRAVITY, depth)) / k;
 }
@@ -170,16 +199,39 @@ export function gaussianNoise(size, seed = 1337) {
  * at k is `h0(k) + conj(h0(−k))`, two independent such terms — so each texel
  * contributes 8·S·Δk² to the variance, counted once over the whole grid.
  */
-export function expectedVariance(size, bands, settings) {
-  let total = 0;
+export function expectedVariance(size, bands, settings) { return spectrumMoments(size, bands, settings).variance; }
+/**
+ * The variance of the height AND of the horizontal displacement's gradient
+ * (∂Dx/∂x = −h·kx²/k, per unit amplitude). The second is what decides how
+ * much `choppiness` a sea can take before it folds — see `foldingLimit`.
+ */
+export function spectrumMoments(size, bands, settings) {
+  let variance = 0, gradient = 0;
   for (const { L, cutLow, cutHigh } of bands) {
     const dk = 2 * Math.PI / L;
     for (let j = 0; j < size; j++) for (let i = 0; i < size; i++) {
       const kx = (i - size / 2) * dk, kz = (j - size / 2) * dk, k = Math.hypot(kx, kz);
-      if (k <= cutHigh && k >= cutLow) total += 8 * spectrumAt(kx, kz, settings) * dk * dk;
+      if (!(k <= cutHigh && k >= cutLow && k > 0)) continue;
+      const cell = 8 * spectrumAt(kx, kz, settings) * dk * dk;
+      variance += cell;
+      gradient += cell * (kx * kx / k) ** 2;
     }
   }
-  return total;
+  return { variance, gradient };
+}
+/**
+ * ⭐ TESSENDORF'S FOLDING LIMIT, FROM THE SPECTRUM ITSELF. The horizontal
+ * displacement λ·Dx sharpens a crest; where λ·∂Dx/∂x reaches −1 the surface
+ * folds over itself. ∂Dx/∂x is Gaussian with the deviation the moments give,
+ * so a λ of 1/(2.5σ) folds only the crests past 2.5σ — about one percent of
+ * the surface, which is what whitecaps ARE. Uncapped, `choppiness 1` on a
+ * steep authored sea folded almost everywhere: crumpled foil, and foam over
+ * all of it (the premium sheet, 2026-09-06). The cap is the physics, not a
+ * taste setting; `choppiness` still chooses anything up to it.
+ */
+export function foldingLimit(amplitude, gradientVariance) {
+  const sigma = amplitude * Math.sqrt(Math.max(0, gradientVariance));
+  return sigma > 1e-9 ? 1 / (2.5 * sigma) : 1;
 }
 
 /** One cascade's initial spectrum: h0 (h0(k), conj h0(−k)) and the wave data
@@ -269,31 +321,52 @@ export function ifft2d(packed, size) {
   return packed;
 }
 
-/** Displacement (λ·Dx, Dy, λ·Dz, J) and derivatives (Dyx, Dyz, λ·Dxx, λ·Dzz)
- *  from the transformed maps, plus the foam memory update. */
-export function merge(A, B, size, lambda, turbulence = null, dt = 0) {
+/** Displacement (λ·Dx, Dy, λ·Dz, λ·Dxz) and derivatives (Dyx, Dyz, λ·Dxx,
+ *  λ·Dzz) from the transformed maps — the ingredients of the composed
+ *  surface's Jacobian, see `jacobianOf`. */
+export function merge(A, B, size, lambda) {
   const n = size * size;
   const displacement = new Float32Array(n * 4), derivatives = new Float32Array(n * 4);
-  const turb = turbulence ?? new Float32Array(n).fill(1);
   for (let t = 0; t < n; t++) {
     const Dx = A[t * 4], Dz = A[t * 4 + 1], Dy = A[t * 4 + 2], Dxz = A[t * 4 + 3];
     const Dyx = B[t * 4], Dyz = B[t * 4 + 1], Dxx = B[t * 4 + 2], Dzz = B[t * 4 + 3];
-    const J = (1 + lambda * Dxx) * (1 + lambda * Dzz) - lambda * lambda * Dxz * Dxz;
-    displacement.set([lambda * Dx, Dy, lambda * Dz, J], t * 4);
+    displacement.set([lambda * Dx, Dy, lambda * Dz, lambda * Dxz], t * 4);
     derivatives.set([Dyx, Dyz, Dxx * lambda, Dzz * lambda], t * 4);
-    turb[t] = Math.min(J, turb[t] + dt * .5 / Math.max(J, .5));
   }
-  return { displacement, derivatives, turbulence: turb };
+  return { displacement, derivatives };
+}
+/** The Jacobian of the COMPOSED surface at texel t, summed over cascades
+ *  before the product (all cascades share one size here). */
+export function jacobianOf(cascades, t) {
+  let dxx = 0, dzz = 0, dxz = 0;
+  for (const c of cascades) { dxx += c.derivatives[t * 4 + 2]; dzz += c.derivatives[t * 4 + 3]; dxz += c.displacement[t * 4 + 3]; }
+  return (1 + dxx) * (1 + dzz) - dxz * dxz;
 }
 
 // ── SAMPLING, FOR BUOYANCY ───────────────────────────────────────────────────
+/**
+ * Half → float, for maps read straight back from the GPU (rgba16f). Converted
+ * lazily at the sample, never as a whole map: a 256² readback is a quarter of
+ * a million halves and converting them all every frame would cost more CPU
+ * than the physics it feeds.
+ */
+const _f32 = new Float32Array(1), _u32 = new Uint32Array(_f32.buffer);
+export function halfToFloat(h) {
+  const s = (h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+  if (e === 0) return (s ? -1 : 1) * m * 5.960464477539063e-8;     // subnormal, or ±0
+  if (e === 31) return m ? NaN : (s ? -Infinity : Infinity);
+  _u32[0] = s | ((e + 112) << 23) | (m << 13);
+  return _f32[0];
+}
 /** Bilinear, tiling sample of a displacement map at world (x, z). `map` is
- *  N²·4 floats; `L` the cascade's length in metres. */
+ *  N²·4 floats — or N²·4 halves (Uint16Array) straight from a readback; `L`
+ *  the cascade's length in metres. */
 export function sampleDisplacement(map, size, L, x, z, out = [0, 0, 0]) {
   const fx = (x / L) * size, fz = (z / L) * size;
   const x0 = Math.floor(fx), z0 = Math.floor(fz), tx = fx - x0, tz = fz - z0;
   const wrap = (v) => ((v % size) + size) % size;
-  const read = (i, j, c) => map[(wrap(j) * size + wrap(i)) * 4 + c];
+  const half = map instanceof Uint16Array;
+  const read = half ? (i, j, c) => halfToFloat(map[(wrap(j) * size + wrap(i)) * 4 + c]) : (i, j, c) => map[(wrap(j) * size + wrap(i)) * 4 + c];
   for (let c = 0; c < 3; c++) {
     const a = read(x0, z0, c) + (read(x0 + 1, z0, c) - read(x0, z0, c)) * tx;
     const b = read(x0, z0 + 1, c) + (read(x0 + 1, z0 + 1, c) - read(x0, z0 + 1, c)) * tx;
@@ -320,15 +393,15 @@ export function seaHeightAt(cascades, x, z, steps = 3) {
 }
 
 /** The whole model, end to end, for tests and the parity smoke. */
-export function realizeSea({ size = 64, props = {}, depth = 20, time = 0, seed = 1337, cascadeCount = 3, amplitude: given = null }) {
+export function realizeSea({ size = 64, props = {}, depth = 20, time = 0, seed = 1337, cascadeCount = 3, amplitude: given = null, lambda: givenLambda = null }) {
   const settings = seaSettings(props, depth);
   const bands = cascadeBands(cascadeScales(settings.waveLength, cascadeCount));
-  const variance = expectedVariance(size, bands, settings);
+  const { variance, gradient } = spectrumMoments(size, bands, settings);
   const amplitude = given ?? (variance > 0 ? settings.sigma / Math.sqrt(variance) : 0);
+  settings.lambda = givenLambda ?? Math.min(settings.lambda, foldingLimit(amplitude, gradient));
   const noise = gaussianNoise(size, seed);
-  const cascades = bands.map((band, i) => {
-    // `rippleStrength` is the energy of the cascades above the swell's own.
-    const c = initialSpectrum({ size, ...band, settings, noise, amplitude: amplitude * (i ? settings.ripple : 1) });
+  const cascades = bands.map((band) => {
+    const c = initialSpectrum({ size, ...band, settings, noise, amplitude });
     const { A, B } = evolve(c, time * settings.timeScale);
     ifft2d(A, size); ifft2d(B, size);
     return { ...c, ...merge(A, B, size, settings.lambda) };
