@@ -91,7 +91,7 @@ import { If, Loop, float, int, ivec2, mix, select, step, uint, vec3, vec4 } from
 import { MAX_LOOP_ALBEDO } from "./srcConfig.js";
 import { hashKey } from "./srcMathTsl.js";
 import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
-import { waterCausticGainNode } from "../../engine/vfx/waterCaustics.js";
+import { waterCausticAboveNode, waterCausticGainNode } from "../../engine/vfx/waterCaustics.js";
 
 /**
  * How far below the mean importance a contributing emitter may be ranked before
@@ -722,6 +722,38 @@ export function createSrcHitLighting({
           E.addAssign(raw.mul(compensationBundle ? sunGain : float(1)));
           if (compensationBundle) sunRawE.addAssign(raw);
         }
+      });
+    }
+
+    // ── THE WATER LIGHTS WHAT IS ABOVE IT: the mirrored sun ──────────────
+    //
+    // "Proper lighting from the water surface onto the surrounding surfaces,
+    // with caustics and beams … in terms of GI" (user, 2026-09-06). A pool
+    // reflects the sun onto the ceiling above it, the underside of a pier, a
+    // wall beside it — and the probes then carry that light around the room.
+    // Per water slot: the sun's MIRROR IMAGE is a second directional source
+    // (direction `toSunMirror`, which points DOWN, so only a surface facing the
+    // water has a cosine with it), its irradiance the sun's times the
+    // surface's Fresnel reflectance, patterned by the reflected lens
+    // (`waterCausticAboveNode`: the caustic map read back through the mirror,
+    // zero outside the footprint or below the surface — the cheap gate that
+    // keeps this off every hit not over water), and its visibility a real
+    // shadow ray toward the mirrored sun, no farther than the water's rest
+    // plane: the beam must reach the surface before anything else does.
+    if (sun && caustics.length) for (const slot of caustics) {
+      const s = slot.uniforms;
+      const lm = vec3(s.toSunMirror).toVar();
+      const cosM = n.dot(lm).toVar();
+      If(cosM.greaterThan(0), () => {
+        const lens = float(waterCausticAboveNode(P, slot)).toVar();
+        If(lens.greaterThan(0), () => {
+          const local = s.inverse.mul(vec4(P, 1)).xyz;
+          // Height above the rest surface in world metres, along the beam.
+          const reach = local.y.mul(s.rise).div(lm.y.negate().max(.05));
+          const v = visibility ? float(visibility(P, n, lm, reach)).toVar() : float(1).toVar();
+          if (count && visibility) count.shadowRays(1);
+          E.addAssign(vec3(s.radiance).mul(s.reflectance).mul(cosM).mul(v).mul(lens));
+        });
       });
     }
 
