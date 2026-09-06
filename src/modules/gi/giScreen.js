@@ -178,6 +178,53 @@ export function createGiGBuffer(width, height) {
  * found it — a leaked render target or MRT would redirect the main scene
  * render into our half-res buffer.
  */
+/**
+ * Water refraction (2026-09-06): renders ONE layer of the scene — the water
+ * lid — through the water's own MRT material into a gbuffer whose "normal"
+ * attachment carries the refracted ray direction. Nested inside the engine's
+ * pre-render phase like `renderGiGBuffer`, and leaves the renderer as found.
+ */
+export function renderWaterGBuffer(renderer, scene, camera, { rt, mrtNode, material, layer }) {
+  const previousTarget = renderer.getRenderTarget();
+  const previousMRT = renderer.getMRT();
+  const previousOverride = scene.overrideMaterial;
+  const previousMask = camera.layers.mask;
+  const previousTransparent = renderer.transparent;
+  const previousAutoClear = renderer.autoClear;
+  const previousBackground = scene.background;
+  const previousBackgroundNode = scene.backgroundNode;
+  const previousClearColor = renderer.getClearColor(new THREE.Color()).clone();
+  const previousClearAlpha = renderer.getClearAlpha();
+  const previousShadows = renderer.shadowMap.enabled;
+  const previousFog = scene.fogNode;
+  try {
+    renderer.shadowMap.enabled = false;
+    renderer.transparent = true;
+    scene.background = null;
+    scene.backgroundNode = null;
+    scene.fogNode = null;
+    renderer.setClearColor(0x000000, 0);
+    renderer.autoClear = true;
+    scene.overrideMaterial = material;
+    camera.layers.set(layer);
+    renderer.setRenderTarget(rt);
+    renderer.setMRT(mrtNode);
+    renderer.render(scene, camera);
+  } finally {
+    renderer.setMRT(previousMRT);
+    renderer.setRenderTarget(previousTarget);
+    scene.overrideMaterial = previousOverride;
+    camera.layers.mask = previousMask;
+    renderer.transparent = previousTransparent;
+    renderer.autoClear = previousAutoClear;
+    scene.background = previousBackground;
+    scene.backgroundNode = previousBackgroundNode;
+    scene.fogNode = previousFog;
+    renderer.setClearColor(previousClearColor, previousClearAlpha);
+    renderer.shadowMap.enabled = previousShadows;
+  }
+}
+
 export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask = false, depthProxies = null } = {}) {
   const previousTarget = renderer.getRenderTarget();
   const previousMRT = renderer.getMRT();
@@ -1192,7 +1239,12 @@ export function giBvhHitShadeReplicatesTarget(rawCopy, hatch = globalThis.__giBv
   return !!rawCopy && hatch !== false;
 }
 
-export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null, bounceWeight = null }) {
+export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null, bounceWeight = null,
+  // Water refraction (2026-09-06): 'given' reconstructs the hit along the
+  // direction stored in the gbuffer's normal attachment (see
+  // createGiBvhReflect's rayMode); `causticGain(point, normal)` multiplies
+  // the analytic (sun) term — the lens on a hit under the water.
+  rayMode = 'reflect', causticGain = null }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
@@ -1311,8 +1363,8 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
           // that merely happen to be written from the same camera each tick
           // is one write-ordering bug away from striped reflections.
           const incident = P.sub(vec3(cameraPosition)).normalize().toVar();
-          const R = reflect(incident, rawN).toVar();
-          const hitP = P.add(rawN.mul(normalOffset)).add(R.mul(hitTexel.x)).toVar();
+          const R = (rayMode === 'given' ? rawN : reflect(incident, rawN)).toVar();
+          const hitP = P.add((rayMode === 'given' ? R : rawN).mul(normalOffset)).add(R.mul(hitTexel.x)).toVar();
           // The hit's true face normal, flipped to face the incoming ray: a
           // BVH hit routinely lands on single-sided geometry whose winding
           // points away, and gathering with a back-facing normal samples the
@@ -1604,6 +1656,7 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
             // materials ignore lighting, appearing too bright".
             // Term 4 of 4.
             const analyticTerm = vec3(analyticDirectAt(bvhShade.lightSlots, hitP, nFace, lightShadowFn, true, { rolled: globalThis.__giRolledDirect !== false })).toVar();
+            if (causticGain) analyticTerm.mulAssign(vec3(causticGain(shadePoint, nFace)));
             hitE.addAssign(termMask ? analyticTerm.mul(termMask.w) : analyticTerm);
           }
           // ×intensity to match the convention of the term this is mixed WITH
@@ -5054,6 +5107,11 @@ export function createGiBvhReflect({
   // per-slot surface palette. Null keeps the incumbent path compiled
   // (`__giOneBvhReflect = false` forces it from GISystem).
   oneBvh = null,
+  // Water refraction (2026-09-06): 'reflect' derives the ray from the
+  // receiver's normal and the camera; 'given' reads the ray DIRECTION from
+  // the gbuffer's normal attachment as it is (the water's own gbuffer stores
+  // the refracted direction there) and steps the origin along the ray.
+  rayMode = 'reflect',
 }) {
   // ── ONE RAY PER stride×stride BLOCK (2026-08-16) ────────────────────────────
   //
@@ -5161,8 +5219,8 @@ export function createGiBvhReflect({
       const P = g0.xyz.toVar();
       const N = g1.xyz.normalize().toVar();
       const incident = P.sub(cameraPosition).normalize().toVar();
-      const R = reflect(incident, N).toVar();
-      const origin = P.add(N.mul(normalOffset)).toVar();
+      const R = (rayMode === 'given' ? N : reflect(incident, N)).toVar();
+      const origin = P.add((rayMode === 'given' ? R : N).mul(normalOffset)).toVar();
       // TRACED MISS IS ITS OWN VALUE (-2) since 2026-08-21: a ray that ran
       // the whole BVH and left the scene has PROVEN the environment is
       // visible along R, and giLight's env-on-miss term keys on exactly

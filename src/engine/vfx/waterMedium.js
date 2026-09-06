@@ -149,11 +149,12 @@ export function waterSegmentNode(slot, { shapeClip = true } = {}) {
  * 4.76, and the dotted grain is gone from the image.
  */
 const SHAFT_TAPS = 24;
-const SUN_SCATTER_ALBEDO = .08;
 /** The mip the shafts read the caustic map at — 1024 >> 4 = 64 texels across
  *  the pool. A beam is a low-frequency thing; the filaments underneath it are
  *  what the taps could not resolve. */
-const SHAFT_MIP = 5;
+// 6 since 2026-09-06: with the shafts back at the water colour's albedo, mip
+// 5's taps flickered at 4.3× smooth motion; a level coarser reads 2.3×.
+const SHAFT_MIP = 6;
 /**
  * ══ WHAT MAKES A SHAFT LOOK LIKE A SHAFT ═══════════════════════════════════
  *
@@ -206,6 +207,9 @@ const shaftPhase = (slot) => {
  * into a fine dither the eye reads as haze — the same trick, and the same
  * function, the volumetric materials use.
  */
+/** Clear water scatters a few percent of what it extinguishes: the sun's
+ *  forward HAZE, the glow looking up at it, at water's own albedo. */
+const SUN_HAZE_ALBEDO = .08;
 function shaftNode(slot, segment, tau, sigma) {
   const jitter = fract(interleavedGradientNoise(screenCoordinate));
   const total = vec3(0).toVar();
@@ -219,15 +223,23 @@ function shaftNode(slot, segment, tau, sigma) {
   // `scene.fogNode`): a plain floor material compiled a 362 kB fragment shader
   // and the editor froze 10–15 s on every material it minted (user,
   // 2026-09-06). One copy, one loop.
+  // Two terms in one beam. The HAZE is the sun's whole light at water's
+  // own albedo — the forward glow looking up at it, which the excess alone
+  // cannot give (its mean along a ray is nothing). The SHAFTS are the
+  // filaments' EXCESS over the flat sun, at the water colour's albedo (near
+  // one), which is what reads as a ray; carried at the haze's albedo they
+  // flattened away — "our underwater godrays got broken" (user, 2026-09-06).
+  const shaftAlbedo = vec3(slot.uniforms.scatter).mul(4).clamp(0, 1);
   Loop({ start: 0, end: SHAFT_TAPS }, ({ i }) => {
     const k = float(i).add(jitter).div(SHAFT_TAPS);
-    // The WHOLE beam, not its excess over the mean: with a map that adds onto
-    // black (mean one, cells below, filaments above) the excess averages to
-    // nothing along a ray, and the forward-scattered sun — the bright haze
-    // when looking up at it — vanished with it (harness: looking up 1.5
-    // against 112 before the map was corrected). The sun's in-scatter is the
-    // beam's own light times the phase; the lens shapes it.
-    const beam = waterCausticGainLocalNode(segment.at(k), slot, mip);
+    // The beam's EXCESS over the mean, positive half: the shafts are the
+    // filaments' light above the flat sun, and only that reads as a ray.
+    // Carrying the whole beam at a tenth of the albedo flattened them to a
+    // haze — "our underwater godrays got broken" (user, 2026-09-06).
+    const gain = waterCausticGainLocalNode(segment.at(k), slot, mip);
+    // The excess is clamped: a filament at the map's cap (5) is a one-frame
+    // spike along a ray, and the shafts flickered at 4.3× smooth motion.
+    const beam = shaftAlbedo.mul(gain.sub(1).clamp(0, 1.5)).add(SUN_HAZE_ALBEDO);
     const depth = mix(segment.near, segment.far, k);
     const reach = sigma.mul(depth).mul(slant).negate().exp();
     total.addAssign(tau.mul(k).negate().exp().mul(reach).mul(beam));
@@ -266,9 +278,17 @@ function shaftNode(slot, segment, tau, sigma) {
  * finite there, so the guard is on the division and not on the geometry.
  */
 function applyMedium(rgb, slot, { shapeClip }) {
+  applyMediumSegment(rgb, slot, waterSegmentNode(slot, { shapeClip }));
+}
+/**
+ * The medium over an EXPLICIT segment — { near, far (depths below the
+ * surface, metres), length (metres), at(k) → world point } — for a ray that
+ * is not the eye's: the water's BVH-traced refraction (2026-09-06) shades
+ * its hit through the same absorption, in-scatter and shafts.
+ */
+export function applyMediumSegment(rgb, slot, segment) {
   const s = slot.uniforms;
   If(s.active.greaterThan(0), () => {
-    const segment = waterSegmentNode(slot, { shapeClip });
     const sigma = vec3(s.sigma);
     const length = segment.length.toVar();
     const tau = sigma.mul(length).toVar();
@@ -290,19 +310,11 @@ function applyMedium(rgb, slot, { shapeClip }) {
     If(s.strength.greaterThan(0), () => {
       // Scattered sunlight, tinted by the water it is travelling through. The
       // albedo is the water's own colour: a beam in green water is green.
-      // ── THE SUN'S IN-SCATTER, AT WATER'S OWN ALBEDO ────────────────────
-      //
-      // Clear water scatters a few percent of what it extinguishes
-      // (single-scatter albedo ~0.05–0.1; the rest is absorbed), so the sun's
-      // haze is `radiance × 0.08 × τ × phase × mean(beam)` along the ray: a
-      // blinding forward glow looking up at the sun, a faint one looking
-      // down. It used to take the water COLOUR ×4 as the albedo — near one,
-      // milk — which only stayed sane while the beam term averaged to zero;
-      // with the beam carried whole (the lens's mean is one) it washed a
-      // floor two metres down from 105 to 141 (harness, 2026-09-06). The
-      // beam's colour comes from σ per channel on its way down and back.
-      const albedo = float(SUN_SCATTER_ALBEDO);
-      inScatter.addAssign(vec3(s.radiance).mul(albedo).mul(shaftNode(slot, segment, tau, sigma)).mul(tau.min(2)).mul(shaftPhase(slot)));
+      // The water's own colour, near one, as the shafts' albedo: it stays sane
+      // because the beam term above averages to nearly nothing along a ray —
+      // the floor keeps its brightness and the filaments read as rays.
+      // The albedos live inside the beam (haze + shafts, see shaftNode).
+      inScatter.addAssign(vec3(s.radiance).mul(shaftNode(slot, segment, tau, sigma)).mul(tau.min(2)).mul(shaftPhase(slot)));
     });
     rgb.assign(rgb.mul(tau.negate().exp()).add(inScatter));
   });
