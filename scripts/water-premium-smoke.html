@@ -144,6 +144,11 @@ try {
    await shoot('caustics-under');
    pose([0, -DEPTH + 2.2, .001], [0, -DEPTH, 0]);
    await shoot('caustics-down');
+   // From under the surface, looking up at 35°: Snell's window (the world
+   // above) in the middle, total internal reflection of the pool toward the
+   // horizon — the underside must not be a mirror of the floor everywhere.
+   pose([0, -1.2, 0], [1.6, 0, 0]);
+   await shoot('from-below');
 
    // ── THE SPLASH: a 0.5 m body arriving at 4 m/s, in the SAME place ──────
    //

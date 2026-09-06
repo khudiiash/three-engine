@@ -168,7 +168,23 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       lidNormalLocal = perturbed;
       material.normalNode = transformNormalToView(perturbed);
     }
-    const fresnel = float(1).sub(normalView.dot(positionViewDirection).abs()).clamp(0, 1).pow(5).mul(.97963).add(.02037);
+    // ── TWO SIDES, TWO FRESNELS ───────────────────────────────────────────
+    //
+    // "When looking at the water surface from below, can't see anything above
+    // it, only the reflection of the pool floor" (user, 2026-09-06). From the
+    // air, Schlick at R0 = 2 %. From the WATER, the exit angle is refracted
+    // OUTWARD: beyond the critical angle (cos θ < 0.661 for n = 1.333) nothing
+    // gets out and the underside is a perfect mirror of the pool — total
+    // internal reflection — and inside that cone, Snell's window, the world
+    // above shows through at the air-side transmittance of the exit angle.
+    const eyeLocal = modelWorldMatrixInverse.mul(vec4(cameraPosition, 1)).xyz;
+    const fromBelow = eyeLocal.y.lessThan(0);
+    const cosV = normalView.dot(positionViewDirection).abs().clamp(0, 1);
+    const airFresnel = cosV.oneMinus().pow(5).mul(.97963).add(.02037);
+    const sin2t = float(1.333 * 1.333).mul(cosV.mul(cosV).oneMinus());
+    const cosT = sin2t.oneMinus().max(0).sqrt();
+    const waterFresnel = select(sin2t.greaterThanEqual(1), float(1), cosT.oneMinus().pow(5).mul(.97963).add(.02037));
+    const fresnel = select(fromBelow, waterFresnel, airFresnel);
     // ⚠ FROM THE CAPTURE, NOT FROM THE MATERIAL — this function writes
     // `roughnessNode`, and reading the live slot would feed each rebuild its
     // own previous output and blur the mirror a little further every time.
@@ -238,11 +254,14 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // is in the lid's LOCAL units (three scales it by the model), capped at
       // three depths so a grazing ray does not read the far shore, and
       // `transmission` still scales it — the dial that reads as "refraction".
-      const eyeLocal = modelWorldMatrixInverse.mul(vec4(cameraPosition, 1)).xyz;
       const toEye = eyeLocal.sub(positionLocal).normalize();
       const bent = refract(toEye.negate(), lidNormalLocal, float(1 / 1.333));
       const column = u.waterDepth.div(bent.y.negate().max(.2)).min(u.waterDepth.mul(3));
-      material.thicknessNode = column.mul(u.transmission);
+      // From BELOW the ray leaves into air at the surface: there is no column
+      // beyond it (with the up-facing normal `refract` fails and the column
+      // read five depths — the backdrop was sampled metres away, which is what
+      // showed the floor's mirror in place of the sky).
+      material.thicknessNode = select(fromBelow, float(.01), column.mul(u.transmission));
       emissive = emissive.add(reflected.mul(foam.oneMinus()));
       if (slot) emissive = emissive.add(waterSubsurfaceNode(u, slot).mul(foam.oneMinus()));
     } else {
