@@ -113,7 +113,7 @@ export class WaterPhysics {
     const previous=this.previousWakes.get(body);
     if(!previous)return;
     this.previousWakes.delete(body);this.wakeFilter.delete(body);
-    this.component.simulation?.addWaterImpulse?.(previous.x,previous.z,previous.radius,previous.depth);
+    for(const column of previous.columns) this.component.simulation?.addWaterImpulse?.(column.x,column.z,column.radius,column.depth,column.cap);
   }
   sampleCollider(collider) {
     const volume=collider.volume();
@@ -146,9 +146,27 @@ export class WaterPhysics {
     for(const {body,entity} of physics.dynamicBodies) {
       if(entity===c.entity||!body.isDynamic()||!(body.mass()>0))continue;
       const contacts=[];let volume=0,plane=0,total=0;
+      // ── THE FOOTPRINT IS THE HULL'S COLUMNS (2026-09-07) ─────────────────
+      // One circle per body made a boat press a round dent ("the contact
+      // shape is completely wrong"). An ELONGATED hull (aspect ≥ 1.8) is a
+      // row of columns along its long axis — up to four, each as wide as the
+      // hull, pressed by its own draught and released by the exact record of
+      // its press — so the dent is the shape of the hull. ⚠ A COMPACT BODY IS
+      // ONE DENT, exactly as before: split into a grid, a crate's columns were
+      // narrower than the slope cap lets a dent be deep (a falling crate's
+      // splash read no harder than its floating draught), and sixteen
+      // overlapping columns re-emitted with wandering centroids pumped the
+      // field (the interaction tests: energy wound up, the wake hit the clamp).
+      const columns=new Map();let bhalfMax=0;
       for(let i=0;i<body.numColliders();i++) {
         const collider=body.collider(i),sample=this.sampleCollider(collider);if(!sample)continue;
         const q=new Quaternion().copy(collider.rotation()),t=new Vector3().copy(collider.translation());
+        const bound=localBounds(collider),bhalf=bound?.half??bound??sample.cellHalf.clone().multiplyScalar(4),bcenter=bound?.center??new Vector3();
+        const longX=bhalf.x>=bhalf.z,longHalf=Math.max(bhalf.x,bhalf.z),shortHalf=Math.max(1e-6,Math.min(bhalf.x,bhalf.z));
+        bhalfMax=Math.max(bhalfMax,longHalf);
+        const aspect=longHalf/shortHalf;
+        const bins=aspect>=1.8?Math.min(4,Math.round(aspect)):1;
+        const columnArea=(2*shortHalf)*(2*longHalf/bins),columnSpacing=2*longHalf/bins;
         // Smooth immersion over each quadrature cell's vertical extent.
         const ex=new Vector3(sample.cellHalf.x,0,0).applyQuaternion(q),ey=new Vector3(0,sample.cellHalf.y,0).applyQuaternion(q),ez=new Vector3(0,0,sample.cellHalf.z).applyQuaternion(q);
         const radius=Math.max(.001,Math.abs(ex.y)+Math.abs(ey.y)+Math.abs(ez.y));
@@ -205,6 +223,12 @@ export class WaterPhysics {
           // submerged", user 2026-09-05).
           if(under>0&&under<1)plane+=cell/band;
           const v=cell*fraction;volume+=v;contacts.push({point,volume:v,surface});
+          // This point's column: the quadrature's (x, z) cell, merged to `bins`.
+          const along=longX?(local.x-bcenter.x)/Math.max(1e-6,bhalf.x):(local.z-bcenter.z)/Math.max(1e-6,bhalf.z);
+          const kb=Math.max(0,Math.min(bins-1,Math.floor((along*.5+.5)*bins)));
+          const key=`${i}:${kb}`;
+          const column=columns.get(key)??{x:0,z:0,volume:0,area:columnArea,spacing:columnSpacing};
+          column.x+=point.x*v;column.z+=point.z*v;column.volume+=v;columns.set(key,column);
         }
       }
       if(!volume){this.previousVolumes.set(body,0);this.releaseWake(body);continue;}
@@ -362,10 +386,32 @@ export class WaterPhysics {
         this.wakeFilter.set(body,filter);
         const moved=previous?Math.hypot(filter.x-previous.x,filter.z-previous.z):Infinity;
         const changed=previous?Math.abs(filter.depth-previous.depth):Infinity;
+        // The deadband decides WHEN (the body as a whole, smoothed); the
+        // columns say WHAT: each in-water column of the hull, pressed by its
+        // own draught, and every one released again by the exact record of
+        // its press, so the pair still cancels to the bit.
         if(moved>filter.radius*.15||changed>Math.max(Math.abs(filter.depth)*.08,filter.radius*.02)){
-          if(previous)c.simulation.addWaterImpulse?.(previous.x,previous.z,previous.radius,previous.depth);
-          c.simulation.addWaterImpulse?.(filter.x,filter.z,filter.radius,-filter.depth);
-          this.previousWakes.set(body,{x:filter.x,z:filter.z,radius:filter.radius,depth:filter.depth});
+          const strength=finite(p.wakeStrength,.15,0,2);
+          const pressed=[];
+          // A compact body: the smoothed whole-body footprint, bit for bit as
+          // before (the tests' numbers). Only an elongated hull is columns.
+          const split=[...columns.values()].some((column)=>column.spacing<Math.max(bhalfMax)*2-1e-6);
+          if(!split) pressed.push({x:filter.x,z:filter.z,radius:filter.radius,depth:filter.depth,cap:filter.radius});
+          else for(const column of columns.values()){
+            if(!(column.volume>0))continue;
+            const at=query(new Vector3(column.x/column.volume,0,column.z/column.volume));if(!at)continue;
+            // A column is as wide as the hull: its own footprint caps its depth,
+            // exactly as a compact body's does.
+            const columnRadius=Math.sqrt(column.area/Math.PI)/flat;
+            const columnDraught=column.volume/column.area+sinking*IMPACT_TIME;
+            const columnDepth=strength*columnDraught*straddle/Math.max(.001,Math.abs(scale.y));
+            pressed.push({x:at.localX,z:at.localZ,radius:columnRadius,depth:columnDepth,cap:columnRadius});
+          }
+          if(pressed.length){
+            if(previous)for(const column of previous.columns)c.simulation.addWaterImpulse?.(column.x,column.z,column.radius,column.depth,column.cap);
+            for(const column of pressed)c.simulation.addWaterImpulse?.(column.x,column.z,column.radius,-column.depth,column.cap);
+            this.previousWakes.set(body,{x:filter.x,z:filter.z,radius:filter.radius,depth:filter.depth,columns:pressed});
+          }
         }
       } else this.releaseWake(body);
       void prior;

@@ -360,6 +360,11 @@ export class Engine extends EventEmitter {
       super.emit(event, ...args);
       return;
     }
+    // A STORM DETECTOR (2026-09-07): "Maximum update depth exceeded" in the
+    // editor's mirror means something re-emits this event from within the
+    // reaction to it. The stack is only captured once the flush rate is
+    // already suspicious, so a quiet scene pays nothing.
+    if (!this._hierarchyDirty && (this._hierarchyFlushCount ?? 0) > 10) this._hierarchyStormStack = new Error().stack;
     this._hierarchyDirty = true;
     // An explicit batchHierarchy() owns the flush — it spans `await`s, which a
     // microtask would fire straight through.
@@ -375,6 +380,12 @@ export class Engine extends EventEmitter {
   flushHierarchyChanged() {
     if (!this._hierarchyDirty || this._hierarchyBatchDepth > 0) return;
     this._hierarchyDirty = false;
+    const now = (globalThis.performance?.now?.() ?? Date.now());
+    if (now - (this._hierarchyFlushWindow ?? 0) > 1000) { this._hierarchyFlushWindow = now; this._hierarchyFlushCount = 0; }
+    this._hierarchyFlushCount = (this._hierarchyFlushCount ?? 0) + 1;
+    if (this._hierarchyFlushCount === 30 && this._hierarchyStormStack) {
+      console.warn(`[engine] hierarchy-changed storm: 30 flushes within a second. The last emitter:\n${this._hierarchyStormStack}`);
+    }
     super.emit("hierarchy-changed");
   }
 

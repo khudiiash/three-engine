@@ -472,7 +472,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // In METRES per second: the dent is in local depth units (× sy), the
       // push in local horizontal units (÷ sx) — without the ratio a 60 m
       // body pushed twelve times harder than a 5 m one for the same crate.
-      push.addAssign(away.div(away.length().max(1e-4)).mul(falloff).mul(impulse.w.negate()).mul(FLOW_PUSH)
+      push.addAssign(away.div(away.length().max(1e-4)).mul(falloff).mul(impulse.w.negate()).mul(FLOW_PUSH).mul(u.speed)
         .mul(vec2(u.waveScale.y.div(u.waveScale.x), u.waveScale.y.div(u.waveScale.z))));
     });
     positions.element(index).y.addAssign(displacement);
@@ -740,12 +740,19 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // water thrown upward at splash speed (half a metre a second and up). The
     // whole interaction source now sits behind the dial, so 0.2 means a fifth
     // of the foam a splash would make.
-    const source = u.foam.mul(steepWorld.smoothstep(.45, .9).mul(.5).add(churn.smoothstep(.5, 1.5).mul(3))).add(jacobianFoam.mul(3));
+    // ⛔ FOAM FORMS WHERE THE WATER BREAKS: a slope steep enough AND moving.
+    // Vertical motion alone was a source, and a hull's rim moves fast
+    // everywhere the hull goes — a fishing boat towed a white blanket twenty
+    // metres wide ("foam madness", user, 2026-09-07). Steepness gates the
+    // churn now: the bow wave's breaking crest foams, the dent's floor does
+    // not, however fast it rises and falls.
+    const breaking = steepWorld.smoothstep(.3, .7);
+    const source = u.foam.mul(breaking.mul(churn.smoothstep(.4, 1.5).mul(3).add(.3))).add(jacobianFoam.mul(3));
     const around = scratch.element(west).w.add(scratch.element(east).w).add(scratch.element(north).w).add(scratch.element(south).w).mul(.25);
     // ⭐ THE FOAM RIDES THE FLOW: this cell's foam is what was upstream a tick
     // ago — semi-Lagrangian, bilinear over the foam copy in `scratch`.
     const f = flow.element(index);
-    const bx = x.toFloat().sub(f.x.mul(u.foamRate).div(sx)), by = y.toFloat().sub(f.y.mul(u.foamRate).div(sz));
+    const bx = x.toFloat().sub(f.x.mul(u.foamRate).div(sx)), by = y.toFloat().sub(f.y.mul(u.foamRate).div(sz));   // foamRate is the tick in WATER time
     const ix0 = bx.floor().clamp(0, w - 1), iy0 = by.floor().clamp(0, w - 1);
     const ix1 = ix0.add(1).min(w - 1), iy1 = iy0.add(1).min(w - 1);
     const fx = bx.sub(bx.floor()).clamp(0, 1), fy = by.sub(by.floor()).clamp(0, 1);
@@ -830,7 +837,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // breaking crest lays a SHEET in a fifth of a second; a steep crater
       // rim settles at a network. The sea's folds feed the SAME field, so
       // their foam spreads, persists and dissolves exactly like a wake's.
-      const source = steepWorld.smoothstep(.35, .8).mul(.14).add(churn.smoothstep(.12, 1).mul(3.5)).add(jacobianFoam.mul(3));
+      const source = steepWorld.smoothstep(.3, .7).mul(churn.smoothstep(.4, 1.5).mul(3).add(.3)).add(jacobianFoam.mul(3));
       // ── FOAM SPREADS, AND THE NEIGHBOURS ARE READ FROM `scratch` ────────
       //
       // A patch of foam widens and softens as it ages; without that a splash
@@ -1143,13 +1150,17 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const gradX = positions.element(east).y.sub(positions.element(west).y).div(2 * sx);
     const gradZ = positions.element(south).y.sub(positions.element(north).y).div(2 * sz);
     // du/dt = −g ∂h/∂x in the lid's units: h × sy over x × sx, u in x/s.
-    const gx = gradX.mul(GRAVITY * h).mul(u.waveScale.y).div(u.waveScale.x.mul(u.waveScale.x));
-    const gz = gradZ.mul(GRAVITY * h).mul(u.waveScale.y).div(u.waveScale.z.mul(u.waveScale.z));
-    const v = f.xy.sub(vec2(gx, gz)).mul(1 - FLOW_DAMPING * h).toVar();
+    // In the WATER's time: `u.speed` (the authored waveSpeed) slows the sea,
+    // the ripples and this flow together, or foam ran at real time over a
+    // half-speed sea ("foam movement speed", user, 2026-09-07).
+    const dt = u.speed.mul(h);
+    const gx = gradX.mul(GRAVITY).mul(dt).mul(u.waveScale.y).div(u.waveScale.x.mul(u.waveScale.x));
+    const gz = gradZ.mul(GRAVITY).mul(dt).mul(u.waveScale.y).div(u.waveScale.z.mul(u.waveScale.z));
+    const v = f.xy.sub(vec2(gx, gz)).mul(float(1).sub(dt.mul(FLOW_DAMPING))).toVar();
     const limit = FLOW_CFL * Math.min(sx, sz) / h;
     const speed = v.length().max(1e-6);
     v.assign(v.mul(speed.min(limit).div(speed)));
-    const drift = f.zw.mul(1 - h / FLOW_DRIFT_SECONDS).add(v.mul(h));
+    const drift = f.zw.mul(float(1).sub(dt.div(FLOW_DRIFT_SECONDS))).add(v.mul(dt));
     flow.element(index).assign(vec4(v, drift));
   })().compute(wCount) : null;
   const steps = kind === "cloth" ? [integrate, solveA, solveB, solveA, solveB, solveA, solveB, solveA, solveB, commit] : [integrate, commit, momentum];
@@ -1314,7 +1325,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // The local water box, for buoyancy, the caustic lookup and the medium.
     extent: { halfX: width / 2, halfZ: height / 2, get depth() { return u.waterDepth.value; } },
     update,
-    addWaterImpulse(x,z,radius,strength) {
+    // `capRadius` (2026-09-07): the footprint the slope cap is measured
+    // against, when the impulse is one COLUMN of a wider hull — its own
+    // narrow Gaussian would cap a boat's draught at a fraction of itself.
+    addWaterImpulse(x,z,radius,strength,capRadius=radius) {
       if(kind!=="water" || ![x,z,radius,strength].every(Number.isFinite))return false;
       // ⚠ DROP IN PAIRS. Callers emit a displacement PAIR (release where the body
       // was, press where it is), and discarding one half of one leaves a term
@@ -1377,7 +1391,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // splash could be. The per-CELL slope is a different and much gentler
       // number, because `span` is floored at two and a half cells.
       const aspect = Math.max(u.waveScale.value.x, u.waveScale.value.z) / Math.max(1e-4, u.waveScale.value.y);
-      const limit = Math.max(radius, 1e-6) * MAX_DENT_SLOPE * aspect;
+      const limit = Math.max(Number.isFinite(capRadius)?capRadius:radius, 1e-6) * MAX_DENT_SLOPE * aspect;
       const capped = Math.max(-limit, Math.min(limit, strength));
       pendingImpulses.push([x,z,span,Math.max(-1,Math.min(1,capped))]);
       return true;
@@ -1414,7 +1428,14 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // units, floored so a still pool still carries its wakes, CFL-clamped
         // in the kernel because the grid has the final say.
         const horizontal = Math.max(1e-4, Math.max(u.waveScale.value.x, u.waveScale.value.z));
-        const peakSpeed = Math.sqrt(GRAVITY * (spectrum?.settings?.waveLength ?? u.waveLength.value) / (2 * Math.PI));
+        // ⚠ THE RIPPLES ARE METRE-SCALE WAVES WHATEVER THE SWELL. A wake or a
+        // splash ring is a wave a few metres long, and its phase speed is
+        // that wave's — c = sqrt(g·λ/2π) of at most a 5 m wave (2.8 m/s) —
+        // not the 24 m swell's 6 m/s, at which "the contact looks too fast"
+        // (user, 2026-09-07, on an ocean at half speed). A pool's 1.5 m peak
+        // is under the cap and unchanged; at 3 m a body driven at 6 m/s
+        // piled its bow wave onto the injection clamp (the interaction test).
+        const peakSpeed = Math.sqrt(GRAVITY * Math.min(5, spectrum?.settings?.waveLength ?? u.waveLength.value) / (2 * Math.PI));
         u.rippleSpeed.value = Math.max(.35, Math.max(.05, u.speed.value) * peakSpeed) / horizontal;
         // Each cascade is read at the mip whose texel is no finer than this
         // grid's cell, so a coarse mesh over a big lake samples a smooth sea
@@ -1436,11 +1457,14 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // and gone by 12 s — the sheet → web → specks sequence `waterFoam.js`
         // draws. The rate is set so a crest has to stay steep for about a
         // second to lay a sheet; a passing ripple leaves only threads.
-        u.foamDecay.value = Math.exp(-delta / 2.5);   // a splash's foam is gone in seconds, not a lace that lingers (2026-09-07)
-        u.foamRate.value = delta;
+        // The foam's clock is the WATER's: an authored waveSpeed slows the
+        // sea, the ripples, the flow and the foam together.
+        const waterDelta = delta * Math.max(0, u.speed.value);
+        u.foamDecay.value = Math.exp(-waterDelta / 2.5);   // a splash's foam is gone in seconds, not a lace that lingers (2026-09-07)
+        u.foamRate.value = waterDelta;
         // 0.015 m²/s of spread, in cells per tick — bounded well inside the
         // four-neighbour blend's stability.
-        u.foamSpread.value = Math.min(.5, .015 * delta / Math.max(1e-6, cell * cell));
+        u.foamSpread.value = Math.min(.5, .015 * delta * Math.max(0, u.speed.value) / Math.max(1e-6, cell * cell));
       }
       if(kind === "cloth") anchorCount.value=resolveClothAnchors(authoredAnchors,anchorEngine,simulationInverse.value,n,anchorRows);
       if (colliderField) {

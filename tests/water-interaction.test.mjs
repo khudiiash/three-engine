@@ -36,11 +36,12 @@ function solver({ n = 64, width = 1, height = 1, damping = .998, speed = 2, ripp
     dx, limit,
     nu,
     injected: [],
-    impulse(x, z, radius, strength) {
+    impulse(x, z, radius, strength, capRadius = radius) {
       const cell = Math.max(dx, dy);
       const span = Math.max(2.5 * cell, radius);
-      // World-space slope cap — see `gridSimulation.js`'s `addWaterImpulse`.
-      const limit = Math.max(radius, 1e-6) * 1 * aspect;
+      // World-space slope cap — see `gridSimulation.js`'s `addWaterImpulse`
+      // (`capRadius`: a hull column is capped against the hull, not itself).
+      const limit = Math.max(capRadius, 1e-6) * 1 * aspect;
       const capped = Math.max(-limit, Math.min(limit, strength));
       this.injected.push(capped);
       pending.push([x, z, span, Math.max(-1, Math.min(1, capped))]);

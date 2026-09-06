@@ -410,6 +410,36 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     subsurface term is a bright teal, not the body's own dark blue, which
     glowed invisibly against itself. Receipts: whitecaps 6.7 %, far band
     1.2 %, sheets 0 %.
+45. INTERACTION RUNS IN THE WATER'S TIME, AT METRE-SCALE SPEEDS. "The
+    contact looks too fast, as well as foam movement speed" on an ocean at
+    waveSpeed .5: the ripple solver ran at the SWELL's phase speed (6 m/s
+    for a 24 m peak) while a wake or a splash ring is a wave a few metres
+    long — now c = sqrt(g·min(λp, 5 m)/2π) (a pool's 1.5 m peak unchanged;
+    at 3 m a body driven at 6 m/s piled its bow wave onto the injection
+    clamp). The flow's momentum, damping and drift, the body's push and the
+    foam's decay, source and spread all use the tick × `u.speed`.
+46. A HULL PRESSES A HULL-SHAPED DENT. "The contact is round, it does not
+    consider the collider shape at all" (a boat). An elongated collider
+    (aspect ≥ 1.8) is a row of up to four columns along its long axis, each
+    as wide as the hull, pressed by its own draught and released by the
+    exact record of its press (`addWaterImpulse(..., capRadius)` caps a
+    column's depth against its own width). ⛔ A COMPACT BODY STAYS ONE DENT,
+    bit for bit: split into a 4 × 4 grid, a crate's columns were narrower
+    than the slope cap lets a dent be deep (a falling crate's splash read no
+    harder than its floating draught), and sixteen overlapping columns
+    re-emitted with wandering centroids PUMPED the field (energy wound up,
+    the wake sat on the clamp) — the interaction tests caught both.
+    `test:water` 39 (the conservation assertion is now against what was
+    pressed; the footprint's reach is the union of its columns).
+47. FOAM FORMS WHERE THE WATER BREAKS. A fishing boat towed a white blanket
+    twenty metres wide ("foam madness"): vertical motion alone was a foam
+    source, and a hull's rim moves fast everywhere it goes. Steepness gates
+    the churn now (`breaking = steep.smoothstep(.3, .7)` × churn) — the bow
+    wave's breaking crest foams, the dent's floor does not. Receipt: foam
+    4 s after the harness splash 3.6 % of the lid (was 8.6 %), flow and
+    caustic receipts unchanged. The React "Maximum update depth" loop in the
+    editor's mirror is not water: `Engine.emit` now logs the emitter's stack
+    once a second sees 30 `hierarchy-changed` flushes — read the console.
 
 ## Open
 

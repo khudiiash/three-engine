@@ -162,8 +162,10 @@ test('a floating body at rest injects nothing, and its footprint is its waterpla
     r.wakes.length=0;
     body.setLinvel({x:3,y:0,z:0},true);
     r.step(.5);
-    const widest=Math.max(...r.wakes.map(([,,radius])=>radius));
-    assert.ok(widest>1.5,`footprint is the waterplane, not the draught: ${widest.toFixed(2)} m`);
+    // The footprint is a set of hull columns now (2026-09-07): its REACH — the
+    // farthest column edge from the body's axis — spans the waterplane.
+    const reach=Math.max(...r.wakes.map(([x,z,radius])=>Math.hypot(x,z)+radius));
+    assert.ok(reach>1.5,`footprint is the waterplane, not the draught: reach ${reach.toFixed(2)} m`);
   }finally{r.dispose();}
 });
 
@@ -179,8 +181,11 @@ test('a body that moves leaves the water it was holding down behind it',()=>{
     const xs=r.wakes.map(([x])=>x);
     assert.ok(Math.max(...xs)-Math.min(...xs)>.3,`the released and pressed footprints separate ${Math.max(...xs)-Math.min(...xs)}`);
     const net=r.wakes.reduce((sum,[,,,depth])=>sum+depth,0);
-    const deepest=Math.max(...r.wakes.map(([,,,depth])=>Math.abs(depth)));
-    assert.ok(Math.abs(net)<deepest*.6,'and the pair still very nearly conserves what it moved');
+    // The footprint is a set of hull columns (2026-09-07): what was moved is
+    // the sum of what was pressed, and the net over presses and releases stays
+    // a fraction of it.
+    const pressed=r.wakes.filter(([,,,depth])=>depth<0).reduce((sum,[,,,depth])=>sum+Math.abs(depth),0);
+    assert.ok(Math.abs(net)<pressed*.6,`and the pair still very nearly conserves what it moved: net ${net.toFixed(4)} of ${pressed.toFixed(4)} pressed`);
   }finally{r.dispose();}
 });
 
