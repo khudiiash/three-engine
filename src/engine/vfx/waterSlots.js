@@ -213,6 +213,18 @@ export function waterSlotPool(engine) {
     release(owner) { for (const slot of slots) if (slot.owner === owner) { slot.owner = null; slot.uniforms.active.value = 0; slot.uniforms.strength.value = 0; } },
     /** Slots a consumer should actually read this frame. */
     live() { return slots.filter((slot) => slot.owner && slot.uniforms.active.value > 0); },
+    /**
+     * What the per-material nodes (the medium, the caustic light) should be
+     * COMPILED for: the slots up to the highest claimed one (at least the
+     * first, so a pool appearing later needs no rebuild), and whether any
+     * claimed slot is a solid of revolution (the quadric clip is 20 kB per
+     * slot in EVERY material — compiled only when a round pool exists).
+     */
+    compileShape() {
+      let count = 1, round = false;
+      slots.forEach((slot, i) => { if (!slot.owner) return; count = Math.max(count, i + 1); if (slot.uniforms.shape.value.x > .5) round = true; });
+      return { count, round };
+    },
   };
   return engine.waterSlots;
 }

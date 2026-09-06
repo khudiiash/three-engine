@@ -62,14 +62,14 @@ function clipSlab(t0, t1, origin, delta, min, max) {
  * because an image test of "half in, half out" has to argue from pixels about a
  * quantity it cannot see; this lets a smoke page read the quantity itself.
  */
-export function waterCrossedLengthNode(slot) { return waterSegmentNode(slot).length; }
+export function waterCrossedLengthNode(slot) { return waterSegmentNode(slot, { shapeClip: true }).length; }
 
 /**
  * The clipped segment: how far it runs through water, and how deep each END of
  * it is. Both depths, because the in-scatter integral needs the near one and
  * the slope — see `applyMedium`.
  */
-export function waterSegmentNode(slot) {
+export function waterSegmentNode(slot, { shapeClip = true } = {}) {
   const s = slot.uniforms;
   const a = s.inverse.mul(vec4(cameraPosition, 1)).xyz.toVar();
   const b = s.inverse.mul(vec4(positionWorld, 1)).xyz.toVar();
@@ -78,9 +78,10 @@ export function waterSegmentNode(slot) {
   const t0 = float(0).toVar(), t1 = float(1).toVar();
   clipSlab(t0, t1, a.x, d.x, half.x.negate(), half.x);
   clipSlab(t0, t1, a.z, d.z, half.z.negate(), half.z);
-  // A solid of revolution: one exact quadric clip on top of the slabs
-  // (`__waterShapeClip = false` is the harness's ablation switch).
-  if (globalThis.__waterShapeClip !== false) clipShapeNode(vec4(s.shape), t0, t1, a, d);
+  // A solid of revolution: one exact quadric clip on top of the slabs —
+  // compiled only when a round pool exists (`pool.compileShape()`; 20 kB per
+  // slot in every material otherwise). `__waterShapeClip = false` ablates.
+  if (shapeClip && globalThis.__waterShapeClip !== false) clipShapeNode(vec4(s.shape), t0, t1, a, d);
   // THE TOP FACE IS THE WAVE, AND SAYING SO TAKES TWO PASSES. The entry point
   // is needed to sample the height and the height is needed to find the entry
   // point. Clip against the rest surface, sample there, clip again: one
@@ -257,10 +258,10 @@ function shaftNode(slot, segment, tau, sigma) {
  * zero for a ray running along a depth contour, and the `x/(1−e^−x)` form is
  * finite there, so the guard is on the division and not on the geometry.
  */
-function applyMedium(rgb, slot) {
+function applyMedium(rgb, slot, { shapeClip }) {
   const s = slot.uniforms;
   If(s.active.greaterThan(0), () => {
-    const segment = waterSegmentNode(slot);
+    const segment = waterSegmentNode(slot, { shapeClip });
     const sigma = vec3(s.sigma);
     const length = segment.length.toVar();
     const tau = sigma.mul(length).toVar();
@@ -312,13 +313,24 @@ export function installWaterMedium(engine) {
   const pool = waterSlotPool(engine);
   const atmosphere = { color: uniform(new THREE.Color()), near: uniform(1), far: uniform(1000), density: uniform(0) };
   let fogKey = null;
+  // ── COMPILED FOR THE POOLS THAT EXIST, NOT FOR EVERY SLOT ─────────────
+  //
+  // This node goes into EVERY material. Two slots and four primitives'
+  // quadric clips compiled unconditionally were 63 kB of fragment shader per
+  // material (the floor of the bindings smoke: 114 kB with the shaft loop,
+  // 362 kB before it). It is built for the slots claimed and the shapes in
+  // use, and rebuilt — one compile wave, on the rare event — when a second
+  // pool or a first round one appears.
+  let compiled = { count: 1, round: false };
   const build = (fog) => {
+    compiled = pool.compileShape();
     engine.scene.fogNode = Fn(() => {
       const rgb = output.rgb.toVar();
       sceneFog(rgb, fog, atmosphere);
-      for (const slot of pool.slots) applyMedium(rgb, slot);
+      for (const slot of pool.slots.slice(0, compiled.count)) applyMedium(rgb, slot, { shapeClip: compiled.round });
       return vec4(rgb, output.a);
     })();
+    pool.compiled = compiled;
   };
   // ── AND A CENSUS, BECAUSE ONE OPTED-OUT MATERIAL HIDES THE WHOLE EFFECT ──
   //
@@ -354,7 +366,8 @@ export function installWaterMedium(engine) {
   const stop = engine.onUpdate?.(() => {
     const fog = engine.scene.fog ?? null;
     const key = fog ? (fog.isFogExp2 ? "exp2" : "range") : "none";
-    if (key !== fogKey) { fogKey = key; build(fog); }
+    const want = pool.compileShape();
+    if (key !== fogKey || want.count > compiled.count || (want.round && !compiled.round)) { fogKey = key; build(fog); }
     if (fog) {
       atmosphere.color.value.copy(fog.color);
       if (fog.isFogExp2) atmosphere.density.value = fog.density;

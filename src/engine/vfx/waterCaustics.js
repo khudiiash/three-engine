@@ -231,7 +231,11 @@ export class WaterCausticLightNode extends THREE.AnalyticLightNode {
   static get type() { return 'WaterCausticLightNode'; }
   setup(builder) {
     if (!builder.context.irradiance || builder.object?.userData?.vfxSimulation === 'water') return;
-    for (const slot of this.light.waterPool.slots) {
+    // Only the slots the medium compiled for (`pool.compileShape()`): a
+    // rebuild of the fog node recompiles every material, and this setup runs
+    // again with the new count.
+    const pool = this.light.waterPool;
+    for (const slot of pool.slots.slice(0, pool.compiled?.count ?? pool.compileShape().count)) {
       const s = slot.uniforms;
       // ⚠ THE GEOMETRIC NORMAL, NOT THE BUMP-MAPPED ONE. A caustic is a sheet
       // of light, smooth at the scale of a tile's grout; read against the
