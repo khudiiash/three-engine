@@ -1,0 +1,108 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import { createWaterSpectrum, SEA_SIZE } from '/src/engine/vfx/waterSpectrum.js';
+import { realizeSea } from '/src/engine/vfx/waterSpectrumCPU.js';
+
+/**
+ * ══ THE GPU SEA AGAINST ITS SPECIFICATION ══════════════════════════════════
+ *
+ * `waterSpectrumCPU.js` is the model in plain JavaScript; `waterSpectrum.js`
+ * is the same model in TSL with a shared-memory FFT. This page runs both on
+ * the same seed, the same settings and the same clock, reads the GPU's maps
+ * back and prints the largest disagreement per cascade and per map. A shared
+ * seed is what makes this a bit-level question rather than a statistical one:
+ * anything above float precision plus half-float storage is a bug in one of
+ * the two, and the CPU side has unit tests.
+ *
+ * It also writes the maps as images and times the whole per-frame update.
+ */
+const IMAGES = [];
+const log = (...a) => console.log('SEA:', ...a);
+try {
+ const adapter = await navigator.gpu.requestAdapter();
+ const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+ const errors = []; device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
+ const renderer = new THREE.WebGPURenderer({ device, antialias: false });
+ await renderer.init(); renderer.setSize(64, 64);
+ document.body.append(renderer.domElement);
+
+ const props = { waveHeight: .5, waveLength: 6, choppiness: .7, waveDirection: 30, waveOctaves: 6, waveGain: .5, rippleStrength: 1, waveSpeed: 1 };
+ const DEPTH = 20, DT = 1 / 60, FRAMES = 5;
+ const spectrum = createWaterSpectrum();
+ spectrum.configure(props, DEPTH);
+ log('cascades', spectrum.cascades.map((c) => c.L.toFixed(2) + ' m').join(', '), 'amplitude', spectrum.amplitude.toExponential(3));
+ let time = 0;
+ for (let f = 0; f < FRAMES; f++) { time = f * DT; spectrum.tick(renderer, DT, time); }
+ await device.queue.onSubmittedWorkDone();
+
+ const N = SEA_SIZE;
+ const halves = (px) => { const out = new Float32Array(px.length); for (let i = 0; i < px.length; i++) out[i] = THREE.DataUtils.fromHalfFloat(px[i]); return out; };
+ const read = async (tex) => halves(await renderer.backend.copyTextureToBuffer(tex, 0, 0, N, N));
+
+ const cpu = realizeSea({ size: N, props, depth: DEPTH, time, amplitude: spectrum.amplitude });
+ const canvas = document.createElement('canvas'); canvas.width = N; canvas.height = N;
+ const ctx = canvas.getContext('2d');
+ const dump = (label, pick, scale) => {
+   const image = ctx.createImageData(N, N);
+   for (let t = 0; t < N * N; t++) { const [r, g, b] = pick(t); image.data[t * 4] = 128 + r * scale; image.data[t * 4 + 1] = 128 + g * scale; image.data[t * 4 + 2] = 128 + b * scale; image.data[t * 4 + 3] = 255; }
+   ctx.putImageData(image, 0, 0);
+   IMAGES.push({ label, url: canvas.toDataURL('image/png') });
+ };
+ let worst = 0;
+ for (let i = 0; i < spectrum.cascades.length; i++) {
+   const c = spectrum.cascades[i], ref = cpu.cascades[i];
+   const disp = await read(c.displacement), deriv = await read(c.derivatives);
+   const compare = (name, gpu, exp, channels) => {
+     let maxDiff = 0, rms = 0, scale = 0;
+     for (let t = 0; t < N * N; t++) for (const ch of channels) {
+       const d = Math.abs(gpu[t * 4 + ch] - exp[t * 4 + ch]);
+       maxDiff = Math.max(maxDiff, d); rms += d * d; scale = Math.max(scale, Math.abs(exp[t * 4 + ch]));
+     }
+     rms = Math.sqrt(rms / (N * N * channels.length));
+     worst = Math.max(worst, scale > 1e-6 ? maxDiff / scale : 0);
+     log(`cascade ${i} (${c.L.toFixed(1)} m) ${name.padEnd(12)} max |Δ| ${maxDiff.toExponential(2)}  rms ${rms.toExponential(2)}  of a peak ${scale.toExponential(2)}`);
+   };
+   // Split the question: is it the SPECTRUM (h0, before any transform) or the
+   // TRANSFORM? h0 is float32 on the GPU, so it reads back exactly.
+   const h0 = await renderer.backend.copyTextureToBuffer(c.textures[1], 0, 0, N, N);
+   compare('h0', h0, ref.h0, [0, 1, 2, 3]);
+   compare('displacement', disp, ref.displacement, [0, 1, 2]);
+   compare('derivatives', deriv, ref.derivatives, [0, 1, 2, 3]);
+   if (i === spectrum.cascades.length - 1) {
+     // Where does the fine cascade disagree — near the band's low cutoff, or everywhere?
+     let ring = [0, 0, 0, 0, 0], count = [0, 0, 0, 0, 0];
+     for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+       const t = y * N + x, r = Math.hypot(x - N / 2, y - N / 2), bin = Math.min(4, Math.floor(r / 8));
+       ring[bin] += Math.abs(h0[t * 4] - ref.h0[t * 4]); count[bin]++;
+     }
+     log('cascade 2 mean |Δh0| by radius (texels 0-8, 8-16, 16-24, 24-32, 32+):', ring.map((v, b) => (v / count[b]).toExponential(2)).join('  '));
+     let big = 0, at = -1;
+     for (let t = 0; t < N * N; t++) { const d = Math.abs(h0[t * 4] - ref.h0[t * 4]); if (d > big) { big = d; at = t; } }
+     log(`cascade 2 worst h0 texel ${at % N},${Math.floor(at / N)}: gpu ${h0[at * 4].toExponential(3)} cpu ${ref.h0[at * 4].toExponential(3)}`);
+   }
+   // The Jacobian memory after five frames: min over the map says whether
+   // choppiness folds anything at this sea state.
+   let minJ = Infinity, minTurb = Infinity;
+   for (let t = 0; t < N * N; t++) { minJ = Math.min(minJ, ref.displacement[t * 4 + 3]); minTurb = Math.min(minTurb, disp[t * 4 + 3]); }
+   log(`cascade ${i} min J ${minJ.toFixed(3)} (cpu), min foam memory ${minTurb.toFixed(3)} (gpu)`);
+   const amp = 1 / Math.max(1e-6, Math.max(...Array.from({ length: N * N }, (_, t) => Math.abs(disp[t * 4 + 1]))));
+   dump(`cascade${i}-height`, (t) => [disp[t * 4 + 1] * 127 * amp, disp[t * 4 + 1] * 127 * amp, disp[t * 4 + 1] * 127 * amp], 1);
+   dump(`cascade${i}-slopes`, (t) => [deriv[t * 4] * 200, deriv[t * 4 + 1] * 200, 0], 1);
+   dump(`cascade${i}-foam`, (t) => [(disp[t * 4 + 3] - 1) * 200, (disp[t * 4 + 3] - 1) * 200, (disp[t * 4 + 3] - 1) * 200], 1);
+ }
+ // The whole update, timed: thirty frames of every cascade.
+ const t0 = performance.now();
+ for (let f = 0; f < 30; f++) { time += DT; spectrum.tick(renderer, DT, time); }
+ await device.queue.onSubmittedWorkDone();
+ log(`30 frames of ${spectrum.cascades.length} cascades at ${N}²: ${((performance.now() - t0) / 30).toFixed(2)} ms per frame (CPU + GPU, serialized)`);
+ const pass = errors.length === 0 && worst < .02;
+ log(`worst relative disagreement ${(worst * 100).toFixed(3)} % — ${pass ? 'the GPU sea IS the specification' : '⛔ the GPU and the CPU disagree'}`);
+ log('validation', errors.length ? errors : 'clean');
+ spectrum.dispose(renderer);
+ globalThis.__VFX_SMOKE_RESULT__ = { pass, images: IMAGES };
+ console.log(pass ? 'WATER-SPECTRUM PASS' : 'WATER-SPECTRUM FAIL');
+} catch (error) {
+ console.error(error.stack);
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: String(error.stack), images: IMAGES };
+}
+</script></body></html>
