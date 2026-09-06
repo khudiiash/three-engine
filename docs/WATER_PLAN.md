@@ -74,7 +74,7 @@ gate.
 | 1 | spectral sea in TSL, CPU specification | `smoke:water-spectrum` GPU vs CPU maps 0.087 % |
 | 2 | composition, Jacobian foam source, buoyancy on a GPU readback, presets | `smoke:water-surface` vertex parity 0.66 mm; `smoke:water-props` 20/20 controls alive |
 | 3 | lens from the real surface; god rays | `smoke:water-rate` 0 % turnover with waves stopped; premium god-ray arm: phase 2.7 : 1 : 0.9, one-frame change 1.8× smooth motion, map border 1.000 |
-| 3b | the water lights what is above it, through GI | the mirrored-sun term compiles in the editor's wave with the pool present (error channel empty); a harness irradiance receipt is open |
+| 3b | the water lights what is above it, and is seen through, in GI | mirrored sun (shadow ray to the surface) at hits above; hits seen THROUGH the water get exp(−σ·path)·(1−F) and F × the sun-extracted sky mirror (the hit record carries the ray direction: 16 → 20 words); `test:gi-src-shade` 50 checks, `test:gi-src-deposit` PASS, the secondary probe's multibounce arm PASS; a harness irradiance receipt is open |
 | 4.1–4.2 | the ripple window | same splash at 5/60/500 m; a 6 m window step 4.75 vs 4.81 for one tick of motion; open-water edge absorbs (0.22× of a wall) |
 | 4.3 | clipmap lid over 64 m | 500 m = 9 levels / 38 k vertices, 2048 boundary vertices worst gap 0.007 mm, rim 0.000 mm |
 | 4b | any primitive, `fill` | sphere/cylinder/cone/capsule: lid on the outline 0.000 mm, shell seam 0.000 mm, medium chord 4.97 m for 4.96 m, field calm (0.3 vs 0.4 cm RMS) |
@@ -120,12 +120,15 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
 14. Refraction thickness must be the WATER COLUMN along the bent ray: a fixed
     22 cm on a physically capped sea moved the floor by centimetres — "no
     water refraction".
+15. Foam is made by BREAKING water: a churn gate at 0.12 m/s foamed a whole
+    pool under a bobbing crate, and the `foam` dial did not reach it. Steep
+    crests (> 25°) or splash speeds (> 0.5 m/s), scaled by the dial.
+16. The GI tests need `npx vite --port 5201`; the water smokes use 5307.
 
 ## Open
 
-- 3b: the sky's mirror on probe rays crossing the water (the hit shader has no
-  directional sky lookup); a GI harness receipt for the mirrored sun.
-- A round pool wider than 64 m (clipmap + round outline) is untested.
+- A GI harness irradiance receipt for the water terms (mirrored sun, the
+  through-water attenuation and sky mirror).
 - At 500 m a 6 m walk re-snaps the rings by a 10 m cell (7.0 vs 5.0 for one
   tick of motion) — per-level snapping with trims would remove the pop.
 
