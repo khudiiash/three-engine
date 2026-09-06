@@ -11368,7 +11368,9 @@ export class GISystem {
     w.trace = createGiBvhReflect({
       gbuffer: w.gbuffer, target: w.hit, colorTarget: w.albedo, width, height,
       bvhScene: this.state?.bvhScene ?? null, cameraPosition: this._bvhCameraPosition,
-      normalOffset: light?.normalOffset ?? 0.02, maxDistance: Math.max(light?.mirrorRange ?? 24, 64),
+      // ⚠ A plain number: `light.mirrorRange` can be a uniform node, and a
+      // Math.max over it baked "NaN.0" into the WGSL (editor, 2026-09-06).
+      normalOffset: light?.normalOffset ?? 0.02, maxDistance: 64,
       mask: false, dyn: this._dynSet ?? null, strideDefault: 1, replicate: false, oneBvh, rayMode: 'given',
     });
     w.trace.compute.__giPassName = "waterRefractTrace";

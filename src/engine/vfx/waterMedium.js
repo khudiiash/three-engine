@@ -152,9 +152,7 @@ const SHAFT_TAPS = 24;
 /** The mip the shafts read the caustic map at — 1024 >> 4 = 64 texels across
  *  the pool. A beam is a low-frequency thing; the filaments underneath it are
  *  what the taps could not resolve. */
-// 6 since 2026-09-06: with the shafts back at the water colour's albedo, mip
-// 5's taps flickered at 4.3× smooth motion; a level coarser reads 2.3×.
-const SHAFT_MIP = 6;
+const SHAFT_MIP = 5;
 /**
  * ══ WHAT MAKES A SHAFT LOOK LIKE A SHAFT ═══════════════════════════════════
  *
@@ -207,9 +205,11 @@ const shaftPhase = (slot) => {
  * into a fine dither the eye reads as haze — the same trick, and the same
  * function, the volumetric materials use.
  */
-/** Clear water scatters a few percent of what it extinguishes: the sun's
- *  forward HAZE, the glow looking up at it, at water's own albedo. */
-const SUN_HAZE_ALBEDO = .08;
+/** The beam's floor above the flat sun. The old map averaged above one, so
+ *  the excess carried a haze of its own — the forward glow looking up at the
+ *  sun on CALM water, where the filaments' excess alone is nothing ("god rays
+ *  underwater got almost absent", user, 2026-09-06). */
+const SUN_HAZE_EXCESS = .35;
 function shaftNode(slot, segment, tau, sigma) {
   const jitter = fract(interleavedGradientNoise(screenCoordinate));
   const total = vec3(0).toVar();
@@ -239,7 +239,7 @@ function shaftNode(slot, segment, tau, sigma) {
     const gain = waterCausticGainLocalNode(segment.at(k), slot, mip);
     // The excess is clamped: a filament at the map's cap (5) is a one-frame
     // spike along a ray, and the shafts flickered at 4.3× smooth motion.
-    const beam = shaftAlbedo.mul(gain.sub(1).clamp(0, 1.5)).add(SUN_HAZE_ALBEDO);
+    const beam = shaftAlbedo.mul(gain.sub(1).add(SUN_HAZE_EXCESS).clamp(0, 1.5));
     const depth = mix(segment.near, segment.far, k);
     const reach = sigma.mul(depth).mul(slant).negate().exp();
     total.addAssign(tau.mul(k).negate().exp().mul(reach).mul(beam));

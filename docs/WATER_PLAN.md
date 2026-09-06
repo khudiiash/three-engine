@@ -217,14 +217,15 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     where `getRenderTarget()` is null and `currentSamples` 0 — the copy's
     source has 4). Receipts: MSAA and plain bindings smokes clean, `?crate=1`.
 
-30. The god rays are TWO terms in one beam: the sun's haze at water's own
-    albedo (0.08 × the whole gain — the forward glow looking up, which the
-    excess alone cannot give since its mean along a ray is nothing) plus the
-    filaments' EXCESS over the flat sun at the water colour's albedo, clamped
-    at 1.5. Carrying the whole beam at 0.08 flattened the shafts ("our
-    underwater godrays got broken"); the excess alone at albedo ~1 washed a
-    floor two metres down. Shaft mip 6 (mip 5 flickered at 4.3× smooth
-    motion). Receipt: phase 2.47 : 1 : 0.54, flicker 0.17 / 2.33.
+30. The god rays are the filaments' EXCESS over the flat sun at the water
+    colour's albedo, with a BIAS of 0.35 under the excess (clamped 0..1.5):
+    `albedo × clamp(gain − 1 + .35, 0, 1.5)`. The old white-cleared map
+    averaged above one, so the excess carried a haze of its own — the forward
+    glow looking up at the sun on CALM water, where filaments are nothing
+    ("god rays underwater got almost absent"). The whole beam at 0.08 had
+    flattened the shafts; the bare excess at mip 6 blurred them away. Mip 5.
+    Receipt: up 125 / across 67 / down 38 (1.86 : 1 : 0.57), flicker
+    1.65 / 2.48 (gate 4), floor contrast 24.1 % vs 13.0 %.
 
 ## Open
 
