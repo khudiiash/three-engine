@@ -1,7 +1,7 @@
 import { Object3D, Vector3 } from 'three/webgpu';
 import {
-  cameraViewMatrix, float, materialColor, mix, modelNormalMatrix, normalLocal, normalView, positionLocal,
-  positionViewDirection, reflector, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4,
+  cameraPosition, cameraViewMatrix, float, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
+  positionViewDirection, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4,
 } from 'three/tsl';
 import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
 import { seaShadingSlopeNode } from './waterSpectrum.js';
@@ -67,6 +67,8 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
   };
 
   const build = () => {
+    // The lid's shaded normal in LOCAL space (flat until the sea block sets it).
+    let lidNormalLocal = normalLocal;
     const u = simulation?.uniforms ?? null;
     node?.dispose();
     // ── ONE MIRROR PER RENDER, NOT ONE PER FRAME ─────────────────────────
@@ -163,6 +165,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
         local = local.add(vec2(r.y.negate().div(ny), r.z.negate().div(ny)));
       }
       const perturbed = normalLocal.add(vec3(local.x.negate().mul(normalLocal.y), 0, local.y.negate().mul(normalLocal.y))).normalize();
+      lidNormalLocal = perturbed;
       material.normalNode = transformNormalToView(perturbed);
     }
     const fresnel = float(1).sub(normalView.dot(positionViewDirection).abs()).clamp(0, 1).pow(5).mul(.97963).add(.02037);
@@ -224,7 +227,22 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // world metres divided by the mesh's own scale rather than the volume
       // depth it used to be — the depth put the exit point metres away and
       // sampled the shore, which is the ghost that got the mirror blamed.
-      material.thicknessNode = u.refraction;
+      // ── THE THICKNESS IS THE WATER COLUMN, ALONG THE REFRACTED RAY ─────
+      //
+      // "There is no water refraction currently" (user, 2026-09-06). A fixed
+      // 22 cm (`u.refraction`) displaced the floor by 22 cm × tan(slope): a
+      // few centimetres once the sea was capped at physical steepness, which
+      // is invisible on a floor 3 m down. Real refraction moves the floor by
+      // the whole column: the eye's ray bends at the surface and travels to
+      // the bottom, so the backdrop is read where THAT ray lands. The column
+      // is in the lid's LOCAL units (three scales it by the model), capped at
+      // three depths so a grazing ray does not read the far shore, and
+      // `transmission` still scales it — the dial that reads as "refraction".
+      const eyeLocal = modelWorldMatrixInverse.mul(vec4(cameraPosition, 1)).xyz;
+      const toEye = eyeLocal.sub(positionLocal).normalize();
+      const bent = refract(toEye.negate(), lidNormalLocal, float(1 / 1.333));
+      const column = u.waterDepth.div(bent.y.negate().max(.2)).min(u.waterDepth.mul(3));
+      material.thicknessNode = column.mul(u.transmission);
       emissive = emissive.add(reflected.mul(foam.oneMinus()));
       if (slot) emissive = emissive.add(waterSubsurfaceNode(u, slot).mul(foam.oneMinus()));
     } else {
