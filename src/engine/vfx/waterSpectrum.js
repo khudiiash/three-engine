@@ -5,6 +5,7 @@ import {
 } from "three/tsl";
 import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
 import { releaseComputeNodes } from "../../modules/gi/releaseCompute.js";
+import { mipmapBlitter } from "./gpuMipmaps.js";
 
 /**
  * ══ THE SPECTRAL SEA, ON THE GPU ═══════════════════════════════════════════
@@ -366,11 +367,15 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
      * reads them, so the coarse levels describe THIS frame's sea.
      */
     generateMipmaps(renderer) {
-      const backend = renderer?.backend;
-      if (!backend?.generateMipmaps || globalThis.__waterSeaMips === false) return;   // `__waterSeaMips = false`: the harness's control arm
-      for (const t of [displacement, derivatives, foamWritten]) {
-        if (t && backend.get?.(t)?.texture) backend.generateMipmaps(t);
-      }
+      if (globalThis.__waterSeaMips === false) return;   // `__waterSeaMips = false`: the harness's control arm
+      // ⛔ NOT three's mipmap pass: it creates a view and a bind group per
+      // layer per level per call, and every frame of that exhausted Dawn's
+      // D3D12 descriptor heaps ("CreateDescriptorHeap failed with
+      // E_OUTOFMEMORY", device lost, 2026-09-07). gpuMipmaps.js builds them
+      // once per GPU texture and only encodes passes here.
+      const blitter = mipmapBlitter(renderer);
+      if (!blitter) return;
+      for (const t of [displacement, derivatives, foamWritten]) if (t) blitter.generate(t);
     },
     tick(renderer, dt, time, options) {
       const queue = spectrum.passes(dt, time, options);

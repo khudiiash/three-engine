@@ -440,6 +440,20 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     caustic receipts unchanged. The React "Maximum update depth" loop in the
     editor's mirror is not water: `Engine.emit` now logs the emitter's stack
     once a second sees 30 `hierarchy-changed` flushes — read the console.
+48. ⛔ A BIND GROUP A FRAME IS A DEVICE LOSS. Trap 37(a)'s per-frame mip
+    regeneration went through three's mipmap pass, which creates a texture
+    view and a bind group for every layer of every level on every call —
+    ~60 a frame for the two 3-layer arrays and the whitecap memory, on top
+    of the caustic map's 11. WebGPU frees a bind group only when it is
+    collected, Dawn's D3D12 backend backs them with descriptor heaps, and a
+    few minutes in: "ID3D12Device::CreateDescriptorHeap failed with
+    E_OUTOFMEMORY", device lost, the renderer rebuilt (user, 2026-09-07).
+    `gpuMipmaps.js` builds views, bind groups and a blit pipeline ONCE per
+    GPU texture (keyed by the GPUTexture, so a rebuild re-caches) and only
+    encodes render passes per frame. Receipt: lid RMS per clipmap level
+    still 0.86 … 0.44/0.29/0.18 m (mips live), pool receipts unchanged,
+    bindings smoke 0 validation errors. Rule: anything that runs every
+    frame must not call `createBindGroup`/`createView` — cache them.
 
 ## Open
 
