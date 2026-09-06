@@ -283,6 +283,20 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     The exact per-tap alternative (a shadow sample per shaft tap in the
     medium) is the fallback if beams must end ABOVE an occluder rather than
     at its floor shadow.
+36. A DISABLED ENTITY ONLY HID ITS OBJECT3D. The Pool entity (the walls, the
+    water and the Global Illumination component) disabled in the editor
+    still ran every component: GI collected no meshes (the subtree was
+    invisible), built its kernels over an EMPTY scene and failed every frame
+    (`src:deposit` "Cannot read properties of null (reading 'x')",
+    `bvhHitShade` "params.shadowTraceFn is not a function"), and the water
+    kept registering its refraction pass with it. Now an entity disabled in
+    the current mode DETACHES its components and its subtree's
+    (`Entity.reconcileActivity`: the setters, `setParent`, `setPlaying` and
+    a per-frame walk from the roots); a detached component stores prop
+    changes without reacting (`Component.setProp` gate — several
+    components re-run `onAttach` themselves on a prop change) and fires no
+    enable/disable hooks; GI's dispose releases the water's trace/shade pair
+    with the build. Receipt: `npm run test:entity-activity` (6).
 
 ## Open
 

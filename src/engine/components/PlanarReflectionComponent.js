@@ -117,7 +117,7 @@ export class PlanarReflectionComponent extends Component {
         this._healQueued = true;
         queueMicrotask(() => {
           this._healQueued = false;
-          if (!this.entity) return;
+          if (!this.entity || this._attached === false) return; // detached while queued
           this.onDetach();
           this.onAttach();
         });
@@ -141,7 +141,7 @@ export class PlanarReflectionComponent extends Component {
         this._healQueued = true;
         queueMicrotask(() => {
           this._healQueued = false;
-          if (!this.entity) return; // detached while queued
+          if (!this.entity || this._attached === false) return; // detached while queued
           this.onDetach();
           this.onAttach();
         });

@@ -253,16 +253,22 @@ declare module "engine" {
     viewOnly: boolean;
     setViewOnly(value: boolean): void;
     /**
-     * Contributes to the scene while not in Play mode. Toggling `false` hides
-     * the entity's `object3D` subtree; the entity itself stays in the tree and
-     * scripts/inspectors can still read and write it. Inherits to descendants
-     * unless a child has its own override.
+     * Contributes to the scene while not in Play mode. Toggling `false` makes
+     * the entity inert: its `object3D` subtree is hidden AND every component
+     * on it and under it is detached — nothing ticks, renders or simulates —
+     * as if it had never been added. The entity itself stays in the tree with
+     * its components' props, so scripts/inspectors can still read and write
+     * it; toggling `true` re-attaches everything from those props (a script's
+     * runtime state does not survive the round trip). A disabled ancestor
+     * disables the whole subtree, whatever the children's own flags say.
      */
     enabledInEditor: boolean;
     setEnabledInEditor(value: boolean): void;
     /** Same as `enabledInEditor`, but for Play mode. */
     enabledInGame: boolean;
     setEnabledInGame(value: boolean): void;
+    /** This entity's flag for the CURRENT mode, resolved through its ancestors. */
+    readonly activeInHierarchy: boolean;
 
     /**
      * Set only on the root of a prefab instance — this, plus a matching

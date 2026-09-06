@@ -66,15 +66,26 @@ export class Entity extends EventEmitter {
     this.viewOnly = false;
     // Per-mode enabled flags. An entity is "enabled in editor" when it
     // contributes to the scene while not in play mode; "enabled in game"
-    // is the equivalent during play. Toggling false hides the entity's
-    // Object3D subtree (so its MeshComponent / LightComponent / etc. all
-    // drop out of the render) — the entity itself remains in the tree, so
-    // scripts can still read/write it and inspectors still show it.
-    // Inherits to descendants via the per-frame resolver in Engine.#tick;
-    // a parent disabled in editor disables its whole subtree unless the
-    // child has its own override set. Serialised with the entity.
+    // is the equivalent during play. A disabled entity is INERT: its
+    // Object3D subtree is hidden (Engine.#tick's visibility walk) AND every
+    // component on it and under it is DETACHED — not ticking, not rendering,
+    // holding no three.js state — exactly as if it had never been added
+    // (2026-09-06: a Global Illumination component inside a disabled "Pool"
+    // kept building and dispatching its kernels over an empty scene and
+    // failed every frame; "make sure the engine does not run ANY components
+    // inside of a disabled entity"). The entity itself remains in the tree
+    // with its components and their props, so scripts can still read/write
+    // it and inspectors still show it; re-enabling re-attaches, from props.
+    // Inherits to descendants: a parent disabled in the current mode disables
+    // its whole subtree, whatever the children's own flags say — see
+    // `activeInHierarchy` / `reconcileActivity`. Serialised with the entity.
     this.enabledInEditor = true;
     this.enabledInGame = true;
+    // Whether this entity's components are attached right now — the flags
+    // above resolved through the ancestors for the current mode. Written only
+    // by `reconcileActivity`; read by `addComponent` so a component added to
+    // an inactive entity waits, unattached, for the entity to become active.
+    this._componentsActive = true;
     // Prefab bookkeeping. `prefab` ({ guid, path }) is set only on the root of
     // a prefab instance and is what makes it one; `fid` / `fidPath` address
     // this entity inside the prefab it came from. All three are absent on
@@ -322,7 +333,10 @@ export class Entity extends EventEmitter {
     }
     component.entity = this;
     this.components.set(type, component);
-    component.onAttach();
+    // An inactive entity's components are not attached (see the flags above);
+    // `reconcileActivity` attaches them the moment the entity becomes active.
+    if (this._componentsActive !== false) this.#attachComponent(component);
+    else component._attached = false;
     this.engine?.emit?.("component-added", { entityId: this.id, componentType: type });
     return component;
   }
@@ -355,6 +369,7 @@ export class Entity extends EventEmitter {
     const next = !!value;
     if (next === this.enabledInEditor) return;
     this.enabledInEditor = next;
+    this.reconcileActivity();
     this.engine.emit("hierarchy-changed");
   }
 
@@ -375,14 +390,72 @@ export class Entity extends EventEmitter {
     const next = !!value;
     if (next === this.enabledInGame) return;
     this.enabledInGame = next;
+    this.reconcileActivity();
     this.engine.emit("hierarchy-changed");
+  }
+
+  /**
+   * True when this entity contributes to the scene in the CURRENT mode: its
+   * own per-mode flag and every ancestor's. The value `reconcileActivity`
+   * drives the components with; computed fresh here, so it is right even
+   * mid-frame, before the walk in Engine.#tick has run.
+   */
+  get activeInHierarchy() {
+    const mode = this.engine?.playing ? "enabledInGame" : "enabledInEditor";
+    for (let entity = this; entity; entity = entity.parent) {
+      if (entity[mode] === false) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Brings this entity's components — and, recursively, its descendants' —
+   * into line with the per-mode enabled flags: attaches them when the entity
+   * becomes active, detaches them when it becomes inactive, does nothing on a
+   * frame where nothing changed (one boolean compare per entity). Called by
+   * the enable setters and `setParent` for an immediate effect, by
+   * `Engine.setPlaying` when the mode flips, and once per frame from the
+   * roots as the safety net. `parentActive` is the parent's resolved state;
+   * the default reads the parent's cached value, which the parent's own
+   * reconcile keeps current.
+   */
+  reconcileActivity(parentActive = this.parent ? this.parent._componentsActive !== false : true) {
+    const mode = this.engine?.playing ? "enabledInGame" : "enabledInEditor";
+    const active = parentActive && this[mode] !== false;
+    if (active !== this._componentsActive) {
+      this._componentsActive = active;
+      for (const component of this.components.values()) {
+        if (active) this.#attachComponent(component);
+        else this.#detachComponent(component);
+      }
+    }
+    for (const child of this.children) child.reconcileActivity(active);
+  }
+
+  /**
+   * The one place a component's `onAttach` / `onDetach` run from an entity,
+   * so the pair is idempotent whatever order the flags, prop changes and
+   * removals arrive in. `_attached` is read by `Component.onPropChanged`
+   * (a prop change on a detached component must not attach it) and by
+   * `Component.reconcileEnabled` (no enable/disable hooks while detached).
+   */
+  #attachComponent(component) {
+    if (component._attached === true) return;
+    component._attached = true;
+    component.onAttach();
+  }
+
+  #detachComponent(component) {
+    if (component._attached !== true) return;
+    component._attached = false;
+    component.onDetach();
   }
 
   removeComponent(typeOrCtor) {
     const type = resolveComponentType(typeOrCtor);
     const component = this.components.get(type);
     if (!component) return;
-    component.onDetach();
+    this.#detachComponent(component);
     this.components.delete(type);
     // Drop it from the engine's per-frame frustum-gating registry (see
     // Component._viewOnlyActive) so a destroyed component can't be ticked.
@@ -458,6 +531,9 @@ export class Entity extends EventEmitter {
       // engine.d.ts) — the engine itself still needs the real THREE.Scene.
       /** @type {THREE.Scene} */ (this.engine.scene).add(this.object3D);
     }
+    // A new parent may be inactive (or the old one was): the subtree's
+    // components follow at once, not on the next frame's walk.
+    this.reconcileActivity();
   }
 
   /** Depth-first walk over this entity and all descendants. */

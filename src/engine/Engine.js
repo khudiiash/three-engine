@@ -689,6 +689,10 @@ export class Engine extends EventEmitter {
   setPlaying(playing) {
     if (playing === this.playing) return;
     this.playing = playing;
+    // The mode decides which flag counts: an entity enabled in game but not in
+    // editor attaches its components now, ahead of "play-changed" and the
+    // first update, and the reverse detaches — see Entity.reconcileActivity.
+    for (const entity of this.rootEntities) entity.reconcileActivity(true);
     if (!playing) {
       this.input.reset();
       // Game time is game state. A script that paused the game or slowed it to
@@ -1024,6 +1028,12 @@ export class Engine extends EventEmitter {
     this.stats.markPhase(PHASE.occlusionApply);
     this.occlusion.apply();
     this.stats.markPhase(PHASE.visibilityWalk);
+    // Components first: a disabled entity's components are DETACHED, not just
+    // hidden (Entity.reconcileActivity). The setters and setParent already did
+    // this the moment they ran; the walk is the safety net for anything that
+    // wrote the flags or the tree without going through them. One boolean
+    // compare per entity on a frame where nothing changed.
+    for (const entity of this.rootEntities) entity.reconcileActivity(true);
     const modeFlag = this.playing ? "enabledInGame" : "enabledInEditor";
     for (const entity of this.entities.values()) {
       // `_lodHidden` and `_occluded` are vetoes, not overrides: a level the

@@ -311,6 +311,8 @@ export class InstancerComponent extends Component {
    */
   regenerate() {
     this.props.seed = (this.props.seed ?? 0) + 1;
+    // Detached (the entity is disabled): the new seed takes effect on re-attach.
+    if (this._attached === false) return;
     this.onDetach();
     this.onAttach();
     this.entity?.engine?.emit?.("component-changed", {

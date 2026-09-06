@@ -15952,6 +15952,11 @@ export class GISystem {
 
   #dispose({ preserveMaterialLight = false } = {}) {
     const state = this.state;
+    // Water refraction (2026-09-06): its trace + hit-shade pair reads this
+    // build's gather and BVH — release them with it. The registrations stay;
+    // #tickWaterRefraction rebuilds on the next build (`!w.trace`).
+    for (const w of this._waterRefractions ?? []) this.#disposeWaterRefraction(w);
+    this._hitShadeInputs = null;
     releaseComputeNodes(this.engine.renderer, this._dynSet?.gpuGridComputes?.() ?? []);
     if (this._vfxGatherCompute) releaseComputeNodes(this.engine.renderer, [this._vfxGatherCompute]);
     this._vfxGatherCompute = null;

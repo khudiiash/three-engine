@@ -137,6 +137,12 @@ export class Component extends EventEmitter {
     // in `setEnabled` so external mutation (loading a saved scene, undo/redo)
     // is reconciled on the next enable/disable call.
     this._enabled = this.props.enabled !== false;
+    // Whether an Entity has this component attached right now: `true` after
+    // `onAttach`, `false` after `onDetach` (or never attached because the
+    // entity is disabled — see Entity.reconcileActivity). Left `undefined` for
+    // a component something other than an Entity attaches by hand (a
+    // VfxComponent's element particles), which the guards below leave alone.
+    this._attached = undefined;
     // Cached "currently visible per frustum" decision. Updated once per
     // frame by `updateViewVisibility` (called from the engine's main loop
     // when this component is `viewOnly`). `null` = not yet decided.
@@ -219,6 +225,10 @@ export class Component extends EventEmitter {
 
   /** Called after a prop changes. Default: rebuild by detach/attach. */
   onPropChanged() {
+    // A prop change on a component its entity has detached (the entity is
+    // disabled) must not attach it: the props are stored, and the entity's
+    // reconcile attaches from them when it becomes active.
+    if (this._attached === false) return;
     this.onDetach();
     this.onAttach();
   }
@@ -234,6 +244,9 @@ export class Component extends EventEmitter {
     const effective = this.enabled;
     if (effective === this._enabled) return false;
     this._enabled = effective;
+    // No hooks on a detached component: there is no state to enable or
+    // disable, and `onAttach` reads `this.enabled` when the entity comes back.
+    if (this._attached === false) return true;
     if (effective) this.onEnable();
     else this.onDisable();
     return true;
@@ -303,7 +316,10 @@ export class Component extends EventEmitter {
       return;
     }
     this.props[key] = value;
-    this.onPropChanged(key, value);
+    // Detached (the entity is disabled): store the prop, react on re-attach.
+    // Gated here rather than in each subclass's onPropChanged, several of
+    // which re-run `this.onAttach()` themselves.
+    if (this._attached !== false) this.onPropChanged(key, value);
     // Two events, both for editor consumers:
     //   - "component-changed" is a precise signal — the camera follow
     //     section uses it to know exactly which entity/component changed
