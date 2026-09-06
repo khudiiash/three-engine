@@ -10,7 +10,7 @@ import { waterAutoResolution } from '/src/engine/vfx/waterVolume.js';
 import { halfToFloat } from '/src/engine/vfx/waterSpectrumCPU.js';
 import { waterCrossedLengthNode } from '/src/engine/vfx/waterMedium.js';
 import { waterProfileRadius } from '/src/engine/vfx/waterVolume.js';
-import { Fn } from 'three/tsl';
+import { Fn, pass } from 'three/tsl';
 
 /**
  * ══ THE SAME BODY, THE SAME FRAMING, THREE SIZES OF WATER ══════════════════
@@ -111,11 +111,18 @@ try {
    holder.updateMatrixWorld(true);
    installWaterMedium(engine);
    installWaterCausticLight(engine);
+   // ?post=1 renders through a scene pass, as the editor does with a Post
+   // Process component: its depth is what the water's refraction and contact
+   // foam read (`engine.scenePass`).
+   const camera = new THREE.PerspectiveCamera(55, W / H, .05, 400);
+   engine.camera = camera;
+   const POST = argument('post', '0') === '1';
+   const postChain = POST ? new THREE.PostProcessing(renderer) : null;
+   const scenePass = POST ? pass(scene, camera, { samples: 1 }) : null;
+   if (POST) { postChain.outputNode = scenePass; engine.scenePass = scenePass; }
    installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
    log(`pool ${S} m: lid ${sim.clip ? `${sim.clip.levels} clipmap levels of ${sim.clip.size}² (${(sim.clip.cell.x * S * 100).toFixed(1)} cm at the eye, ${(sim.clip.cell.x * S * 2 ** (sim.clip.levels - 1)).toFixed(1)} m at the rim, ${sim.count} vertices)` : `${sim.resolution}² flat (${(S / (sim.resolution - 1) * 100).toFixed(1)} cm)`}, ripple window ${sim.ripple.resolution} cells over ${(sim.ripple.windowWidth * S).toFixed(1)} m (${(sim.ripple.cellX * S * 100).toFixed(1)} cm cells${sim.ripple.windowed ? ', following the camera' : ''})`);
 
-   const camera = new THREE.PerspectiveCamera(55, W / H, .05, 400);
-   engine.camera = camera;
    const pose = (eye, at) => { camera.position.set(...eye); camera.lookAt(...at); camera.updateMatrixWorld(true); };
    const step = async () => {
      sim.tick(renderer, 1 / 60);
@@ -124,11 +131,22 @@ try {
      await device.queue.onSubmittedWorkDone();
    };
    const run = async (n) => { for (let i = 0; i < n; i++) await step(); };
+   // Arm or disarm the lens for the NEXT shot (no ticks in between: `step`
+   // re-arms the slot from the original props).
+   const armLens = async (on) => { const p = { ...props, causticIntensity: on ? props.causticIntensity : 0 }; sim.update(p); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); };
    const shoot = async (label) => {
-     renderer.setRenderTarget(target);
-     await renderer.renderAsync(scene, camera);
-     const px = await renderer.readRenderTargetPixelsAsync(target, 0, 0, W, H);
-     renderer.setRenderTarget(null);
+     let px;
+     if (POST) {
+       // The pass renders the whole scene (lid included) into its own target.
+       renderer.setRenderTarget(null);
+       postChain.render();
+       px = await renderer.readRenderTargetPixelsAsync(scenePass.renderTarget, 0, 0, W, H);
+     } else {
+       renderer.setRenderTarget(target);
+       await renderer.renderAsync(scene, camera);
+       px = await renderer.readRenderTargetPixelsAsync(target, 0, 0, W, H);
+       renderer.setRenderTarget(null);
+     }
      const image = ctx.createImageData(W, H);
      for (let i = 0; i < W * H * 4; i += 4) { for (let c = 0; c < 3; c++) image.data[i + c] = px[i + c]; image.data[i + 3] = 255; }
      ctx.putImageData(image, 0, 0);
@@ -148,11 +166,41 @@ try {
    await shoot('caustics-under');
    pose([0, -DEPTH + 2.2, .001], [0, -DEPTH, 0]);
    await shoot('caustics-down');
+   // ── THE FLOOR'S CAUSTIC CONTRAST ────────────────────────────────────────
+   //
+   // "Caustics are way too dim, even when increased intensity" (user,
+   // 2026-09-06, against a reference of bright filaments over dark cells).
+   // The lens now multiplies the sun; the floor's luma contrast (std/mean over
+   // the tiles) with the lens on must be several times what it is off.
+   {
+     const luma = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
+     const contrastOf = (px) => { let m = 0, n = 0; for (let y = H * .2; y < H * .8; y++) for (let x = W * .2; x < W * .8; x++) { m += luma(px, ((y | 0) * W + (x | 0)) * 4); n++; } m /= n; let v = 0; for (let y = H * .2; y < H * .8; y++) for (let x = W * .2; x < W * .8; x++) { const d = luma(px, ((y | 0) * W + (x | 0)) * 4) - m; v += d * d; } return { mean: m, contrast: Math.sqrt(v / n) / Math.max(1, m) }; };
+     await armLens(true); const on = contrastOf(await shoot('caustics-down-on'));
+     // The map itself, under this view: what the floor is asked to show.
+     {
+       const R = slot.causticTarget.width, px = await renderer.readRenderTargetPixelsAsync(slot.causticTarget, 0, 0, R, R);
+       // Inside the lid's footprint only: the window reaches past the rim.
+       const cc = slot.uniforms.causticCenter.value, ch = slot.uniforms.causticHalf.value, hh = slot.uniforms.half.value;
+       const vals = [];
+       for (let i = 0; i < R * R; i += 7) { const tx = i % R, ty = (i / R) | 0; const lx = cc.x + (tx / R - .5) * 2 * ch.x, lz = cc.y + (ty / R - .5) * 2 * ch.y; if (Math.abs(lx) < hh.x * .9 && Math.abs(lz) < hh.z * .9) vals.push(halfToFloat(px[i * 4])); }
+       vals.sort((a, b) => a - b); const q = (f) => vals[Math.floor(f * (vals.length - 1))];
+       log(`caustic map focus: p1 ${q(.01).toFixed(2)} p10 ${q(.1).toFixed(2)} median ${q(.5).toFixed(2)} p90 ${q(.9).toFixed(2)} p99 ${q(.99).toFixed(2)} max ${q(1).toFixed(2)}`);
+     }
+     await armLens(false); const off = contrastOf(await shoot('caustics-down-off'));
+     await armLens(true);
+     log(`floor caustics (looking straight down): lens on → mean ${on.mean.toFixed(1)}, contrast ${(on.contrast * 100).toFixed(1)}% · off → mean ${off.mean.toFixed(1)}, contrast ${(off.contrast * 100).toFixed(1)}%`);
+     if (!(on.contrast > off.contrast * 2 + .05)) throw new Error(`the floor's caustics are dim: ${JSON.stringify({ on, off })}`);
+   }
    // From under the surface, looking up at 35°: Snell's window (the world
    // above) in the middle, total internal reflection of the pool toward the
    // horizon — the underside must not be a mirror of the floor everywhere.
    pose([0, -1.2, 0], [1.6, 0, 0]);
    await shoot('from-below');
+   // The straw in the glass: the post crossing the surface, seen from above
+   // at 30° — its submerged part must appear broken at the waterline, and
+   // nowhere else.
+   pose([.3, 1.1, .3], [1.6, -.4, -1.2]);
+   await shoot('straw');
    // A pool WALL under water, a metre away: caustics on it must be soft bands,
    // not chains of dots. Grain = |pixel − its 4 neighbours| over the frame's
    // mean luma, and its change over one frame.
@@ -332,8 +380,7 @@ try {
        const R = slot.causticTarget.width, px = await renderer.readRenderTargetPixelsAsync(slot.causticTarget, 0, 0, R, R);
        let borderMin = Infinity, interior = 0, n = 0;
        for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) { const v = px[(y * R + x) * 4]; if (x < 2 || y < 2 || x >= R - 2 || y >= R - 2) borderMin = Math.min(borderMin, v); else { interior += v; n++; } }
-       log(`caustic map border: minimum ${borderMin.toFixed(3)} against an interior mean of ${(interior / n).toFixed(3)} (an uncovered texel reads 1: no lens, no darkening)`);
-       if (!(borderMin > .5)) throw new Error(`the map's border is dark: ${borderMin}`);
+       log(`caustic map border: minimum ${borderMin.toFixed(3)} against an interior mean of ${(interior / n).toFixed(3)} (beams add onto black; a receiver whose beam entered outside the lid reads gain 1 instead)`);
      }
      if (!(rows.up.mean > 1.5 * rows.side.mean && rows.up.mean > 1.5 * rows.down.mean)) throw new Error(`the shafts are not forward-peaked: ${phase}`);
      if (!(rows.up.grain < .15 * rows.up.mean + .5)) throw new Error(`the shafts are grainy: ${rows.up.grain} on a mean of ${rows.up.mean}`);

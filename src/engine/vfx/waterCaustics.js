@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { float, mix, normalWorldGeometry, positionWorld, select, vec2, vec3, vec4 } from 'three/tsl';
+import { float, mix, normalWorldGeometry, positionWorld, select, uniform, vec2, vec3, vec4 } from 'three/tsl';
 import { CAUSTIC_RESOLUTION, CAUSTIC_WINDOW_METRES, waterSlotPool } from './waterSlots.js';
 import { waterInsideNode, waterRimDistanceNode } from './waterShape.js';
 
@@ -41,7 +41,14 @@ const registered = new WeakSet();
  *  its brightness: a caustic allowed to add three times the sun on top of a
  *  floor that now receives all of it is not a filament, it is an exposure
  *  error, and the whole pool bottom went white. */
-const MAX_GAIN = 2.5;
+// The lens can concentrate the sun into a filament several times over (the
+// map's own cap is MAX_FOCUS 5). This used to be 2.5, and with only the
+// positive half added on top of a full sun the network read as dim
+// ("caustics are way too dim, even when increased intensity", user,
+// 2026-09-06). Now the gain MULTIPLIES the sun (see `installSunGain`), so a
+// cell between filaments goes dark and a filament goes bright, the way the
+// reference pools do; the cap only bounds the map's noise.
+const MAX_GAIN = 6;
 
 /**
  * The caustic GAIN at a world point — a MULTIPLIER on light arriving from
@@ -241,6 +248,12 @@ export class WaterCausticLightNode extends THREE.AnalyticLightNode {
   static get type() { return 'WaterCausticLightNode'; }
   setup(builder) {
     if (!builder.context.irradiance || builder.object?.userData?.vfxSimulation === 'water') return;
+    // ── THE REFRACTED LENS IS NO LONGER ADDED HERE ──────────────────────
+    //
+    // It multiplies the sun's own light node (`installSunGain`): that is the
+    // whole lens, dark cells and bright filaments, behind the sun's shadow
+    // map. What this node still carries is the OTHER source — the mirrored
+    // sun on surfaces above the water — which no existing light provides.
     // Only the slots the medium compiled for (`pool.compileShape()`): a
     // rebuild of the fog node recompiles every material, and this setup runs
     // again with the new count.
@@ -253,19 +266,6 @@ export class WaterCausticLightNode extends THREE.AnalyticLightNode {
       // beam met and the lens's turnover made the jumps flicker — evenly
       // spaced dotted lines down the pool walls (user's scene, 2026-09-06).
       // The material's own sun term keeps its bumps.
-      const gain = waterCausticGainNode(positionWorld, slot, normalWorldGeometry);
-          // Underwater the incoming beam is the REFRACTED one, steeper than the
-      // sun's own direction, so that is the cosine a caustic arrives with. The
-      // term is zero outside the volume regardless (`gain - 1` is), so this
-      // needs no branch. A DOWNWARD-facing surface still receives nothing, and
-      // that is not a gap: no refracted sunbeam reaches the underside of
-      // anything. Light there arrives by bounce, which is the GI path's job.
-  const cos = normalWorldGeometry.dot(s.toSunRefracted).max(0);
-      builder.context.irradiance.addAssign(s.radiance.mul(cos).mul(gain.sub(1).max(0)));
-      // ...and the same lens reflected upward, onto whatever overhangs the
-      // water. A DOWNWARD-facing normal is the whole audience for this term:
-      // `toSunMirror` points down, so every other surface in the scene gets a
-      // cosine of zero and pays one clamped dot product for it.
       const under = normalWorldGeometry.dot(s.toSunMirror).max(0);
       builder.context.irradiance.addAssign(
         s.radiance.mul(under).mul(s.reflectance).mul(waterCausticAboveNode(positionWorld, slot)));
@@ -317,6 +317,51 @@ export function installWaterCausticLight(engine) {
 export function removeWaterCausticLight(engine) {
   engine._waterCausticLight?.removeFromParent();
   engine._waterCausticLight = null;
+  // …and the sun gets its own colour back.
+  engine.scene?.traverse?.((o) => { if (o.userData?.waterGain) releaseSunGain(engine, o); });
+}
+
+/**
+ * ══ THE LENS MULTIPLIES THE SUN ═══════════════════════════════════════════
+ *
+ * three's `AnalyticLightNode` takes the light's colour from `light.colorNode`
+ * when the light carries one — a per-fragment expression, multiplied by the
+ * shadow map like any colour. So the water's refracted lens goes exactly
+ * where a caustic belongs: on the sun itself. Underwater, a cell between
+ * filaments receives less than the flat sun and a filament several times
+ * more, energy-conserving on average; above water and in shadow, nothing
+ * changes. One node per sun, rebuilt when the pool's compiled slot count
+ * changes; the colour uniform tracks the light every frame.
+ *
+ * ⚠ A light node reads `light.colorNode` when a MATERIAL builds its lights,
+ * so a sun hooked after the scene compiled needs one recompile — asked for
+ * here, and only on the first hook or a slot-count change.
+ */
+export function installSunGain(engine, sun, pool) {
+  const count = pool.compiled?.count ?? pool.compileShape().count;
+  let hook = sun.userData.waterGain;
+  // ⚠ Rebuild on the slot COUNT only. Keying on the pool object too rebuilt
+  // the hook — and asked every material to recompile — every frame in a
+  // harness whose engine stub hands out the pool anew: an endless wave.
+  if (!hook || hook.count !== count) {
+    if (hook) sun.colorNode = null;
+    const colour = uniform(new THREE.Color());
+    let gain = null;
+    for (const slot of pool.slots.slice(0, count)) {
+      const g = waterCausticGainNode(positionWorld, slot, normalWorldGeometry);
+      gain = gain ? gain.mul(g) : g;
+    }
+    sun.colorNode = colour.mul(gain);
+    hook = sun.userData.waterGain = { pool, count, colour };
+    engine.scene?.traverse?.((o) => { const m = o.material; if (!m) return; for (const material of Array.isArray(m) ? m : [m]) material.needsUpdate = true; });
+  }
+  hook.colour.value.copy(sun.color).multiplyScalar(sun.intensity);
+}
+export function releaseSunGain(engine, sun) {
+  if (!sun.userData.waterGain) return;
+  delete sun.userData.waterGain;
+  sun.colorNode = null;
+  engine.scene?.traverse?.((o) => { const m = o.material; if (!m) return; for (const material of Array.isArray(m) ? m : [m]) material.needsUpdate = true; });
 }
 
 /**
@@ -470,6 +515,8 @@ export function updateWaterSlot({ engine, slot, kernel, mesh, simulation, props 
   // exaggerated, both around the same neutral point.
   s.strength.value = Math.max(0, Math.min(3, Number(props.causticIntensity ?? 1)));
   s.radiance.value.copy(source.color).multiplyScalar(source.intensity);
+  // The refracted lens rides on the sun's own colour node.
+  installSunGain(engine, source, engine.waterSlots ?? waterSlotPool(engine));
 }
 
 /** Snell on the CPU, matching WGSL's `refract` including total internal

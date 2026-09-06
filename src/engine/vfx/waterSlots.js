@@ -457,13 +457,17 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
       const alpha = renderer.getClearAlpha();
       renderer.getClearColor(previousClear);
       renderer.setRenderTarget(slot.causticTarget);
-      // ⚠ NEUTRAL, NOT BLACK. A texel no beam lands on — the map's border on
-      // the up-sun side, where beams from the rim land outside the window and
-      // are clipped — must read "no focusing" (1), or a receiver whose walk
-      // down its beam ends there gets a DARKENING that changes with every
-      // frame's clip: "black stripes quickly flickering all over the pool
-      // walls" (user, 2026-09-06, underwater screenshot).
-      renderer.setClearColor(0xffffff, 1);
+      // ⚠ BLACK. The beams ADD onto this: a texel's value is the sum of the
+      // compression of every beam landing on it, so a cell between filaments
+      // reads below 1 (its beams diverged) and a filament above (they
+      // converged) — a mean of one, energy conserved. A white clear, tried
+      // for the border, lifted the whole map by one: no cell could go dark
+      // and the floor read as a flat sun with faint lines on it ("caustics
+      // are way too dim", user, 2026-09-06). The border is the receiver's
+      // business: a beam that entered outside the lid gets gain 1
+      // (`waterCausticGainLocalNode`'s origin test), and the window reaches
+      // past the rim by the beams' lateral travel so wall beams are recorded.
+      renderer.setClearColor(0x000000, 1);
       renderer.render(scene, camera);
       renderer.setClearColor(previousClear, alpha);
       renderer.setRenderTarget(target);
