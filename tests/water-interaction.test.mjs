@@ -71,6 +71,19 @@ function solver({ n = 64, width = 1, height = 1, damping = .998, speed = 2, ripp
       previous.set(position); position.set(scratch);
     },
     seed(fill) { for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) { const v = fill(x, y); position[y * n + x] = v; previous[y * n + x] = v; } },
+    at(x, y) { return position[y * n + x]; },
+    // gridSimulation.js's window shift, verbatim: every cell takes the cell that
+    // held its new position, or nothing at the new edge — position AND history.
+    shift(di, dj) {
+      for (const buffer of [position, previous]) {
+        scratch.fill(0);
+        for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+          const sx = x + di, sy = y + dj;
+          if (sx >= 0 && sx < n && sy >= 0 && sy < n) scratch[y * n + x] = buffer[sy * n + sx];
+        }
+        buffer.set(scratch);
+      }
+    },
     peak() { let m = 0; for (let i = 0; i < count; i++) m = Math.max(m, Math.abs(position[i])); return m; },
     energy() { let e = 0; for (let i = 0; i < count; i++) e += position[i] * position[i]; return e; },
     /**
@@ -384,4 +397,37 @@ test('a body FALLING in dents the water far harder than one already floating', (
     assert.ok(entry > floating * 1.5,
       `and far harder than the same body afloat: ${entry.toFixed(4)} against ${floating.toFixed(4)}`);
   } finally { p.dispose(); }
+});
+
+test('the ripple WINDOW moves under a wake, and the wake does not notice', () => {
+  // ⭐ THE WINDOW IS A SHIFT, NOT A RESAMPLE. The solver follows the camera in
+  // whole cells (Stage 4): the field is transported cell for cell, so a wake
+  // seen from a window that has moved is the SAME wake, bit for bit, and it
+  // keeps evolving identically wherever the moved edge cannot yet reach.
+  const make = () => solver({ n: 96, width: 4, height: 4, speed: 2 });
+  const fixed = make(), moving = make();
+  for (const s of [fixed, moving]) s.impulse(.2, -.1, .3, -.3);
+  for (let i = 0; i < 40; i++) { fixed.step(); moving.step(); }
+  const di = 5, dj = -3, n = 96;
+  moving.shift(di, dj);
+  let transport = 0;
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const sx = x + di, sy = y + dj;
+    if (sx < 0 || sx >= n || sy < 0 || sy >= n) continue;
+    transport = Math.max(transport, Math.abs(moving.at(x, y) - fixed.at(sx, sy)));
+  }
+  assert.equal(transport, 0, 'the shift is exact transport');
+  // Forty more steps at no more than half a cell a step: nothing within
+  // twenty cells of either edge has heard from the edge yet.
+  for (let i = 0; i < 40; i++) { fixed.step(); moving.step(); }
+  let drift = 0, compared = 0, peak = 0;
+  for (let y = 20; y < n - 20; y++) for (let x = 20; x < n - 20; x++) {
+    const sx = x + di, sy = y + dj;
+    if (sx < 20 || sx >= n - 20 || sy < 20 || sy >= n - 20) continue;
+    drift = Math.max(drift, Math.abs(moving.at(x, y) - fixed.at(sx, sy)));
+    peak = Math.max(peak, Math.abs(fixed.at(sx, sy)));
+    compared++;
+  }
+  assert.ok(compared > 2000 && peak > 1e-4, `the wake is still there to compare (${compared} cells, peak ${peak.toExponential(2)})`);
+  assert.ok(drift < 1e-12, `and evolves identically under the moved window: drift ${drift.toExponential(2)} against a peak of ${peak.toExponential(2)}`);
 });

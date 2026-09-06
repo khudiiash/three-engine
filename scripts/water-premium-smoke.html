@@ -7,6 +7,7 @@ import { installWaterSurfaceLook } from '/src/engine/vfx/waterSurfaceLook.js';
 import { installWaterMedium } from '/src/engine/vfx/waterMedium.js';
 import { installWaterCausticLight, updateWaterSlot } from '/src/engine/vfx/waterCaustics.js';
 import { waterAutoResolution } from '/src/engine/vfx/waterVolume.js';
+import { halfToFloat } from '/src/engine/vfx/waterSpectrumCPU.js';
 
 /**
  * ══ THE SAME BODY, THE SAME FRAMING, THREE SIZES OF WATER ══════════════════
@@ -158,11 +159,60 @@ try {
    pose([-3.2, 3.4, 3.2], [.6, 0, -.6]);
    await shoot('foam-after-splash');
 
-   // Numbers beside the pictures: how wide and how deep the dent is right
-   // after entry, read straight off the surface map in world metres.
-   {
-     const tex = sim.waterSurfaceTexture;
-     void tex;
+   // ── THE WINDOW, WHERE THERE IS ONE (the pool is wider than it) ─────────
+   //
+   // Two things the window must not do: show a seam when it moves, and act
+   // as a wall where its edge lies in open water. The first as pictures with
+   // a number (the frame after a 6 m window step differs from the frame
+   // before it by no more than one tick of wave motion does); the second as
+   // a ratio (the energy a wake leaves in the east band after it would have
+   // bounced off the window's edge — sponge on, against the same run with the
+   // sponge off).
+   if (sim.ripple.windowed) {
+     const w = sim.ripple.resolution, cellM = sim.ripple.cellX * S;
+     const meanDiff = (a, b) => { let s = 0; for (let i = 0; i < a.length; i += 4) s += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]); return s / (a.length / 4 * 3); };
+     sim.addWaterImpulse(0, 0, radius, -entry / DEPTH);
+     await run(18);
+     pose([-2.2, 1.8, 2.2], [0, 0, 0]);
+     const before = await shoot('window-before');
+     await run(1);
+     const oneTick = await shoot('window-one-tick');
+     sim.followCamera(6 / S, 0);                 // the eye walks 6 m east: ~95 cells
+     await run(1);
+     const shifted = await shoot('window-shifted');
+     const seam = meanDiff(shifted, oneTick), motion = meanDiff(oneTick, before);
+     log(`window step of 6 m: frame change ${seam.toFixed(3)} against one tick of wave motion ${motion.toFixed(3)} (centre now ${(sim.rippleCenter.x * S).toFixed(2)} m)`);
+     if (seam > 2 * motion + .5) throw new Error(`the window's step shows: ${seam.toFixed(3)} vs ${motion.toFixed(3)}`);
+
+     const bandEnergy = async () => {
+       const halves = await renderer.backend.copyTextureToBuffer(sim.rippleTexture, 0, 0, w, w);
+       const c = sim.rippleCenter; let sum = 0, count = 0;
+       for (let iy = 0; iy < w; iy++) for (let ix = 0; ix < w; ix++) {
+         const xm = (c.x + (ix - (w - 1) / 2) * sim.ripple.cellX) * S, zm = (c.y + (iy - (w - 1) / 2) * sim.ripple.cellZ) * S;
+         if (xm < 11 || xm > 16 || Math.abs(zm) > 4) continue;
+         const h = halfToFloat(halves[(iy * w + ix) * 4]) * DEPTH; sum += h * h; count++;
+       }
+       return Math.sqrt(sum / Math.max(1, count));
+     };
+     const strikeNearEdge = async (sponge) => {
+       sim.followCamera(0, 0); await run(1);
+       sim.sponge = sponge; sim.restart(); await renderer.computeAsync(sim.init); await run(5);
+       sim.addWaterImpulse(14 / S, 0, .5 / S, -.3 / DEPTH);   // 2 m inside the east edge of a 32 m window
+       if (argument('series', '0') === '1') { for (let k = 1; k <= 8; k++) { await run(24); log(`   sponge ${sponge} t=${(k * .4).toFixed(1)}s band ${(await bandEnergy()).toExponential(2)}`); } sim.restart(); await renderer.computeAsync(sim.init); await run(5); sim.addWaterImpulse(14 / S, 0, .5 / S, -.3 / DEPTH); }
+       // A 2-D wave leaves a TAIL behind its front (no Huygens in 2-D), and
+       // for the first two seconds the band is that tail in both arms. From
+       // 2.0 s the outgoing ring and most of its tail have left the band; a
+       // wall's reflected ring is crossing it (12.4 m at 2.0 s, 11.3 m at 2.4 s).
+       await run(120); let e = await bandEnergy();
+       await run(24); e += await bandEnergy();
+       await run(24); e += await bandEnergy();
+       return e / 3;
+     };
+     const absorbed = await strikeNearEdge(true), reflected = await strikeNearEdge(false);
+     sim.sponge = true;
+     log(`east band after a strike 2 m from the window's edge: sponge ${absorbed.toExponential(2)} m RMS, wall ${reflected.toExponential(2)} m RMS → ${(absorbed / Math.max(1e-9, reflected)).toFixed(2)}x (cells ${(cellM * 100).toFixed(1)} cm)`);
+     if (!(absorbed < .5 * reflected)) throw new Error(`the window's edge reflects: ${absorbed} vs ${reflected}`);
+     log(`window: a 6 m step is seamless (${seam.toFixed(2)} vs ${motion.toFixed(2)}), and the edge absorbs (${(absorbed / reflected).toFixed(2)}x of a wall)`);
    }
    sim.dispose(renderer);
    engine._waterMedium?.dispose();
