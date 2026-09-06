@@ -356,7 +356,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     if (u) {
       // Foam is WHITE, ROUGH AND OPAQUE — a material, not a glow, and not a
       // mirror either.
-      const soft = waterFoamNode(u, engine?.scenePass?.getTexture?.("depth") ?? null, simulation?.spectrum ?? null).toVar();
+      const soft = waterFoamNode(u, engine?.scenePass?.getTexture?.("depth") ?? null, simulation?.spectrum ?? null, simulation?.flowTexture ? texture(simulation.flowTexture) : null).toVar();
       // ── ⛔ `style` EXISTED ONLY IN A MATERIAL NOBODY USES ─────────────────
       //
       // The banding and the hard foam edge that make "stylized" stylized were

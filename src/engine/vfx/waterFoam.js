@@ -124,17 +124,30 @@ const worldXZ = (u) => vec2(positionLocal.x.mul(u.waveScale.x), positionLocal.z.
  * generation threshold in the solver) and gates this on or off; it is not a
  * dimmer, because half-transparent foam is a grey wash and not less foam.
  */
-export function waterFoamNode(u, sceneDepth = null, spectrum = null) {
+export function waterFoamNode(u, sceneDepth = null, spectrum = null, flow = null) {
   // ⚠ WRAPPED IN `Fn`, AND IT HAS TO BE. `toVar()` and `addAssign` allocate on
   // the builder's STACK, and a node factory called straight from a material
   // build has no stack — "No stack defined for assign operation". Anything here
   // that declares a variable belongs inside one of these.
-  return Fn(() => waterFoamBody(u, sceneDepth, spectrum))();
+  return Fn(() => waterFoamBody(u, sceneDepth, spectrum, flow))();
 }
-function waterFoamBody(u, sceneDepth, spectrum) {
+function waterFoamBody(u, sceneDepth, spectrum, flow) {
   const p = worldXZ(u);
   const clock = waveClock(u);
   const drift = clock.mul(.5);
+  // ── THE WAKE PATTERN RIDES THE FLOW ──────────────────────────────────
+  // The pattern's coordinates follow the water: the drift the solver
+  // accumulated (`flowTexture` .zw, local units) where the ripple window is,
+  // so a wake's sheet and web move with the water they float on instead of
+  // sitting still while it passes ("a static pattern", user, 2026-09-07).
+  let carried = vec2(0);
+  if (flow) {
+    const t = vec2(positionLocal.x.sub(u.rippleCenter.x).div(u.rippleHalf.x.mul(2)).add(.5), positionLocal.z.sub(u.rippleCenter.y).div(u.rippleHalf.y.mul(2)).add(.5));
+    const inside = t.x.greaterThan(0).and(t.x.lessThan(1)).and(t.y.greaterThan(0)).and(t.y.lessThan(1));
+    const d = flow.sample(t.clamp(0, 1)).zw;
+    carried = select(inside, vec2(d.x.mul(u.waveScale.x), d.y.mul(u.waveScale.z)), vec2(0));
+  }
+  const pw = p.sub(carried);
 
   // The solver's own foam, and the contact term.
   // ── WHITECAPS, PER PIXEL ──────────────────────────────────────────────
@@ -205,11 +218,11 @@ function waterFoamBody(u, sceneDepth, spectrum) {
   // of the edge distance a few times wider than before, and a fine fractal
   // rides along it so it thins and thickens like a real strand.
   const warp = vec2(fbm(p.mul(.35).add(vec2(3.1, 7.7)), clock, .5), fbm(p.mul(.35).add(vec2(-5.3, 2.9)), clock, .5)).sub(.5).mul(1.6);
-  const q = p.add(warp);
+  const q = pw.add(warp);
   const lineWidth = mix(float(.2), float(.55), v);
   const coarse = cellular(q.mul(.9), drift), fine = cellular(q.mul(2.6).add(warp.mul(1.5)), drift.mul(1.3));
   const filament = (cells, width) => cells.y.sub(cells.x).div(width).clamp(0, 1).oneMinus().pow(1.6);
-  const grain = fbm(p.mul(6), clock, 2).mul(.9).add(.35);
+  const grain = fbm(pw.mul(6), clock, 2).mul(.9).add(.35);
   const network = filament(coarse, lineWidth).mul(.95).add(filament(fine, lineWidth.mul(.9)).mul(.6)).clamp(0, 1).mul(grain).toVar();
 
   // ── THE SHEET ──────────────────────────────────────────────────────────
@@ -222,7 +235,7 @@ function waterFoamBody(u, sceneDepth, spectrum) {
   // ── THE FLECKS ─────────────────────────────────────────────────────────
   // The last of a patch: soft irregular flecks from a fractal threshold —
   // never round dots, which read as stars on the water.
-  const specks = fbm(p.mul(11), clock, 1.5).smoothstep(.6, .78).mul(fbm(p.mul(2.5), clock, .8).smoothstep(.4, .7));
+  const specks = fbm(pw.mul(11), clock, 1.5).smoothstep(.6, .78).mul(fbm(pw.mul(2.5), clock, .8).smoothstep(.4, .7));
 
   const sheetMask = v.smoothstep(.5, .82);
   const webMask = v.smoothstep(.05, .38);

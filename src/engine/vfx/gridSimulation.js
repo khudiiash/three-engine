@@ -25,6 +25,24 @@ import { Vector2, Vector4 } from "three/webgpu";
  */
 export const RIPPLE_WINDOW_METRES = 32;
 /**
+ * ══ THE FLOW (2026-09-07) ═══════════════════════════════════════════════════
+ *
+ * "After interaction with an object, foam patterns on the water remain
+ * static, very unnatural" (user). Foam is a passive tracer: it rides the
+ * water's horizontal motion. The height field already IS the pressure of a
+ * shallow-water solver, so its momentum equation comes for free — the
+ * column's horizontal velocity accelerates down the surface slope
+ * (du/dt = −g ∂h/∂x), a body pressing in drives water outward and a release
+ * draws it back — and the foam is advected through it (semi-Lagrangian, in
+ * the foam field's own kernel). No pressure projection: the wave equation
+ * plays that role. The pattern the foam is DRAWN with rides the same flow
+ * through an accumulated drift the lid reads (`flowTexture` .zw).
+ */
+const FLOW_DAMPING = .6;          // 1/s — a current dies in a couple of seconds
+const FLOW_DRIFT_SECONDS = 6;     // the drawn pattern's drift forgets on this scale
+const FLOW_PUSH = 4;              // local units/s of push per local unit of dent, at the dent's centre
+const FLOW_CFL = .4;              // cells per substep the advection may carry
+/**
  * The window's edge is not a wall. Where it lies INSIDE the pool a wake that
  * reaches it must leave, not bounce back toward the eye off nothing; the
  * outer `SPONGE_CELLS` cells damp the field quadratically toward the edge
@@ -152,8 +170,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const positions = instancedArray(wCount, "vec4");
   const previous = instancedArray(wCount, "vec4");
   const scratch = instancedArray(wCount, "vec4");
+  // The flow: .xy the column's horizontal velocity (local units per second),
+  // .zw the accumulated drift the wake pattern rides (local units).
+  const flow = kind === "water" ? instancedArray(wCount, "vec4") : null;
   // The window's field as a texture: (height, normal.x, normal.z, foam) per
   // cell, for the render mesh, the fragment, the medium and the caustic lens.
+  const flowTexture = kind === "water" ? new THREE.StorageTexture(w, w) : null;
+  if (flowTexture) { flowTexture.type = THREE.HalfFloatType; flowTexture.format = THREE.RGBAFormat; flowTexture.minFilter = flowTexture.magFilter = THREE.LinearFilter; flowTexture.name = "water flow"; }
   const rippleTexture = kind === "water" ? new THREE.StorageTexture(w, w) : null;
   if (rippleTexture) { rippleTexture.type = THREE.HalfFloatType; rippleTexture.format = THREE.RGBAFormat; rippleTexture.minFilter = rippleTexture.magFilter = THREE.LinearFilter; rippleTexture.wrapS = rippleTexture.wrapT = THREE.ClampToEdgeWrapping; rippleTexture.name = "Water ripple window"; }
   // ── FOAM IS SIMULATED, NOT STAMPED ────────────────────────────────────────
@@ -296,6 +319,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     positions.element(index).assign(vec4(p, 0));
     previous.element(index).assign(vec4(p, 0));
     scratch.element(index).assign(vec4(p, 0));
+    if (flow) flow.element(index).assign(vec4(0));
   })().compute(wCount);
   // ── THE WINDOW MOVES IN WHOLE CELLS, AND THE FIELD MOVES WITH IT ───────────
   //
@@ -317,7 +341,14 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     scratch.element(index).assign(vec4(rest.x, select(valid, src.y, float(0)), rest.z, select(valid, src.w, fresh)));
   })().compute(wCount);
   const shiftInto = (target) => Fn(() => { target.element(index).assign(scratch.element(index)); })().compute(wCount);
-  const shiftKernels = kind === "water" ? [shiftFrom(positions, true), shiftInto(positions), shiftFrom(previous, false), shiftInto(previous)] : [];
+  const shiftFlowFrom = flow ? Fn(() => {
+    const di = u.rippleShift.x.toInt(), dj = u.rippleShift.y.toInt();
+    const sxi = x.add(di), syi = y.add(dj);
+    const valid = sxi.greaterThanEqual(0).and(sxi.lessThan(w)).and(syi.greaterThanEqual(0)).and(syi.lessThan(w));
+    scratch.element(index).assign(select(valid, flow.element(syi.clamp(0, w - 1).mul(w).add(sxi.clamp(0, w - 1))), vec4(0)));
+  })().compute(wCount) : null;
+  const shiftFlowInto = flow ? Fn(() => { flow.element(index).assign(scratch.element(index)); })().compute(wCount) : null;
+  const shiftKernels = kind === "water" ? [shiftFrom(positions, true), shiftInto(positions), shiftFrom(previous, false), shiftInto(previous), shiftFlowFrom, shiftFlowInto] : [];
   const integrate = Fn(() => {
     const p = positions.element(index).xyz.toVar();
     const old = previous.element(index).xyz;
@@ -429,13 +460,24 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const injectWater = kind === "water" ? Fn(()=>{
     const p=positions.element(index).xyz;
     const displacement=float(0).toVar();
+    const push=vec2(0).toVar();
     Loop({start:0,end:impulseCount},({i})=>{
       const impulse=impulses.element(i);
-      const t=p.x.sub(impulse.x).pow(2).add(p.z.sub(impulse.y).pow(2)).sqrt().div(impulse.z.max(1e-4));
-      displacement.addAssign(t.mul(1.5).pow(6).min(20).negate().exp().mul(impulse.w));
+      const away=vec2(p.x.sub(impulse.x),p.z.sub(impulse.y));
+      const t=away.length().div(impulse.z.max(1e-4));
+      const falloff=t.mul(1.5).pow(6).min(20).negate().exp();
+      displacement.addAssign(falloff.mul(impulse.w));
+      // A press (w < 0) drives the water outward from the dent; the release
+      // where the body was draws it back — between the two, the body's wake.
+      // In METRES per second: the dent is in local depth units (× sy), the
+      // push in local horizontal units (÷ sx) — without the ratio a 60 m
+      // body pushed twelve times harder than a 5 m one for the same crate.
+      push.addAssign(away.div(away.length().max(1e-4)).mul(falloff).mul(impulse.w.negate()).mul(FLOW_PUSH)
+        .mul(vec2(u.waveScale.y.div(u.waveScale.x), u.waveScale.y.div(u.waveScale.z))));
     });
     positions.element(index).y.addAssign(displacement);
     previous.element(index).y.addAssign(displacement);
+    if (flow) { const f = flow.element(index).toVar(); flow.element(index).assign(vec4(f.xy.add(push), f.zw)); }
   })().compute(wCount) : null;
   const constrain = (source, target) => Fn(() => {
     const p = source.element(index).xyz.toVar();
@@ -700,7 +742,16 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // of the foam a splash would make.
     const source = u.foam.mul(steepWorld.smoothstep(.45, .9).mul(.5).add(churn.smoothstep(.5, 1.5).mul(3))).add(jacobianFoam.mul(3));
     const around = scratch.element(west).w.add(scratch.element(east).w).add(scratch.element(north).w).add(scratch.element(south).w).mul(.25);
-    const spread = mix(positions.element(index).w, around, u.foamSpread);
+    // ⭐ THE FOAM RIDES THE FLOW: this cell's foam is what was upstream a tick
+    // ago — semi-Lagrangian, bilinear over the foam copy in `scratch`.
+    const f = flow.element(index);
+    const bx = x.toFloat().sub(f.x.mul(u.foamRate).div(sx)), by = y.toFloat().sub(f.y.mul(u.foamRate).div(sz));
+    const ix0 = bx.floor().clamp(0, w - 1), iy0 = by.floor().clamp(0, w - 1);
+    const ix1 = ix0.add(1).min(w - 1), iy1 = iy0.add(1).min(w - 1);
+    const fx = bx.sub(bx.floor()).clamp(0, 1), fy = by.sub(by.floor()).clamp(0, 1);
+    const foamAt = (ix, iy) => scratch.element(iy.toInt().mul(w).add(ix.toInt())).w;
+    const advected = mix(mix(foamAt(ix0, iy0), foamAt(ix1, iy0), fx), mix(foamAt(ix0, iy1), foamAt(ix1, iy1), fx), fy);
+    const spread = mix(advected, around, u.foamSpread);
     positions.element(index).w.assign(spread.mul(u.foamDecay).add(source.mul(u.foamRate)).clamp(0, 1));
   })().compute(wCount) : null;
   // The window as a texture: height, the ripple normal's x and z, foam.
@@ -712,6 +763,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const rippleZ = positions.element(south).y.sub(positions.element(north).y).div(2 * sz);
     const nrm = vec3(rippleX.negate(), 1, rippleZ.negate()).normalize();
     textureStore(rippleTexture, ivec2(x, y), vec4(positions.element(index).y, nrm.x, nrm.z, positions.element(index).w));
+    textureStore(flowTexture, ivec2(x, y), flow.element(index));
   })().compute(wCount) : null;
   const heightfieldVertex = () => {
     if (kind !== "water") {
@@ -1080,7 +1132,27 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   let targetCenter = null;
   // The eye in the sea's metres (local × scale), for the whitecap memory window.
   let seaEye = null;
-  const steps = kind === "cloth" ? [integrate, solveA, solveB, solveA, solveB, solveA, solveB, solveA, solveB, commit] : [integrate, commit];
+  // Shallow-water momentum on the committed heights, once a substep: the
+  // column accelerates down the slope, damps, and never outruns what the
+  // foam advection can carry; the drift integrates the velocity and forgets.
+  const momentum = kind === "water" ? Fn(() => {
+    const at = (ix, iy) => iy.mul(w).add(ix);
+    const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(w - 1), y);
+    const north = at(x, y.sub(1).max(0)), south = at(x, y.add(1).min(w - 1));
+    const f = flow.element(index).toVar();
+    const gradX = positions.element(east).y.sub(positions.element(west).y).div(2 * sx);
+    const gradZ = positions.element(south).y.sub(positions.element(north).y).div(2 * sz);
+    // du/dt = −g ∂h/∂x in the lid's units: h × sy over x × sx, u in x/s.
+    const gx = gradX.mul(GRAVITY * h).mul(u.waveScale.y).div(u.waveScale.x.mul(u.waveScale.x));
+    const gz = gradZ.mul(GRAVITY * h).mul(u.waveScale.y).div(u.waveScale.z.mul(u.waveScale.z));
+    const v = f.xy.sub(vec2(gx, gz)).mul(1 - FLOW_DAMPING * h).toVar();
+    const limit = FLOW_CFL * Math.min(sx, sz) / h;
+    const speed = v.length().max(1e-6);
+    v.assign(v.mul(speed.min(limit).div(speed)));
+    const drift = f.zw.mul(1 - h / FLOW_DRIFT_SECONDS).add(v.mul(h));
+    flow.element(index).assign(vec4(v, drift));
+  })().compute(wCount) : null;
+  const steps = kind === "cloth" ? [integrate, solveA, solveB, solveA, solveB, solveA, solveB, solveA, solveB, commit] : [integrate, commit, momentum];
   if (collide) steps.push(collide);
   if (collideEdges) steps.push(collideEdges, commit, collideEdges, commit, collide);
   if (pinEntities) steps.push(pinEntities);
@@ -1208,7 +1280,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   };
   update(props);
   const simulation = { mesh, skirtMesh, skirtMaterial, positions, count, resolution: n, vertexCount: total, init, surface, steps, uniforms: u,waterSurfaceTexture,slotKernel,causticPass,
-    spectrum, rippleTexture,
+    spectrum, rippleTexture, flowTexture,
     /** The solver's grid and its window, in local units. */
     ripple: { resolution: w, cellX: sx, cellZ: sz, windowWidth: winW, windowHeight: winH, windowed },
     /**
@@ -1464,7 +1536,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       geometry.dispose();
       waterSurfaceTexture?.dispose();
 
-      releaseStorageAttributes(renderer, [positions.value, previous.value, scratch.value, normalAttribute, positionAttribute, foamAttribute].filter(Boolean));
+      releaseStorageAttributes(renderer, [positions.value, previous.value, scratch.value, flow?.value, normalAttribute, positionAttribute, foamAttribute].filter(Boolean));
+      flowTexture?.dispose();
     },
   };
   return simulation;

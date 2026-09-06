@@ -360,6 +360,56 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     memory, with its linear percentiles), `?seaMips=0`, `?poseTick=0`; the
     `ocean-eye` pose and the lid-geometry receipt (RMS per clipmap level,
     the sea's σ and cascade-0 RMS beside it).
+41. GI BLACKS OUT THE MATERIAL'S IBL. GI installs a black
+    `scene.environmentNode` so its probes replace image-based lighting, and
+    leaves the water out of its radiance block — after trap 37(c) moved the
+    sky onto the lid's IBL, a GI scene's sea reflected nothing ("no sky
+    reflection from the surface … cartoonish"). The lid samples the
+    environment texture itself along the reflected ray, with the same
+    analytic environment BRDF (Karis) the IBL applies, gated by a uniform
+    that is 1 exactly while `scene.environmentNode` overrides a texture
+    environment; `skyNode.value` follows the scene's texture. Receipt: the
+    sea under the horizon reads 48 % of the sky over it with the IBL, 34 %
+    with GI's node emulated (`?giEnv=1` — the foam loses the sky irradiance
+    the harness has no GI to replace), 0 % before. ⚠ Plain Fresnel on that
+    term read 108 %: a rough far sea at grazing returns a fraction of the
+    sky, and the BRDF says how much.
+42. THE EYE'S SIDE COMES FROM THE SURFACE UNDER IT. The rest plane decided
+    above/below (with a ±1.5 × wave-height band): on a metre of swell an eye
+    in a trough was "under water" for metres — fog over the far surface,
+    the whole lid on the water-side Fresnel (total-internal-reflection
+    white on every near slope) — and one on a crest "in the air" ("depth
+    issues under grazing angles"). The component reads the surface under
+    the eye from the sea's CPU copy (the buoyancy query) with a hysteresis
+    of centimetres, publishes `simulation.eyeBelow` (the mirror's flip)
+    and the slot's `eyeBelow` uniform (the medium's lid segment); the lid's
+    Fresnel and refraction branch on `frontFacing` per fragment. Receipt:
+    the eye 15 cm over a −2.05 m trough keeps the sky at 91 % of the 1.2 m
+    eye's; the rest plane would have called it under water.
+43. FOAM RIDES A FLOW. "After interaction with an object, foam patterns on
+    the water remain static." The ripple field now carries the column's
+    horizontal velocity (`flow` .xy, local units/s): shallow-water momentum
+    on the committed heights every substep (du/dt = −g ∂h/∂x, damped 0.6/s,
+    capped at 0.4 cell per substep), a body's press driving water outward
+    and its release drawing it back (in metres: the dent's local depth ×
+    sy/sx), and the foam advected through it semi-Lagrangian in the foam
+    field's kernel. The pattern the foam is DRAWN with rides an accumulated
+    drift (.zw, forgetting over 6 s) the lid reads from `flowTexture`. No
+    pressure projection — the wave equation plays that role. Receipts: a
+    splash leaves 0.18 / 0.09 / 0.06 m/s peak flow at 5 / 20 / 60 m and the
+    pattern drifts 6.8 cm at all three (scale-invariant), foam and shaft
+    receipts unchanged. The sea's whitecaps (the memory) do not ride it: the
+    crests carry them.
+44. WHITECAPS AGAINST THE REAL THING (a storm sea beside ours, user
+    2026-09-07): foam is SPARSE — a sheet only where a crest has just broken
+    (memory > .7), thin streaks along the crests behind it (a 9:1 stretched
+    fractal under 1.3 × the value), holes in both, 0.75 albedo. The
+    transmitted light is lighter and greener along the crests (thin water:
+    `waterCrestGradientNode`, ×1.4 green at the crest, fading in between 10
+    and 50 cm of wave height so a pool's ripples never turn green) and the
+    subsurface term is a bright teal, not the body's own dark blue, which
+    glowed invisibly against itself. Receipts: whitecaps 6.7 %, far band
+    1.2 %, sheets 0 %.
 
 ## Open
 

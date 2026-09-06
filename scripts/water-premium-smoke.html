@@ -506,6 +506,22 @@ globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
    await shoot('splash-0.6s');
    await run(54);
    await shoot('splash-1.5s');
+   // ── THE FLOW THE SPLASH LEFT, 1.5 s ON ───────────────────────────────
+   // The foam rides it (the shallow-water momentum on the ripple field, and
+   // the body's push): a splash that leaves no current leaves a pattern
+   // sitting where it was made (2026-09-07).
+   {
+     const w = sim.ripple.resolution, halves = await renderer.backend.copyTextureToBuffer(sim.flowTexture, 0, 0, w, w);
+     let peak = 0, sum = 0, n = 0, driftPeak = 0;
+     for (let i = 0; i < w * w; i++) {
+       const v = Math.hypot(halfToFloat(halves[i * 4]) * S, halfToFloat(halves[i * 4 + 1]) * S);
+       const d = Math.hypot(halfToFloat(halves[i * 4 + 2]) * S, halfToFloat(halves[i * 4 + 3]) * S);
+       if (!Number.isFinite(v) || !Number.isFinite(d)) continue;
+       peak = Math.max(peak, v); driftPeak = Math.max(driftPeak, d); sum += v; n++;
+     }
+     log(`flow 1.5 s after the splash: peak ${peak.toFixed(3)} m/s, mean ${(sum / n).toFixed(4)} m/s, the pattern drifted up to ${(driftPeak * 100).toFixed(1)} cm`);
+     if (!(peak > .02 && driftPeak > .005)) throw new Error(`the splash left no flow: peak ${peak.toFixed(3)} m/s, drift ${(driftPeak * 100).toFixed(1)} cm`);
+   }
    await run(150);
    await shoot('splash-4s');
    pose([-3.2, 3.4, 3.2], [.6, 0, -.6]);
