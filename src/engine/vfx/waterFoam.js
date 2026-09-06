@@ -206,41 +206,40 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
   const patch = fbm(p.mul(.55), clock, .6);
   const v = amount.mul(patch.mul(.5).add(.75)).clamp(0, 1).toVar();
 
-  // ── THE NETWORK ────────────────────────────────────────────────────────
+  // ── THE WAKE: A SHEET, THEN PATCHES ALONG THE CURRENT, THEN FLECKS ────
   //
-  // ⛔ A CELL BOUNDARY DRAWN AS A THIN HARD LINE IS A VORONOI DIAGRAM, NOT
-  // FOAM — "the foam patterns look quite weird" (user, 2026-09-06, with a
-  // screenshot of exactly that: crisp polygons and a sky of white dots). What
-  // the photograph has is WIDE, SOFT filaments whose density varies along
-  // their length, joining irregular blobs rather than polygons. So the lattice
-  // is DOMAIN-WARPED by a low-frequency fractal before the cells are found
-  // (no straight edges, no regular polygons), the filament is a soft falloff
-  // of the edge distance a few times wider than before, and a fine fractal
-  // rides along it so it thins and thickens like a real strand.
-  const warp = vec2(fbm(p.mul(.35).add(vec2(3.1, 7.7)), clock, .5), fbm(p.mul(.35).add(vec2(-5.3, 2.9)), clock, .5)).sub(.5).mul(1.6);
-  const q = pw.add(warp);
-  const lineWidth = mix(float(.2), float(.55), v);
-  const coarse = cellular(q.mul(.9), drift), fine = cellular(q.mul(2.6).add(warp.mul(1.5)), drift.mul(1.3));
-  const filament = (cells, width) => cells.y.sub(cells.x).div(width).clamp(0, 1).oneMinus().pow(1.6);
+  // ⛔ NO LATTICE. The Worley network read as a Voronoi diagram twice ("the
+  // foam patterns look quite weird"; "what do we do with those static foam
+  // upon object falling the water?", 2026-09-07 — a five-metre lace mat
+  // around a floating crate). A splash leaves a bright disc of foam that
+  // the ring's current tears into ragged PATCHES stretched along the flow
+  // — radial streaks from an impact, a trail behind a moving body — and
+  // the last of it is flecks. The pattern rides the drift (`pw`), and its
+  // stretch follows the flow's direction and speed where the flow texture
+  // is read; still water leaves it isotropic.
+  let dir = vec2(1, 0), speed = float(0);
+  if (flow) {
+    const t = vec2(positionLocal.x.sub(u.rippleCenter.x).div(u.rippleHalf.x.mul(2)).add(.5), positionLocal.z.sub(u.rippleCenter.y).div(u.rippleHalf.y.mul(2)).add(.5));
+    const f = flow.sample(t.clamp(0, 1)).xy;
+    const metres = vec2(f.x.mul(u.waveScale.x), f.y.mul(u.waveScale.z));
+    speed = metres.length();
+    dir = metres.div(speed.max(1e-3));
+    dir = select(speed.greaterThan(1e-3), dir, vec2(1, 0));
+  }
+  const stretch = float(1).add(speed.smoothstep(0, .3).mul(3));
+  const alongFlow = pw.dot(dir), acrossFlow = pw.y.mul(dir.x).sub(pw.x.mul(dir.y));
+  const holes = fbm(pw.mul(5), clock, 1.7);
+  const patches = fbm(vec2(alongFlow.div(stretch).mul(1.6), acrossFlow.mul(1.6)), clock, .6);
   const grain = fbm(pw.mul(6), clock, 2).mul(.9).add(.35);
-  const network = filament(coarse, lineWidth).mul(.95).add(filament(fine, lineWidth.mul(.9)).mul(.6)).clamp(0, 1).mul(grain).toVar();
-
-  // ── THE SHEET ──────────────────────────────────────────────────────────
-  // White, with warped holes of two sizes where the water shows through, and
-  // a fine texture so it never reads as a flat fill.
-  const holesA = cellular(q.mul(5), drift.mul(1.7)).x.smoothstep(.2, .5).oneMinus();
-  const holesB = cellular(q.mul(13), drift.mul(2.3)).x.smoothstep(.14, .38).oneMinus();
-  const sheet = float(.9).add(grain.mul(.15)).sub(holesA.mul(.45)).sub(holesB.mul(.25)).clamp(0, 1);
-
-  // ── THE FLECKS ─────────────────────────────────────────────────────────
-  // The last of a patch: soft irregular flecks from a fractal threshold —
-  // never round dots, which read as stars on the water.
+  // The fresh sheet: bright, its edge eaten by holes.
+  const sheet = v.sub(holes.mul(.35)).smoothstep(.5, .8);
+  // Patches: where the stretched fractal falls under one and a half times
+  // the value — most of a fresh patch, a fifth of a fading one.
+  const torn = v.mul(1.5).sub(patches).div(.2).clamp(0, 1).mul(holes.mul(.6).add(.5));
+  // The flecks of the last of it.
   const specks = fbm(pw.mul(11), clock, 1.5).smoothstep(.6, .78).mul(fbm(pw.mul(2.5), clock, .8).smoothstep(.4, .7));
-
-  const sheetMask = v.smoothstep(.5, .82);
-  const webMask = v.smoothstep(.05, .38);
   const speckMask = v.smoothstep(.015, .16);
-  const wake = sheetMask.mul(sheet).max(webMask.mul(network)).max(speckMask.mul(specks)).clamp(0, 1);
+  const wake = sheet.max(torn.mul(.85)).max(speckMask.mul(specks)).mul(grain.mul(.4).add(.7)).clamp(0, 1);
   if (!sea) return wake.mul(u.foam.smoothstep(0, .15));
 
   // ── THE WHITECAPS (2026-09-07) ──────────────────────────────────────

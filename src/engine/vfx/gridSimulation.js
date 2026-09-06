@@ -1436,7 +1436,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // and gone by 12 s — the sheet → web → specks sequence `waterFoam.js`
         // draws. The rate is set so a crest has to stay steep for about a
         // second to lay a sheet; a passing ripple leaves only threads.
-        u.foamDecay.value = Math.exp(-delta / 3.5);
+        u.foamDecay.value = Math.exp(-delta / 2.5);   // a splash's foam is gone in seconds, not a lace that lingers (2026-09-07)
         u.foamRate.value = delta;
         // 0.015 m²/s of spread, in cells per tick — bounded well inside the
         // four-neighbour blend's stability.

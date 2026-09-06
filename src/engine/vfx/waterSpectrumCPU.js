@@ -51,9 +51,12 @@ export const SEA_STATES = Object.freeze({
   // that its crests fold — over water that is dark: deep blue in-scatter,
   // extinction that swallows any floor. So this preset alone also writes
   // the look; pool/pond/lake leave colour and clarity to the author.
-  ocean: { waveHeight: 1, waveLength: 24, choppiness: 1, rippleStrength: 1, waveOctaves: 8, waveGain: .6, waveSpeed: 1,
-    surfaceDetail: 1.2, foam: .25, foamThreshold: .3, roughness: .12,
-    color: "#0d4f8a", deepColor: "#04213a", saturation: .75, transmission: 1 },
+  // The user's own tuning of it (2026-09-07: "look at my current water
+  // params, make them default for ocean preset"): a slower, rougher, greyer
+  // sea than the first draft.
+  ocean: { waveHeight: 1, waveLength: 24, choppiness: 1, rippleStrength: 1, waveOctaves: 8, waveGain: .4, waveSpeed: .5,
+    surfaceDetail: 1, foam: .3, foamThreshold: 1, roughness: .5,
+    color: "#77aca6", deepColor: "#04213a", saturation: .75, transmission: 1 },
 });
 
 // ── SEA STATE FROM THE COMPONENT'S FIELDS ────────────────────────────────────
