@@ -145,8 +145,30 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     travel; walls read the map at the grazing mip plus a defocus that grows
     with height above the floor; the caustic light's cosine is the geometric
     normal.
+23. A WATER LID MUST NOT CAST A SHADOW-MAP SHADOW. The user's Water had
+    `castShadow` on, so the pool floor never received the sun the lens was
+    meant to modulate — "caustics are way too dim, even when increased
+    intensity". Water never casts now; its shadow IS the caustic gain (focus
+    × absorption). Cloth still casts.
+24. The refracted caustic is a MULTIPLIER on the sun, and a light node can
+    only add. A `colorNode` hook on the sun (0abe2b6) silenced the water
+    light's own mirrored-sun add (catcher 77.3 = 77.3), and three caches ONE
+    light node per light (`_lightsNodeRef`), so a hook installed after the
+    scene compiled was never seen in the editor. The water light now adds
+    E·cos·(gain − 1) × the SUN'S OWN shadow node, found through
+    `builder.lightsNode` (lights build in id order; the sun's node already
+    carries `shadowNode`). Receipt: in the post's shadow the floor reads
+    66.5 with the lens on and 66.5 off; beside it 177 vs 211; floor contrast
+    25.4 % vs 13.0 %; catcher 80.9 vs 77.3.
+25. The shadow map lags a `castShadow` toggle by a frame (one update per
+    frame id per camera): a receipt that toggles a caster reads the previous
+    state. Compute the shadow region from geometry instead.
 
 ## Open
+
+- The medium's shafts are lit by the caustic map only: an object's shadow
+  (the sun's shadow map) does not cut the beams under it. One shadow tap per
+  few shaft taps would, at a cost to the fog node every material carries.
 
 - A GI harness irradiance receipt for the water terms (mirrored sun, the
   through-water attenuation and sky mirror).
