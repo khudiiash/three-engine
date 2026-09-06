@@ -1018,8 +1018,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // it rasterized, regardless of what was in front — a flat lighter quad
     // sitting across the near corner of every pool, which no amount of looking
     // at the surface shader explains.
+    // ⚠ POLYGON OFFSET: a water box sized to its pool's interior puts this
+    // shell's side faces exactly ON the pool's walls, and two coincident
+    // surfaces z-fight into flickering stripes underwater (user's scene,
+    // 2026-09-06; a 1 % scale nudge was the workaround). Pushed a little
+    // deeper, the shell yields to whatever wall it touches; the medium still
+    // tints that wall by the water the eye's ray crossed.
     ? new THREE.MeshPhysicalNodeMaterial({ roughness: .06, metalness: 0, transmission: 1, thickness: 0, ior: 1.333,
-        transparent: true, depthWrite: false, depthTest: true, side: THREE.FrontSide })
+        transparent: true, depthWrite: false, depthTest: true, side: THREE.FrontSide,
+        polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 })
     : null;
   const skirtMesh = skirtGeometry ? new THREE.Mesh(skirtGeometry, skirtMaterial) : null;
   if (skirtMesh) {

@@ -28,7 +28,13 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
     props: {
       color: factors.color ?? "#ffffff",
       roughness: factors.roughness ?? 1,
-      metalness: factors.metalness ?? 1,
+      // ⚠ A texture set with NO metalness map is a DIELECTRIC. This defaulted
+      // to 1 (glTF's factor default, which only makes sense as a multiplier on
+      // a metallic map), so every Poly Haven tile, plaster and wood imported
+      // as a metal: no diffuse sun, no bounce, and no caustic on a pool floor
+      // ("caustics never shipped", user, 2026-09-06). With a map wired the
+      // edge drives the input and this constant is unread.
+      metalness: factors.metalness ?? (maps.metalness || maps.arm ? 1 : 0),
       ior: factors.ior ?? 1.5,
       specularIntensity: factors.specularIntensity ?? 0.5,
       specularColor: factors.specularColor ?? "#ffffff",
