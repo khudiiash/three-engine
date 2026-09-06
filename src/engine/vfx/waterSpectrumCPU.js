@@ -38,12 +38,22 @@ export const GRAVITY = 9.81;
  * the preset back to `custom`. `waveHeight: 0` is a perfectly smooth pool
  * with nothing but the interactive ripples on it.
  */
-export const SEA_STATE_FIELDS = ["waveHeight", "waveLength", "choppiness", "rippleStrength", "waveOctaves", "waveGain", "waveSpeed"];
+export const SEA_STATE_FIELDS = ["waveHeight", "waveLength", "choppiness", "rippleStrength", "waveOctaves", "waveGain", "waveSpeed",
+  "surfaceDetail", "foam", "foamThreshold", "roughness", "color", "deepColor", "saturation", "transmission"];
 export const SEA_STATES = Object.freeze({
   pool:  { waveHeight: .02, waveLength: 1.5, choppiness: .2, rippleStrength: .5, waveOctaves: 5, waveGain: .5, waveSpeed: 1 },
   pond:  { waveHeight: .06, waveLength: 3,   choppiness: .3, rippleStrength: .7, waveOctaves: 6, waveGain: .5, waveSpeed: 1 },
   lake:  { waveHeight: .25, waveLength: 8,   choppiness: .5, rippleStrength: 1,  waveOctaves: 7, waveGain: .5, waveSpeed: 1 },
-  ocean: { waveHeight: 1.2, waveLength: 60,  choppiness: .9, rippleStrength: 1,  waveOctaves: 8, waveGain: .55, waveSpeed: 1 },
+  // ⚠ THE OCEAN IS A DIFFERENT WATER, NOT A BIGGER POOL (2026-09-07). A 60 m
+  // swell at 1.2 m is a lagoon: too gentle to fold, so no whitecaps, and the
+  // pool's clear cyan under a sky is a white sheet. The reference sea
+  // (Popov72/OceanDemo) is a WIND SEA — a 20-odd-metre peak, steep enough
+  // that its crests fold — over water that is dark: deep blue in-scatter,
+  // extinction that swallows any floor. So this preset alone also writes
+  // the look; pool/pond/lake leave colour and clarity to the author.
+  ocean: { waveHeight: 1, waveLength: 24, choppiness: 1, rippleStrength: 1, waveOctaves: 8, waveGain: .6, waveSpeed: 1,
+    surfaceDetail: 1.2, foam: .3, foamThreshold: .3, roughness: .12,
+    color: "#0d4f8a", deepColor: "#04213a", saturation: .75, transmission: 1 },
 });
 
 // ── SEA STATE FROM THE COMPONENT'S FIELDS ────────────────────────────────────

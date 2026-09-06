@@ -297,6 +297,69 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     components re-run `onAttach` themselves on a prop change) and fires no
     enable/disable hooks; GI's dispose releases the water's trace/shade pair
     with the build. Receipt: `npm run test:entity-activity` (6).
+37. THE OCEAN WAS A LAGOON (user, 2026-09-07: "our default ocean looks
+    pathetic", a 500 × 10 × 500 cylinder). Four faults, each with a receipt:
+    (a) THE SEA'S TEXTURE-ARRAY MIPS WERE NEVER GENERATED — three regenerates
+    a storage texture's mips only when a sampled binding of it is rebuilt
+    after a store binding marked it, and the arrays are bound once and
+    cached — so every `.level(n > 0)` read (the clipmap's coarse rings, far
+    pixels' hardware mip, the caustic lens's band-limited cascades, the foam
+    memory's coverage) read zero. Receipt: lid RMS height per clipmap level
+    0.57/0.75/0.97/0.87/0.73/0.41/0.00/0.00/0.00 m before (level 5 = 0.8 ×
+    mip 0 + 0.2 × an empty mip 1), 0.57…0.42/0.28/0.17 after
+    (`spectrum.generateMipmaps` after the sea's own compute submission,
+    before anything samples). (b) THE CLIPMAP ADDED ITS LEVEL INDEX TO THE
+    CLAMPED LOD, and that LOD came from the base grid's cell (a local unit ×
+    500 m = a metre), so the swell left the geometry from the fourth ring
+    out: "the tiny rect in the centre that actually does some waves". Now
+    `seaLodRaw` (unclamped, from the level-0 cell) + level, clamped at zero.
+    (c) THE SKY WAS REFLECTED TWICE — the material's own image-based
+    lighting plus the sky-by-direction term of trap 32 — and the horizon
+    read brighter than the sky it mirrored. With an environment on the
+    scene the mirror renders without a background and counts only where it
+    saw geometry; without one it keeps the background, as before. (d) THE
+    OCEAN IS A DIFFERENT WATER: the preset now writes a wind sea (H 1 m,
+    λ 24 m, chop 1) AND its look (deep blue in-scatter, saturation .75,
+    transmission 1, foam .3); pool/pond/lake still leave the look alone,
+    and editing a field a preset carries flips it to custom.
+38. WHITECAPS ARE A MEMORY, NOT A GATE. The per-pixel gate on the composed
+    Jacobian is instantaneous and mip-averages toward "nothing" past a few
+    tens of metres, while the reference carries streaky foam to the
+    horizon. The sea keeps a camera-following window (`FOAM_WINDOW_METRES`
+    512 at 1024², texel-snapped like the caustic and ripple windows) of
+    max(whitecap now, last frame × e^(−dt/6 s)) over the COMPOSED Jacobian
+    (never per cascade, see the ⛔ in waterSpectrum.js); a crest that folds
+    leaves a trail as it travels. The look is the memory's own distribution
+    (linear, ocean preset: median .14, p90 .46, p99 1 — ⚠ the readback is
+    sRGB, linearize before setting a threshold on it): a sheet above .55,
+    streaks where a fractal stretched 4:1 along the wind falls under
+    1.6 × the value, bubbles over both, and past 60–240 m the mip-filtered
+    coverage as a tone. The ripple field no longer carries sea foam at all
+    (one value with two looks was a seam at the window's edge): it is the
+    INTERACTION foam — wakes, splashes, rim churn — with the wake look.
+    Receipts: whitecaps 12.9 % of the water, far band 3.7 %, green sheets
+    0 %, the lid at 11 sampled textures.
+39. THE CAUSTIC LENS KEEPS ITS OLD BAND (deliberately). With the mips real
+    the fine cascades reached the lens for the first time and the 20 m
+    arm's shaft term changed 12.5 % a frame (baseline 6.2 %, gate 4 %; the
+    5 m arm 0.13 %). A cascade now fades out of the lens as its texel drops
+    under the band limit (`lens.weights`, 1 at mip ≤ ½, 0 at ≥ 1½), and the
+    band limit is at least four beam spacings (a splat sampled 2.3× per
+    wave jittered). Receipts: 5 m floor 25.0 % vs 13.1 %, catcher 81.0 vs
+    77.3, shafts 0.16 %/0.26 %; 20 m shafts 6.09 %/4.83 % = the previous
+    commit's 6.19 %/4.99 % (measured on a worktree of 17d4b44). ⚠ THE 20 m
+    AND 60 m SHAFT FLICKER IS PRE-EXISTING and above the gate; the ripple-
+    scale shimmer the fine cascades would add is real physics and needs a
+    temporal term on the shaft taps before it can ship.
+40. HARNESS: `pose()` now applies the camera follow with a zero-length tick
+    (the windows and the ring centre were at the origin, 175 m from the
+    ocean poses, so every earlier ocean shot looked at the coarsest rings);
+    a vec3 storage attribute reads back with a 16-byte stride (four floats
+    per vertex); `?hdr=`, `?toneMapping=`, `?sun=`, `?sunIntensity=`,
+    `?color=`, `?deepColor=`, `?waterDepth=`, `?foamDebug=sea` (the raw
+    memory, with its linear percentiles), `?seaMips=0`, `?poseTick=0`; the
+    `ocean-eye` pose and the lid-geometry receipt (RMS per clipmap level,
+    the sea's σ and cascade-0 RMS beside it).
 
 ## Open
 
@@ -318,6 +381,9 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
 
 `npm run smoke:water-premium` (`?scales=5,60,500`, `?shape=sphere|cylinder|
 cone|capsule&fill=.75`, `?shaftMip=N`, `?crate=1` — the floating crate seen
-through the surface, with and without it), `smoke:water-surface`,
+through the surface, with and without it; the ocean: `?scales=500&shape=
+cylinder&fill=1&depth=10&ocean=1&hdr=/artifacts/sky/user.hdr&toneMapping=
+linear&sun=3.7,19.58,-1.68&sunIntensity=4` plus the preset's fields as
+overrides), `smoke:water-surface`,
 `smoke:water-spectrum`, `smoke:water-props`, `smoke:water-rate`,
 `scripts/water-bindings-smoke.html?msaa=1`, `npm run test:water`.

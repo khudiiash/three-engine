@@ -4,12 +4,14 @@ import { waterCausticGainNode } from './waterCaustics.js';
 import { applyMediumSegment } from './waterMedium.js';
 import {
   Fn, cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraProjectionMatrixInverse, cameraViewMatrix, cameraWorldMatrix, float, linearDepth, materialAttenuationColor, materialAttenuationDistance, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
-  mrt, pmremTexture, positionViewDirection, positionWorld, reflect, reflector, refract, screenSize, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
+  mrt, positionViewDirection, positionWorld, reflector, refract, screenSize, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
 } from 'three/tsl';
-import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
+import { seaFoamValueNode, waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
 import { seaLostSlopeVarianceNode, seaShadingSlopeNode } from './waterSpectrum.js';
 
 const _eye = new Vector3(), _origin = new Vector3(), _up = new Vector3(), _clearColor = new Color();
+/** Whether three's own image-based lighting supplies the sky's reflection. */
+const sceneHasEnvironment = (scene) => !!(scene?.environmentNode || scene?.environment?.isTexture);
 /** Recursion guard: a mirror must not render itself. */
 let reflecting = false;
 
@@ -41,6 +43,9 @@ let reflecting = false;
 export function installWaterSurfaceLook({ engine, mesh, material, simulation = null, slot = null, getSlot = null }) {
   const target = new Object3D(); target.rotation.x = -Math.PI / 2; mesh.add(target);
   const gain = uniform(1), distortion = uniform(.02);
+  // 1 while the scene has an environment: the mirror then renders without
+  // its background and counts only where it saw geometry (see the hook).
+  const envReflection = uniform(0);
   // ⚠ EVERY SLOT THIS TOUCHES IS CAPTURED, and every rebuild starts from the
   // capture rather than from what it built last time — `build()` re-runs on
   // each GI compile wave, and composing onto its own output would stack foam on
@@ -197,9 +202,21 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       const scene = frame.scene, renderer = frame.renderer;
       const background = scene.background, backgroundNode = scene.backgroundNode;
       const clearColor = renderer.getClearColor(_clearColor).clone(), clearAlpha = renderer.getClearAlpha();
-      scene.background = null; scene.backgroundNode = null; renderer.setClearColor(0x000000, 0);
+      // ── THE SKY IS THREE'S OWN (2026-09-07) ────────────────────────────
+      //
+      // With an environment on the scene, the material's image-based lighting
+      // already reflects the sky along every pixel's true reflected ray,
+      // prefiltered by the wave roughness. The mirror's job is then what
+      // STANDS near the water: it renders without a background and its alpha
+      // says where it saw geometry. (A second sky term on top of the IBL
+      // reflected the sky twice, and the sea's horizon read brighter than the
+      // sky it mirrored — "our default ocean looks pathetic".) Without an
+      // environment there is no IBL, and the mirror keeps the background.
+      const strip = sceneHasEnvironment(scene);
+      envReflection.value = strip ? 1 : 0;
+      if (strip) { scene.background = null; scene.backgroundNode = null; renderer.setClearColor(0x000000, 0); }
       try { return original(frame); } finally {
-        scene.background = background; scene.backgroundNode = backgroundNode; renderer.setClearColor(clearColor, clearAlpha);
+        if (strip) { scene.background = background; scene.backgroundNode = backgroundNode; renderer.setClearColor(clearColor, clearAlpha); }
         reflecting = false;
         mesh.visible = body;
         for (let i = 0; i < slots.length; i++) slots[i].uniforms.active.value = armed[i];
@@ -285,29 +302,18 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     // zero on flat water instead of drifting with where the camera points.
     const flatNormalView = transformDirection(cameraViewMatrix, modelNormalMatrix.mul(vec3(0, 1, 0)).normalize()).normalize();
     const uv = screenUV.flipX().add(normalView.sub(flatNormalView).xy.mul(distortion)).clamp(.001, .999);
-    // ── THE SKY ALONG THE REFLECTED RAY, PER PIXEL ────────────────────────
+    // ── THE MIRROR IS FOR WHAT STANDS NEAR THE WATER ──────────────────────
     //
     // A planar mirror of a flat sky, bent by a two-percent distortion, is a
     // sheet of glass: the swells' slopes could not show through it (the
-    // ocean arm, 2026-09-06). The demo samples its environment along each
-    // pixel's true reflected direction, and so does the sea now: the scene's
-    // environment (or its texture background), prefiltered by the roughness
-    // the far field earns. The mirror keeps what stands near the water —
-    // read where its alpha says it saw geometry, since it renders without a
-    // background — and the sky fills the rest, GI reflections on or off.
-    const sky = engine?.scene?.environment?.isTexture ? engine.scene.environment
-      : (engine?.scene?.background?.isTexture ? engine.scene.background : null);
+    // ocean arm, 2026-09-06). The sky along each pixel's true reflected ray,
+    // prefiltered by the roughness the far field earns, is the material's own
+    // image-based lighting whenever the scene has an environment — so then
+    // the mirror counts only where its alpha says it saw geometry (it renders
+    // without a background; see the hook). Without an environment the mirror
+    // carries the background as it always did.
     const mirror = node.sample(uv).level(float(roughness).clamp(0, 1).mul(6));
-    let reflected;
-    if (sky) {
-      const lidNormalWorldR = modelNormalMatrix.mul(lidNormalLocal).normalize();
-      const toEyeR = cameraPosition.sub(positionWorld).normalize();
-      const R = reflect(toEyeR.negate(), lidNormalWorldR);
-      const env = pmremTexture(sky, R, float(roughness).clamp(0, 1)).rgb;
-      reflected = mix(env, mirror.rgb, mirror.a.clamp(0, 1).mul(gain)).mul(fresnel);
-    } else {
-      reflected = mirror.rgb.mul(fresnel).mul(gain);
-    }
+    const reflected = mirror.rgb.mul(mix(float(1), mirror.a.clamp(0, 1), envReflection)).mul(fresnel).mul(gain);
 
     let emissive = vec3(previous.emissiveNode ?? 0);
     if (u) {
@@ -504,7 +510,8 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       emissive = emissive.add(reflected);
     }
     // Harness probe: the foam value alone (`?foamDebug=1`).
-    if (globalThis.__waterFoamDebug && u) { material.emissiveNode = vec3(waterFoamNode(u, null, simulation?.spectrum ?? null)); material.colorNode = vec3(0); }
+    if (globalThis.__waterFoamDebug === 'sea' && u) { material.emissiveNode = vec3(seaFoamValueNode(u, simulation?.spectrum ?? null)); material.colorNode = vec3(0); }
+    else if (globalThis.__waterFoamDebug && u) { material.emissiveNode = vec3(waterFoamNode(u, null, simulation?.spectrum ?? null)); material.colorNode = vec3(0); }
     else material.emissiveNode = emissive;
     material.userData.giWater = true;
     material.needsUpdate = true;

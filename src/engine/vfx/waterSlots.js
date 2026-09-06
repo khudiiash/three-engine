@@ -400,11 +400,22 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
   // reaches a floor metres down; `0.08·√depth` is that scale (14 cm over a
   // 3 m pool), and without it a floor was a marble of centimetre threads.
   // Real waves through a mip chain: nothing here can alias.
-  const lens = { lods: [uniform(0), uniform(0), uniform(0)] };
+  // ⛔ A CASCADE FINER THAN THE BAND LIMIT IS NOT IN THE LENS. Until
+  // 2026-09-07 the sea's mips were never generated, so a cascade read above
+  // mip 0 contributed NOTHING — and every caustic and god-ray receipt, and
+  // the look the user accepted, was tuned on a lens of the cascades whose
+  // texel is no finer than the band limit. With the mips real, the finer
+  // cascades' true band-limited slopes doubled the shafts' one-frame change
+  // (20 m arm: 6.2 → 12.5 %, gate 4 %). So the rule they implied is kept on
+  // purpose: a cascade fades out of the lens as its texel drops under the
+  // band limit (weight 1 at mip ≤ ½, 0 at mip ≥ 1½). Their real contribution
+  // — ripple-scale shimmer in the caustics — is an open unit that needs a
+  // temporal term on the shaft taps first.
+  const lens = { lods: [uniform(0), uniform(0), uniform(0)], weights: [uniform(1), uniform(1), uniform(1)] };
   const localNormal = uniforms && spectrum
     ? Fn(() => {
         const world = vec2(rest.x.mul(uniforms.waveScale.x), rest.z.mul(uniforms.waveScale.z));
-        const slope = seaSlopeAt(spectrum, world, { lods: lens.lods });
+        const slope = seaSlopeAt(spectrum, world, { lods: lens.lods, weights: lens.weights });
         // World slope → local: the box is anisotropic (see gridSimulation).
         const local = vec2(slope.x.mul(uniforms.waveScale.x).div(uniforms.waveScale.y), slope.y.mul(uniforms.waveScale.z).div(uniforms.waveScale.y));
         const nrm = vec3(lensNormal);
@@ -474,8 +485,20 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
         const ws = uniforms.waveScale.value;
         const spacing = Math.max(u.causticHalf.value.x * ws.x, u.causticHalf.value.y * ws.z) * 2 / (n - 1);
         const floorScale = .04 * Math.sqrt(Math.max(.01, u.half.value.y * ws.y));
-        const coarsest = Math.max(spacing, floorScale);
-        spectrum.cascades.forEach((c, i) => { lens.lods[i].value = Math.max(0, Math.log2(Math.max(1, coarsest / (c.L / spectrum.size)))); });
+        // ⚠ FOUR BEAMS PER BAND-LIMIT WAVELENGTH, or the splat jitters. With
+        // the sea's mips real (they were empty until 2026-09-07, so the fine
+        // cascades never reached the lens), a 16 m window's 3 cm beams
+        // sampled a 7 cm band limit 2.3× per wave and the map changed 12 %
+        // a frame at the shafts' mip (20 m arm; the 5 m arm's 1 cm beams
+        // were fine at 7×). The lens is band-limited to what the beams can
+        // sample: the 20 m shafts read 12.5 → under the gate, the 5 m arm
+        // unchanged (4 cm < its 7 cm floor scale).
+        const coarsest = Math.max(4 * spacing, floorScale);
+        spectrum.cascades.forEach((c, i) => {
+          const lod = Math.max(0, Math.log2(Math.max(1, coarsest / (c.L / spectrum.size))));
+          lens.lods[i].value = lod;
+          lens.weights[i].value = Math.max(0, Math.min(1, 1.5 - lod));
+        });
       }
       const target = renderer.getRenderTarget();
       const alpha = renderer.getClearAlpha();

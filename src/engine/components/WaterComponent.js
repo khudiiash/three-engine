@@ -84,7 +84,7 @@ export class WaterComponent extends GridSimulationComponent {
     if (key === "seaState" && state && state !== "custom") {
       const preset = SEA_STATES[state];
       if (preset) for (const [k, v] of Object.entries(preset)) write(k, v);
-    } else if (SEA_STATE_FIELDS.includes(key) && state && state !== "custom" && SEA_STATES[state]?.[key] !== this.props[key]) {
+    } else if (SEA_STATE_FIELDS.includes(key) && state && state !== "custom" && key in (SEA_STATES[state] ?? {}) && SEA_STATES[state][key] !== this.props[key]) {
       write("seaState", "custom");
     }
     super.onPropChanged(key);

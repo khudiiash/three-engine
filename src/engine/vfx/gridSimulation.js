@@ -183,6 +183,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // texel is no finer than this grid's cell (render mesh / solver). See `tick`.
     seaLod: [uniform(0), uniform(0), uniform(0)],
     seaLodSolver: [uniform(0), uniform(0), uniform(0)],
+    // The same per cascade, UNCLAMPED (negative where the mesh cell is finer
+    // than the cascade's texel): what a clipmap level adds its index to.
+    seaLodRaw: [uniform(0), uniform(0), uniform(0)],
     // The ripple window in LOCAL units: its centre and half extent (half the
     // texture's span, so uv = (local − centre) / (2·half) + ½).
     rippleCenter: uniform(new Vector2(0, 0)),
@@ -248,6 +251,12 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const farFoamAt = (local, lods) => {
     if (kind !== "water" || !spectrum) return float(0);
     const world = vec2(local.x.mul(u.waveScale.x), local.z.mul(u.waveScale.z));
+    // With the whitecap memory (waterSpectrum.js) the sea's foam is not the
+    // field's business at all: the pixels read the memory directly, with the
+    // whitecap look, and the field carries only what INTERACTION makes —
+    // wakes, splashes, a rim's churn — with the wake look. One value with
+    // two looks was a seam at the window's edge.
+    if (spectrum.foam) return float(0);
     const sea = seaDisplacementAt(spectrum, world, lods);
     return seaFoamNode(seaJacobianAt(spectrum, world, sea.w, lods), u.foam).mul(4).clamp(0, 1);
   };
@@ -609,7 +618,16 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // above the finest lid cell's. One function for both lid layouts and the rim.
   const lidSurfaceAt = (rest, lodShift = null) => {
     const world = vec2(rest.x.mul(u.waveScale.x), rest.z.mul(u.waveScale.z));
-    const sea = seaDisplacementAt(spectrum, world, lodShift ? u.seaLod.map((l) => l.add(lodShift)) : u.seaLod);
+    // ⛔ A CLIPMAP LEVEL SHIFTS THE UNCLAMPED LOD. Level k's cell is 2^k of
+    // the finest, so it reads each cascade at max(0, log2(cell/texel) + k) —
+    // the RAW ratio, negative for a swell whose texel is a metre and a mesh
+    // cell of centimetres. Adding k to the CLAMPED base pushed the swell
+    // cascade to mip k from level 1 on, and by level 4 (a 60 cm cell) a
+    // 24 m wave was averaged out of the geometry: the sea was flat except
+    // for "the tiny rect in the centre that actually does some waves"
+    // (user, 2026-09-07, a 500 m ocean seen from a metre up).
+    const lods = lodShift ? u.seaLodRaw.map((l) => l.add(lodShift).max(0)) : u.seaLod;
+    const sea = seaDisplacementAt(spectrum, world, lods);
     const hold = edgeHold(rest);
     const ripple = rippleAt(rest);
     return vec3(rest.x.add(sea.x.div(u.waveScale.x).mul(hold)), ripple.x.add(sea.y.div(u.waveScale.y)), rest.z.add(sea.z.div(u.waveScale.z).mul(hold)));
@@ -664,7 +682,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const world = vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z));
     const sea = seaDisplacementAt(spectrum, world, u.seaLodSolver).toVar();
     const jacobian = seaJacobianAt(spectrum, world, sea.w, u.seaLodSolver);
-    const jacobianFoam = seaFoldNode(jacobian).mul(u.foam.smoothstep(0, .2)); // the FOLD seeds the field; whitecaps are per pixel (waterFoam.js)
+    const jacobianFoam = spectrum?.foam ? float(0) : seaFoldNode(jacobian).mul(u.foam.smoothstep(0, .2)); // the FOLD seeds the field only without the whitecap memory (waterSpectrum.js)
     const rise = u.waveScale.y;
     const rippleX = positions.element(east).y.sub(positions.element(west).y).div(2 * sx);
     const rippleZ = positions.element(south).y.sub(positions.element(north).y).div(2 * sz);
@@ -752,7 +770,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // steep rim) is the other half and lives in `positions.w`, spreading and
       // decaying as a field. `waterFoam.js` says what a value DRAWS.
       const jacobian = seaJacobianAt(spectrum, world, sea.w, u.seaLod);
-      const jacobianFoam = seaFoldNode(jacobian).mul(u.foam.smoothstep(0, .2)); // the FOLD seeds the field; whitecaps are per pixel (waterFoam.js)
+      const jacobianFoam = spectrum?.foam ? float(0) : seaFoldNode(jacobian).mul(u.foam.smoothstep(0, .2)); // the FOLD seeds the field only without the whitecap memory (waterSpectrum.js)
       const rise = u.waveScale.y;
       const steepWorld = vec2(rippleX.mul(rise).div(u.waveScale.x), rippleZ.mul(rise).div(u.waveScale.z)).length();
       const churn = positions.element(index).y.sub(previous.element(index).y).mul(rise).div(h).abs();
@@ -1060,6 +1078,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     : null;
   // Where the eye wants the window; the tick moves it (see `followCamera`).
   let targetCenter = null;
+  // The eye in the sea's metres (local × scale), for the whitecap memory window.
+  let seaEye = null;
   const steps = kind === "cloth" ? [integrate, solveA, solveB, solveA, solveB, solveA, solveB, solveA, solveB, commit] : [integrate, commit];
   if (collide) steps.push(collide);
   if (collideEdges) steps.push(collideEdges, commit, collideEdges, commit, collide);
@@ -1197,6 +1217,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
      * cells, and a change queues the field shift for the next tick.
      */
     followCamera(x, z) {
+      seaEye = [(Number(x) || 0) * u.waveScale.value.x, (Number(z) || 0) * u.waveScale.value.z];
       if (!windowed) return;
       targetCenter = {
         x: Math.max(-(width / 2 - winW / 2), Math.min(width / 2 - winW / 2, Number(x) || 0)),
@@ -1305,7 +1326,16 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // floor, so asking for finer detail gives the finest detail this
         // resolution HAS rather than a broken version of what was asked for.
         const cell = Math.max(sx * u.waveScale.value.x, sz * u.waveScale.value.z);          // the solver's
-        const vertexCell = Math.max(dx * u.waveScale.value.x, dy * u.waveScale.value.z);    // the render mesh's
+        // ⛔ THE CLIPMAP'S CELL AT THE EYE, not the base grid's. The base grid
+        // is the 32 m window at 512 (a metre of local width over a 500 m
+        // sea reads as a METRE here), and the LOD it set put every clipmap
+        // level three mips too coarse: the swell survived only the innermost
+        // rings ("the tiny rect in the centre that actually does some
+        // waves", user, 2026-09-07). Level 0 is WATER_CELL_METRES; the levels
+        // add their index to the raw ratio (see lidSurfaceAt).
+        const vertexCell = clip
+          ? Math.max(clipCell.x * u.waveScale.value.x, clipCell.z * u.waveScale.value.z)
+          : Math.max(dx * u.waveScale.value.x, dy * u.waveScale.value.z);                  // the render mesh's
         // The ripple solver runs at the swell's PHYSICAL phase speed — the
         // deep-water c = sqrt(g·λp/2π) of the peak wave, times the authored
         // time scale — so a wake and a crest cross the pool together. Local
@@ -1319,6 +1349,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // instead of aliasing the capillary cascade into spikes.
         if (spectrum) spectrum.cascades.forEach((c, i) => {
           u.seaLod[i].value = simulation.seaLodOverride ?? Math.max(0, Math.log2(Math.max(1, vertexCell / (c.L / spectrum.size))));
+          u.seaLodRaw[i].value = simulation.seaLodOverride ?? Math.max(-16, Math.log2(Math.max(1e-6, vertexCell / (c.L / spectrum.size))));
           u.seaLodSolver[i].value = simulation.seaLodOverride ?? Math.max(0, Math.log2(Math.max(1, cell / (c.L / spectrum.size))));
         });
         // The box's depth in metres reaches the spectrum (the TMA shallow-water
@@ -1403,7 +1434,12 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       }
       // The sea advances before the surface reads it; the foam field and the
       // ripple texture follow the substeps and precede the render surface.
-      if (spectrum) queue.push(...spectrum.passes(delta, elapsed));
+      // Its own submission, and its mips made before anything samples them
+      // (see waterSpectrum.js `generateMipmaps`).
+      if (spectrum) {
+        const seaQueue = spectrum.passes(delta, elapsed, { eye: seaEye, foam: u.foam.value });
+        if (seaQueue.length) { renderer.compute(seaQueue); spectrum.generateMipmaps(renderer); }
+      }
       if (foamField) queue.push(foamField, rippleWrite);
       queue.push(surface);
       if (slotKernel) queue.push(...slotKernel.compute);

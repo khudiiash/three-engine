@@ -11,6 +11,7 @@ import { halfToFloat } from '/src/engine/vfx/waterSpectrumCPU.js';
 import { waterCrossedLengthNode } from '/src/engine/vfx/waterMedium.js';
 import { waterProfileRadius } from '/src/engine/vfx/waterVolume.js';
 import { Fn, pass } from 'three/tsl';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 
 /**
  * ══ THE SAME BODY, THE SAME FRAMING, THREE SIZES OF WATER ══════════════════
@@ -50,6 +51,9 @@ try {
  const W = 768, H = 512;                      // 768 * 4 = 12 * 256
  const renderer = new THREE.WebGPURenderer({ device, antialias: false });
  await renderer.init(); renderer.setSize(W, H);
+// ?toneMapping=linear|aces|agx|neutral — the user's scene runs LINEAR at exposure 1.
+{ const tm = { linear: THREE.LinearToneMapping, aces: THREE.ACESFilmicToneMapping, agx: THREE.AgXToneMapping, neutral: THREE.NeutralToneMapping }[argument('toneMapping', '')];
+  if (tm != null) { renderer.toneMapping = tm; renderer.toneMappingExposure = Number(argument('exposure', '1')); } }
  document.body.append(renderer.domElement);
  const target = new THREE.RenderTarget(W, H);
  target.texture.colorSpace = THREE.SRGBColorSpace;
@@ -64,12 +68,14 @@ try {
    foam: Number(argument('foam', '1')), foamThreshold: .5 };
  // Any wave/look field can be overridden from the URL (?waveHeight=.1&choppiness=0…) to
  // reproduce a user's own pool.
- for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain', 'roughness'])
+ for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain', 'roughness', 'transmission', 'waterDepth', 'godRays', 'waveDirection'])
    if (argument(key, null) != null) USER[key] = Number(argument(key, '0'));
+ for (const key of ['color', 'deepColor']) if (argument(key, null) != null) USER[key] = argument(key, '');
  // ?depth= for the ocean arm (60 m: no floor shows through the medium).
  const DEPTH = Number(argument('depth', '3'));
- globalThis.__waterFoamDebug = argument('foamDebug', '0') === '1';
+ globalThis.__waterFoamDebug = argument('foamDebug', '0') === 'sea' ? 'sea' : argument('foamDebug', '0') === '1';
  globalThis.__waterSunProbe = argument('sunProbe', '0') === '1';
+globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
 
  for (const S of SCALES) {
    const scene = new THREE.Scene();
@@ -96,12 +102,23 @@ try {
      // Background only: as an ENVIRONMENT it would light the tiles by IBL and
      // move every floor receipt (the editor's GI owns that light there).
      scene.background = skyTex;
+     // The ocean arm reflects the sky through three's image-based lighting,
+     // as the editor's scenes do; the pool arms keep the floor receipts.
+     if (argument('ocean', '0') === '1') scene.environment = skyTex;
+   }
+   // ?hdr=/artifacts/sky/x.hdr — the user's own HDRI as background AND
+   // environment, as the editor's scene has it.
+   if (argument('hdr', null)) {
+     const hdr = await new RGBELoader().loadAsync(argument('hdr', ''));
+     hdr.mapping = THREE.EquirectangularReflectionMapping;
+     scene.background = hdr; scene.environment = hdr;
    }
    const engine = { scene, renderer, camera: null, onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; },
      _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null }, waterSlots: null };
    const pool = waterSlotPool(engine);
-   const sun = new THREE.DirectionalLight('#fff6e0', 3);
-   sun.position.set(6, 14, 4); scene.add(sun); scene.add(sun.target);
+   const sun = new THREE.DirectionalLight(argument('sunColor', '#fff6e0'), Number(argument('sunIntensity', '3')));
+   // ?sun=x,y,z — the sun's position (its direction); the user's is 78° up.
+   sun.position.fromArray(argument('sun', '6,14,4').split(',').map(Number)); scene.add(sun); scene.add(sun.target);
    // The user's sun casts a shadow map (PCFSoft 4096): the caustic light
    // borrows its shadow node, so the harness sun must cast one too.
    sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
@@ -129,7 +146,7 @@ try {
    holder.scale.set(S, DEPTH, S);
    scene.add(holder);
    const resolution = AUTO ? waterAutoResolution(S) : 128;
-   const props = { ...USER, resolution, width: 1, height: 1, waterDepth: SHAPE_HEIGHT * FILL, shapeKind: SHAPE, shapeRadius: .5, shapeHeight: SHAPE_HEIGHT, enclosed: Number(argument('enclosed', '1')) };
+   const props = { ...USER, resolution, width: 1, height: 1, waterDepth: argument('waterDepth', null) != null ? Number(argument('waterDepth', '1')) : SHAPE_HEIGHT * FILL, shapeKind: SHAPE, shapeRadius: .5, shapeHeight: SHAPE_HEIGHT, enclosed: Number(argument('enclosed', '1')) };
    const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0, ior: 1.333,
      transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
    const slot = pool.claim({});
@@ -153,7 +170,11 @@ try {
    installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
    log(`pool ${S} m: lid ${sim.clip ? `${sim.clip.levels} clipmap levels of ${sim.clip.size}² (${(sim.clip.cell.x * S * 100).toFixed(1)} cm at the eye, ${(sim.clip.cell.x * S * 2 ** (sim.clip.levels - 1)).toFixed(1)} m at the rim, ${sim.count} vertices)` : `${sim.resolution}² flat (${(S / (sim.resolution - 1) * 100).toFixed(1)} cm)`}, ripple window ${sim.ripple.resolution} cells over ${(sim.ripple.windowWidth * S).toFixed(1)} m (${(sim.ripple.cellX * S * 100).toFixed(1)} cm cells${sim.ripple.windowed ? ', following the camera' : ''})`);
 
-   const pose = (eye, at) => { camera.position.set(...eye); camera.lookAt(...at); camera.updateMatrixWorld(true); };
+   // The eye: the ripple and whitecap windows follow it, as the component's do.
+   // A zero-length tick applies the follow (window shifts, ring centre) before
+   // the shot, as the component's per-frame follow does; the sea does not advance.
+   const POSE_TICK = argument('poseTick', '1') !== '0';
+   const pose = (eye, at) => { camera.position.set(...eye); camera.lookAt(...at); camera.updateMatrixWorld(true); sim.followCamera(eye[0] / S, eye[2] / S); if (POSE_TICK) sim.tick(renderer, 0); };
    const step = async () => {
      sim.tick(renderer, 1 / 60);
      updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props });
@@ -192,6 +213,47 @@ try {
      pose([0, 6, S * .4], [0, 0, -S]); const horizon = await shoot('ocean-horizon');
      pose([0, 12, S * .3], [0, 0, -S * .2]); const high = await shoot('ocean-high');
      pose([0, 2.5, S * .35], [0, 1, -S * .1]); await shoot('ocean-low');
+     // The eye a metre over the water, as a swimmer or a deck sees it: the
+     // GEOMETRY's waves, which a higher eye lets the shading normal fake.
+     pose([0, 1.2, S * .35], [0, .9, -S * .1]); await shoot('ocean-eye');
+     // ── THE GEOMETRY'S WAVES, IN METRES ─────────────────────────────────
+     // The lid's vertices, read back: the RMS and the peak of their height
+     // within 80 m of the eye and over the whole lid. The sea's σ is
+     // waveHeight/2, so a 1 m preset must read ~0.5 m RMS here — anything
+     // far under it is a flat mesh with waves painted on ("the tiny rect
+     // in the centre that actually does some waves", user, 2026-09-07).
+     {
+       const attr = sim.mesh.geometry.attributes.position;
+       const v = new Float32Array(await renderer.getArrayBufferAsync(attr));
+       // ⚠ A vec3 storage array has a 16-byte stride: four floats per vertex.
+       const ST = Math.round(v.length / attr.count);
+       let n = 0, s2 = 0, peak = 0, nAll = 0, s2All = 0; const buckets = [0, 0, 0, 0, 0];
+       // The shell shares the buffer (its profile rings sit metres down): only
+       // the lid's own vertices — the clipmap's levels, in order — are the sea.
+       const lidCount = sim.clip ? sim.clip.levels * sim.clip.size * sim.clip.size : v.length / 3;
+       const perLevel = sim.clip ? Array.from({ length: sim.clip.levels }, () => ({ q: 0, k: 0 })) : null;
+       for (let k = 0; k < lidCount; k++) {
+         const i = k * ST;
+         const x = v[i] * S, y = v[i + 1] * DEPTH, z = v[i + 2] * S;
+         if (!Number.isFinite(y)) continue;
+         nAll++; s2All += y * y;
+         if (perLevel) { const lv = perLevel[Math.floor(k / (sim.clip.size * sim.clip.size))]; lv.q += y * y; lv.k++; }
+         const d = Math.hypot(x - 0, z - S * .35); buckets[Math.min(4, Math.floor(Math.log2(Math.max(1, d / 10))))]++;
+         if (d < 80) { n++; s2 += y * y; peak = Math.max(peak, Math.abs(y)); }
+       }
+       if (perLevel) log(`ocean: lid RMS height per clipmap level (m): ${perLevel.map((l) => Math.sqrt(l.q / Math.max(1, l.k)).toFixed(2)).join(' / ')}`);
+       if (sim.clip) { const at = (k) => `${(v[k * ST] * S).toFixed(1)},${(v[k * ST + 1] * DEPTH).toFixed(2)},${(v[k * ST + 2] * S).toFixed(1)}`; const sz = sim.clip.size * sim.clip.size;
+         log(`ocean: lid vertices (x,y,z m) — level0 first ${at(0)}, level0 centre ${at(32 * 65 + 32)}, level1 first ${at(sz)}, level1 centre ${at(sz + 32 * 65 + 32)}, level8 first ${at(8 * sz)}, last ${at(lidCount - 1)}, buffer vertices ${attr.count} (stride ${ST})`); }
+       const cc = sim.uniforms?.clipCenter?.value, rc = sim.uniforms?.rippleCenter?.value;
+       // The sea's own numbers beside the mesh's: the realized amplitude and
+       // the RMS of the coarse cascade's height map (metres).
+       const ws = sim.uniforms?.waveScale?.value, sp = sim.spectrum;
+       let seaRms = NaN;
+       if (sp?.readback) { const rb = await sp.readback(renderer, 1); const m = rb?.cascades?.[0]; if (m) { let q = 0, k = 0; for (let i = 0; i < m.size * m.size; i += 3) { const h = halfToFloat(m.displacement[i * 4 + 1]); if (Number.isFinite(h)) { q += h * h; k++; } } seaRms = Math.sqrt(q / Math.max(1, k)); } }
+       log(`ocean: sea — waveScale ${ws ? `${ws.x},${ws.y},${ws.z}` : '?'}, σ ${sp?.settings?.sigma?.toFixed(3)} m, λ ${sp?.settings?.lambda?.toFixed(2)}, amplitude ${sp?.amplitude?.toFixed(4)}, cascade 0 height RMS ${seaRms.toFixed(3)} m, L0 ${sp?.cascades?.[0]?.L?.toFixed(0)} m`);
+       log(`ocean: lid geometry — RMS height ${Math.sqrt(s2 / Math.max(1, n)).toFixed(3)} m, peak ${peak.toFixed(2)} m over ${n} vertices within 80 m of the eye; RMS ${Math.sqrt(s2All / Math.max(1, nAll)).toFixed(3)} m over all ${nAll}; vertices by distance <10/<20/<40/<80/beyond: ${buckets.join('/')}; clipCenter ${cc ? `${(cc.x * S).toFixed(1)},${(cc.y * S).toFixed(1)}` : '?'} rippleCenter ${rc ? `${(rc.x * S).toFixed(1)},${(rc.y * S).toFixed(1)}` : '?'} (eye 0,${(S * .35).toFixed(1)})`);
+       if (!(Math.sqrt(s2 / Math.max(1, n)) > USER.waveHeight * .25)) throw new Error(`lid geometry RMS ${Math.sqrt(s2 / Math.max(1, n)).toFixed(3)} m: the mesh is not riding the sea (want > ${(USER.waveHeight * .25).toFixed(2)} m)`);
+     }
      // ── THE OCEAN'S RECEIPTS ────────────────────────────────────────────
      //
      // Whitecaps: white pixels (bright, unsaturated) over the water in the
@@ -199,13 +261,32 @@ try {
      // and never most. Sheets: green-dominant bright pixels, the crest
      // scattering's failure mode. Sparkle: the horizon band's luma spread.
      const luma = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
-     let white = 0, green = 0, n = 0;
+     let white = 0, green = 0, n = 0, farWhite = 0, farN = 0;
      for (let y = H * .5; y < H; y++) for (let x = 0; x < W; x++) {
        const i = ((y | 0) * W + (x | 0)) * 4; const r = high[i], g = high[i + 1], b = high[i + 2]; const l = luma(high, i); n++;
        const spread = Math.max(r, g, b) - Math.min(r, g, b);
-       if (l > 175 && spread < 40) white++;
+       const isWhite = l > 175 && spread < 40;
+       if (isWhite) white++;
        if (l > 110 && g > 1.35 * Math.max(r, b)) green++;
+       // The FAR band: the water's top fifth of rows in the high shot, a
+       // hundred metres and more from the eye — the whitecap memory's
+       // receipt (an instantaneous gate reads nothing there).
+       if (y < H * .6) { farN++; if (isWhite) farWhite++; }
      }
+     log(`ocean: far band whitecaps ${(farWhite / farN * 100).toFixed(2)}% (rows ${H * .5}–${H * .6})`);
+     // ?foamDebug=sea: the lid draws the RAW whitecap memory — its distribution
+     // over the water (the high shot), so the look's thresholds are set on
+     // numbers rather than on a picture.
+     if (globalThis.__waterFoamDebug === 'sea') {
+       // The readback is sRGB-encoded; the memory's numbers are linear.
+       const lin = (c) => (c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4);
+       const vals = []; for (let y = H * .5; y < H; y += 2) for (let x = 0; x < W; x += 2) vals.push(lin(high[((y | 0) * W + (x | 0)) * 4] / 255));
+       vals.sort((a, b) => a - b); const q = (f) => vals[Math.min(vals.length - 1, Math.floor(f * vals.length))].toFixed(3);
+       const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+       log(`ocean: whitecap MEMORY over the water — mean ${mean.toFixed(3)}, p50 ${q(.5)}, p75 ${q(.75)}, p90 ${q(.9)}, p99 ${q(.99)}, above .1: ${(vals.filter((v) => v > .1).length / vals.length * 100).toFixed(1)}%, above .5: ${(vals.filter((v) => v > .5).length / vals.length * 100).toFixed(1)}%`);
+       throw new Error('ocean: stop');
+     }
+     if (!(farWhite / farN > .002)) throw new Error(`far whitecaps: ${(farWhite / farN * 100).toFixed(2)}% (want > 0.2 %)`);
      let m = 0, m2 = 0, k = 0;
      for (let y = H * .5; y < H * .62; y++) for (let x = 0; x < W; x++) { const l = luma(horizon, ((y | 0) * W + (x | 0)) * 4); m += l; m2 += l * l; k++; }
      const sparkle = Math.sqrt(Math.max(0, m2 / k - (m / k) ** 2)) / Math.max(1, m / k);

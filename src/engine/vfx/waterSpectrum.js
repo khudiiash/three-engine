@@ -43,8 +43,33 @@ export const SEA_SIZE = 256;
 /** How much sea a build quality buys: cascades × resolution. One model, sized
  *  to the device — a phone runs two 128² cascades of the same spectrum. */
 export function seaQuality(quality = "high") {
-  return { low: { size: 128, cascadeCount: 2 }, medium: { size: 128, cascadeCount: 3 } }[quality] ?? { size: SEA_SIZE, cascadeCount: 3 };
+  return { low: { size: 128, cascadeCount: 2, foamSize: 256 }, medium: { size: 128, cascadeCount: 3, foamSize: 512 } }[quality]
+    ?? { size: SEA_SIZE, cascadeCount: 3, foamSize: 1024 };
 }
+/**
+ * ══ THE WHITECAP MEMORY (2026-09-07) ══════════════════════════════════════
+ *
+ * "Our default ocean looks pathetic" — a 500 m sea with soft foam blobs in
+ * the 32 m ripple window and NOTHING beyond it. The per-pixel whitecap gate
+ * (`seaFoamNode` on the composed Jacobian) is instantaneous and reads the
+ * cascades at the pixel's own mip, and a filtered Jacobian averages toward 1:
+ * past a few tens of metres the gate can never open, so the far sea is glass
+ * while the reference (Popov72/OceanDemo) carries streaky foam to the
+ * horizon. Its foam is a MEMORY — "turbulence", the Jacobian's deficit
+ * integrated over seconds and decaying — and a memory mip-filters as a
+ * COVERAGE, which is exactly what the distance needs.
+ *
+ * So the sea keeps one: a camera-following window of FOAM_WINDOW_METRES
+ * (texel-snapped, like the caustic and ripple windows) over the COMPOSED
+ * Jacobian — never per cascade, see the ⛔ below — where each texel holds
+ * max(whitecap now, last frame's value × decay). A crest that folds leaves
+ * a trail as it travels: the streaks. The lid reads it per pixel
+ * (`waterFoam.js`) and per vertex (the solver's far-foam seed), the ripple
+ * window's field remains the near-field memory a splash writes into.
+ */
+export const FOAM_WINDOW_METRES = 512;
+/** e-folding time of a whitecap's memory: a few seconds, as in the demo. */
+export const FOAM_LIFE_SECONDS = 6;
 /** Babylon's LOD scale: a cascade fades out of the shading normal past
  *  LOD_SCALE × L metres from the eye, where its texels are under a pixel. */
 export const LOD_SCALE = 7.13;
@@ -177,7 +202,7 @@ function fftKernel(srcA, srcB, dstA, dstB, horizontal, size) {
  * The sea: `configure(props, depthMetres)` re-realizes the spectrum,
  * `tick(renderer, dt, time)` advances it. `cascades[i]` exposes the maps.
  */
-export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 1337 } = {}) {
+export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 1337, foamSize = 1024 } = {}) {
   const noiseData = gaussianNoise(size, seed);
   const noise = new THREE.DataTexture(noiseData, size, size, THREE.RGFormat, THREE.FloatType);
   noise.minFilter = noise.magFilter = THREE.NearestFilter;
@@ -194,6 +219,16 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   const sign = select(px.add(py).bitAnd(int(1)).equal(int(1)), float(-1), float(1));
   const displacement = storageMap(size, { half: true, mips: true, layers: cascadeCount, name: "sea displacement" });
   const derivatives = storageMap(size, { half: true, mips: true, layers: cascadeCount, name: "sea derivatives" });
+  // The whitecap memory: two maps, ping-ponged (a storage texture is never
+  // read and written in one kernel), and its window's placement.
+  const foamMaps = [0, 1].map((i) => storageMap(foamSize, { half: true, mips: true, name: `sea foam ${i}` }));
+  for (const t of foamMaps) t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+  const f = {
+    size: foamSize, center: uniform(new THREE.Vector2(0, 0)), half: uniform(FOAM_WINDOW_METRES / 2),
+    texel: uniform(FOAM_WINDOW_METRES / foamSize), shift: uniform(new THREE.Vector2(0, 0)),
+    gate: uniform(.25), decay: uniform(1), lods: Array.from({ length: cascadeCount }, () => uniform(0)),
+  };
+  let foamPhase = 0, foamWritten = null;
 
   const cascades = Array.from({ length: cascadeCount }, (_, i) => {
     const c = { dk: uniform(1), cutLow: uniform(0), cutHigh: uniform(9999), amplitude: uniform(0), invL: uniform(1), L: 1,
@@ -282,6 +317,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         // The x-slope moment of this band alone, doubled for both directions,
         // at the realized amplitude.
         c.slopeVariance.value = 2 * spectrumMoments(64, [band], settings).gradient * spectrum.amplitude * spectrum.amplitude;
+        // The foam window reads each cascade at the level whose texel matches
+        // its own, or a fine cascade aliases across the window's texels.
+        f.lods[i].value = Math.max(0, Math.log2(Math.max(1, f.texel.value / (band.L / size))));
       });
       dirty = true;
       return settings;
@@ -289,18 +327,54 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     /** The sea carries no memory of its own (the solver's foam field does);
      *  a restart re-realizes nothing. Kept so the solver may call it. */
     restart() {},
-    /** The dispatches for this frame, in order; `renderer.compute(...)` them. */
-    passes(dt, time) {
+    /** The dispatches for this frame, in order; `renderer.compute(...)` them.
+     *  `eye` is the camera in the sea's metres (a water's local XZ × its
+     *  scale) — the foam window follows it; `foam` is the water's dial. */
+    passes(dt, time, { eye = null, foam = null } = {}) {
       const queue = [];
       if (!settings) return queue;
       if (dirty) { for (const c of cascades) queue.push(c.kernels.initial, c.kernels.conjugate); dirty = false; }
       u.time.value = time * settings.timeScale; u.dt.value = Math.min(.5, Math.max(0, dt));
       for (const c of cascades) queue.push(c.kernels.evolve, c.kernels.fftRows, c.kernels.fftCols, c.kernels.merge);
+      // The whitecap memory: window snapped to whole texels on the eye, last
+      // frame's map read at the shifted texel, this frame's written to the
+      // other map, which the lid then samples.
+      if (foam != null) f.gate.value = Math.max(0, Math.min(1, foam));
+      f.decay.value = Math.exp(-Math.min(.5, Math.max(0, dt)) / FOAM_LIFE_SECONDS);
+      const t = f.texel.value;
+      if (eye) {
+        const cx = Math.round(eye[0] / t) * t, cz = Math.round(eye[1] / t) * t;
+        f.shift.value.set(Math.round((cx - f.center.value.x) / t), Math.round((cz - f.center.value.y) / t));
+        f.center.value.set(cx, cz);
+      } else f.shift.value.set(0, 0);
+      queue.push(foamKernels[foamPhase]);
+      foamWritten = foamMaps[1 - foamPhase];
+      spectrum.nodes.foam.value = foamWritten;
+      foamPhase = 1 - foamPhase;
       return queue;
     },
-    tick(renderer, dt, time) {
-      const queue = spectrum.passes(dt, time);
-      if (queue.length && renderer?.isWebGPURenderer) renderer.compute(queue);
+    /**
+     * ⛔ THE MAPS' MIPS ARE OURS TO MAKE. three regenerates a storage
+     * texture's mips only when a SAMPLED binding of it is (re)built after a
+     * store binding marked it (Bindings.js), and the sea's arrays are bound
+     * once and cached — so every mip above 0 stayed the zero it was created
+     * with. Every `.level(n > 0)` read — the clipmap's coarse rings, the
+     * far pixels' hardware mip, the foam memory's coverage — read NOTHING:
+     * the sea was flat from the sixth ring out (receipt: RMS 0.00 m on
+     * levels 6–8, 0.41 on level 5 = 0.8 × mip 0 + 0.2 × an empty mip 1;
+     * 2026-09-07). Called after the sea's dispatches and before the surface
+     * reads them, so the coarse levels describe THIS frame's sea.
+     */
+    generateMipmaps(renderer) {
+      const backend = renderer?.backend;
+      if (!backend?.generateMipmaps || globalThis.__waterSeaMips === false) return;   // `__waterSeaMips = false`: the harness's control arm
+      for (const t of [displacement, derivatives, foamWritten]) {
+        if (t && backend.get?.(t)?.texture) backend.generateMipmaps(t);
+      }
+    },
+    tick(renderer, dt, time, options) {
+      const queue = spectrum.passes(dt, time, options);
+      if (queue.length && renderer?.isWebGPURenderer) { renderer.compute(queue); spectrum.generateMipmaps(renderer); }
     },
     /**
      * The displacement maps of the cascades that carry height, copied to the
@@ -314,11 +388,35 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       return { cascades: maps.map((map, i) => ({ size, L: cascades[i].L, displacement: map })) };
     },
     dispose(renderer) {
-      releaseComputeNodes(renderer, cascades.flatMap((c) => Object.values(c.kernels)));
+      releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), ...foamKernels]);
       for (const c of cascades) for (const t of c.textures) t.dispose();
+      for (const t of foamMaps) t.dispose();
       displacement.dispose(); derivatives.dispose(); noise.dispose();
     },
   };
+  spectrum.foam = f;
+  spectrum.nodes.foam = texture(foamMaps[0]);
+  // The memory's step, one kernel per ping-pong direction. A texel's world
+  // position is the window's centre plus its offset; the whitecap it holds
+  // is the same per-pixel gate the lid uses (on the composed Jacobian, at
+  // the cascades' matching levels); its past is the OTHER map at the texel
+  // that held this world position before the window moved, or — at the
+  // window's fresh edge — the present.
+  const foamKernel = (source, target) => Fn(() => {
+    const i = instanceIndex.toInt();
+    const fx = i.mod(foamSize), fy = i.div(foamSize);
+    const world = vec2(
+      fx.toFloat().add(.5).sub(foamSize / 2).mul(f.texel).add(f.center.x),
+      fy.toFloat().add(.5).sub(foamSize / 2).mul(f.texel).add(f.center.y));
+    const sea = seaDisplacementAt(spectrum, world, f.lods);
+    const now = seaFoamNode(seaJacobianAt(spectrum, world, sea.w, f.lods), f.gate).toVar();
+    const sx = fx.add(f.shift.x.toInt()), sy = fy.add(f.shift.y.toInt());
+    const inside = sx.greaterThanEqual(0).and(sx.lessThan(foamSize)).and(sy.greaterThanEqual(0)).and(sy.lessThan(foamSize));
+    const prev = select(inside, textureLoad(source, ivec2(sx.clamp(0, foamSize - 1), sy.clamp(0, foamSize - 1))).x, now);
+    textureStore(target, ivec2(fx, fy), vec4(now.max(prev.mul(f.decay)), 0, 0, 1));
+  })().compute(foamSize * foamSize);
+  const foamKernels = [foamKernel(foamMaps[0], foamMaps[1]), foamKernel(foamMaps[1], foamMaps[0])];
+  foamKernels.forEach((k, i) => { k.__giPassName = `sea.foam${i}`; });
   return spectrum;
 }
 
@@ -403,6 +501,21 @@ export function seaSlopeAt(spectrum, world, { lods = null, weights = null } = {}
  */
 export function seaFoldNode(jacobian) {
   return float(.45).sub(jacobian).div(.15).clamp(0, 1);
+}
+/**
+ * The whitecap memory at a world point (see FOAM_WINDOW_METRES): 0–1, fading
+ * to nothing over the window's outer 4 %. `level` for a compute stage (no
+ * screen derivatives); a fragment lets the hardware pick — the mips are a
+ * COVERAGE, so a far pixel reads the fraction of its footprint that foams.
+ */
+export function seaFoamWindowNode(spectrum, world, level = null) {
+  const f = spectrum.foam;
+  if (!f) return float(0);
+  const uv = world.sub(f.center).div(f.half.mul(2)).add(.5).toVar();
+  const margin = uv.x.min(uv.x.oneMinus()).min(uv.y).min(uv.y.oneMinus());
+  let s = spectrum.nodes.foam.sample(uv.clamp(.001, .999));
+  if (level != null) s = s.level(level);
+  return s.x.mul(margin.smoothstep(0, .04));
 }
 export function seaFoamNode(jacobian, foam) {
   // ⚠ THE GATE IS ON J ITSELF. It used to open at 1 − J > mix(1.3, .6, foam),

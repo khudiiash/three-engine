@@ -3,7 +3,7 @@ import {
   screenUV, select, texture, vec2, vec3,
 } from "three/tsl";
 import { waterRimDistanceNode } from "./waterShape.js";
-import { seaDisplacementAt, seaFoamNode, seaJacobianAt } from "./waterSpectrum.js";
+import { seaDisplacementAt, seaFoamNode, seaFoamWindowNode, seaJacobianAt } from "./waterSpectrum.js";
 
 /**
  * ══ WHAT A WATER SURFACE ADDS ON TOP OF BEING A MIRROR ═════════════════════
@@ -144,10 +144,17 @@ function waterFoamBody(u, sceneDepth, spectrum) {
   // average away — an ocean at full choppiness showed no whitecaps at all
   // (the ocean arm, 2026-09-06). The fold is read here at the pixel from the
   // same cascades the shading normal reads, band-limited by their own mips.
-  let simulated = attribute("waterFoam", "float").clamp(0, 1);
+  // The ripple field's foam: wakes, splashes, a rim's churn — drawn with the
+  // sheet / network / flecks below. The SEA's whitecaps are a separate value
+  // and a separate look (the end of this function).
+  const simulated = attribute("waterFoam", "float").clamp(0, 1);
+  let sea = null;
   if (spectrum) {
+    // The whitecap MEMORY (waterSpectrum.js, the foam window) carries the
+    // streaks and the distance; the instantaneous gate keeps the fold's own
+    // edge crisp where the eye is close enough to see it.
     const cross = seaDisplacementAt(spectrum, p).w;
-    simulated = simulated.max(seaFoamNode(seaJacobianAt(spectrum, p, cross), u.foam));
+    sea = seaFoamWindowNode(spectrum, p).max(seaFoamNode(seaJacobianAt(spectrum, p, cross), u.foam)).toVar();
   }
   // The width itself is modulated, so the shoreline is ragged rather than a
   // uniform ring offset from the geometry.
@@ -220,8 +227,42 @@ function waterFoamBody(u, sceneDepth, spectrum) {
   const sheetMask = v.smoothstep(.5, .82);
   const webMask = v.smoothstep(.05, .38);
   const speckMask = v.smoothstep(.015, .16);
-  const foam = sheetMask.mul(sheet).max(webMask.mul(network)).max(speckMask.mul(specks)).clamp(0, 1);
-  return foam.mul(u.foam.smoothstep(0, .15));
+  const wake = sheetMask.mul(sheet).max(webMask.mul(network)).max(speckMask.mul(specks)).clamp(0, 1);
+  if (!sea) return wake.mul(u.foam.smoothstep(0, .15));
+
+  // ── THE WHITECAPS (2026-09-07) ──────────────────────────────────────
+  //
+  // A breaking crest is a ragged sheet that dissolves into STREAKS along the
+  // wind and then into bubbles — never the wake's lattice, which at sea
+  // scale read as lace over hundreds of metres. The memory (0–1, decaying
+  // from the fold) is cut by a fractal stretched four to one along the wave
+  // direction: fresh foam is a sheet with bubbles in it, older foam only
+  // where the streaks run, and the last of it a few bubbles. The texture is
+  // finer than a pixel past a few tens of metres, so it fades out with
+  // distance and the mip-filtered COVERAGE takes over as a soft tone — the
+  // horizon is a stipple, not a speckle.
+  // The memory's values are SMALL (linear, at the ocean preset, harness
+  // 2026-09-07: median .05, p90 .28, p99 .64 — the gate opens a little,
+  // often, and decays). A SHEET above .3 (its edge eaten by the bubbles),
+  // STREAKS where the stretched fractal falls under three times the value
+  // (a tenth of the area at the median, nearly all of a fresh patch), the
+  // bubbles' own texture over both — with holes, or under a sun the foam
+  // clips to a flat white. (Distance fades written as 1 − smoothstep: the
+  // reversed-edge form is undefined in GLSL and not worth a doubt in WGSL.)
+  const wind = vec2(u.waveCos, u.waveSin);
+  const along = p.dot(wind), across = p.y.mul(wind.x).sub(p.x.mul(wind.y));
+  const streak = fbm(vec2(along.mul(.3), across.mul(1.3)), clock, .5);
+  const bubbles = fbm(p.mul(4.5), clock, 1.6);
+  const metres = positionWorld.sub(cameraPosition).length();
+  const bubbleDetail = metres.smoothstep(15, 60).oneMinus(), streakDetail = metres.smoothstep(60, 240).oneMinus();
+  const capSheet = sea.sub(bubbles.mul(.15).mul(bubbleDetail)).smoothstep(.55, .8);
+  const streaks = sea.mul(1.6).sub(mix(float(.45), streak, streakDetail)).div(.2).clamp(0, 1);
+  const capTexture = mix(float(.85), bubbles.smoothstep(.3, .7).mul(.7).add(.3), bubbleDetail);
+  const near = capSheet.max(streaks.mul(.85)).mul(capTexture).clamp(0, 1);
+  // Far: the mip-filtered coverage itself, as a tone.
+  const far = sea.smoothstep(.15, .7).mul(.7);
+  const whitecap = mix(near, far, metres.smoothstep(60, 240));
+  return wake.max(whitecap).mul(u.foam.smoothstep(0, .15));
 }
 
 /**
@@ -232,6 +273,15 @@ function waterFoamBody(u, sceneDepth, spectrum) {
  * within. One dot product, and it is the cue that most separates water from a
  * polished surface.
  */
+/** The sea's raw whitecap value at the pixel (memory ∨ instantaneous gate) — a probe. */
+export function seaFoamValueNode(u, spectrum) {
+  if (!spectrum) return float(0);
+  return Fn(() => {
+    const p = worldXZ(u);
+    const cross = seaDisplacementAt(spectrum, p).w;
+    return seaFoamWindowNode(spectrum, p).max(seaFoamNode(seaJacobianAt(spectrum, p, cross), u.foam));
+  })();
+}
 export function waterSubsurfaceNode(u, slot) {
   const toEye = cameraPosition.sub(positionWorld).normalize();
   const toSun = vec3(slot.uniforms.toSun);
