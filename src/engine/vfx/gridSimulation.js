@@ -3,7 +3,7 @@ import { Fn, If, float, int, instanceIndex, instancedArray, select, storage, uni
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
 import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt } from "./waterSpectrum.js";
 import { GRAVITY } from "./waterSpectrumCPU.js";
-import { waterAutoResolution } from "./waterVolume.js";
+import { WATER_CELL_METRES, waterAutoResolution } from "./waterVolume.js";
 import { Vector2, Vector4 } from "three/webgpu";
 
 /**
@@ -32,6 +32,23 @@ export const RIPPLE_WINDOW_METRES = 32;
  * rim the reflection is physical and the sponge is off on that side.
  */
 export const SPONGE_CELLS = 16, SPONGE_STRENGTH = .08;
+/**
+ * ══ THE LID OVER A WIDE POOL IS CLIPMAP RINGS ═══════════════════════════════
+ *
+ * A flat grid caps at 512² (a metre a vertex on a 500 m sea, a 5 m crest four
+ * vertices wide). Over `CLIP_ABOVE_METRES` the lid is Babylon's idea instead
+ * (oceanGeometry.ts): concentric levels of a `CLIP_SIZE`² lattice, level ℓ's
+ * cell 2^ℓ times the pool cell, all centred on the eye — 4 cm at the feet, a
+ * few metres at the horizon, ~4 k vertices a level. All levels share ONE
+ * centre snapped to the coarsest cell, so every level's lattice contains the
+ * finer one's and a level's hole IS the finer level's boundary: no trims, no
+ * stitching. The outer band of a level morphs onto the coarser lattice so its
+ * boundary lands on the next level's own vertices exactly (sea read at the
+ * coarser mip, at the two coarse vertices whose edge the fine one sits on).
+ * The mesh normal is flat everywhere, so a level change is a change of
+ * tessellation only — the shading never sees it.
+ */
+export const CLIP_ABOVE_METRES = 64, CLIP_SIZE = 65;
 import { waterExtinction, waterSaturation } from "./waterVolume.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
 import { projectClothMeshContact, projectClothClosedContact } from "./clothMeshContact.js";
@@ -72,6 +89,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const windowed = scaled && (winW < width * .999 || winH < height * .999);
   const w = kind === "water" ? (scaled ? waterAutoResolution(Math.max(winW * scaleX, winH * scaleZ)) : n) : n;
   const wCount = w * w, sx = winW / (w - 1), sz = winH / (w - 1);
+  // ── THE LID: a flat n×n grid, or clipmap rings over a wide pool ───────────
+  const clip = kind === "water" && scaled && Math.max(width * scaleX, height * scaleZ) > CLIP_ABOVE_METRES;
+  const clipCell = { x: WATER_CELL_METRES / scaleX, z: WATER_CELL_METRES / scaleZ };   // level 0, local units
+  // Enough levels that the coarsest one spans the pool with a cell to spare
+  // for the centre's snap (63 cells ≥ the footprint).
+  const clipLevels = clip ? Math.max(1, Math.ceil(Math.log2(Math.max(width / clipCell.x, height / clipCell.z) / (CLIP_SIZE - 2))) + 1) : 0;
+  const clipHalf = (CLIP_SIZE - 1) / 2;
+  const clipCoarsest = { x: clipCell.x * 2 ** Math.max(0, clipLevels - 1), z: clipCell.z * 2 ** Math.max(0, clipLevels - 1) };
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   // ── THE SEA IS A SEPARATE FIELD, TILING IN WORLD METRES ───────────────────
   //
   // The spectral cascades (`waterSpectrum.js`) do not know how big this box
@@ -80,7 +106,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // one of its own; the component may hand one in.
   const ownsSpectrum = kind === "water" && !givenSpectrum;
   const spectrum = kind === "water" ? (givenSpectrum ?? createWaterSpectrum(seaQuality ?? {})) : null;
-  const count = n * n, dx = width / (n - 1), dy = height / (n - 1);
+  const count = clip ? clipLevels * CLIP_SIZE * CLIP_SIZE : n * n, dx = width / (n - 1), dy = height / (n - 1);
+  // The rim ring's vertices per edge: the flat grid's own, or the outer
+  // level's lattice (so the shell's top meets the lid's boundary exactly).
+  const rimN = clip ? CLIP_SIZE : n;
+  const rimRest = (ix, iz) => clip
+    ? [clamp((ix - clipHalf) * clipCoarsest.x, -width / 2, width / 2), clamp((iz - clipHalf) * clipCoarsest.z, -height / 2, height / 2)]
+    : [ix * dx - width / 2, iz * dy - height / 2];
   // ── THE WATER BODY IS A BOX, AND THESE ARE THE VERTICES THAT CLOSE IT ─────
   //
   // The solver owns `count` heightfield vertices and nothing else. The SKIRT —
@@ -99,15 +131,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // interpolated a -Z normal into a +X one across the last cell of every edge
   // and lit a visible seam into all four corners of the body. Duplicated, each
   // wall is flat to its own normal and the corner is the hard edge it is.
-  const ringLength = kind === "water" ? 4 * n : 0;
+  const ringLength = kind === "water" ? 4 * rimN : 0;
   const WALL_TOP = count, WALL_BOTTOM = count + ringLength, FLOOR = count + ringLength * 2;
   const total = kind === "water" ? FLOOR + 4 : count;
   const ringCell = (k) => {
-    const e = Math.floor(k / n), i = k % n;
-    return e === 0 ? [i, 0] : e === 1 ? [n - 1, i] : e === 2 ? [n - 1 - i, n - 1] : [0, n - 1 - i];
+    const e = Math.floor(k / rimN), i = k % rimN;
+    return e === 0 ? [i, 0] : e === 1 ? [rimN - 1, i] : e === 2 ? [rimN - 1 - i, rimN - 1] : [0, rimN - 1 - i];
   };
   const ringNormal = (k) => {
-    const e = Math.floor(k / n);
+    const e = Math.floor(k / rimN);
     return e === 0 ? [0, 0, -1] : e === 1 ? [1, 0, 0] : e === 2 ? [0, 0, 1] : [-1, 0, 0];
   };
   const positions = instancedArray(wCount, "vec4");
@@ -151,6 +183,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     rippleShift: uniform(new Vector2(0, 0)),
     // Which sides of the window lie inside the pool (west, east, north, south).
     rippleSponge: uniform(new Vector4(0, 0, 0, 0)),
+    // The clipmap's shared centre (local x, z), snapped to the coarsest cell.
+    clipCenter: uniform(new Vector2(0, 0)),
     waveOctaves: uniform(4), waveGain: uniform(.5), surfaceDetail: uniform(.6),
     choppiness: uniform(.35), rippleStrength: uniform(.25),
     color: uniform(new THREE.Color()), deepColor: uniform(new THREE.Color()), waterDepth: uniform(2), absorption: uniform(0), saturation: uniform(.35),
@@ -195,6 +229,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const world = vec2(local.x.mul(u.waveScale.x), local.z.mul(u.waveScale.z));
     const sea = seaDisplacementAt(spectrum, world, lods);
     return seaFoamNode(seaJacobianAt(spectrum, world, sea.w, lods), u.foam).mul(4).clamp(0, 1);
+  };
+  // The lid's foam at a rest point: the window's persistent field where the
+  // window is, the sea's instantaneous fold foam beyond it (blended over the
+  // window's outer band), so an ocean's whitecaps do not stop 16 m from the eye.
+  const lidFoamAt = (rest, ripple) => {
+    const t = rippleUv(rest);
+    const margin = t.x.min(t.x.oneMinus()).min(t.y).min(t.y.oneMinus());
+    const core = margin.smoothstep(.5 / w, (SPONGE_CELLS + .5) / w);
+    return ripple.w.max(farFoamAt(rest, u.seaLod).mul(core.oneMinus()));
   };
   // Where a LOCAL point falls in the ripple texture, and whether it is inside.
   const rippleUv = (local) => vec2(local.x.sub(u.rippleCenter.x).div(u.rippleHalf.x.mul(2)).add(.5), local.z.sub(u.rippleCenter.y).div(u.rippleHalf.y.mul(2)).add(.5));
@@ -524,6 +567,36 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     return float(width / 2).sub(p.x.abs()).div(mx).clamp(0, 1).mul(float(height / 2).sub(p.z.abs()).div(mz).clamp(0, 1));
   };
   const seaAt = (p) => seaDisplacementAt(spectrum, vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z)), u.seaLod);
+  // The composed surface at a lid rest point, the sea read `lodShift` mips
+  // above the finest lid cell's. One function for both lid layouts and the rim.
+  const lidSurfaceAt = (rest, lodShift = null) => {
+    const world = vec2(rest.x.mul(u.waveScale.x), rest.z.mul(u.waveScale.z));
+    const sea = seaDisplacementAt(spectrum, world, lodShift ? u.seaLod.map((l) => l.add(lodShift)) : u.seaLod);
+    const hold = edgeHold(rest);
+    const ripple = rippleAt(rest);
+    return vec3(rest.x.add(sea.x.div(u.waveScale.x).mul(hold)), ripple.x.add(sea.y.div(u.waveScale.y)), rest.z.add(sea.z.div(u.waveScale.z).mul(hold)));
+  };
+  // ── CLIPMAP RINGS (see CLIP_ABOVE_METRES) ─────────────────────────────────
+  const clipRest = (level, i, j) => {
+    const cell = float(2).pow(level.toFloat());
+    return vec3(
+      u.clipCenter.x.add(i.toFloat().sub(clipHalf).mul(cell).mul(clipCell.x)).clamp(-width / 2, width / 2), 0,
+      u.clipCenter.y.add(j.toFloat().sub(clipHalf).mul(cell).mul(clipCell.z)).clamp(-height / 2, height / 2));
+  };
+  const clipPoint = (level, i, j) => {
+    const lf = level.toFloat();
+    const fine = lidSurfaceAt(clipRest(level, i, j), lf);
+    // The two coarse-lattice vertices whose edge this vertex sits on (itself,
+    // twice, when it is one): odd i → its x neighbours, odd j → its z
+    // neighbours, both odd → the quad's split diagonal, which the index buffer
+    // runs from (i+1, j−1) to (i−1, j+1).
+    const pi = i.mod(2), pj = j.mod(2), both = pi.mul(pj).mul(2);
+    const a = lidSurfaceAt(clipRest(level, i.sub(pi).add(both), j.sub(pj)), lf.add(1));
+    const b = lidSurfaceAt(clipRest(level, i.add(pi).sub(both), j.add(pj)), lf.add(1));
+    const d = i.toFloat().sub(clipHalf).abs().max(j.toFloat().sub(clipHalf).abs()).div(clipHalf);
+    const morph = select(level.equal(int(clipLevels - 1)), float(0), d.smoothstep(.7, .95));
+    return mix(fine, a.add(b).mul(.5), morph);
+  };
   // Render vertex coordinates (n×n) and the rest of a render vertex.
   const rx = index.mod(n), ry = index.div(n);
   const restOf = (i) => initial(i.mod(n), i.div(n));
@@ -581,27 +654,23 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       return;
     }
     // A render vertex: its rest, the sea there, and the window's ripple there.
-    const p = initial(rx, ry).toVar();
-    const world = vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z));
-    const sea = seaDisplacementAt(spectrum, world, u.seaLod).toVar();
-    const hold = edgeHold(p);
-    const ripple = rippleAt(p).toVar();
-    const point = vec3(p.x.add(sea.x.div(u.waveScale.x).mul(hold)), ripple.x.add(sea.y.div(u.waveScale.y)), p.z.add(sea.z.div(u.waveScale.z).mul(hold))).toVar();
     // ⭐ THE MESH NORMAL IS FLAT. Both slopes — the window's ripples and the
     // sea's cascades — are composed per PIXEL from textures
     // (`waterSurfaceLook.js`), so a splash reads the same on a 4 cm mesh and
     // on a 40 cm one; the geometry only has to be displaced.
-    normals.element(index).assign(vec3(0, 1, 0));
-    output.element(index).assign(point);
-    if (foamOut) {
-      // Inside the window the persistent field; beyond it (and blended over
-      // the window's outer band) the sea's instantaneous fold foam, so an
-      // ocean's whitecaps do not stop 16 m from the eye.
-      const t = rippleUv(p);
-      const margin = t.x.min(t.x.oneMinus()).min(t.y).min(t.y.oneMinus());
-      const core = margin.smoothstep(.5 / w, (SPONGE_CELLS + .5) / w);
-      foamOut.element(index).assign(ripple.w.max(farFoamAt(p, u.seaLod).mul(core.oneMinus())));
+    if (clip) {
+      const level = index.div(CLIP_SIZE * CLIP_SIZE), r = index.mod(CLIP_SIZE * CLIP_SIZE);
+      const i = r.mod(CLIP_SIZE), j = r.div(CLIP_SIZE);
+      const rest = clipRest(level, i, j).toVar();
+      normals.element(index).assign(vec3(0, 1, 0));
+      output.element(index).assign(clipPoint(level, i, j));
+      if (foamOut) foamOut.element(index).assign(lidFoamAt(rest, rippleAt(rest)));
+      return;
     }
+    const p = initial(rx, ry).toVar();
+    normals.element(index).assign(vec3(0, 1, 0));
+    output.element(index).assign(lidSurfaceAt(p));
+    if (foamOut) foamOut.element(index).assign(lidFoamAt(p, rippleAt(p)));
     if (false) {
       // ── FOAM IS MEASURED AGAINST THE FIELD'S OWN STEEPNESS ───────────────
       //
@@ -661,17 +730,17 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // The skirt's own vertices. Reads only `positions` (committed by the previous
   // dispatch) and the depth uniform, so nothing here races the solver.
   const skirtVertex = kind === "water" ? () => {
-    const m = n - 1;
+    const m = rimN - 1;
     const k = index.sub(count).toVar();
     If(k.lessThan(ringLength * 2), () => {
       const ring = k.mod(ringLength).toVar();
-      const edge = ring.div(n).toVar(), along = ring.mod(n).toVar();
+      const edge = ring.div(rimN).toVar(), along = ring.mod(rimN).toVar();
       const ix = int(0).toVar(), iz = int(0).toVar(), outward = vec3(0).toVar();
       If(edge.equal(int(0)), () => { ix.assign(along); iz.assign(int(0)); outward.assign(vec3(0, 0, -1)); })
         .ElseIf(edge.equal(int(1)), () => { ix.assign(int(m)); iz.assign(along); outward.assign(vec3(1, 0, 0)); })
         .ElseIf(edge.equal(int(2)), () => { ix.assign(int(m).sub(along)); iz.assign(int(m)); outward.assign(vec3(0, 0, 1)); })
         .Else(() => { ix.assign(int(0)); iz.assign(int(m).sub(along)); outward.assign(vec3(-1, 0, 0)); });
-      const rim = surfacePosition(iz.mul(n).add(ix)).toVar();
+      const rim = (clip ? clipPoint(int(clipLevels - 1), ix, iz) : surfacePosition(iz.mul(n).add(ix))).toVar();
       if(foamOut)foamOut.element(index).assign(float(0));
       normals.element(index).assign(outward);
       output.element(index).assign(vec3(rim.x, select(k.lessThan(ringLength), rim.y, u.waterDepth.negate()), rim.z));
@@ -692,7 +761,24 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   })().compute(total);
   const geometry = new THREE.BufferGeometry();
   const indices = [], uv = new Float32Array(total * 2);
-  for (let iy = 0; iy < n; iy++) for (let ix = 0; ix < n; ix++) {
+  if (clip) {
+    // The rings' rest lattice about the origin (the kernel re-centres it every
+    // frame); level ℓ > 0 leaves the hole the finer level fills. The quad split
+    // is the flat grid's — `clipPoint`'s diagonal rule depends on it.
+    const hole0 = (CLIP_SIZE - 1) / 4, hole1 = hole0 * 3;
+    for (let level = 0; level < clipLevels; level++) {
+      const cell = 2 ** level, base = level * CLIP_SIZE * CLIP_SIZE;
+      for (let j = 0; j < CLIP_SIZE; j++) for (let i = 0; i < CLIP_SIZE; i++) {
+        const v = base + j * CLIP_SIZE + i;
+        const px = clamp((i - clipHalf) * cell * clipCell.x, -width / 2, width / 2), pz = clamp((j - clipHalf) * cell * clipCell.z, -height / 2, height / 2);
+        positionAttribute.setXYZ(v, px, 0, pz); normalAttribute.setXYZ(v, 0, 1, 0);
+        uv[v * 2] = px / width + .5; uv[v * 2 + 1] = .5 - pz / height;
+        if (i === CLIP_SIZE - 1 || j === CLIP_SIZE - 1) continue;
+        if (level > 0 && i >= hole0 && i < hole1 && j >= hole0 && j < hole1) continue;
+        indices.push(v, v + CLIP_SIZE, v + 1, v + 1, v + CLIP_SIZE, v + CLIP_SIZE + 1);
+      }
+    }
+  } else for (let iy = 0; iy < n; iy++) for (let ix = 0; ix < n; ix++) {
     const i = iy * n + ix; uv[i * 2] = ix / (n - 1); uv[i * 2 + 1] = 1 - iy / (n - 1);
     // Keep an authored rest surface on the CPU for editor picking/bounds.
     // Render and shadow passes read the GPU-deformed attribute. Raycasts are
@@ -709,7 +795,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const restDepth = finite(props.waterDepth, 2, .01, 1000);
     for (let k = 0; k < ringLength; k++) {
       const [ix, iz] = ringCell(k), nrm = ringNormal(k);
-      const px = ix * dx - width / 2, pz = iz * dy - height / 2;
+      const [px, pz] = rimRest(ix, iz);
       for (const [slot, py] of [[WALL_TOP, 0], [WALL_BOTTOM, -restDepth]]) {
         positionAttribute.setXYZ(slot + k, px, py, pz);
         normalAttribute.setXYZ(slot + k, nrm[0], nrm[1], nrm[2]);
@@ -722,7 +808,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // viewer outside the water can see and drew the ones behind them.
       // No quad spans a corner: the last vertex of an edge and the first of the
       // next occupy the same place but belong to different walls.
-      if (k % n === n - 1) continue;
+      if (k % rimN === rimN - 1) continue;
       const next = k + 1;
       indices.push(WALL_TOP + k, WALL_TOP + next, WALL_BOTTOM + k, WALL_TOP + next, WALL_BOTTOM + next, WALL_BOTTOM + k);
     }
@@ -996,10 +1082,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       targetCenter = {
         x: Math.max(-(width / 2 - winW / 2), Math.min(width / 2 - winW / 2, Number(x) || 0)),
         z: Math.max(-(height / 2 - winH / 2), Math.min(height / 2 - winH / 2, Number(z) || 0)),
+        eyeX: clamp(Number(x) || 0, -width / 2, width / 2), eyeZ: clamp(Number(z) || 0, -height / 2, height / 2),
       };
     },
     /** The window's centre in local units (a Vector2: x, z). */
     get rippleCenter() { return u.rippleCenter.value; },
+    /** The lid's layout: clipmap rings over a wide pool, or null for the flat grid. */
+    clip: clip ? { levels: clipLevels, size: CLIP_SIZE, cell: clipCell, get center() { return u.clipCenter.value; } } : null,
     /** The sea as the CPU last saw it — `waterPhysics.js` floats bodies on this. */
     get seaSample() { return seaSample; },
     /** Harness aid: force every cascade to mip 0 for a bit-level parity check. */
@@ -1134,6 +1223,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         if (meshColliderField) { meshColliderField.refresh(); u.meshCollisionSkip.value = meshColliderField.entityIndices?.get(colliderEntityId) ?? -1; }
       }
       if (!initialized) { queue.push(init); initialized = true; targetCenter = null; }
+      if (targetCenter && clip) {
+        // The rings' centre snaps to the coarsest cell so every level's lattice
+        // stays inside the next one's (see CLIP_ABOVE_METRES).
+        u.clipCenter.value.set(
+          clamp(Math.round(targetCenter.eyeX / clipCoarsest.x) * clipCoarsest.x, -width / 2, width / 2),
+          clamp(Math.round(targetCenter.eyeZ / clipCoarsest.z) * clipCoarsest.z, -height / 2, height / 2));
+      }
       if (targetCenter) {
         // The window moves here, in whole cells, and the field moves with it in
         // the same queue — a centre that moved before its field would put this

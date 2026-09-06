@@ -98,7 +98,7 @@ try {
    installWaterMedium(engine);
    installWaterCausticLight(engine);
    installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
-   log(`pool ${S} m: mesh ${sim.resolution} (${(S / (sim.resolution - 1) * 100).toFixed(1)} cm), ripple window ${sim.ripple.resolution} cells over ${(sim.ripple.windowWidth * S).toFixed(1)} m (${(sim.ripple.cellX * S * 100).toFixed(1)} cm cells${sim.ripple.windowed ? ', following the camera' : ''})`);
+   log(`pool ${S} m: lid ${sim.clip ? `${sim.clip.levels} clipmap levels of ${sim.clip.size}² (${(sim.clip.cell.x * S * 100).toFixed(1)} cm at the eye, ${(sim.clip.cell.x * S * 2 ** (sim.clip.levels - 1)).toFixed(1)} m at the rim, ${sim.count} vertices)` : `${sim.resolution}² flat (${(S / (sim.resolution - 1) * 100).toFixed(1)} cm)`}, ripple window ${sim.ripple.resolution} cells over ${(sim.ripple.windowWidth * S).toFixed(1)} m (${(sim.ripple.cellX * S * 100).toFixed(1)} cm cells${sim.ripple.windowed ? ', following the camera' : ''})`);
 
    const camera = new THREE.PerspectiveCamera(55, W / H, .05, 400);
    engine.camera = camera;
@@ -158,6 +158,45 @@ try {
    await shoot('splash-4s');
    pose([-3.2, 3.4, 3.2], [.6, 0, -.6]);
    await shoot('foam-after-splash');
+
+   // ── THE RINGS HAVE NO CRACKS ───────────────────────────────────────────
+   //
+   // Every boundary vertex of level ℓ−1 must land on level ℓ's own surface:
+   // on a level-ℓ vertex where the lattices share one, on the midpoint of the
+   // two level-ℓ vertices whose edge it sits on otherwise. Read straight off
+   // the vertex buffer, in world metres, at the pose where a crack would show.
+   if (sim.clip) {
+     const M = sim.clip.size, L = sim.clip.levels, M2 = M * M;
+     const v = new Float32Array(await renderer.getArrayBufferAsync(sim.mesh.geometry.attributes.position));
+     // ⚠ a vec3 storage attribute reads back at a 16-byte stride (4 floats).
+     const at = (idx) => [v[idx * 4] * S, v[idx * 4 + 1] * DEPTH, v[idx * 4 + 2] * S];
+     const h0 = (M - 1) / 4;
+     let worst = 0, checked = 0, worstAt = '';
+     for (let level = 1; level < L; level++) {
+       for (let j = 0; j < M; j++) for (let i = 0; i < M; i++) {
+         if (i !== 0 && i !== M - 1 && j !== 0 && j !== M - 1) continue;
+         const fine = at((level - 1) * M2 + j * M + i);
+         const pi = i % 2, pj = j % 2, both = pi * pj * 2;
+         const ca = [h0 + (i - pi + both) / 2, h0 + (j - pj) / 2], cb = [h0 + (i + pi - both) / 2, h0 + (j + pj) / 2];
+         const a = at(level * M2 + ca[1] * M + ca[0]), b = at(level * M2 + cb[1] * M + cb[0]);
+         const gap = Math.hypot(fine[0] - (a[0] + b[0]) / 2, fine[1] - (a[1] + b[1]) / 2, fine[2] - (a[2] + b[2]) / 2);
+         if (gap > worst) { worst = gap; worstAt = `level ${level - 1} (${i},${j}) fine ${fine.map((x) => x.toFixed(3))} vs coarse ${ca} ${a.map((x) => x.toFixed(3))} + ${cb} ${b.map((x) => x.toFixed(3))}`; }
+         checked++;
+       }
+     }
+     log(`clipmap seams: ${checked} boundary vertices over ${L - 1} level joins, worst gap ${(worst * 1000).toFixed(3)} mm (${worstAt})`);
+     if (!(worst < .002)) throw new Error(`the rings crack: ${worst} m`);
+     // ...and the shell's top edge is the outer level's boundary, vertex for vertex.
+     let rimGap = 0;
+     for (let k = 0; k < 4 * M; k++) {
+       const e = Math.floor(k / M), t = k % M;
+       const [ix, iz] = e === 0 ? [t, 0] : e === 1 ? [M - 1, t] : e === 2 ? [M - 1 - t, M - 1] : [0, M - 1 - t];
+       const lid = at((L - 1) * M2 + iz * M + ix), wall = at(sim.count + k);
+       rimGap = Math.max(rimGap, Math.hypot(lid[0] - wall[0], lid[1] - wall[1], lid[2] - wall[2]));
+     }
+     log(`clipmap rim: the shell's ${4 * M} top vertices sit on the lid's boundary to ${(rimGap * 1000).toFixed(3)} mm`);
+     if (!(rimGap < .002)) throw new Error(`the shell parts from the lid: ${rimGap} m`);
+   }
 
    // ── THE WINDOW, WHERE THERE IS ONE (the pool is wider than it) ─────────
    //
