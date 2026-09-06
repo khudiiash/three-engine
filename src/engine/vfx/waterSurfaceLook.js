@@ -333,7 +333,12 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // offset is the water between the surface and the object — nothing at
       // the waterline, the whole column at the floor.
       const behind = worldAt(screenUV, viewportDepth.sample(screenUV).x).sub(positionWorld).length();
-      column = column.min(behind);
+      // ⚠ A METRE OF TRAVEL AT MOST. The floor's absolute displacement is
+      // invisible (nothing undisplaced stands beside it to compare with); what
+      // the eye reads is the waves' wobble and an object's break at the
+      // waterline, both of which a metre carries. The full three-metre column
+      // only widened the band beside a crate whose samples land on it.
+      column = column.min(behind).min(1);
       // `transmission` still scales the travel — the dial that reads as
       // "refraction". From below there is no column: the pixel behind.
       const travel = select(fromBelow, float(0), column.mul(through));
@@ -358,11 +363,17 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // normal gives the ray survives next to the crate, only shorter.
       const aboveAt = (uv) => modelWorldMatrixInverse.mul(vec4(worldAt(uv, viewportDepth.sample(uv).x), 1)).y.greaterThan(.002);
       const texel = vec2(1.5).div(screenSize);
-      const uvFull = uvAt(travel), uvMid = uvAt(travel.mul(.35)), uvNear = uvAt(travel.mul(.1));
-      const blockedFull = aboveAt(uvFull)
-        .or(aboveAt(uvFull.add(vec2(texel.x, 0)))).or(aboveAt(uvFull.sub(vec2(texel.x, 0))))
-        .or(aboveAt(uvFull.add(vec2(0, texel.y)))).or(aboveAt(uvFull.sub(vec2(0, texel.y))));
-      const sampleUv = select(blockedFull, select(aboveAt(uvMid), select(aboveAt(uvNear), screenUV, uvNear), uvMid), uvFull);
+      // Every level eroded the same way: a level tested at its centre only
+      // left its own one-pixel contour of bled colour ("several layers of red
+      // borders", user, 2026-09-06).
+      const blockedAt = (uv) => aboveAt(uv)
+        .or(aboveAt(uv.add(vec2(texel.x, 0)))).or(aboveAt(uv.sub(vec2(texel.x, 0))))
+        .or(aboveAt(uv.add(vec2(0, texel.y)))).or(aboveAt(uv.sub(vec2(0, texel.y))));
+      // The last resort keeps the waves: the pixel beneath, nudged by the
+      // surface's slope a few pixels — the wobble without the travel.
+      const uvFull = uvAt(travel), uvMid = uvAt(travel.mul(.4));
+      const uvWobble = screenUV.add(normalView.sub(flatNormalView).xy.mul(vec2(.03, -.03))).clamp(.001, .999);
+      const sampleUv = select(blockedAt(uvFull), select(blockedAt(uvMid), select(blockedAt(uvWobble), screenUV, uvWobble), uvMid), uvFull);
       // ⚠ THE MATERIAL'S OWN ATTENUATION, exactly as three's `volumeAttenuation`
       // read it: colour^(travel / distance), none at an infinite distance. Every
       // water in practice wears the AUTHORED material, whose distance is
