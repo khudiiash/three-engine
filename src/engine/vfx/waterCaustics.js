@@ -76,7 +76,18 @@ export function waterCausticGainLocalNode(P, slot, level = 0, normal = null) {
   // The mip for a stretch of 1/cos is log2(1/cos): the floor stays sharp,
   // the wall reads the soft elongated bands a real pool wall shows.
   const graze = normal ? vec3(normal).dot(vec3(s.toSunRefracted)).abs().max(.06) : null;
-  const lod = graze ? float(level).add(graze.reciprocal().log2().clamp(0, 4)) : float(level);
+  // ── THE PATTERN IS SHARP AT THE FLOOR, AND ONLY THERE ────────────────────
+  //
+  // The map is the lens FOCUSED at floor depth. Higher in the column the
+  // beams have not converged yet: a wall a metre below the surface sees wide
+  // soft bands, not the floor's filaments. Reading the floor's sharp map for
+  // every depth painted the pool walls with full-height razor streaks that
+  // blinked with the lens (user's scene, 2026-09-06). The defocus is a mip
+  // that grows with the distance above the floor — four levels at the
+  // surface, none at the floor — on top of the grazing-angle level.
+  const depthFor = vec3(P).y.negate().min(s.half.y);
+  const defocus = float(1).sub(depthFor.div(s.half.y.max(.001))).clamp(0, 1).mul(4);
+  const lod = (graze ? float(level).add(graze.reciprocal().log2().clamp(0, 4)) : float(level)).add(defocus);
   // ⚠ NOT BOUNDED BELOW BY THE VOLUME FLOOR. It used to be, and that excluded
   // the single most important receiver there is: the floor of the pool sits
   // exactly ON the volume's bottom plane, so `depth < D` was a coin flip on the
@@ -98,8 +109,11 @@ export function waterCausticGainLocalNode(P, slot, level = 0, normal = null) {
   // The receiver may sit ON the volume's boundary — a pool's wall and floor
   // are what bound the water, and a strict inside test left them dry (the
   // harness wall read no caustic at all). A margin of 2 % of the footprint.
+  // ...and a pool's floor is often modelled BELOW the water volume (a thick
+  // slab under a box sized to the rim): the beams carry on past the volume's
+  // bottom, so a receiver may sit up to half a depth under it.
   const margin = s.half.x.max(s.half.z).mul(.02);
-  const inside = depth.greaterThan(0).and(depth.lessThan(s.half.y.add(margin)))
+  const inside = depth.greaterThan(0).and(depth.lessThan(s.half.y.mul(1.5)))
     .and(waterRimDistanceNode(vec4(s.shape), s.half, local.x, local.z).greaterThan(margin.negate()))
     .and(waterRimDistanceNode(vec4(s.shape), s.half, origin.x, origin.y).greaterThan(0));
   const remaining = s.half.y.sub(d).max(0).div(rise);
