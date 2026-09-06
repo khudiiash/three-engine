@@ -70,20 +70,20 @@ function clipQuadratic(t0, t1, A, B, C, lowerSide) {
   If(A.abs().greaterThan(1e-7), () => {
     If(disc.lessThan(0), () => {
       // No roots: the whole ray is outside (A > 0) or inside (A < 0).
-      If(A.greaterThan(0), () => empty(t0, t1));
+      If(A.greaterThan(0), () => { empty(t0, t1); });
     }).Else(() => {
       const s = disc.sqrt();
       const ra = B.negate().sub(s).div(A.mul(2)), rb = B.negate().add(s).div(A.mul(2));
       const lo = ra.min(rb), hi = ra.max(rb);
       If(A.greaterThan(0), () => { t0.assign(t0.max(lo)); t1.assign(t1.min(hi)); })
-        .Else(() => { If(lowerSide.greaterThan(0), () => t1.assign(t1.min(lo))).Else(() => t0.assign(t0.max(hi))); });
+        .Else(() => { If(lowerSide.greaterThan(0), () => { t1.assign(t1.min(lo)); }).Else(() => { t0.assign(t0.max(hi)); }); });
     });
   }).Else(() => {
     // Linear: B t + C ≤ 0.
     If(B.abs().greaterThan(1e-9), () => {
       const root = C.negate().div(B);
-      If(B.greaterThan(0), () => t1.assign(t1.min(root))).Else(() => t0.assign(t0.max(root)));
-    }).Else(() => { If(C.greaterThan(0), () => empty(t0, t1)); });
+      If(B.greaterThan(0), () => { t1.assign(t1.min(root)); }).Else(() => { t0.assign(t0.max(root)); });
+    }).Else(() => { If(C.greaterThan(0), () => { empty(t0, t1); }); });
   });
 }
 function clipCylinder(t0, t1, a, d, r) {
@@ -106,9 +106,11 @@ function clipCone(t0, t1, a, d, apexY, k) {
 export function clipShapeNode(shape, t0, t1, a, d) {
   const kind = shape.x, r = shape.y, cy = shape.z, h = shape.w.max(1e-4);
   If(kind.greaterThan(.5), () => {
-    If(kind.lessThan(1.5), () => clipCylinder(t0, t1, a, d, r))
-      .ElseIf(kind.lessThan(2.5), () => clipSphere(t0, t1, a, d, vec3(0, cy, 0), r))
-      .ElseIf(kind.lessThan(3.5), () => clipCone(t0, t1, a, d, cy.add(h.mul(.5)), r.div(h)))
+    // ⚠ Every `If` body here is a BLOCK: an arrow that returns the assign
+    // node makes TSL read the `If` as a typed expression ("expected a float").
+    If(kind.lessThan(1.5), () => { clipCylinder(t0, t1, a, d, r); })
+      .ElseIf(kind.lessThan(2.5), () => { clipSphere(t0, t1, a, d, vec3(0, cy, 0), r); })
+      .ElseIf(kind.lessThan(3.5), () => { clipCone(t0, t1, a, d, cy.add(h.mul(.5)), r.div(h)); })
       .Else(() => {
         const halfCylinder = h.sub(r.mul(2)).max(0).mul(.5);
         const c0 = t0.toVar(), c1 = t1.toVar();
@@ -120,7 +122,7 @@ export function clipShapeNode(shape, t0, t1, a, d) {
         const big = float(1e9);
         const entry = select(c1.greaterThanEqual(c0), c0, big).min(select(p1.greaterThanEqual(p0), p0, big)).min(select(q1.greaterThanEqual(q0), q0, big));
         const exit = select(c1.greaterThanEqual(c0), c1, big.negate()).max(select(p1.greaterThanEqual(p0), p1, big.negate())).max(select(q1.greaterThanEqual(q0), q1, big.negate()));
-        If(exit.lessThan(entry), () => empty(t0, t1)).Else(() => { t0.assign(t0.max(entry)); t1.assign(t1.min(exit)); });
+        If(exit.lessThan(entry), () => { empty(t0, t1); }).Else(() => { t0.assign(t0.max(entry)); t1.assign(t1.min(exit)); });
       });
   });
 }
