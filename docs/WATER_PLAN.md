@@ -217,6 +217,15 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     where `getRenderTarget()` is null and `currentSamples` 0 — the copy's
     source has 4). Receipts: MSAA and plain bindings smokes clean, `?crate=1`.
 
+30. The god rays are TWO terms in one beam: the sun's haze at water's own
+    albedo (0.08 × the whole gain — the forward glow looking up, which the
+    excess alone cannot give since its mean along a ray is nothing) plus the
+    filaments' EXCESS over the flat sun at the water colour's albedo, clamped
+    at 1.5. Carrying the whole beam at 0.08 flattened the shafts ("our
+    underwater godrays got broken"); the excess alone at albedo ~1 washed a
+    floor two metres down. Shaft mip 6 (mip 5 flickered at 4.3× smooth
+    motion). Receipt: phase 2.47 : 1 : 0.54, flicker 0.17 / 2.33.
+
 ## Open
 
 - The refraction pass is a second scene render per water surface per camera
