@@ -900,6 +900,26 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     and the outline's segments. Test: a fixed 2 m cube in a 3 m/s current
     sheds foam and counted spray, presses no wake, does not move; in still
     water neither; physics 21, spectrum 12, the pool arm passes.
+67. THE `underwater` TOGGLE (a performance switch on the component, user
+    2026-09-07: "completely disable underwater as an optimization if we
+    don't need it"). Off: the component claims NO water slot — so this
+    water adds nothing to the medium (the per-pixel fog every material in
+    the scene pays; its taps sit inside the slot's `active` branch, so an
+    unclaimed slot is one branch per pixel), mints no caustic pass, slot
+    kernel or light shafts; the water body shell is hidden; the lid's
+    refraction arm is NONE — no framebuffer read at a refracted pixel, no
+    GI ray through the water, no medium column — the lid is its deep
+    colour under the reflection (`u.deepColor × (1 − fresnel)`); the
+    contact ring keeps its depth copy. Flipping it rebuilds the
+    simulation once (`underwaterBuilt` in `syncPlane`). The harness's
+    `?underwater=0` mirrors the component (no slot, `underwater: false`
+    to the look, the shell hidden; every `updateWaterSlot` guarded on the
+    kernel). Receipts: the ocean arm passes with "refraction arm: NONE
+    (underwater off)", sky 49 %, whitecaps 3.3 %, crown 26 704 px; the
+    pool arm (on) passes. The harness's tiny scene barely moves (0.58 →
+    0.53 ms render); the saving is a whole scene's fog node, the caustic
+    lens on every receiver and the BVH refraction — read it in the editor
+    with `profile_frameStats` before and after the flip.
 
 ## Open
 

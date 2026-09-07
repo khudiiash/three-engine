@@ -72,6 +72,7 @@ try {
  for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain', 'roughness', 'transmission', 'waterDepth', 'godRays', 'waveDirection', 'waveSpeed', 'current', 'currentDirection', 'splash', 'splashSize', 'splashSpread'])
    if (argument(key, null) != null) USER[key] = Number(argument(key, '0'));
  for (const key of ['color', 'deepColor']) if (argument(key, null) != null) USER[key] = argument(key, '');
+ if (argument('underwater', null) != null) USER.underwater = argument('underwater', '1') !== '0';
  // ?depth= for the ocean arm (60 m: no floor shows through the medium).
  const DEPTH = Number(argument('depth', '3'));
  globalThis.__waterFoamDebug = argument('foamDebug', '0') === 'sea' ? 'sea' : argument('foamDebug', '0') === '1';
@@ -157,8 +158,11 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    const props = { ...USER, resolution, width: 1, height: 1, waterDepth: argument('waterDepth', null) != null ? Number(argument('waterDepth', '1')) : SHAPE_HEIGHT * FILL, shapeKind: SHAPE, shapeRadius: .5, shapeHeight: SHAPE_HEIGHT, enclosed: Number(argument('enclosed', '1')) };
    const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0, ior: 1.333,
      transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+   // ?underwater=0: no slot (no medium, caustics, shafts), no shell, no refraction — as the component does it.
+   const UNDERWATER = USER.underwater !== false;
    const slot = pool.claim({});
-   const sim = createGridSimulation('water', props, { material: authored, waterSlot: slot, anchorEngine: engine, worldScale: { x: S, z: S } });
+   const sim = createGridSimulation('water', props, { material: authored, waterSlot: UNDERWATER ? slot : null, anchorEngine: engine, worldScale: { x: S, z: S } });
+   if (!UNDERWATER && sim.skirtMesh) sim.skirtMesh.visible = false;
    holder.add(sim.mesh);
    // The sea's spray sprites — the component adds them to the entity; here
    // there is no component, so the harness does (or the receipt is blind).
@@ -178,7 +182,7 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    const postChain = POST ? new THREE.PostProcessing(renderer) : null;
    const scenePass = POST ? pass(scene, camera, { samples: 1 }) : null;
    if (POST) { postChain.outputNode = scenePass; engine.scenePass = scenePass; }
-   installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
+   installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot: UNDERWATER ? slot : null, underwater: UNDERWATER });
    log(`pool ${S} m: lid ${sim.clip ? `${sim.clip.levels} clipmap levels of ${sim.clip.size}² (${(sim.clip.cell.x * S * 100).toFixed(1)} cm at the eye, ${(sim.clip.cell.x * S * 2 ** (sim.clip.levels - 1)).toFixed(1)} m at the rim, ${sim.count} vertices)` : `${sim.resolution}² flat (${(S / (sim.resolution - 1) * 100).toFixed(1)} cm)`}, ripple window ${sim.ripple.resolution} cells over ${(sim.ripple.windowWidth * S).toFixed(1)} m (${(sim.ripple.cellX * S * 100).toFixed(1)} cm cells${sim.ripple.windowed ? ', following the camera' : ''})`);
 
    // The eye: the ripple and whitecap windows follow it, as the component's do.
@@ -197,14 +201,14 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    };
    const step = async () => {
      sim.tick(renderer, 1 / 60);
-     updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props });
+     sim.slotKernel && updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props });
      for (const fn of engine._tickers) fn();
      await device.queue.onSubmittedWorkDone();
    };
    const run = async (n) => { for (let i = 0; i < n; i++) await step(); };
    // Arm or disarm the lens for the NEXT shot (no ticks in between: `step`
    // re-arms the slot from the original props).
-   const armLens = async (on) => { const p = { ...props, causticIntensity: on ? props.causticIntensity : 0 }; sim.update(p); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); };
+   const armLens = async (on) => { const p = { ...props, causticIntensity: on ? props.causticIntensity : 0 }; sim.update(p); sim.slotKernel && updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); };
    const shoot = async (label) => {
      let px;
      if (POST) {
@@ -562,7 +566,7 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
      const contrastOf = (px) => { let m = 0, n = 0; for (let y = H * .2; y < H * .8; y++) for (let x = W * .2; x < W * .8; x++) { m += luma(px, ((y | 0) * W + (x | 0)) * 4); n++; } m /= n; let v = 0; for (let y = H * .2; y < H * .8; y++) for (let x = W * .2; x < W * .8; x++) { const d = luma(px, ((y | 0) * W + (x | 0)) * 4) - m; v += d * d; } return { mean: m, contrast: Math.sqrt(v / n) / Math.max(1, m) }; };
      // The lens at its physical strength (1); the authored dial is logged beside it.
      const physical = { ...props, causticIntensity: 1 };
-     sim.update(physical); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: physical }); for (const fn of engine._tickers) fn();
+     sim.update(physical); sim.slotKernel && updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: physical }); for (const fn of engine._tickers) fn();
      const on = contrastOf(await shoot('caustics-down-on'));
      // The map itself, as an image (value/4 → 8-bit): holes, folds, border.
      {
@@ -874,7 +878,7 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        down: { eye: [0, -.5, 0], at: [.25, -DEPTH, .1], probe: [0, -DEPTH + .03, 0], rot: [-Math.PI / 2, 0, 0] },
      };
      const rows = {};
-     const lensOn = async (on) => { const p = { ...props, causticIntensity: on ? props.causticIntensity : 0 }; sim.update(p); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); };
+     const lensOn = async (on) => { const p = { ...props, causticIntensity: on ? props.causticIntensity : 0 }; sim.update(p); sim.slotKernel && updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); };
      for (const [name, v] of Object.entries(views)) {
        probe.position.set(...v.probe); probe.rotation.set(...v.rot); pose(v.eye, v.at);
        await lensOn(true); const a = await shoot(`shaft-${name}`);
@@ -923,7 +927,7 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    if (S <= 20) {
      const catcher = new THREE.Mesh(new THREE.BoxGeometry(3, .08, 4), new THREE.MeshStandardNodeMaterial({ color: '#ffffff', roughness: .9 }));
      catcher.position.set(-2.6, 2.4, 0); catcher.rotation.z = Math.PI / 7; scene.add(catcher);
-     const lensOn = async (on) => { const p = { ...props, causticIntensity: on ? props.causticIntensity : 0 }; sim.update(p); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); };
+     const lensOn = async (on) => { const p = { ...props, causticIntensity: on ? props.causticIntensity : 0 }; sim.update(p); sim.slotKernel && updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); };
      pose([.6, 1.4, 1.8], [-2.4, 2.2, 0]);
      // (No ticks between arming and shooting: `step` re-arms the slot from the
      // ORIGINAL props, which is what made the first version of this receipt
@@ -952,7 +956,7 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        paint(V3(s2.radiance).mul(NG.dot(s2.toSunMirror).max(0)).mul(s2.reflectance).mul(waterCausticAboveNode(PW, slot))); await read('the whole term');
        // ...and the lit material at ten times the intensity.
        catcher.material = new THREE.MeshStandardNodeMaterial({ color: '#ffffff', roughness: .9 });
-       { const p = { ...props, causticIntensity: 5 }; sim.update(p); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); await run(2); }
+       { const p = { ...props, causticIntensity: 5 }; sim.update(p); sim.slotKernel && updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); await run(2); }
        await read('lit, intensity 5');
        await lensOn(true);
        log(`   uniforms: reflectance ${s2.reflectance.value.toFixed(4)} radiance ${s2.radiance.value.r.toFixed(2)} toSunMirror ${s2.toSunMirror.value.toArray().map((v) => v.toFixed(2))} mirrorRay ${s2.mirrorRay.value.toArray().map((v) => v.toFixed(3))} strength ${s2.strength.value}`);

@@ -33,6 +33,16 @@ export class GridSimulationComponent extends Component {
     bindVfxAsset(this, () => this.applyGraph());
     this.attachSimulation();
     this.unsubscribeTick = this.entity.engine.onUpdate(() => {
+      // ── A MODAL EDITOR MODE STOPS THE SOLVER (2026-09-07) ────────────────
+      // This tick dispatches the whole spectrum/FFT compute chain EVERY frame,
+      // and for water it does not even check `isInView()` — the sea keeps
+      // solving while the user is inside the geometry editor working on one
+      // mesh. Reported as "when entering geometry editing mode, all the
+      // components currently ticking in the editor viewport must be stopped:
+      // they must be causing freezes and lags in the geometry editor".
+      // `engine.suspendSimulation(reason)` is the seam; leaving the mode
+      // resumes from where the solver stood, because nothing is torn down.
+      if (this.entity.engine.simulationSuspended === true) return;
       if (["cloth", "water"].includes(this.constructor.type)) this.syncPlane();
       if (!this.enabled || !this.graphEnabled || !this.simulation?.mesh.visible || (this.constructor.type !== "water" && !this.isInView())) return;
       this.simulation.tick(this.entity.engine.renderer, this.entity.engine.deltaTime ?? 0);
@@ -134,7 +144,13 @@ export class GridSimulationComponent extends Component {
     // The slot is claimed BEFORE the solver, because the solver builds the
     // kernel that writes into it. A scene past `MAX_WATER_SLOTS` surfaces gets
     // no slot: it still simulates and renders, it just does not light or fog.
-    if (this.constructor.type === "water") this.waterSlot = this.entity.engine.waterSlots?.claim(this) ?? null;
+    // ── UNDERWATER OFF (2026-09-07) ───────────────────────────────────────
+    // "Completely disable underwater as an optimization if we don't need
+    // it" (user): without a slot this water adds nothing to the medium (a
+    // per-pixel fog every material pays), mints no caustic pass, slot
+    // kernel or shafts; the shell is hidden and the lid refracts nothing.
+    this.underwaterBuilt = this.resolvedProps.underwater !== false;
+    if (this.constructor.type === "water") this.waterSlot = this.underwaterBuilt ? (this.entity.engine.waterSlots?.claim(this) ?? null) : null;
     // One sea model, sized to the tier the scene ships at.
     const quality = this.entity.engine?.project?.settings?.build?.quality ?? this.entity.engine?.projectSettings?.build?.quality ?? "high";
     // The ripple window is a size in METRES: hand the solver the box's scale.
@@ -200,6 +216,7 @@ export class GridSimulationComponent extends Component {
     const source = this.planeSource;
     const active = this.enabled && this.graphEnabled && (!source || (source.component.enabled !== false && source.component.materialRenderable !== false && (this.sourceClaim ? this.sourceClaim.visible : source.mesh.visible)));
     this.simulation.mesh.visible = active;
+    if (this.simulation.skirtMesh) this.simulation.skirtMesh.visible = this.resolvedProps.underwater !== false;
     this.refreshWaterSlot();
     if (!source) return;
     const mesh = this.simulation.mesh;
@@ -220,7 +237,7 @@ export class GridSimulationComponent extends Component {
     mesh.matrixWorldNeedsUpdate = true;
     if (this.constructor.type === "water" && !Array.isArray(mesh.material)) {
       this.waterSurfaceLook ??= installWaterSurfaceLook({ engine: this.entity.engine, mesh, material: mesh.material,
-        simulation: this.simulation, slot: this.waterSlot, getSlot: () => this.waterSlot });
+        simulation: this.simulation, slot: this.waterSlot, getSlot: () => this.waterSlot, underwater: this.resolvedProps.underwater !== false });
       this.waterSurfaceLook.update();
     }
     if (active) {
@@ -261,6 +278,10 @@ export class GridSimulationComponent extends Component {
     if ((!source && valid) || (source && (!valid || mesh !== source.mesh || mesh.geometry !== source.geometry || mesh.geometry.getAttribute("position")?.version !== this.sourceGeometryVersion || JSON.stringify(mesh.geometry.groups) !== this.sourceGroups))) {
       this.detachSimulation(); this.attachSimulation();
     } else if (source && this.constructor.type === "water" && this.simulation && this.gridOutgrown(source)) {
+      this.detachSimulation(); this.attachSimulation();
+    } else if (this.constructor.type === "water" && this.simulation && this.underwaterBuilt !== (this.resolvedProps.underwater !== false)) {
+      // The toggle mints a solver without (or with) a slot, a caustic pass
+      // and a look: a rebuild, once, when it flips.
       this.detachSimulation(); this.attachSimulation();
     } else this.syncAppearance();
   }

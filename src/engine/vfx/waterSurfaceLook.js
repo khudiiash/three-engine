@@ -40,7 +40,7 @@ let reflecting = false;
  * fitted the symptom perfectly and was wrong, and acting on it deleted a
  * working subsystem instead of the faulty one standing next to it.
  */
-export function installWaterSurfaceLook({ engine, mesh, material, simulation = null, slot = null, getSlot = null }) {
+export function installWaterSurfaceLook({ engine, mesh, material, simulation = null, slot = null, getSlot = null, underwater = true }) {
   const target = new Object3D(); target.rotation.x = -Math.PI / 2; mesh.add(target);
   const gain = uniform(1), distortion = uniform(.02);
   // 1 while the scene has an environment: the mirror then renders without
@@ -436,9 +436,14 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       let column = tFloor.min(tX).min(tZ).max(0).min(u.waterDepth.mul(u.waveScale.y).mul(3));
       let refracted;
       const giSystem = giSystemNow();
-      const giTraced = !!(giSystem?.registerWaterRefraction && slot);
-      if (globalThis.__waterRefractionLog !== false) console.log(`[water] refraction arm: ${giTraced ? 'BVH-traced' : 'screen-space'} (gi ${giSystem ? 'present' : 'absent'}, register ${typeof giSystem?.registerWaterRefraction}, slot ${slot ? 'yes' : 'no'})`);
-      if (giTraced && !giRefraction) {
+      const giTraced = underwater && !!(giSystem?.registerWaterRefraction && slot);
+      if (globalThis.__waterRefractionLog !== false) console.log(`[water] refraction arm: ${!underwater ? 'NONE (underwater off)' : giTraced ? 'BVH-traced' : 'screen-space'} (gi ${giSystem ? 'present' : 'absent'}, register ${typeof giSystem?.registerWaterRefraction}, slot ${slot ? 'yes' : 'no'})`);
+      if (!underwater) {
+        // ── UNDERWATER OFF: nothing below the surface is looked at. The lid
+        // is its deep colour under the reflection — no framebuffer read at a
+        // refracted pixel, no GI ray through the water, no medium column.
+        refracted = vec3(u.deepColor).mul(fresnel.oneMinus());
+      } else if (giTraced && !giRefraction) {
         mesh.layers.enable(WATER_REFRACTION_LAYER);
         giRefraction = giSystem.registerWaterRefraction({
           mesh, material: gbufferMaterial, layer: WATER_REFRACTION_LAYER,
