@@ -227,8 +227,8 @@ export class WaterPhysics {
             // samples (a 4 × 4 grid per collider). Every straddling sample
             // once seeded a flat disc and a box hull became a white slab of
             // its whole footprint ("a rectangle of foam", user, 2026-09-07).
-            const gx=Math.floor(((local.x-bcenter.x)/Math.max(1e-6,bhalf.x)*.5+.5)*4),gz=Math.floor(((local.z-bcenter.z)/Math.max(1e-6,bhalf.z)*.5+.5)*4);
-            if(gx<=0||gx>=3||gz<=0||gz>=3)waterline.push({point,spacing:Math.max(bhalf.x,bhalf.z)/2});
+            const gx=Math.max(0,Math.min(3,Math.floor(((local.x-bcenter.x)/Math.max(1e-6,bhalf.x)*.5+.5)*4))),gz=Math.max(0,Math.min(3,Math.floor(((local.z-bcenter.z)/Math.max(1e-6,bhalf.z)*.5+.5)*4)));
+            if(gx<=0||gx>=3||gz<=0||gz>=3)waterline.push({collider:i,gx,gz,point,width:Math.max(.2,Math.min(1,Math.min(bhalf.x,bhalf.z)*.15))});
           }
           const v=cell*fraction;volume+=v;contacts.push({point,volume:v,surface});
           // This point's column: the quadrature's (x, z) cell, merged to `bins`.
@@ -432,16 +432,27 @@ export class WaterPhysics {
           const cur=finite(p.current,0,-10,10),curDir=finite(p.currentDirection,0,-180,180)*Math.PI/180;
           const vel=body.linvel();
           const through=Math.hypot(vel.x-cur*Math.cos(curDir),vel.z-cur*Math.sin(curDir));
-          const amount=finite(p.wakeStrength,.15,0,2)*Math.min(1,Math.max(0,through-.2)/3)*1.5;
+          // A quarter per second at full speed: the field's 2.5 s life makes a
+          // steady band of ~0.6 — patches and streaks, not a sheet (1.5/s
+          // saturated the footprint white, "still mostly a blob", 2026-09-07).
+          const amount=finite(p.wakeStrength,.15,0,2)*Math.min(1,Math.max(0,through-.2)/3)*.25;
           if(amount>0){
-            const step=Math.max(1,Math.ceil(waterline.length/24));
-            for(let i=0;i<waterline.length;i+=step){
-              const {point,spacing}=waterline[i];
-              const at=query(point);if(!at)continue;
-              // Half a sample's spacing, in the water's LOCAL units (a floor
-              // meant in metres read as 25 m on a 500 m sea); the solver
-              // floors it at a few cells.
-              c.simulation.addWaterFoam?.(at.localX,at.localZ,spacing*.5/flat,amount);
+            // THE OUTLINE AS A LINE: the border samples are metres apart on a
+            // hull (four per side), so the waterline is drawn BETWEEN
+            // consecutive border samples, a disc of the band's own width
+            // (0.2–1 m, in the water's local units) every two widths.
+            const seed=(point,width)=>{const at=query(point);if(at)c.simulation.addWaterFoam?.(at.localX,at.localZ,width/flat,amount);};
+            const order=[[0,0],[1,0],[2,0],[3,0],[3,1],[3,2],[3,3],[2,3],[1,3],[0,3],[0,2],[0,1]];
+            const byCollider=new Map();
+            for(const sample of waterline){if(!byCollider.has(sample.collider))byCollider.set(sample.collider,new Map());byCollider.get(sample.collider).set(`${sample.gx}:${sample.gz}`,sample);}
+            for(const ring of byCollider.values()){
+              for(let k=0;k<order.length;k++){
+                const a=ring.get(`${order[k][0]}:${order[k][1]}`),b=ring.get(`${order[(k+1)%order.length][0]}:${order[(k+1)%order.length][1]}`);
+                if(!a){continue;}
+                if(!b){seed(a.point,a.width);continue;}
+                const n=Math.max(1,Math.ceil(a.point.distanceTo(b.point)/(2*a.width)));
+                for(let j=0;j<n;j++)seed(a.point.clone().lerp(b.point,j/n),a.width);
+              }
             }
           }
         }
