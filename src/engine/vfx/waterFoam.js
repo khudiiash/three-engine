@@ -263,7 +263,9 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
   // bubbles' own texture over both — with holes, or under a sun the foam
   // clips to a flat white. (Distance fades written as 1 − smoothstep: the
   // reversed-edge form is undefined in GLSL and not worth a doubt in WGSL.)
-  const wind = vec2(u.waveCos, u.waveSin);
+  // Streaks run along the wind — or along the CURRENT when there is one: a
+  // hull's tail streams downstream.
+  const wind = mix(vec2(u.waveCos, u.waveSin), vec2(u.currentCos, u.currentSin), u.current.abs().smoothstep(0, .5));
   const along = p.dot(wind), across = p.y.mul(wind.x).sub(p.x.mul(wind.y));
   const streak = fbm(vec2(along.mul(.18), across.mul(1.6)), clock, .5);
   const bubbles = fbm(p.mul(4.5), clock, 1.6);

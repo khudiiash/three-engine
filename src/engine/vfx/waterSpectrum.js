@@ -1,6 +1,6 @@
 import * as THREE from "three/webgpu";
 import {
-  Fn, If, float, int, ivec2, vec2, vec4, uniform, instanceIndex, texture, textureLoad, textureStore, storageTexture,
+  Fn, If, Loop, float, int, ivec2, vec2, vec4, uniform, uniformArray, instanceIndex, texture, textureLoad, textureStore, storageTexture,
   workgroupArray, workgroupBarrier, localId, workgroupId, select, atan, cameraPosition, positionWorld, mix,
 } from "three/tsl";
 import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
@@ -235,7 +235,15 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     size: foamSize, center: uniform(new THREE.Vector2(0, 0)), half: uniform(FOAM_WINDOW_METRES / 2),
     texel: uniform(FOAM_WINDOW_METRES / foamSize), shift: uniform(new THREE.Vector2(0, 0)),
     gate: uniform(.25), decay: uniform(1), lods: Array.from({ length: cascadeCount }, () => uniform(0)),
+    // Foam handed to the memory from outside — a hull's waterline (x, z,
+    // radius in the sea's metres, a value 0–1): the tail a boat trails, as
+    // long as the current times the memory's life ("there must be a tail
+    // behind the boat", user, 2026-09-07). The ripple window is 32 m; the
+    // memory is 512 m and rides the current.
+    seedRows: Array.from({ length: 64 }, () => new THREE.Vector4()),
+    seedCount: uniform(0, "int"),
   };
+  f.seeds = uniformArray(f.seedRows, "vec4");
   let foamPhase = 0, foamWritten = null;
   // The current's sub-texel remainder for the whitecap memory's shift.
   const scrollAccum = { x: 0, y: 0 };
@@ -340,7 +348,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     /** The dispatches for this frame, in order; `renderer.compute(...)` them.
      *  `eye` is the camera in the sea's metres (a water's local XZ × its
      *  scale) — the foam window follows it; `foam` is the water's dial. */
-    passes(dt, time, { eye = null, foam = null, current = null } = {}) {
+    passes(dt, time, { eye = null, foam = null, current = null, seeds = null } = {}) {
+      // Foam handed in this tick (the sea's metres); the rows are consumed here.
+      const count = Math.min(f.seedRows.length, seeds?.length ?? 0);
+      for (let i = 0; i < count; i++) f.seedRows[i].fromArray(seeds[i]);
+      f.seedCount.value = count;
       const queue = [];
       if (!settings) return queue;
       if (dirty) { for (const c of cascades) queue.push(c.kernels.initial, c.kernels.conjugate); dirty = false; }
@@ -443,6 +455,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       fy.toFloat().add(.5).sub(foamSize / 2).mul(f.texel).add(f.center.y));
     const sea = seaDisplacementAt(spectrum, world, f.lods);
     const now = seaFoamNode(seaJacobianAt(spectrum, world, sea.w, f.lods), f.gate).toVar();
+    Loop({ start: 0, end: f.seedCount }, ({ i }) => {
+      const seed = f.seeds.element(i);
+      const d = world.sub(seed.xy).length().div(seed.z.max(1e-4));
+      now.assign(now.max(d.mul(1.5).pow(6).min(20).negate().exp().mul(seed.w.min(1))));
+    });
     const sx = fx.add(f.shift.x.toInt()), sy = fy.add(f.shift.y.toInt());
     const inside = sx.greaterThanEqual(0).and(sx.lessThan(foamSize)).and(sy.greaterThanEqual(0)).and(sy.lessThan(foamSize));
     const prev = select(inside, textureLoad(source, ivec2(sx.clamp(0, foamSize - 1), sy.clamp(0, foamSize - 1))).x, now);

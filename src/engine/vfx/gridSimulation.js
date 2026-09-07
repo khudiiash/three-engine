@@ -1609,8 +1609,12 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // Its own submission, and its mips made before anything samples them
       // (see waterSpectrum.js `generateMipmaps`).
       if (spectrum) {
+        // The foam the physics handed the field also seeds the whitecap memory
+        // (in the sea's metres, a value near 1 at full speed) — the tail.
+        const ws = u.waveScale.value;
+        const seeds = pendingFoam.map(([x, z, r, a]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .3), Math.min(1, a * 4)]);
         const seaQueue = spectrum.passes(delta, elapsed, { eye: seaEye, foam: u.foam.value,
-          current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value] });
+          current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value], seeds });
         if (seaQueue.length) { renderer.compute(seaQueue); spectrum.generateMipmaps(renderer); }
       }
       if (foamField) {
