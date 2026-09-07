@@ -849,7 +849,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
           const y = surfaceAt(at).add(.1);
           splash.element(i).assign(vec4(at.x, y, at.y, 0));
           splashVel.element(i).assign(vec4(vel, float(1.5).add(rnd(25).mul(2.5))));
-          splashAux.element(i).assign(vec4(strength, rnd(26).mul(.8).add(.6), 0, 0));
+          // Sizes log-uniform over three octaves: a third to nearly three
+          // times the base ("more varied in scale", user, 2026-09-07).
+          splashAux.element(i).assign(vec4(strength, float(2).pow(rnd(26).mul(3).sub(1.5)), 0, 0));
         });
       });
     })().compute(splashCount);
@@ -930,7 +932,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     const up = cross(toCam, right);
     // Bigger while a sheet, smaller as drops.
     const sheet = part.w.mul(1.5).clamp(0, 1).oneMinus().mul(.4).add(1);
-    const size = select(alive, sp.size.mul(sp.sizeScale).mul(aux.y).mul(j2.mul(.6).add(.6)).mul(sheet), float(0));
+    const size = select(alive, sp.size.mul(sp.sizeScale).mul(aux.y).mul(float(2).pow(j2.mul(2).sub(1))).mul(sheet), float(0));
     const stretch = speed.mul(.25).add(1).min(4);
     const offsetWorld = right.mul(positionGeometry.x).add(up.mul(positionGeometry.y).mul(stretch)).mul(size);
     splashMaterial.positionNode = centre.add(modelWorldMatrixInverse.mul(vec4(offsetWorld, 0)).xyz);
