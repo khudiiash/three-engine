@@ -754,6 +754,23 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     6.6 k live, whitecaps 2.3 %, far specks 0.51 %, hull seed 64, crown
     44 037 px, 374 foam from returns; foam .1 — 1.3 k live (11 k before
     the dial's reach); pool arm passes (429); physics 20 + spectrum 12.
+60. THE DIAL'S SQUARE, THE SPREAD DIAL, THE OPEN RANGES. "Still too much
+    foam at 0.1": linear, 0.1 was a tenth of a boat's tail; the
+    INTERACTION sources (a hull's seeds, the ripple field's births, the
+    splash returns) take the dial SQUARED now — a hundredth at 0.1 — while
+    the open sea's whitecaps keep their threshold (.45 + .4 foam) and life
+    (.4 + .6 foam), the cap .2 + .7 foam. Receipt: foam .1 — 470 live
+    (1.3 k a step before, 11 k at the start); foam .3 — 6.2 k live,
+    whitecaps 2.2 %, far specks 0.52 %, hull seed 48, crown 42 667 px.
+    "More settings for sprays — scale, spread, density": `splash`
+    (density: crowns, contact and fold spray), `splashSize`, and the new
+    `splashSpread` (how wide a crown throws, how far fold spray flies
+    along and forward of the crest, how hard a sheet tears — all the
+    horizontal terms and the tear × it). "Expand the allowed values":
+    splash / splashSize / splashSpread 0–100, foamThreshold 0–100 m,
+    current ±100 m/s (schema, `finite` clamps in gridSimulation and
+    waterPhysics, the spectrum's own clamps) — the pool is the only
+    ceiling, and it cannot crash anything. Physics 20 + spectrum 12.
 
 ## Open
 

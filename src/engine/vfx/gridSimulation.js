@@ -230,7 +230,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     color: uniform(new THREE.Color()), deepColor: uniform(new THREE.Color()), waterDepth: uniform(2), absorption: uniform(0), saturation: uniform(.35),
     foam: uniform(0), foamThreshold: uniform(.15), stylized: uniform(0),
     // The spray's dials (waterSpectrum.js's splash pool).
-    splash: uniform(1), splashSize: uniform(1),
+    splash: uniform(1), splashSize: uniform(1), splashSpread: uniform(1),
     transmission: uniform(.75),
     // Local-space thickness for three's screen-space refraction — see
     // `updateWaterSlot`, which is the only place that knows the mesh's scale.
@@ -1306,7 +1306,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     u.waveLength.value = authoredWaveLength;
     const direction = finite(p.waveDirection, 0, -180, 180) * Math.PI / 180;
     u.waveCos.value = Math.cos(direction); u.waveSin.value = Math.sin(direction);
-    u.current.value = finite(p.current, 0, -10, 10);
+    u.current.value = finite(p.current, 0, -100, 100);
     const currentDirection = finite(p.currentDirection, 0, -180, 180) * Math.PI / 180;
     u.currentCos.value = Math.cos(currentDirection); u.currentSin.value = Math.sin(currentDirection);
     u.waterDepth.value = finite(p.waterDepth, 2, 0, 100);
@@ -1316,8 +1316,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // medium all integrate over a path; the authored number is the end state.
     u.saturation.value = waterSaturation(p, u.waterDepth.value);
     u.absorption.value = waterExtinction(u.saturation.value, u.waterDepth.value);
-    u.foam.value = finite(p.foam, .25, 0, 1); u.foamThreshold.value = finite(p.foamThreshold, .15, 0, 5);
-    u.splash.value = finite(p.splash, 1, 0, 3); u.splashSize.value = finite(p.splashSize, 1, .3, 3);
+    u.foam.value = finite(p.foam, .25, 0, 1); u.foamThreshold.value = finite(p.foamThreshold, .15, 0, 100);
+    u.splash.value = finite(p.splash, 1, 0, 100); u.splashSize.value = finite(p.splashSize, 1, 0, 100); u.splashSpread.value = finite(p.splashSpread, 1, 0, 100);
     u.transmission.value = finite(p.transmission, .75, 0, 1);
     u.stylized.value = p.style === "stylized" ? 1 : 0;
     // ⚠ BOTH WATER COLOURS ARE PUBLISHED WHETHER OR NOT THE MATERIAL IS OURS.
@@ -1644,7 +1644,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         spectrum.splash?.scale.value.copy(ws);
         const seaQueue = spectrum.passes(delta, elapsed, { eye: seaEye, foam: u.foam.value,
           current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value], seeds, splashes,
-          splash: u.splash.value, splashSize: u.splashSize.value });
+          splash: u.splash.value, splashSize: u.splashSize.value, splashSpread: u.splashSpread.value });
         if (seaQueue.length) { renderer.compute(seaQueue); spectrum.afterCompute(renderer); }
       }
       if (foamField) {

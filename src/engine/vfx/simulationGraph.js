@@ -20,7 +20,7 @@ export function simulationNodeTypes(kind) {
       number("waveHeight", "Wave height (m)", .15, 0, 5, .05), number("waveLength", "Peak wavelength (m)", 4, .1, 1000),
       number("waveOctaves", "Short-wave octaves", 4, 1, 8, 1), number("waveGain", "Spectral tilt", .5, .2, .9, .05),
       number("waveDirection", "Wave direction (degrees)", 0, -180, 180, 1),
-      number("current", "Current (m/s)", 0, -10, 10, .01), number("currentDirection", "Current direction (degrees)", 0, -180, 180, 1), number("choppiness", "Choppiness", .35, 0, 1, .01), number("rippleStrength", "Ripple strength", .6, 0, 2, .01), number("surfaceDetail", "Surface detail (normals)", .6, 0, 2, .05), { key: "caustics", label: "Caustics", type: "boolean", default: true }, number("causticIntensity", "Caustic intensity", 1, 0, 3, .05)])];
+      number("current", "Current (m/s)", 0, -100, 100, .01), number("currentDirection", "Current direction (degrees)", 0, -180, 180, 1), number("choppiness", "Choppiness", .35, 0, 1, .01), number("rippleStrength", "Ripple strength", .6, 0, 2, .01), number("surfaceDetail", "Surface detail (normals)", .6, 0, 2, .05), { key: "caustics", label: "Caustics", type: "boolean", default: true }, number("causticIntensity", "Caustic intensity", 1, 0, 3, .05)])];
   return {
     grid: { label: "Grid", category: "emitter", inputs: [input("width"), input("height"), input("resolution")], outputs: output("grid"), params: [
       number("resolution", "Grid resolution", cloth ? 32 : 128, 4, 512, 1), number("width", "Width", cloth ? 4 : 8, .1, 1000), number("height", "Height / depth", cloth ? 4 : 8, .1, 1000),
@@ -36,8 +36,8 @@ export function simulationNodeTypes(kind) {
         { key: "deepColor", label: "Deep water color", type: "color", default: "#063a52" },
         number("waterDepth", "Optical depth (metres)", 2, 0, 100), number("fill", "Fill level", 1, .05, 1, .01), number("saturation", "Water saturation", .45, 0, 1, .01),
         number("transmission", "Refraction / transmission", .75, 0, 1, .01),
-        number("foam", "Foam", .5, 0, 1, .01), number("foamThreshold", "Foam contact width (m)", .15, 0, 3, .01),
-        number("splash", "Splash (spray amount)", 1, 0, 3, .05), number("splashSize", "Splash size", 1, .3, 3, .05),
+        number("foam", "Foam", .5, 0, 1, .01), number("foamThreshold", "Foam contact width (m)", .15, 0, 100, .01),
+        number("splash", "Splash (spray amount)", 1, 0, 100, .05), number("splashSize", "Splash size", 1, 0, 100, .05), number("splashSpread", "Splash spread", 1, 0, 100, .05),
         number("godRays", "God rays", 1, 0, 3, .01),
       ]),
     ] },

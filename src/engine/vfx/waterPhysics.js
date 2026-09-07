@@ -438,7 +438,7 @@ export class WaterPhysics {
         // speed THROUGH the water — its velocity against the current — with
         // a dead zone so a hull bobbing at rest sheds nothing.
         if(waterline.length){
-          const cur=finite(p.current,0,-10,10),curDir=finite(p.currentDirection,0,-180,180)*Math.PI/180;
+          const cur=finite(p.current,0,-100,100),curDir=finite(p.currentDirection,0,-180,180)*Math.PI/180;
           const vel=body.linvel();
           const rvx=vel.x-cur*Math.cos(curDir),rvz=vel.z-cur*Math.sin(curDir);
           const through=Math.hypot(rvx,rvz);

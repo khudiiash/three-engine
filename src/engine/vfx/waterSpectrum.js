@@ -396,7 +396,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     // The share of dead foam particles that probe the returns each frame.
     returnTry: uniform(.3),
     // The water's dials: how much spray (crowns, the fold probes) and how big.
-    amount: uniform(1), sizeScale: uniform(1),
+    amount: uniform(1), sizeScale: uniform(1), spreadScale: uniform(1),
   };
   sp.seeds = uniformArray(sp.seedRows, "vec4");
   // Each seed's share of the busiest seed's want (a counted contact seed
@@ -526,9 +526,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     /** The dispatches for this frame, in order; `renderer.compute(...)` them.
      *  `eye` is the camera in the sea's metres (a water's local XZ × its
      *  scale) — the foam window follows it; `foam` is the water's dial. */
-    passes(dt, time, { eye = null, foam = null, current = null, seeds = null, splashes = null, splash = null, splashSize = null } = {}) {
-      if (splash != null) sp.amount.value = Math.max(0, Math.min(3, splash));
-      if (splashSize != null) sp.sizeScale.value = Math.max(.3, Math.min(3, splashSize));
+    passes(dt, time, { eye = null, foam = null, current = null, seeds = null, splashes = null, splash = null, splashSize = null, splashSpread = null } = {}) {
+      // The dials: wide open (0 to a hundred), the pool the only ceiling.
+      if (splash != null) sp.amount.value = Math.max(0, Math.min(100, splash));
+      if (splashSize != null) sp.sizeScale.value = Math.max(0, Math.min(100, splashSize));
+      if (splashSpread != null) sp.spreadScale.value = Math.max(0, Math.min(100, splashSpread));
       const step = Math.min(.1, Math.max(0, dt));
       // Foam handed in this tick (the sea's metres); the rows are consumed
       // here. A seed WANTS particles in proportion to its area and value —
@@ -539,7 +541,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       const wants = new Array(count);
       // The foam dial scales a hull's seeds too ("even on 0.1 there is too
       // much of it", user, 2026-09-07): a fifth at 0, all at 1.
-      const dial = f.gate.value;
+      // ⛔ THE DIAL IS QUADRATIC ON THE INTERACTION SOURCES: linear, 0.1
+      // still read as a tenth of a boat's tail ("still too much foam at
+      // 0.1", user, 2026-09-07); squared it is a hundredth.
+      const dial = f.gate.value * f.gate.value;
       for (let i = 0; i < count; i++) {
         const [, , r, a] = seeds[i];
         wants[i] = Math.PI * r * r * Math.min(1, a) * FOAM_SEED_DENSITY * step * dial;
@@ -597,9 +602,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       f.tryRate.value = Math.min(1, FOAM_RATE * (2 * f.half.value) ** 2 * step / particleCount);
       // The ripple window's foam is probed at twice the sea's rate over its own area.
       const ripple = spectrum.ripple;
-      f.rippleTry.value = ripple ? Math.min(1, 2 * FOAM_RATE * (2 * ripple.half.value.x * ripple.scale.value.x) * (2 * ripple.half.value.y * ripple.scale.value.z) * step / particleCount) * f.gate.value : 0;
-      sp.returnTry.value = .3 * f.gate.value;
-      f.cap.value = .3 + .6 * f.gate.value;
+      f.rippleTry.value = ripple ? Math.min(1, 2 * FOAM_RATE * (2 * ripple.half.value.x * ripple.scale.value.x) * (2 * ripple.half.value.y * ripple.scale.value.z) * step / particleCount) * dial : 0;
+      sp.returnTry.value = .3 * dial;
+      f.cap.value = .2 + .7 * f.gate.value;
       f.life.value = f.baseLife * (.4 + .6 * f.gate.value);
       {
         const cv = f.currentVel.value, speed = Math.hypot(cv.x, cv.y), k = Math.min(1, speed / .5);
@@ -910,7 +915,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         v.xyz.assign(v.xyz.mul(dts.mul(.4).oneMinus().max(0)));
         // The BREAKUP: a sheet flies coherent for a few tenths of a second,
         // then tears into drops — a random walk that grows with age.
-        const tear = p.w.mul(1.2).min(1).mul(dts).mul(2.5);
+        const tear = p.w.mul(1.2).min(1).mul(dts).mul(2.5).mul(sp.spreadScale);
         v.xyz.assign(v.xyz.add(vec3(gauss(rnd(30), rnd(31)), gauss(rnd(32), rnd(33)).mul(.6), gauss(rnd(34), rnd(35))).mul(tear)));
         p.xyz.assign(p.xyz.add(v.xyz.mul(dts)));
         p.xz.assign(p.xz.add(f.currentVel.mul(f.dt)));
@@ -936,8 +941,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
             // place), the rim fastest; the breakup comes with age, below.
             const phase = seed.x.mul(7.3).add(seed.y.mul(3.1));
             const lobes = angle.mul(3).add(phase).sin().mul(.5).add(.5);
-            const up = seed.w.mul(lobes.mul(.5).add(.55).mul(rad.mul(.4).add(.8))), out = seed.w.mul(.4).mul(rad).mul(lobes.mul(.4).add(.6));
-            const turbulence = vec3(gauss(rnd(16), rnd(17)), gauss(rnd(18), rnd(19)), gauss(rnd(20), rnd(21))).mul(seed.w.mul(.04));
+            const up = seed.w.mul(lobes.mul(.5).add(.55).mul(rad.mul(.4).add(.8))), out = seed.w.mul(.4).mul(rad).mul(lobes.mul(.4).add(.6)).mul(sp.spreadScale);
+            const turbulence = vec3(gauss(rnd(16), rnd(17)).mul(sp.spreadScale), gauss(rnd(18), rnd(19)), gauss(rnd(20), rnd(21)).mul(sp.spreadScale)).mul(seed.w.mul(.04));
             vel.assign(vec3(radial.x.mul(out), up, radial.y.mul(out)).add(turbulence));
             born.assign(1); strength.assign(1);
           });
@@ -946,11 +951,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
           const fold = seaFoldAt(spectrum, probe, f.lods);
           If(fold.x.lessThan(sp.threshold), () => {
             const deficit = sp.threshold.sub(fold.x).div(sp.threshold.max(1e-3)).clamp(0, 1);
-            const along = rnd(16).mul(2).sub(1).mul(f.spread.mul(.5)), forward = rnd(17).mul(f.spread.mul(.5));
+            const along = rnd(16).mul(2).sub(1).mul(f.spread.mul(.5)).mul(sp.spreadScale), forward = rnd(17).mul(f.spread.mul(.5)).mul(sp.spreadScale);
             at.assign(probe.add(fold.yz.mul(along)).add(sp.dir.mul(forward)));
             const surf = seaVelocityAt(spectrum, at, f.zeroLods).mul(f.timeScale);
             const speed = sp.speed.mul(deficit.mul(.8).add(.4));
-            const turbulence = vec3(gauss(rnd(18), rnd(19)).mul(.35), gauss(rnd(20), rnd(21)).mul(.3), gauss(rnd(22), rnd(23)).mul(.35)).mul(speed);
+            const turbulence = vec3(gauss(rnd(18), rnd(19)).mul(.35).mul(sp.spreadScale), gauss(rnd(20), rnd(21)).mul(.3), gauss(rnd(22), rnd(23)).mul(.35).mul(sp.spreadScale)).mul(speed);
             vel.assign(vec3(surf.x.mul(2).add(sp.dir.x.mul(speed).mul(.6)), speed.mul(rnd(24).mul(.8).add(.7)), surf.y.mul(2).add(sp.dir.y.mul(speed).mul(.6))).add(turbulence));
             born.assign(1); strength.assign(deficit.mul(.6).add(.4));
           });
