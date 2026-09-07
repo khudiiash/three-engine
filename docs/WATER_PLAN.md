@@ -454,6 +454,35 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     still 0.86 … 0.44/0.29/0.18 m (mips live), pool receipts unchanged,
     bindings smoke 0 validation errors. Rule: anything that runs every
     frame must not call `createBindGroup`/`createView` — cache them.
+49. THE CURRENT (`current` m/s, `currentDirection` degrees, 2026-09-07):
+    "make it look like the boat is floating without actually moving it, so
+    I need to scroll the ocean." Every sample of the sea is taken at
+    world + `scroll` (a spectrum uniform the tick advances by the current),
+    so geometry, normals, whitecaps, caustics and the buoyancy query (the
+    readback carries `scroll`) all stream under a fixed lid. The whitecap
+    memory stays on the eye in world space and its contents take the value
+    that was upstream a tick ago (whole texels, remainder carried). The
+    ripple field — a wake's heights and foam — is advected by the current
+    once a tick, semi-Lagrangian, before the substeps, and the wake
+    pattern's drift adds the current. Receipts: over a frozen sea
+    (`waveSpeed=0`) a 10 m/s current moves the lid under a fixed point
+    0.13 → −0.78 m in a second with the CPU query agreeing to the
+    centimetre; on the 5 m pool a 0.6 m/s current carries the splash
+    foam's centroid 1.38 m in 2.5 s (1.5 expected). ⚠ Direction 0 runs
+    along +X; at waveDirection 0 that is along the crests (the sea varies
+    least there) — a boat heading into the waves wants the current AGAINST
+    the wave direction.
+50. ⛔ THE FOAM KERNEL TRUSTS `scratch`. `foamField` reads `scratch.w` as the
+    foam copy the last `integrate` left there. A tick with no substep (one
+    shorter than a substep, or the harness's zero-length follow tick) runs
+    no integrate, and a shift or advection sequence that ended on
+    `previous` left previous.w in scratch — the foam field read it as its
+    own and was wiped in one tick (the current's advection at any speed,
+    even 0.001 m/s; the identity copies "killed" the foam until probes at
+    1.5/4 s showed the field intact and the attribute dying at the pose's
+    zero tick). Both the window shift and the advection now end on
+    `positions`. Harness: `fieldProbe(label)` logs the texture's height
+    RMS and foam sum beside the attribute's.
 
 ## Open
 

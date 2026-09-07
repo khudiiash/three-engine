@@ -69,7 +69,7 @@ try {
    foam: Number(argument('foam', '1')), foamThreshold: .5 };
  // Any wave/look field can be overridden from the URL (?waveHeight=.1&choppiness=0…) to
  // reproduce a user's own pool.
- for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain', 'roughness', 'transmission', 'waterDepth', 'godRays', 'waveDirection'])
+ for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain', 'roughness', 'transmission', 'waterDepth', 'godRays', 'waveDirection', 'waveSpeed', 'current', 'currentDirection'])
    if (argument(key, null) != null) USER[key] = Number(argument(key, '0'));
  for (const key of ['color', 'deepColor']) if (argument(key, null) != null) USER[key] = argument(key, '');
  // ?depth= for the ocean arm (60 m: no floor shows through the medium).
@@ -77,6 +77,8 @@ try {
  globalThis.__waterFoamDebug = argument('foamDebug', '0') === 'sea' ? 'sea' : argument('foamDebug', '0') === '1';
  globalThis.__waterSunProbe = argument('sunProbe', '0') === '1';
 globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
+globalThis.__waterCurrentAdvect = argument('currentAdvect', '1') !== '0';
+globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
 
  for (const S of SCALES) {
    const scene = new THREE.Scene();
@@ -229,6 +231,25 @@ globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
      // The eye a metre over the water, as a swimmer or a deck sees it: the
      // GEOMETRY's waves, which a higher eye lets the shading normal fake.
      pose([0, 1.2, S * .35], [0, .9, -S * .1]); const eyeShot = await shoot('ocean-eye');
+     // ── THE CURRENT SCROLLS THE SEA (2026-09-07) ────────────────────────
+     // With the sea's clock stopped (?waveSpeed=0) and a current set, the
+     // surface under a fixed point must still change — the sea streams past.
+     if (Number(argument('current', '0')) !== 0) {
+       // The GPU's own vertex nearest the point, and the CPU query beside it.
+       const gpuHeightAt = async (px, pz) => {
+         const attr = sim.mesh.geometry.attributes.position, v = new Float32Array(await renderer.getArrayBufferAsync(attr)), ST = Math.round(v.length / attr.count);
+         const lidCount = sim.clip ? sim.clip.levels * sim.clip.size * sim.clip.size : attr.count;
+         let best = Infinity, height = NaN;
+         for (let k = 0; k < lidCount; k++) { const d = Math.hypot(v[k * ST] * S - px, v[k * ST + 2] * S - pz); if (d < best) { best = d; height = v[k * ST + 1] * DEPTH; } }
+         return height;
+       };
+       const g0 = await gpuHeightAt(0, S * .35), h0 = surfaceAt(0, S * .35), s0 = { ...(sim.seaSample?.scroll ?? {}) };
+       await run(60);
+       const g1 = await gpuHeightAt(0, S * .35), h1 = surfaceAt(0, S * .35), s1 = { ...(sim.seaSample?.scroll ?? {}) };
+       log(`ocean: current ${argument('current', '0')} m/s (uniform ${sim.uniforms.current.value}) over a frozen sea (waveSpeed ${USER.waveSpeed}): the lid under a fixed point went ${g0.toFixed(3)} → ${g1.toFixed(3)} m (GPU), the query ${h0.toFixed(3)} → ${h1.toFixed(3)} m, readback scroll ${JSON.stringify(s0)} → ${JSON.stringify(s1)}`);
+       if (!(Math.abs(g1 - g0) > .02)) throw new Error(`the current does not scroll the sea: lid ${g0.toFixed(3)} → ${g1.toFixed(3)} m`);
+       if (!(Math.abs(h1 - h0) > .02)) throw new Error(`the buoyancy query does not follow the current: ${h0.toFixed(3)} → ${h1.toFixed(3)} m`);
+     }
      // ── THE EYE ON THE WATERLINE ───────────────────────────────────────
      // The lowest surface point near the pose, and the eye 15 cm over it —
      // in a trough, in the AIR, below the rest plane. The sky must stay
@@ -522,10 +543,35 @@ globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
      log(`flow 1.5 s after the splash: peak ${peak.toFixed(3)} m/s, mean ${(sum / n).toFixed(4)} m/s, the pattern drifted up to ${(driftPeak * 100).toFixed(1)} cm`);
      if (!(peak > .02 && driftPeak > .005)) throw new Error(`the splash left no flow: peak ${peak.toFixed(3)} m/s, drift ${(driftPeak * 100).toFixed(1)} cm`);
    }
+   // The foam's centroid along the current (metres), for the current receipt below.
+   const foamCentroid = async () => {
+     const f = new Float32Array(await renderer.getArrayBufferAsync(sim.mesh.geometry.attributes.waterFoam));
+     const attr = sim.mesh.geometry.attributes.position, v = new Float32Array(await renderer.getArrayBufferAsync(attr)), ST = Math.round(v.length / attr.count);
+     const dir = [Math.cos((USER.currentDirection ?? 0) * Math.PI / 180), Math.sin((USER.currentDirection ?? 0) * Math.PI / 180)];
+     let m = 0, along = 0; for (let k = 0; k < sim.count; k++) { const w = Math.max(0, f[k] - .02); if (!w) continue; m += w; along += w * (v[k * ST] * S * dir[0] + v[k * ST + 2] * S * dir[1]); }
+     return m > 0 ? along / m : NaN;
+   };
+   const foamAt1_5 = await foamCentroid();
+   { // the ripple field itself at 1.5 s: heights and foam, straight from the texture
+     const w = sim.ripple.resolution, halves = await renderer.backend.copyTextureToBuffer(sim.rippleTexture, 0, 0, w, w);
+     let h2 = 0, foamSum = 0, n = 0; for (let i = 0; i < w * w; i++) { const h = halfToFloat(halves[i * 4]) * DEPTH, f = halfToFloat(halves[i * 4 + 3]); if (Number.isFinite(h)) { h2 += h * h; n++; } if (Number.isFinite(f)) foamSum += f; }
+     log(`ripple field 1.5 s after the splash: height RMS ${(Math.sqrt(h2 / Math.max(1, n)) * 100).toFixed(2)} cm, foam sum ${foamSum.toFixed(1)} over ${w * w} cells`);
+   }
+   const fieldProbe = async (label) => {
+     const w = sim.ripple.resolution, halves = await renderer.backend.copyTextureToBuffer(sim.rippleTexture, 0, 0, w, w);
+     let h2 = 0, foamSum = 0, n = 0; for (let i = 0; i < w * w; i++) { const h = halfToFloat(halves[i * 4]) * DEPTH, f = halfToFloat(halves[i * 4 + 3]); if (Number.isFinite(h)) { h2 += h * h; n++; } if (Number.isFinite(f)) foamSum += f; }
+     const a = new Float32Array(await renderer.getArrayBufferAsync(sim.mesh.geometry.attributes.waterFoam)); let as = 0; for (let k = 0; k < sim.count; k++) as += a[k];
+     log(`ripple field ${label}: height RMS ${(Math.sqrt(h2 / Math.max(1, n)) * 100).toFixed(2)} cm, texture foam sum ${foamSum.toFixed(1)}, attribute foam sum ${as.toFixed(1)}`);
+   };
+   await fieldProbe('1.5 s (probe)');
    await run(150);
+   await fieldProbe('4 s, before the shot');
    await shoot('splash-4s');
+   await fieldProbe('4 s, after the shot');
    pose([-3.2, 3.4, 3.2], [.6, 0, -.6]);
+   await fieldProbe('after the pose');
    await shoot('foam-after-splash');
+   await fieldProbe('after the foam shot');
    // How much of the lid the splash left foamed, 4 s on: the field itself.
    {
      const f = new Float32Array(await renderer.getArrayBufferAsync(sim.mesh.geometry.attributes.waterFoam));
@@ -533,6 +579,14 @@ globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
      for (let i = 0; i < sim.count; i++) { const v = f[i]; sum += v; if (v > .5) sheet++; if (v > .05) any++; }
      log(`foam 4 s after the splash (foam dial ${USER.foam}): mean ${(sum / sim.count).toFixed(3)}, ${(sheet / sim.count * 100).toFixed(1)}% of the lid a sheet (> .5), ${(any / sim.count * 100).toFixed(1)}% foamed at all (> .05)`);
      if (!(sheet / sim.count < .15 * USER.foam + .02)) throw new Error(`the splash foamed the pool: ${(sheet / sim.count * 100).toFixed(1)}% sheet`);
+     // ── THE CURRENT CARRIES THE WAKE'S FOAM (2026-09-07) ──────────────
+     // With ?current=, the splash's foam centroid must have moved along the
+     // current by roughly the 2.5 s between the two readings.
+     if (Number(argument('current', '0')) !== 0) {
+       const foamAt4 = await foamCentroid(), moved = foamAt4 - foamAt1_5, expected = Number(argument('current', '0')) * 2.5;
+       log(`current ${argument('current', '0')} m/s: the splash foam's centroid moved ${moved.toFixed(2)} m along it between 1.5 s and 4 s (expected about ${expected.toFixed(2)} m)`);
+       if (!(moved > expected * .4 && moved < expected * 1.6)) throw new Error(`the wake's foam does not ride the current: moved ${moved.toFixed(2)} m of ${expected.toFixed(2)}`);
+     }
    }
 
    // The field at the wall against the field inside: a wall that piles a

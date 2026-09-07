@@ -202,6 +202,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   Object.assign(u, {
     shear: uniform(1), bend: uniform(.1), gust: uniform(0), gustFrequency: uniform(1), simTime: uniform(0), pin: uniform(0),
     waveHeight: uniform(0), waveLength: uniform(4), waveCos: uniform(1), waveSin: uniform(0),
+    // The current (metres per second, and its direction) — see waterSpectrum.js `scroll`;
+    // `tick` is the frame's real seconds for the advection kernels.
+    current: uniform(0), currentCos: uniform(1), currentSin: uniform(0), tick: uniform(0),
     // Per-cascade mip the surface kernel reads the sea at — the level whose
     // texel is no finer than this grid's cell (render mesh / solver). See `tick`.
     seaLod: [uniform(0), uniform(0), uniform(0)],
@@ -348,7 +351,36 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     scratch.element(index).assign(select(valid, flow.element(syi.clamp(0, w - 1).mul(w).add(sxi.clamp(0, w - 1))), vec4(0)));
   })().compute(wCount) : null;
   const shiftFlowInto = flow ? Fn(() => { flow.element(index).assign(scratch.element(index)); })().compute(wCount) : null;
-  const shiftKernels = kind === "water" ? [shiftFrom(positions, true), shiftInto(positions), shiftFrom(previous, false), shiftInto(previous), shiftFlowFrom, shiftFlowInto] : [];
+  // ⛔ `positions` LAST. `foamField` reads `scratch.w` as the foam copy the
+  // last `integrate` left there; a tick with no substep (shorter than one, or
+  // the harness's zero-length follow tick) runs no integrate, and a shift or
+  // advection that ended on `previous` left previous.w in scratch — the foam
+  // field read it as its own and was wiped in one tick (the current's
+  // advection, 2026-09-07). Ending on `positions` leaves the foam in place.
+  const shiftKernels = kind === "water" ? [shiftFlowFrom, shiftFlowInto, shiftFrom(previous, false), shiftInto(previous), shiftFrom(positions, true), shiftInto(positions)] : [];
+  // ── THE CURRENT CARRIES THE RIPPLE FIELD (2026-09-07) ────────────────────
+  // `current` scrolls the sea under a fixed lid (a boat that "moves" without
+  // moving): a wake's heights and foam must stream with the water too, or the
+  // wake sits still beside a hull the sea is passing. Semi-Lagrangian, once a
+  // tick, before the substeps: each cell takes the value that was upstream —
+  // the current over the lid's scale, in cells — with the rest position kept.
+  const advectFrom = (source) => Fn(() => {
+    if (globalThis.__waterCurrentCopy) { scratch.element(index).assign(source.element(index)); return; }   // harness: the plumbing alone
+    const cx = u.current.mul(u.currentCos).mul(u.tick).div(u.waveScale.x).div(sx);
+    const cz = u.current.mul(u.currentSin).mul(u.tick).div(u.waveScale.z).div(sz);
+    const bx = x.toFloat().sub(cx), by = y.toFloat().sub(cz);
+    const ix0 = bx.floor().clamp(0, w - 1), iy0 = by.floor().clamp(0, w - 1);
+    const ix1 = ix0.add(1).min(w - 1), iy1 = iy0.add(1).min(w - 1);
+    const fx = bx.sub(bx.floor()).clamp(0, 1), fy = by.sub(by.floor()).clamp(0, 1);
+    const at = (ix, iy) => source.element(iy.toInt().mul(w).add(ix.toInt()));
+    const a = at(ix0, iy0), b = at(ix1, iy0), c = at(ix0, iy1), d = at(ix1, iy1);
+    const height = mix(mix(a.y, b.y, fx), mix(c.y, d.y, fx), fy);
+    const foam = mix(mix(a.w, b.w, fx), mix(c.w, d.w, fx), fy);
+    const rest = source.element(index);
+    scratch.element(index).assign(vec4(rest.x, height, rest.z, foam));
+  })().compute(wCount);
+  const advectInto = (target) => Fn(() => { target.element(index).assign(scratch.element(index)); })().compute(wCount);
+  const currentKernels = kind === "water" ? [advectFrom(previous), advectInto(previous), advectFrom(positions), advectInto(positions)] : [];   // positions last — see shiftKernels
   const integrate = Fn(() => {
     const p = positions.element(index).xyz.toVar();
     const old = previous.element(index).xyz;
@@ -1160,7 +1192,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const limit = FLOW_CFL * Math.min(sx, sz) / h;
     const speed = v.length().max(1e-6);
     v.assign(v.mul(speed.min(limit).div(speed)));
-    const drift = f.zw.mul(float(1).sub(dt.div(FLOW_DRIFT_SECONDS))).add(v.mul(dt));
+    // The drawn pattern also rides the current (the field's values are
+    // advected by it once a tick; the drift is what the pattern is read at).
+    const currentLocal = vec2(u.current.mul(u.currentCos).div(u.waveScale.x), u.current.mul(u.currentSin).div(u.waveScale.z));
+    const drift = f.zw.mul(float(1).sub(dt.div(FLOW_DRIFT_SECONDS))).add(v.mul(dt)).add(currentLocal.mul(h));
     flow.element(index).assign(vec4(v, drift));
   })().compute(wCount) : null;
   const steps = kind === "cloth" ? [integrate, solveA, solveB, solveA, solveB, solveA, solveB, solveA, solveB, commit] : [integrate, commit, momentum];
@@ -1236,6 +1271,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     u.waveLength.value = authoredWaveLength;
     const direction = finite(p.waveDirection, 0, -180, 180) * Math.PI / 180;
     u.waveCos.value = Math.cos(direction); u.waveSin.value = Math.sin(direction);
+    u.current.value = finite(p.current, 0, -10, 10);
+    const currentDirection = finite(p.currentDirection, 0, -180, 180) * Math.PI / 180;
+    u.currentCos.value = Math.cos(currentDirection); u.currentSin.value = Math.sin(currentDirection);
     u.waterDepth.value = finite(p.waterDepth, 2, 0, 100);
     if (shape) { const s = waterVolumeShape(p); Object.assign(shape, s); u.shape.value.set(s.kind, s.radius, s.centerY, s.height); }
     // `absorption` is DERIVED now — see `waterSaturation`. The uniform stays
@@ -1500,6 +1538,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
           c.x - winW / 2 > -width / 2 + sx ? 1 : 0, c.x + winW / 2 < width / 2 - sx ? 1 : 0,
           c.y - winH / 2 > -height / 2 + sz ? 1 : 0, c.y + winH / 2 < height / 2 - sz ? 1 : 0);
       }
+      // The current streams the field, once a tick, before the substeps.
+      u.tick.value = delta;
+      if (kind === "water" && u.current.value !== 0 && initialized && globalThis.__waterCurrentAdvect !== false) queue.push(...currentKernels);
       if(injectWater) {
         impulseCount.value=pendingImpulses.length;
         for(let i=0;i<pendingImpulses.length;i++)impulseRows[i].fromArray(pendingImpulses[i]);
@@ -1533,7 +1574,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // Its own submission, and its mips made before anything samples them
       // (see waterSpectrum.js `generateMipmaps`).
       if (spectrum) {
-        const seaQueue = spectrum.passes(delta, elapsed, { eye: seaEye, foam: u.foam.value });
+        const seaQueue = spectrum.passes(delta, elapsed, { eye: seaEye, foam: u.foam.value,
+          current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value] });
         if (seaQueue.length) { renderer.compute(seaQueue); spectrum.generateMipmaps(renderer); }
       }
       if (foamField) queue.push(foamField, rippleWrite);

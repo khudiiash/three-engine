@@ -211,6 +211,13 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
 
   const u = {
     time: uniform(0), dt: uniform(0), lambda: uniform(.35),
+    // ── THE CURRENT (2026-09-07) ──────────────────────────────────────────
+    // "I want to make it look like the boat is floating, without actually
+    // moving it, so I need to scroll the ocean." Every sample of the sea is
+    // taken at world + scroll, and scroll advances by the authored current
+    // (metres per second) each tick: the sea streams under a fixed lid —
+    // geometry, normals, whitecaps, caustics and the buoyancy query alike.
+    scroll: uniform(new THREE.Vector2(0, 0)),
     depth: uniform(20), peakOmega: uniform(1), kPeak: uniform(1), kMax: uniform(10), tilt: uniform(0), ripple: uniform(1),
     spectra: [0, 1].map(() => ({ scale: uniform(1), angle: uniform(0), spreadBlend: uniform(1), swell: uniform(.3), gamma: uniform(3.3) })),
   };
@@ -230,6 +237,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     gate: uniform(.25), decay: uniform(1), lods: Array.from({ length: cascadeCount }, () => uniform(0)),
   };
   let foamPhase = 0, foamWritten = null;
+  // The current's sub-texel remainder for the whitecap memory's shift.
+  const scrollAccum = { x: 0, y: 0 };
 
   const cascades = Array.from({ length: cascadeCount }, (_, i) => {
     const c = { dk: uniform(1), cutLow: uniform(0), cutHigh: uniform(9999), amplitude: uniform(0), invL: uniform(1), L: 1,
@@ -331,7 +340,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     /** The dispatches for this frame, in order; `renderer.compute(...)` them.
      *  `eye` is the camera in the sea's metres (a water's local XZ × its
      *  scale) — the foam window follows it; `foam` is the water's dial. */
-    passes(dt, time, { eye = null, foam = null } = {}) {
+    passes(dt, time, { eye = null, foam = null, current = null } = {}) {
       const queue = [];
       if (!settings) return queue;
       if (dirty) { for (const c of cascades) queue.push(c.kernels.initial, c.kernels.conjugate); dirty = false; }
@@ -348,6 +357,18 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         f.shift.value.set(Math.round((cx - f.center.value.x) / t), Math.round((cz - f.center.value.y) / t));
         f.center.value.set(cx, cz);
       } else f.shift.value.set(0, 0);
+      // The current: the sea's samples move by it, and so must the whitecap
+      // memory — foam rides the water. The window stays on the eye (world
+      // space); its CONTENTS take the value that was upstream a tick ago,
+      // whole texels at a time with the remainder carried.
+      if (current && (current[0] || current[1])) {
+        const step = Math.min(.1, Math.max(0, dt));
+        u.scroll.value.x += current[0] * step; u.scroll.value.y += current[1] * step;
+        scrollAccum.x += current[0] * step; scrollAccum.y += current[1] * step;
+        const sx = Math.round(scrollAccum.x / t), sz = Math.round(scrollAccum.y / t);
+        scrollAccum.x -= sx * t; scrollAccum.y -= sz * t;
+        f.shift.value.x -= sx; f.shift.value.y -= sz;
+      }
       queue.push(foamKernels[foamPhase]);
       foamWritten = foamMaps[1 - foamPhase];
       spectrum.nodes.foam.value = foamWritten;
@@ -390,7 +411,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     async readback(renderer, count = 2) {
       if (!renderer?.backend?.copyTextureToBuffer || !settings) return null;
       const maps = await Promise.all(cascades.slice(0, count).map((c, i) => renderer.backend.copyTextureToBuffer(displacement, 0, 0, size, size, i)));
-      return { cascades: maps.map((map, i) => ({ size, L: cascades[i].L, displacement: map })) };
+      return { cascades: maps.map((map, i) => ({ size, L: cascades[i].L, displacement: map })), scroll: { x: u.scroll.value.x, z: u.scroll.value.y } };
     },
     dispose(renderer) {
       releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), ...foamKernels]);
@@ -445,7 +466,7 @@ const texelCentre = (spectrum) => .5 / spectrum.size;
 export function seaDisplacementAt(spectrum, world, lods = null) {
   let sum = vec4(0);
   spectrum.cascades.forEach((c, i) => {
-    const uv = world.mul(c.uniforms.invL).add(texelCentre(spectrum));
+    const uv = world.add(spectrum.uniforms.scroll).mul(c.uniforms.invL).add(texelCentre(spectrum));
     let s = spectrum.nodes.displacement.sample(uv).depth(i);
     if (lods) s = s.level(lods[i]);
     sum = sum.add(s);
@@ -463,7 +484,7 @@ export function seaDisplacementAt(spectrum, world, lods = null) {
 export function seaJacobianAt(spectrum, world, crossSum, lods = null) {
   let dxx = float(0), dzz = float(0);
   spectrum.cascades.forEach((c, i) => {
-    const uv = world.mul(c.uniforms.invL).add(texelCentre(spectrum));
+    const uv = world.add(spectrum.uniforms.scroll).mul(c.uniforms.invL).add(texelCentre(spectrum));
     let s = spectrum.nodes.derivatives.sample(uv).depth(i);
     if (lods) s = s.level(lods[i]);
     dxx = dxx.add(s.z); dzz = dzz.add(s.w);
@@ -479,7 +500,7 @@ export function seaJacobianAt(spectrum, world, crossSum, lods = null) {
 export function seaSlopeAt(spectrum, world, { lods = null, weights = null } = {}) {
   let d = vec4(0);
   spectrum.cascades.forEach((c, i) => {
-    const uv = world.mul(c.uniforms.invL).add(texelCentre(spectrum));
+    const uv = world.add(spectrum.uniforms.scroll).mul(c.uniforms.invL).add(texelCentre(spectrum));
     let s = spectrum.nodes.derivatives.sample(uv).depth(i);
     if (lods) s = s.level(lods[i]);
     if (weights) s = s.mul(weights[i]);
@@ -568,7 +589,7 @@ export function seaShadingSlopeNode(spectrum, world, surfaceDetail, vertexLods =
   const viewDist = positionWorld.sub(cameraPosition).length();
   let d = vec4(0);
   spectrum.cascades.forEach((c, i) => {
-    const uv = world.mul(c.uniforms.invL).add(texelCentre(spectrum));
+    const uv = world.add(spectrum.uniforms.scroll).mul(c.uniforms.invL).add(texelCentre(spectrum));
     const fade = float(1).div(c.uniforms.invL).mul(LOD_SCALE).div(viewDist.max(1e-3)).min(1);
     const full = spectrum.nodes.derivatives.sample(uv).depth(i);
     let s = full;

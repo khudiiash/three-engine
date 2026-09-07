@@ -71,7 +71,7 @@ export function createWaterSurfaceQuery(mesh, props, time, sea = null) {
   return (point) => {
   const world=new Vector3(point.x,point.y,point.z),local=world.clone().applyMatrix4(frame.inverse);
   if(!waterInsideXZ(shape,extent,local.x,local.z)) return null;
-  const height=sea?.cascades?.length?seaHeightAt(sea.cascades,local.x*frame.scale.x,local.z*frame.scale.z)/frame.scale.y:0;
+  const height=sea?.cascades?.length?seaHeightAt(sea.cascades,local.x*frame.scale.x+(sea.scroll?.x??0),local.z*frame.scale.z+(sea.scroll?.z??0))/frame.scale.y:0;
   const worldHeight=world.y+(height-local.y)*frame.rise;
   return {height:worldHeight,bottom:worldHeight-extent.depth*Math.abs(frame.rise),localX:local.x,localZ:local.z};
   };
