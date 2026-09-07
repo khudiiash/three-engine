@@ -16,9 +16,36 @@ function rig(extra={}) {
     physics.world.createCollider(RAPIER.ColliderDesc.cuboid(size/2,size/2,size/2).setMass(mass),body);
     const entity={object3D:new THREE.Object3D(),getComponent:()=>null};physics.dynamicBodies.push({body,entity});return body;
   };
+  // A FIXED body (a pier, a rock): registered the way the physics system
+  // registers every body, in `bodyByEntity`, never in `dynamicBodies`.
+  const addFixed=(size=1,x=0,y=0)=>{
+    const body=physics.world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x,y,0));
+    physics.world.createCollider(RAPIER.ColliderDesc.cuboid(size/2,size/2,size/2),body);
+    const entity={object3D:new THREE.Object3D(),getComponent:()=>null};physics.bodyByEntity.set(entity,body);return body;
+  };
   const step=(seconds)=>{for(let i=0;i<seconds*60;i++){component.simulation.uniforms.simTime.value+=1/60;physics.update(1/60);}};
-  return {physics,component,add,step,wakes,foams,splashes,dispose:()=>{physics.world.free();physics.eventQueue.free();}};
+  return {physics,component,add,addFixed,step,wakes,foams,splashes,dispose:()=>{physics.world.free();physics.eventQueue.free();}};
 }
+
+// ── EVERY COLLIDER, NOT ONLY THE DYNAMIC (2026-09-07) ───────────────────────
+// A fixed cube straddling the waterline in a 3 m/s current sheds contact foam
+// and throws spray off its leading side like a hull, but presses no wake
+// (the surface meets a rock, it is not pressed by it) and takes no force.
+test('a FIXED collider in a current sheds foam and spray but presses no wake',()=>{
+  const r=rig({current:3,currentDirection:0});try{
+    const body=r.addFixed(2,0,0); r.step(2);   // the surface exactly on a layer boundary — the hard case
+    assert.ok(r.foams.length>0,`a fixed body in a current sheds contact foam: ${r.foams.length}`);
+    const counted=r.splashes.filter((s)=>s[4]!=null);
+    assert.ok(counted.length>0,`a fixed body in a current throws contact spray: ${counted.length}`);
+    assert.equal(r.wakes.length,0,`a fixed body presses no wake: ${r.wakes.length}`);
+    const t=body.translation(); assert.ok(Math.abs(t.x)<1e-6&&Math.abs(t.y)<1e-6,'a fixed body does not move');
+  }finally{r.dispose();}
+  const still=rig();try{
+    still.addFixed(2,0,0); still.step(2);
+    assert.equal(still.wakes.length,0,'still water, a fixed body: no wake');
+    assert.equal(still.splashes.filter((s)=>s[4]!=null).length,0,'still water, a fixed body: no spray');
+  }finally{still.dispose();}
+});
 
 // ── CONTACT SPRAY (2026-09-07) ──────────────────────────────────────────────
 // A hull held in a 3 m/s current moves through the water at 3 m/s: its

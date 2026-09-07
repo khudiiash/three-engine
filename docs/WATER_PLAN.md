@@ -878,6 +878,28 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     the water's to fix but the phone's real load: the 8000² shadow map
     (2048 on mobile), 424 draws (merge the boat), the refraction and
     mirror scene passes, GI.
+66. EVERY COLLIDER, NOT ONLY THE DYNAMIC. "I see it react only to dynamic
+    rigid body colliders … make the wave react to any collider — a fixed
+    one and a water current, water still should react to it, contact with
+    it" (user, 2026-09-07). The loop walked `physics.dynamicBodies`; it
+    walks the union of `dynamicBodies`, `kinematicBodies` and
+    `bodyByEntity` now (every body the physics system registers, once).
+    Per body: DYNAMIC (mass > 0) — everything as before; KINEMATIC — the
+    wake dent, the contact foam, contact and slam spray, no forces, its
+    velocity from the physics system's own position delta when Rapier
+    reports none; FIXED — the contact foam ring, foam shed by water
+    flowing past it, spray where a wave climbs it or a current hits it, NO
+    forces and NO wake dent (the surface meets a rock, it is not pressed
+    by it). ⚠ Found on the way: the waterline test `0 < under < 1` is the
+    waterplane's partition and stays so for the spring, but a body at rest
+    with the surface EXACTLY on a sample-layer boundary (a fixed cube on a
+    flat pool) had no strictly-partial layer at all — no waterline, no
+    contact, no spray. The outline's test is inclusive now (a cell whose
+    band contains the surface counts); `plane` is unchanged.
+    `__waterPhysicsDebug = true` logs each body's volume/plane/waterline
+    and the outline's segments. Test: a fixed 2 m cube in a 3 m/s current
+    sheds foam and counted spray, presses no wake, does not move; in still
+    water neither; physics 21, spectrum 12, the pool arm passes.
 
 ## Open
 

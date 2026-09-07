@@ -143,8 +143,25 @@ export class WaterPhysics {
     const density=finite(p.waterDensity,1000,.01),drag=finite(p.fluidDrag,3,0,100),angular=finite(p.angularDrag,2,0,100);
     const gravity=new Vector3(...physics.gravity);
     let displaced=0,bodies=0;
-    for(const {body,entity} of physics.dynamicBodies) {
-      if(entity===c.entity||!body.isDynamic()||!(body.mass()>0))continue;
+    // ── EVERY COLLIDER, NOT ONLY THE DYNAMIC (2026-09-07) ─────────────────
+    // "I see it react only to dynamic rigid body colliders … make the wave
+    // react to any collider." A FIXED body (a pier, a rock) gets the contact
+    // foam ring, foam shed by water flowing past it and spray where a wave
+    // climbs it — no forces (nothing to push) and no wake dent (the surface
+    // meets a rock, it is not pressed by it). A KINEMATIC body (a driven
+    // hull) gets everything a dynamic one does but the forces, its velocity
+    // from the physics system's own position delta when Rapier reports none.
+    const seen=new Set(),every=[];
+    const take=(body,entity)=>{if(!body||seen.has(body))return;seen.add(body);every.push({body,entity});};
+    for(const e of physics.dynamicBodies??[])take(e.body,e.entity);
+    for(const e of physics.kinematicBodies??[])take(e.body,e.entity);
+    if(physics.bodyByEntity)for(const [entity,body] of physics.bodyByEntity)take(body,entity);
+    for(const {body,entity} of every) {
+      if(entity===c.entity)continue;
+      const dynamic=body.isDynamic()&&body.mass()>0;
+      const kinematic=!dynamic&&!!body.isKinematic?.();
+      const fixed=!dynamic&&!kinematic;
+      const linvel=(()=>{const lv=body.linvel();if(kinematic&&dt>0&&Math.hypot(lv.x,lv.y,lv.z)<1e-6){const k=physics.kinematicBodies?.find((e)=>e.body===body);if(k?.delta)return {x:k.delta[0]/dt,y:k.delta[1]/dt,z:k.delta[2]/dt};}return lv;})();
       const contacts=[],waterline=[];let volume=0,plane=0,total=0;
       // ── THE FOOTPRINT IS THE HULL'S COLUMNS (2026-09-07) ─────────────────
       // One circle per body made a boat press a round dent ("the contact
@@ -221,8 +238,15 @@ export class WaterPhysics {
           // for ever ("the surface continues to wobble as if the object is
           // entering water each frame ... must calm down when the cube
           // submerged", user 2026-09-05).
-          if(under>0&&under<1){
-            plane+=cell/band;
+          if(under>0&&under<1)plane+=cell/band;
+          // ⚠ THE WATERLINE TEST IS INCLUSIVE. `under` strictly inside (0, 1)
+          // is the waterplane's partition (exactly one layer partial) and
+          // must stay so for the spring; but a body at rest with the surface
+          // EXACTLY on a layer boundary — a fixed pier on a flat pool — has
+          // no strictly-partial layer at all and reported no waterline, no
+          // contact, no spray (the fixed-body test, 2026-09-07). For the
+          // outline, a cell whose band contains the surface counts.
+          if(Math.abs(surface.height-point.y)<=radius+1e-6){
             // Only the hull's OUTLINE sheds foam: the quadrature's border
             // samples (a 4 × 4 grid per collider). Every straddling sample
             // once seeded a flat disc and a box hull became a white slab of
@@ -239,6 +263,7 @@ export class WaterPhysics {
           column.x+=point.x*v;column.z+=point.z*v;column.volume+=v;columns.set(key,column);
         }
       }
+      if(globalThis.__waterPhysicsDebug)console.log('[water-physics]',{dynamic,kinematic,fixed,volume,plane,total,waterline:waterline.length,linvel});
       if(!volume){this.previousVolumes.set(body,0);this.releaseWake(body);continue;}
       // ── BUOYANCY IS A STIFF SPRING, AND A STIFF SPRING NEEDS AN IMPLICIT STEP ─
       //
@@ -256,18 +281,20 @@ export class WaterPhysics {
       // density contributes ~0.005 and nothing about it changes, while the crate
       // contributes 48 and settles instead of launching. Archimedes' equilibrium
       // is untouched — at rest the spring term multiplies a zero displacement.
-      const mass=body.mass(),fluidMass=volume*density;
-      const stiffness=density*Math.abs(gravity.y)*plane;
-      const denominator=1+(drag*fluidMass*dt+stiffness*dt*dt)/mass;
-      const buoyancy=gravity.clone().multiplyScalar(-density*dt/denominator);
-      const velocity=new Vector3().copy(body.linvel());
-      for(const contact of contacts) body.applyImpulseAtPoint(buoyancy.clone().multiplyScalar(contact.volume),contact.point,true);
-      // Include Rapier's upcoming gravity in the implicit drag solve. This
-      // retains Archimedes' equilibrium even when water is denser than a body.
-      const dragImpulse=velocity.clone().addScaledVector(gravity,dt*body.gravityScale()).multiplyScalar(-mass*(1-1/denominator));
-      body.applyImpulse(dragImpulse,true);
-      const spin=body.angvel(),retain=1/(1+angular*fluidMass*dt/mass);
-      body.setAngvel({x:spin.x*retain,y:spin.y*retain,z:spin.z*retain},true);
+      if(dynamic){
+        const mass=body.mass(),fluidMass=volume*density;
+        const stiffness=density*Math.abs(gravity.y)*plane;
+        const denominator=1+(drag*fluidMass*dt+stiffness*dt*dt)/mass;
+        const buoyancy=gravity.clone().multiplyScalar(-density*dt/denominator);
+        const velocity=new Vector3().copy(linvel);
+        for(const contact of contacts) body.applyImpulseAtPoint(buoyancy.clone().multiplyScalar(contact.volume),contact.point,true);
+        // Include Rapier's upcoming gravity in the implicit drag solve. This
+        // retains Archimedes' equilibrium even when water is denser than a body.
+        const dragImpulse=velocity.clone().addScaledVector(gravity,dt*body.gravityScale()).multiplyScalar(-mass*(1-1/denominator));
+        body.applyImpulse(dragImpulse,true);
+        const spin=body.angvel(),retain=1/(1+angular*fluidMass*dt/mass);
+        body.setAngvel({x:spin.x*retain,y:spin.y*retain,z:spin.z*retain},true);
+      }
       // ── THE WAKE IS A DISPLACEMENT PAIR, NOT AN IMPULSE ─────────────────────
       //
       // Ported from the MIT jeantimex/webgpu-water reference's `sphere.frag`,
@@ -337,7 +364,7 @@ export class WaterPhysics {
         // has not had time to get out of the way of; it decays to nothing as
         // the body slows, so a resting body is untouched by this and the pair
         // still cancels exactly.
-        const sinking=Math.max(0,-body.linvel().y);
+        const sinking=Math.max(0,-linvel.y);
         const draught=volume/silhouette+sinking*IMPACT_TIME;
         const depth=finite(p.wakeStrength,.15,0,2)*draught*straddle/Math.max(.001,Math.abs(scale.y));
         const previous=this.previousWakes.get(body);
@@ -407,7 +434,7 @@ export class WaterPhysics {
         // columns say WHAT: each in-water column of the hull, pressed by its
         // own draught, and every one released again by the exact record of
         // its press, so the pair still cancels to the bit.
-        if(moved>filter.radius*.15||changed>Math.max(Math.abs(filter.depth)*.08,filter.radius*.02)){
+        if(!fixed&&(moved>filter.radius*.15||changed>Math.max(Math.abs(filter.depth)*.08,filter.radius*.02))){
           const strength=finite(p.wakeStrength,.15,0,2);
           const pressed=[];
           // A compact body: the smoothed whole-body footprint, bit for bit as
@@ -439,7 +466,7 @@ export class WaterPhysics {
         // a dead zone so a hull bobbing at rest sheds nothing.
         if(waterline.length){
           const cur=finite(p.current,0,-100,100),curDir=finite(p.currentDirection,0,-180,180)*Math.PI/180;
-          const vel=body.linvel();
+          const vel=linvel;
           const rvx=vel.x-cur*Math.cos(curDir),rvz=vel.z-cur*Math.sin(curDir);
           const through=Math.hypot(rvx,rvz);
           // ── CONTACT SPRAY (2026-09-07) ─────────────────────────────────
@@ -498,6 +525,7 @@ export class WaterPhysics {
               segments.push({ax:qa.localX,az:qa.localZ,bx:qb.localX,bz:qb.localZ,nx:nx2,nz:nz2,metres:len*flat,mx,mz});
             }
           }
+          if(globalThis.__waterPhysicsDebug)console.log('[water-physics] outline',{segments:segments.length,through,cur,curDir});
           if(through>1.5&&dt>0){
             const perMetre=(through-1)*60*dt;
             for(const s of segments){
