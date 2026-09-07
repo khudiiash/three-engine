@@ -7,6 +7,7 @@ import {
 import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
 import { mipmapBlitter } from "./gpuMipmaps.js";
+import { createFoamFlow } from "./waterFoamFlow.js";
 
 /**
  * ══ THE SPECTRAL SEA, ON THE GPU ═══════════════════════════════════════════
@@ -481,7 +482,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     },
     /** The sea carries no memory of its own (the solver's foam field does);
      *  a restart re-realizes nothing. Kept so the solver may call it. */
-    restart() { particlesReady = false; },
+    restart() { particlesReady = false; kernels?.flow.restart(); },
     /** The dispatches for this frame, in order; `renderer.compute(...)` them.
      *  `eye` is the camera in the sea's metres (a water's local XZ × its
      *  scale) — the foam window follows it; `foam` is the water's dial. */
@@ -561,7 +562,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       }
       const k = ensureKernels();
       if (!particlesReady) { queue.push(k.particleInit, k.splashInit); particlesReady = true; }
-      // The splash step first: its returns feed the foam step this frame.
+      // The fluid first, then the splash step (its returns feed the foam step).
+      queue.push(...k.flow.passes(step, time, eye));
       queue.push(k.liveReset, k.splashStep, k.particleStep);
       return queue;
     },
@@ -639,7 +641,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       return { pos: new Float32Array(pos), vel: new Float32Array(vel) };
     },
     dispose(renderer) {
-      releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), ...(kernels ? Object.values(kernels) : [])]);
+      releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), ...(kernels ? Object.values(kernels).filter((k) => k?.isNode !== false && k !== kernels.flow) : [])]);
+      kernels?.flow.dispose(renderer);
       releaseStorageAttributes(renderer, [particles.value, particleAux.value, splash.value, splashVel.value, splashAux.value, returns.value, liveCounter.value].filter(Boolean));
       for (const c of cascades) for (const t of c.textures) t.dispose();
       foamTarget.dispose(); splatMaterial.dispose(); splatGeometry.dispose();
@@ -673,6 +676,22 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   const buildKernels = () => {
     const ripple = spectrum.ripple ?? null;
     const localOf = (world) => vec3(world.x.div(ripple.scale.x), 0, world.y.div(ripple.scale.z));
+    // The surface under a point: the sea plus the ripple window's height
+    // (a bow wave lifts the lid at the hull — spray born at the sea's own
+    // height started UNDER it: "the splashes are just under the water
+    // surface", user, 2026-09-07).
+    const surfaceAt = (xz) => {
+      const sea = seaDisplacementAt(spectrum, xz, f.zeroLods).y;
+      return ripple ? sea.add(ripple.at(localOf(xz)).x.mul(ripple.scale.y)) : sea;
+    };
+    // The foam's fluid (waterFoamFlow.js): a divergence-free perturbation
+    // on the sea's surface velocity, on a 128 m window around the eye.
+    const flow = createFoamFlow({
+      size: Math.max(64, foamSize >> 2),
+      seaFold: (world, lods) => seaFoldAt(spectrum, world, lods ?? f.lods),
+      seaVelocity: (world) => seaVelocityAt(spectrum, world, f.zeroLods),
+      threshold: f.threshold, timeScale: f.timeScale, ripple,
+    });
     // ── THE FOAM STEP ────────────────────────────────────────────────────
     // A live particle rides the surface velocity, the current and — inside
     // the ripple window — the wake's flow, and ages. A dead one probes: a
@@ -690,11 +709,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       const i = instanceIndex.toInt();
       const p = particles.element(i).toVar();
       If(p.z.lessThan(p.w), () => {
-        const vel = seaVelocityAt(spectrum, p.xy, f.zeroLods).mul(f.timeScale).add(f.currentVel).toVar();
-        if (ripple) {
-          const flow = ripple.flow(localOf(p.xy)).xy;
-          vel.addAssign(vec2(flow.x.mul(ripple.scale.x), flow.y.mul(ripple.scale.z)));
-        }
+        // The sea's own velocity, the fluid's swirl on top of it (which
+        // carries the ripple field's flow inside its window), the current.
+        const vel = seaVelocityAt(spectrum, p.xy, f.zeroLods).mul(f.timeScale).add(flow.at(p.xy)).add(f.currentVel).toVar();
         p.xy.assign(p.xy.add(vel.mul(f.dt)));
         p.z.assign(p.z.add(f.dt));
         particles.element(i).assign(p);
@@ -788,7 +805,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         p.xyz.assign(p.xyz.add(v.xyz.mul(dts)));
         p.xz.assign(p.xz.add(f.currentVel.mul(f.dt)));
         p.w.assign(p.w.add(dts));
-        const surface = seaDisplacementAt(spectrum, p.xz, f.zeroLods).y;
+        const surface = surfaceAt(p.xz);
         If(p.y.lessThan(surface).and(p.w.greaterThan(.15)), () => {
           returns.element(i).assign(vec4(p.x, p.z, splashAux.element(i).x, 1));
           p.w.assign(v.w.add(1));
@@ -829,7 +846,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
           });
         });
         If(born.greaterThan(.5), () => {
-          const y = seaDisplacementAt(spectrum, at, f.zeroLods).y.add(.05);
+          const y = surfaceAt(at).add(.1);
           splash.element(i).assign(vec4(at.x, y, at.y, 0));
           splashVel.element(i).assign(vec4(vel, float(1.5).add(rnd(25).mul(2.5))));
           splashAux.element(i).assign(vec4(strength, rnd(26).mul(.8).add(.6), 0, 0));
@@ -838,8 +855,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     })().compute(splashCount);
     particleInit.__giPassName = "sea.foamInit"; particleStep.__giPassName = "sea.foamStep"; liveReset.__giPassName = "sea.foamLiveReset";
     splashInit.__giPassName = "sea.splashInit"; splashStep.__giPassName = "sea.splashStep";
-    return { particleInit, particleStep, liveReset, splashInit, splashStep };
+    return { particleInit, particleStep, liveReset, splashInit, splashStep, flow };
   };
+  spectrum.flowField = () => kernels?.flow ?? null;
   // ── THE SPLAT ────────────────────────────────────────────────────────────
   // Every live particle is a Gaussian of `f.disc` metres (times its size
   // factor) in the map (the window's NDC; the target's row 0 is the TOP, so
@@ -916,7 +934,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     const stretch = speed.mul(.25).add(1).min(4);
     const offsetWorld = right.mul(positionGeometry.x).add(up.mul(positionGeometry.y).mul(stretch)).mul(size);
     splashMaterial.positionNode = centre.add(modelWorldMatrixInverse.mul(vec4(offsetWorld, 0)).xyz);
-    const fade = varying(part.w.div(velocity.w.max(1e-3)).oneMinus().clamp(0, 1).mul(aux.x), "seaSplashFade");
+    // A sheet is translucent water, a drop is a bright bead: the opacity
+    // climbs from .45 to .9 over the first half second.
+    const fade = varying(part.w.div(velocity.w.max(1e-3)).oneMinus().clamp(0, 1).mul(aux.x).mul(part.w.mul(2).clamp(0, 1).mul(.45).add(.45)), "seaSplashFade");
     splashMaterial.colorNode = vec3(.85);
     splashMaterial.opacityNode = uvAttribute().sub(.5).length().mul(2).smoothstep(.3, 1).oneMinus().mul(fade).mul(.9);
   }

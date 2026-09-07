@@ -661,6 +661,41 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     12. ⚠ `tests/water-interaction.test.mjs` fails on an UNCOMMITTED
     working-tree change to PhysicsSystem.js (`this.engine.batchHierarchy
     is not a function` — the test's engine stub lacks it); not this unit's.
+57. ⭐ THE FOAM'S FLUID, AND WHAT THE USER'S SCREEN TAUGHT (a lot better,
+    then four reports). (1) "Fluid motion like the 2D fluid sims":
+    `waterFoamFlow.js` — a stable-fluids field on a 128 m camera window
+    at 256² (half-metre cells): NOT the surface velocity projected (that
+    would delete the crests' convergence) but a PERTURBATION `w` on top
+    of it — shifted with the window, advected by sea + w (semi-Lagrangian),
+    kicked by a three-octave divergence-free curl noise where crests fold
+    (2.5 m/s² at a full fold), relaxed to the ripple field's flow inside
+    its window (a hull's push, a splash's ring — the field carries it to
+    the particles now), rolled up by vorticity confinement (ε .5 × cell),
+    damped at .35/s, projected divergence-free by 12 Jacobi sweeps
+    (warm-started) — 17 dispatches of 256² a frame. A foam particle inside
+    the window moves at sea + w + current. Receipt: rms 0.11–0.12 m/s,
+    peak 1.6–1.7 m/s, no blow-up; the current receipt still 1.96 m. (2)
+    "Flickery, stuttering": a newborn speck popped in at full brightness
+    (a half-second fade-in now) and the lace was tiled at 0.35–0.55 m —
+    7 mm cells shimmering under any motion (4.5 / 1.3 / 1.6 m tiles now,
+    feather .18). (3) "Spray flashes, flat planes that do not billboard":
+    the billboard basis was built in the water's LOCAL space, and an
+    ocean is scaled 500 × 60 × 500 — a camera-facing plane in local space
+    is skewed edge-on in world space; the basis is world metres now and
+    only the offset goes back through the inverse model matrix. (4) "The
+    splashes are just under the water surface": spray was born at the
+    SEA's height, but a bow wave lifts the lid by the ripple field's
+    height, and the lid writes depth now — birth and death read sea +
+    ripple. Beside these: a crown is a SHEET first (velocity smooth
+    around the ring, three lobes, the rim fastest, turbulence .04 at
+    emission) that TEARS with age (a random walk growing to 2.5 m/s² by
+    0.8 s), drawn bigger and translucent early (opacity .45 → .9), its
+    four billboards spreading apart as it ages; a wave SLAMMING the hull
+    (the surface's climb at the body + its sinking > 1.5 m/s) and a bow
+    in a current (> 1.5 m/s through, 60 drops/s per leading sample per
+    m/s over the first, at the full speed) throw counted spray. Physics
+    tests 20 (crowns are the uncounted seeds), spectrum 12, the pool arm
+    passes (431 foam particles from the splash).
 
 ## Open
 

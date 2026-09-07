@@ -317,6 +317,14 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        let seaRms = NaN;
        if (sp?.readback) { const rb = await sp.readback(renderer, 1); const m = rb?.cascades?.[0]; if (m) { let q = 0, k = 0; for (let i = 0; i < m.size * m.size; i += 3) { const h = halfToFloat(m.displacement[i * 4 + 1]); if (Number.isFinite(h)) { q += h * h; k++; } } seaRms = Math.sqrt(q / Math.max(1, k)); } }
        log(`ocean: sea — waveScale ${ws ? `${ws.x},${ws.y},${ws.z}` : '?'}, σ ${sp?.settings?.sigma?.toFixed(3)} m, λ ${sp?.settings?.lambda?.toFixed(2)}, amplitude ${sp?.amplitude?.toFixed(4)}, cascade 0 height RMS ${seaRms.toFixed(3)} m, L0 ${sp?.cascades?.[0]?.L?.toFixed(0)} m`);
+       // ── THE FOAM'S FLUID (2026-09-07) ───────────────────────────────────
+       // The stable-fluids perturbation on the sea's velocity: alive after
+       // the warm-up (the crests' kicks and the confinement keep it so).
+       if (sp?.flowField?.()) {
+         const fl = await sp.flowField().readback(renderer);
+         if (fl) { log(`ocean: foam flow — rms ${fl.rms.toFixed(3)} m/s, peak ${fl.peak.toFixed(2)} m/s over ${fl.cells} cells (${sp.flowField().size}², ${sp.flowField().metres} m)`);
+           if (!(fl.rms > .02 && fl.peak < 20)) throw new Error(`the foam's fluid is ${fl.rms > .02 ? 'blowing up' : 'dead'}: rms ${fl.rms.toFixed(3)}, peak ${fl.peak.toFixed(2)} m/s`); }
+       }
        // ── THE FOAM PARTICLES (2026-09-07) ─────────────────────────────────
        // The pool behind the whitecap map: how many live, where they sit
        // against the window, the fold threshold they were born under.
