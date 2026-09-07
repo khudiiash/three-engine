@@ -442,7 +442,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       f.life.value = Math.min(20, Math.max(3, 2 * period));
       // Spray flies at ~1.6 √(g σ): a metre and a half up on a 1 m sea.
       sp.speed.value = 1.6 * Math.sqrt(GRAVITY * Math.max(.02, settings.sigma));
-      sp.size.value = Math.min(.5, Math.max(.05, settings.sigma * .5));
+      sp.size.value = Math.min(.3, Math.max(.04, settings.sigma * .25));
       const angle = settings.spectra?.[0]?.angle ?? 0;
       sp.dir.value.set(Math.cos(angle), Math.sin(angle));
       dirty = true;
@@ -767,9 +767,16 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     const centre = vec3(part.x.div(sp.scale.x), part.y.div(sp.scale.y), part.z.div(sp.scale.z));
     const cameraLocal = modelWorldMatrixInverse.mul(vec4(cameraPosition, 1)).xyz;
     const toCam = normalize(cameraLocal.sub(centre).add(vec3(0, 1e-5, 0)));
-    const right = normalize(cross(vec3(0, 1, 0), toCam)), up = cross(toCam, right);
+    // The billboard's up is the particle's velocity (a drop is a STREAK,
+    // not a ball): stretched by its speed, the width stays the size.
+    const along = velocity.xyz.add(vec3(0, 1e-4, 0));
+    const speed = along.length();
+    const dir = along.div(speed.max(1e-4));
+    const right = normalize(cross(dir, toCam).add(vec3(1e-5, 0, 0)));
+    const up = cross(toCam, right);
     const size = select(alive, sp.size.mul(aux.y).div(sp.scale.x), float(0));
-    splashMaterial.positionNode = centre.add(right.mul(positionGeometry.x).add(up.mul(positionGeometry.y)).mul(size));
+    const stretch = speed.mul(.25).add(1).min(4);
+    splashMaterial.positionNode = centre.add(right.mul(positionGeometry.x).add(up.mul(positionGeometry.y).mul(stretch)).mul(size));
     const fade = varying(part.w.div(velocity.w.max(1e-3)).oneMinus().clamp(0, 1).mul(aux.x), "seaSplashFade");
     splashMaterial.colorNode = vec3(.85);
     splashMaterial.opacityNode = uvAttribute().sub(.5).length().mul(2).smoothstep(.3, 1).oneMinus().mul(fade).mul(.9);
