@@ -2,7 +2,7 @@ import * as THREE from "three/webgpu";
 import {
   Fn, If, float, int, uint, ivec2, ivec3, vec2, vec3, vec4, uniform, uniformArray, instanceIndex, instancedArray, texture, textureLoad, textureStore, storageTexture,
   workgroupArray, workgroupBarrier, localId, workgroupId, select, atan, cameraPosition, positionWorld, positionGeometry, mix, varying, uv as uvAttribute,
-  modelWorldMatrixInverse, modelWorldMatrix, normalize, cross, atomicAdd, atomicStore, atomicLoad,
+  modelWorldMatrixInverse, modelWorldMatrix, normalize, cross, atomicAdd, atomicStore, atomicLoad, transformNormalToView,
 } from "three/tsl";
 import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
@@ -1127,7 +1127,13 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
   const splashGeometry = new THREE.InstancedBufferGeometry();
   { const plane = new THREE.PlaneGeometry(1, 1); splashGeometry.setAttribute("position", plane.getAttribute("position")); splashGeometry.setAttribute("uv", plane.getAttribute("uv")); splashGeometry.setIndex(plane.getIndex()); }
   splashGeometry.instanceCount = splashCount * spriteCount;
-  const splashMaterial = new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false, blending: THREE.NormalBlending, side: THREE.DoubleSide, fog: false });
+  // ⚠ LIT, NOT BASIC. A basic material drew every drop the same white in
+  // sun and in shadow ("purely white regardless of shadow or lit", user,
+  // 2026-09-07). A standard material takes the sun, its shadow map and
+  // GI's probe field (`giParticle`, as the engine's lit particles do); the
+  // drop's normal leans toward the sky with a little toward the eye, so
+  // it is lit from above and never goes black when the sun is behind it.
+  const splashMaterial = new THREE.MeshStandardNodeMaterial({ transparent: true, depthWrite: false, blending: THREE.NormalBlending, side: THREE.DoubleSide, fog: false, roughness: 1, metalness: 0 });
   splashMaterial.userData.giParticle = true;
   {
     const which = instanceIndex.div(uint(spriteCount)), k = instanceIndex.mod(uint(spriteCount));
@@ -1161,7 +1167,8 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
     // A sheet is translucent water, a drop is a bright bead: the opacity
     // climbs from .45 to .9 over the first half second.
     const fade = varying(part.w.div(velocity.w.max(1e-3)).oneMinus().clamp(0, 1).mul(aux.x).mul(part.w.mul(2).clamp(0, 1).mul(.55).add(.35)), "seaSplashFade");
-    splashMaterial.colorNode = vec3(.85);
+    splashMaterial.colorNode = vec3(.9);
+    splashMaterial.normalNode = transformNormalToView(normalize(toCam.mul(.5).add(vec3(0, 1, 0))));
     splashMaterial.opacityNode = uvAttribute().sub(.5).length().mul(2).smoothstep(.3, 1).oneMinus().mul(fade).mul(.9);
   }
   const splashMesh = new THREE.Mesh(splashGeometry, splashMaterial);
@@ -1172,7 +1179,7 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
   // vertex stage ("Binding size for [Buffer] is zero … bindGroup_object",
   // user, 2026-09-07). The lid and the body carry the same flags.
   splashMesh.userData.noBatch = true; splashMesh.userData.noMerge = true;
-  splashMesh.castShadow = false; splashMesh.receiveShadow = false;
+  splashMesh.castShadow = false; splashMesh.receiveShadow = true;
   spectrum.splashMesh = splashMesh;
   return spectrum;
 }
