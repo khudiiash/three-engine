@@ -919,7 +919,26 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     pool arm (on) passes. The harness's tiny scene barely moves (0.58 →
     0.53 ms render); the saving is a whole scene's fog node, the caustic
     lens on every receiver and the BVH refraction — read it in the editor
-    with `profile_frameStats` before and after the flip.
+    with `profile_frameStats` before and after the flip. ⚠ The
+    refraction-free lid's first body colour (the deep colour alone, then
+    a 55 % mix to the water colour) read as MILK inside a rectangle with
+    dark contour scribbles: the crest gradient (×1.4 at crests) drew its
+    bands on a flat bright body, and the rectangle was where the geometry
+    carries the crests finely. Isolated by drawing the foam value
+    (`?foamDebug=1`: fine) and by `foam=0` (the milk stayed): not the
+    foam. The body is a quarter of the way to the water colour at seven
+    tenths — a dark, absorbing column — and the crest gradient is not
+    applied to it.
+68. `splashScale` — "the sprays are too huge, do not match the boat
+    scale" (a yacht, user 2026-09-07) and "splash spread works for wave
+    contacts but the collider contact seems unaffected": spread scaled
+    only the horizontal part of a throw that is mostly vertical, and no
+    dial scaled the throw itself. `splashScale` (0–100, default 1)
+    multiplies every throw speed — crowns, contact and slam seeds, fold
+    spray — by √scale, so the REACH (v²/g) is linear in the dial; spread
+    also widens a segment seed's birth line now. Receipts: crown 49 040
+    px, the segment seed 380 drops outward, 468 foam from returns; tests
+    34.
 
 ## Open
 

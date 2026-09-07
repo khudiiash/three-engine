@@ -42,7 +42,7 @@ export function simulationNodeTypes(kind) {
         number("waterDepth", "Optical depth (metres)", 2, 0, 100), number("fill", "Fill level", 1, .05, 1, .01), number("saturation", "Water saturation", .45, 0, 1, .01),
         number("transmission", "Refraction / transmission", .75, 0, 1, .01),
         number("foam", "Foam", .5, 0, 1, .01), number("foamThreshold", "Foam contact width (m)", .15, 0, 100, .01),
-        number("splash", "Splash (spray amount)", 1, 0, 100, .05), number("splashSize", "Splash size", 1, 0, 100, .05), number("splashSpread", "Splash spread", 1, 0, 100, .05),
+        number("splash", "Splash (spray amount)", 1, 0, 100, .05), number("splashSize", "Splash size", 1, 0, 100, .05), number("splashSpread", "Splash spread", 1, 0, 100, .05), number("splashScale", "Splash scale (how far it flies)", 1, 0, 100, .05),
         number("godRays", "God rays", 1, 0, 3, .01),
       ]),
     ] },

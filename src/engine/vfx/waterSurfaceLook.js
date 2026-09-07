@@ -445,7 +445,10 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
         // The body colour the medium's deep column would have given: the
         // tuned water colour falling to the deep colour — not the deep colour
         // alone, which read as black under a pale sky's reflection.
-        refracted = mix(vec3(u.deepColor), baseColor, .55).mul(fresnel.oneMinus());
+        // A quarter of the way to the water colour, at seven tenths: the
+        // medium's column is a dark, absorbing thing (a bright body colour
+        // read as milk, and the crest gradient drew contour lines on it).
+        refracted = mix(vec3(u.deepColor), baseColor, .25).mul(.7).mul(fresnel.oneMinus());
       } else if (giTraced && !giRefraction) {
         mesh.layers.enable(WATER_REFRACTION_LAYER);
         giRefraction = giSystem.registerWaterRefraction({
@@ -566,7 +569,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(.75), foam);
       // The transmitted light, lighter and greener along the crests (thin
       // water), the body's colour in the troughs — see waterCrestGradientNode.
-      emissive = emissive.add(refracted.mul(waterCrestGradientNode(u)).mul(through).mul(foam.oneMinus()));
+      emissive = emissive.add(refracted.mul(underwater ? waterCrestGradientNode(u) : float(1)).mul(through).mul(foam.oneMinus()));
       emissive = emissive.add(reflected.mul(foam.oneMinus()));
       if (slot) emissive = emissive.add(waterSubsurfaceNode(u, slot).mul(foam.oneMinus()));
     } else {

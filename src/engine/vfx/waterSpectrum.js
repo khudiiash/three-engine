@@ -444,6 +444,10 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
     returnTry: uniform(.3),
     // The water's dials: how much spray (crowns, the fold probes) and how big.
     amount: uniform(1), sizeScale: uniform(1), spreadScale: uniform(1),
+    // How far spray flies: every throw speed × √scale (a reach is v²/g, so
+    // the reach is linear in the dial). A yacht's crown a fifth of a
+    // trawler's ("too huge, does not match the boat scale", user).
+    velScale: uniform(1),
   };
   sp.seeds = uniformArray(sp.seedRows, "vec4");
   // Each seed's share of the busiest seed's want (a counted contact seed
@@ -579,11 +583,12 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
     /** The dispatches for this frame, in order; `renderer.compute(...)` them.
      *  `eye` is the camera in the sea's metres (a water's local XZ × its
      *  scale) — the foam window follows it; `foam` is the water's dial. */
-    passes(dt, time, { eye = null, foam = null, current = null, seeds = null, splashes = null, splash = null, splashSize = null, splashSpread = null } = {}) {
+    passes(dt, time, { eye = null, foam = null, current = null, seeds = null, splashes = null, splash = null, splashSize = null, splashSpread = null, splashScale = null } = {}) {
       // The dials: wide open (0 to a hundred), the pool the only ceiling.
       if (splash != null) sp.amount.value = Math.max(0, Math.min(100, splash));
       if (splashSize != null) sp.sizeScale.value = Math.max(0, Math.min(100, splashSize));
       if (splashSpread != null) sp.spreadScale.value = Math.max(0, Math.min(100, splashSpread));
+      if (splashScale != null) sp.velScale.value = Math.sqrt(Math.max(0, Math.min(100, splashScale)));
       const step = Math.min(.1, Math.max(0, dt));
       // Foam handed in this tick (the sea's metres); the rows are consumed
       // here. A seed WANTS particles in proportion to its area and value —
@@ -1027,7 +1032,7 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
             // A segment seed: born uniformly along it, thrown outward.
             const end = sp.ends.element(which), segment = sp.kinds.element(which).greaterThan(.5);
             If(segment, () => {
-              at.assign(mix(seed.xy, end.xy, r2).add(end.zw.mul(rnd(29).sub(.5).mul(seed.z.mul(2)))));
+              at.assign(mix(seed.xy, end.xy, r2).add(end.zw.mul(rnd(29).sub(.5).mul(seed.z.mul(2)).mul(sp.spreadScale))));
               radial.assign(end.zw.add(vec2(end.w.negate(), end.z).mul(rnd(15).sub(.5).mul(.8))).normalize());
             });
             // A crown is a SHEET before it is drops: its velocity is smooth
@@ -1035,7 +1040,8 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
             // place), the rim fastest; the breakup comes with age, below.
             const phase = seed.x.mul(7.3).add(seed.y.mul(3.1));
             const lobes = angle.mul(3).add(phase).sin().mul(.5).add(.5);
-            const up = seed.w.mul(lobes.mul(.5).add(.55).mul(rad.mul(.4).add(.8))), out = seed.w.mul(.4).mul(rad).mul(lobes.mul(.4).add(.6)).mul(sp.spreadScale);
+            const thrown = seed.w.mul(sp.velScale);
+            const up = thrown.mul(lobes.mul(.5).add(.55).mul(rad.mul(.4).add(.8))), out = thrown.mul(.4).mul(rad).mul(lobes.mul(.4).add(.6)).mul(sp.spreadScale);
             const turbulence = vec3(gauss(rnd(16), rnd(17)).mul(sp.spreadScale), gauss(rnd(18), rnd(19)), gauss(rnd(20), rnd(21)).mul(sp.spreadScale)).mul(seed.w.mul(.04));
             vel.assign(vec3(radial.x.mul(out), up, radial.y.mul(out)).add(turbulence));
             born.assign(1); strength.assign(1);
@@ -1048,7 +1054,7 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
             const along = rnd(16).mul(2).sub(1).mul(f.spread.mul(.5)).mul(sp.spreadScale), forward = rnd(17).mul(f.spread.mul(.5)).mul(sp.spreadScale);
             at.assign(probe.add(fold.yz.mul(along)).add(sp.dir.mul(forward)));
             const surf = seaVelocityAt(spectrum, at, f.zeroLods).mul(f.timeScale);
-            const speed = sp.speed.mul(deficit.mul(.8).add(.4));
+            const speed = sp.speed.mul(deficit.mul(.8).add(.4)).mul(sp.velScale);
             const turbulence = vec3(gauss(rnd(18), rnd(19)).mul(.35).mul(sp.spreadScale), gauss(rnd(20), rnd(21)).mul(.3), gauss(rnd(22), rnd(23)).mul(.35).mul(sp.spreadScale)).mul(speed);
             vel.assign(vec3(surf.x.mul(2).add(sp.dir.x.mul(speed).mul(.6)), speed.mul(rnd(24).mul(.8).add(.7)), surf.y.mul(2).add(sp.dir.y.mul(speed).mul(.6))).add(turbulence));
             born.assign(1); strength.assign(deficit.mul(.6).add(.4));
