@@ -27,6 +27,25 @@ function rig(extra={}) {
   return {physics,component,add,addFixed,step,wakes,foams,splashes,dispose:()=>{physics.world.free();physics.eventQueue.free();}};
 }
 
+// ── A COMPOUND HULL: SEVERAL COLLIDERS ON ONE BODY (2026-09-07) ─────────────
+// The user's boat carried its side walls as FIXED rigid bodies under the
+// dynamic hull — fixed bodies never move, so they stayed at the spawn pose,
+// above the water. The right build is colliders WITHOUT their own body,
+// which the physics system attaches to the ancestor's body; the water
+// then reads every collider of that body: two thin walls astride a keel
+// shed foam along BOTH walls.
+test('a body with several colliders sheds foam along every one of them',()=>{
+  const r=rig({current:3,currentDirection:0});try{
+    const body=r.physics.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(0,4,0));
+    r.physics.world.createCollider(RAPIER.ColliderDesc.cuboid(.5,.5,2).setTranslation(-1.5,0,0).setMass(150),body);   // the left wall
+    r.physics.world.createCollider(RAPIER.ColliderDesc.cuboid(.5,.5,2).setTranslation(1.5,0,0).setMass(150),body);    // the right wall
+    r.physics.dynamicBodies.push({body,entity:{object3D:new THREE.Object3D(),getComponent:()=>null}});
+    r.step(6); r.foams.length=0; r.step(2);
+    const left=r.foams.filter(([x])=>x<-.5).length,right=r.foams.filter(([x])=>x>.5).length;
+    assert.ok(left>0&&right>0,`foam along both walls of a compound hull: left ${left}, right ${right}`);
+  }finally{r.dispose();}
+});
+
 // ── EVERY COLLIDER, NOT ONLY THE DYNAMIC (2026-09-07) ───────────────────────
 // A fixed cube straddling the waterline in a 3 m/s current sheds contact foam
 // and throws spray off its leading side like a hull, but presses no wake
