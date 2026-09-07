@@ -3,7 +3,7 @@ import {
   screenUV, select, texture, vec2, vec3,
 } from "three/tsl";
 import { waterRimDistanceNode } from "./waterShape.js";
-import { seaDisplacementAt, seaFoamNode, seaFoamWindowNode, seaJacobianAt } from "./waterSpectrum.js";
+import { seaFoamWindowNode } from "./waterSpectrum.js";
 
 /**
  * ══ WHAT A WATER SURFACE ADDS ON TOP OF BEING A MIRROR ═════════════════════
@@ -166,8 +166,12 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
     // The whitecap MEMORY (waterSpectrum.js, the foam window) carries the
     // streaks and the distance; the instantaneous gate keeps the fold's own
     // edge crisp where the eye is close enough to see it.
-    const cross = seaDisplacementAt(spectrum, p).w;
-    sea = seaFoamWindowNode(spectrum, p).max(seaFoamNode(seaJacobianAt(spectrum, p, cross), u.foam)).toVar();
+    // The particles' splat (soft discs summed) IS the foam: a fold births
+    // them at nine a square metre a second, so a breaking crest whitens in
+    // a fifth of a second and the trail behind it is what the wind streaks
+    // are. (A per-pixel gate on the fold beside it painted every steep face
+    // a snow blanket — the eye shot, 2026-09-07.)
+    sea = seaFoamWindowNode(spectrum, p).min(1).toVar();
   }
   // The width itself is modulated, so the shoreline is ragged rather than a
   // uniform ring offset from the geometry.
@@ -274,12 +278,16 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
   // Against the real thing (a storm sea beside ours, user 2026-09-07): foam
   // is SPARSE — a sheet only where a crest has just broken, thin streaks
   // drawn along the crests behind it, holes in both — never patches.
-  const capSheet = sea.sub(bubbles.mul(.25).mul(bubbleDetail)).smoothstep(.7, .95);
-  const streaks = sea.mul(1.3).sub(mix(float(.5), streak, streakDetail)).div(.25).clamp(0, 1);
-  const capTexture = mix(float(.8), bubbles.mul(.7).add(.35), bubbleDetail);
-  const near = capSheet.max(streaks.mul(.8)).mul(capTexture).clamp(0, 1);
+  // The particles bring the structure — filaments and holes emerge from the
+  // advection, as the paper shows — so the pixel adds only the bubbles and a
+  // soft threshold; the synthetic streak is gone.
+  const capSheet = sea.sub(bubbles.mul(.2).mul(bubbleDetail)).smoothstep(.55, .9);
+  const capPatches = sea.sub(bubbles.mul(.15).mul(bubbleDetail)).smoothstep(.15, .5).mul(.75);
+  const capTexture = mix(float(.85), bubbles.mul(.6).add(.45), bubbleDetail);
+  const near = capSheet.max(capPatches).mul(capTexture).clamp(0, 1);
+  void streak; void streakDetail;
   // Far: the mip-filtered coverage itself, as a tone.
-  const far = sea.smoothstep(.2, .8).mul(.6);
+  const far = sea.smoothstep(.04, .5).mul(.6);
   const whitecap = mix(near, far, metres.smoothstep(60, 240));
   return wake.max(whitecap).mul(u.foam.smoothstep(0, .15));
 }
@@ -297,8 +305,7 @@ export function seaFoamValueNode(u, spectrum) {
   if (!spectrum) return float(0);
   return Fn(() => {
     const p = worldXZ(u);
-    const cross = seaDisplacementAt(spectrum, p).w;
-    return seaFoamWindowNode(spectrum, p).max(seaFoamNode(seaJacobianAt(spectrum, p, cross), u.foam));
+    return seaFoamWindowNode(spectrum, p).min(1);
   })();
 }
 /** Where on its wave a point sits: 0 in the trough, 1 on the crest — IN

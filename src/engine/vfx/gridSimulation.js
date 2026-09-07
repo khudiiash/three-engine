@@ -1615,7 +1615,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         const seeds = pendingFoam.map(([x, z, r, a]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .3), Math.min(1, a * 4)]);
         const seaQueue = spectrum.passes(delta, elapsed, { eye: seaEye, foam: u.foam.value,
           current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value], seeds });
-        if (seaQueue.length) { renderer.compute(seaQueue); spectrum.generateMipmaps(renderer); }
+        if (seaQueue.length) { renderer.compute(seaQueue); spectrum.afterCompute(renderer); }
       }
       if (foamField) {
         foamImpulseCount.value = pendingFoam.length;

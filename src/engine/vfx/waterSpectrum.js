@@ -1,10 +1,10 @@
 import * as THREE from "three/webgpu";
 import {
-  Fn, If, Loop, float, int, ivec2, vec2, vec4, uniform, uniformArray, instanceIndex, texture, textureLoad, textureStore, storageTexture,
-  workgroupArray, workgroupBarrier, localId, workgroupId, select, atan, cameraPosition, positionWorld, mix,
+  Fn, If, float, int, uint, ivec2, vec2, vec3, vec4, uniform, uniformArray, instanceIndex, instancedArray, texture, textureLoad, textureStore, storageTexture,
+  workgroupArray, workgroupBarrier, localId, workgroupId, select, atan, cameraPosition, positionWorld, positionGeometry, mix, varying, uv as uvAttribute,
 } from "three/tsl";
 import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
-import { releaseComputeNodes } from "../../modules/gi/releaseCompute.js";
+import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
 import { mipmapBlitter } from "./gpuMipmaps.js";
 
 /**
@@ -69,8 +69,28 @@ export function seaQuality(quality = "high") {
  * window's field remains the near-field memory a splash writes into.
  */
 export const FOAM_WINDOW_METRES = 512;
-/** e-folding time of a whitecap's memory: a few seconds, as in the demo. */
+/**
+ * ══ FOAM IS PARTICLES (2026-09-07, after Gao, Tessendorf & Reinhardt 2021,
+ * "Foam, Splash, and Rippling for Spectrum-Based Ocean Surfaces") ═════════
+ *
+ * The grid memory (max of the gate, decaying, shifted whole texels) gave
+ * patches with hard edges that could only smear ("foam still looks awful",
+ * user). The paper's model, which the reference footage matches: foam is
+ * PARTICLES. They are emitted where the MINIMUM EIGENVALUE of the
+ * horizontal displacement's Jacobian falls under a threshold (a fold along
+ * one direction, which the determinant alone can miss), spread along the
+ * crest — the Jacobian's maximum eigenvector — by a random distance (the
+ * whitecap coverage rule), live a random half-to-full lifetime, fade out,
+ * and ride the SURFACE'S OWN HORIZONTAL VELOCITY (the time derivative of
+ * the displacement, one more FFT per cascade): the filaments and holes of
+ * real foam emerge from that advection alone. A hull's waterline hands the
+ * pool seeds too. Each frame the live particles are splatted into the
+ * whitecap map as soft discs (a render target over the window, additive),
+ * and the lid reads the map exactly as it read the memory.
+ */
 export const FOAM_LIFE_SECONDS = 6;
+/** Particles a hull seed asks per square metre per second at full value. */
+export const FOAM_SEED_DENSITY = 4;
 /** Babylon's LOD scale: a cascade fades out of the shading normal past
  *  LOD_SCALE × L metres from the eye, where its texels are under a pixel. */
 export const LOD_SCALE = 7.13;
@@ -163,7 +183,8 @@ const cmul = (a, b) => vec2(a.x.mul(b.x).sub(a.y.mul(b.y)), a.x.mul(b.y).add(a.y
 function fftKernel(srcA, srcB, dstA, dstB, horizontal, size) {
   const LOG2 = Math.log2(size), HALF = size / 2;
   return Fn(() => {
-    const shA = workgroupArray("vec4", size), shB = workgroupArray("vec4", size);
+    const shA = workgroupArray("vec4", size), shB = srcB ? workgroupArray("vec4", size) : null;
+    const lanes = shB ? [[shA, srcA, dstA], [shB, srcB, dstB]] : [[shA, srcA, dstA]];
     const t = localId.x.toInt().toVar();
     const line = workgroupId.x.toInt().toVar();
     const coord = (i) => (horizontal ? ivec2(i, line) : ivec2(line, i));
@@ -173,10 +194,10 @@ function fftKernel(srcA, srcB, dstA, dstB, horizontal, size) {
       return r;
     };
     const i0 = t, i1 = t.add(int(HALF));
-    shA.element(i0).assign(textureLoad(srcA, coord(reversed(i0))));
-    shA.element(i1).assign(textureLoad(srcA, coord(reversed(i1))));
-    shB.element(i0).assign(textureLoad(srcB, coord(reversed(i0))));
-    shB.element(i1).assign(textureLoad(srcB, coord(reversed(i1))));
+    for (const [sh, src] of lanes) {
+      sh.element(i0).assign(textureLoad(src, coord(reversed(i0))));
+      sh.element(i1).assign(textureLoad(src, coord(reversed(i1))));
+    }
     workgroupBarrier();
     for (let stage = 1; stage <= LOG2; stage++) {
       const half = 1 << (stage - 1), span = 1 << stage;
@@ -184,7 +205,7 @@ function fftKernel(srcA, srcB, dstA, dstB, horizontal, size) {
       const i = group.mul(int(span)).add(pos).toVar(), j = i.add(int(half)).toVar();
       const ang = pos.toFloat().mul(2 * Math.PI / span);
       const w = vec2(ang.cos(), ang.sin()).toVar();
-      for (const sh of [shA, shB]) {
+      for (const [sh] of lanes) {
         const a = sh.element(i).toVar(), b = sh.element(j).toVar();
         const bw = vec4(cmul(b.xy, w), cmul(b.zw, w)).toVar();
         sh.element(i).assign(a.add(bw));
@@ -192,10 +213,10 @@ function fftKernel(srcA, srcB, dstA, dstB, horizontal, size) {
       }
       workgroupBarrier();
     }
-    textureStore(dstA, coord(i0), shA.element(i0));
-    textureStore(dstA, coord(i1), shA.element(i1));
-    textureStore(dstB, coord(i0), shB.element(i0));
-    textureStore(dstB, coord(i1), shB.element(i1));
+    for (const [sh, , dst] of lanes) {
+      textureStore(dst, coord(i0), sh.element(i0));
+      textureStore(dst, coord(i1), sh.element(i1));
+    }
   })().compute([size, 1, 1], [HALF, 1, 1]);
 }
 
@@ -227,26 +248,54 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   const sign = select(px.add(py).bitAnd(int(1)).equal(int(1)), float(-1), float(1));
   const displacement = storageMap(size, { half: true, mips: true, layers: cascadeCount, name: "sea displacement" });
   const derivatives = storageMap(size, { half: true, mips: true, layers: cascadeCount, name: "sea derivatives" });
-  // The whitecap memory: two maps, ping-ponged (a storage texture is never
-  // read and written in one kernel), and its window's placement.
-  const foamMaps = [0, 1].map((i) => storageMap(foamSize, { half: true, mips: true, name: `sea foam ${i}` }));
-  for (const t of foamMaps) t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+  // The surface's horizontal VELOCITY (λ·∂D/∂t, metres per second, the
+  // sea's own time) — what the foam particles ride. One more FFT chain.
+  const velocity = storageMap(size, { half: true, mips: false, layers: cascadeCount, name: "sea velocity" });
+  // ── THE FOAM MAP AND THE PARTICLE POOL ───────────────────────────────
+  // The map is a render target the live particles are splatted into every
+  // frame; its mips are the coverage the distance reads. ⚠ The mip chain is
+  // ALLOCATED through `mipmaps.length` with `generateMipmaps` false: three
+  // regenerates a render target's mips after every render with a pass that
+  // allocates a view and a bind group per level (the descriptor-heap OOM of
+  // gpuMipmaps.js); ours are blitted by `generateMipmaps` below instead.
+  const foamTarget = new THREE.RenderTarget(foamSize, foamSize, {
+    type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: false, stencilBuffer: false,
+    minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
+  });
+  foamTarget.texture.name = "sea foam";
+  foamTarget.texture.wrapS = foamTarget.texture.wrapT = THREE.ClampToEdgeWrapping;
+  foamTarget.texture.mipmaps = Array.from({ length: Math.floor(Math.log2(foamSize)) + 1 }, (_, i) => ({ width: foamSize >> i, height: foamSize >> i }));
+  // The pool is sized to the map: 128 k particles behind a 1024² map (a
+  // 4 % whitecap coverage of the window is ~10 k m², three discs deep).
+  const particleCount = (foamSize * foamSize) >> 3;
   const f = {
     size: foamSize, center: uniform(new THREE.Vector2(0, 0)), half: uniform(FOAM_WINDOW_METRES / 2),
-    texel: uniform(FOAM_WINDOW_METRES / foamSize), shift: uniform(new THREE.Vector2(0, 0)),
-    gate: uniform(.25), decay: uniform(1), lods: Array.from({ length: cascadeCount }, () => uniform(0)),
-    // Foam handed to the memory from outside — a hull's waterline (x, z,
-    // radius in the sea's metres, a value 0–1): the tail a boat trails, as
-    // long as the current times the memory's life ("there must be a tail
-    // behind the boat", user, 2026-09-07). The ripple window is 32 m; the
-    // memory is 512 m and rides the current.
+    texel: uniform(FOAM_WINDOW_METRES / foamSize),
+    gate: uniform(.25), lods: Array.from({ length: cascadeCount }, () => uniform(0)),
+    // Foam handed to the pool from outside — a hull's waterline (x, z, a
+    // radius in the sea's metres, an acceptance 0–1 against the frame's
+    // busiest seed): the tail a boat trails ("there must be a tail behind
+    // the boat", user, 2026-09-07). `seedTry` is the share of the pool that
+    // probes a seed this frame, sized on the CPU to the foam the seeds ask.
     seedRows: Array.from({ length: 64 }, () => new THREE.Vector4()),
-    seedCount: uniform(0, "int"),
+    seedCount: uniform(0, "int"), seedTry: uniform(0),
+    // The particle step: the frame's seconds, the sea's time scale, a frame
+    // counter for the hashes, the current (m/s), the fold threshold on the
+    // minimum eigenvalue, the share of dead particles that probe for a fold
+    // this frame (the production rate), the spread along the crest and the
+    // disc a particle splats (both metres, from the peak wavelength).
+    dt: uniform(0), timeScale: uniform(1), frame: uniform(0, "uint"), currentVel: uniform(new THREE.Vector2(0, 0)),
+    threshold: uniform(.55), tryRate: uniform(.3), spread: uniform(2.5), disc: uniform(1.2),
+    // A particle's full life, real seconds: twice the peak period (a crest
+    // outruns the foam it made; the trail is what the wind streaks are).
+    life: uniform(FOAM_LIFE_SECONDS),
+    zeroLods: Array.from({ length: cascadeCount }, () => uniform(0)),
   };
   f.seeds = uniformArray(f.seedRows, "vec4");
-  let foamPhase = 0, foamWritten = null;
-  // The current's sub-texel remainder for the whitecap memory's shift.
-  const scrollAccum = { x: 0, y: 0 };
+  // (x, z, age, life) and (intensity, size factor, 0, 0). Age ≥ life is dead.
+  const particles = instancedArray(particleCount, "vec4");
+  const particleAux = instancedArray(particleCount, "vec4");
+  let particlesReady = false;
 
   const cascades = Array.from({ length: cascadeCount }, (_, i) => {
     const c = { dk: uniform(1), cutLow: uniform(0), cutHigh: uniform(9999), amplitude: uniform(0), invL: uniform(1), L: 1,
@@ -258,6 +307,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     const wavesData = storageMap(size, { name: `sea ${i} waves` });
     const A = storageMap(size, { name: `sea ${i} A` }), B = storageMap(size, { name: `sea ${i} B` });
     const A2 = storageMap(size, { name: `sea ${i} A2` }), B2 = storageMap(size, { name: `sea ${i} B2` });
+    const C = storageMap(size, { name: `sea ${i} C` }), C2 = storageMap(size, { name: `sea ${i} C2` });
     const layer = int(i);
 
     const initial = Fn(() => {
@@ -291,27 +341,38 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       const Dydz = ih.mul(kz), Dzdz = h.negate().mul(kz).mul(kz).mul(invK);
       textureStore(A, texel, vec4(Dx.x.sub(Dz.y), Dx.y.add(Dz.x), Dy.x.sub(Dzdx.y), Dy.y.add(Dzdx.x)));
       textureStore(B, texel, vec4(Dydx.x.sub(Dydz.y), Dydx.y.add(Dydz.x), Dxdx.x.sub(Dzdz.y), Dxdx.y.add(Dzdz.x)));
+      // ∂h/∂t = iω(h0 e^{iωt} − h0* e^{−iωt}); the horizontal velocity is
+      // i(k/|k|) of it, packed as Dx/Dz are (real → Vx, imaginary → Vz).
+      const ht = cmul(h0v.xy, e).sub(cmul(h0v.zw, vec2(e.x, e.y.negate()))).toVar();
+      const hd = vec2(ht.y.negate(), ht.x).mul(omega).toVar();
+      const ihd = vec2(hd.y.negate(), hd.x).toVar();
+      const Vx = ihd.mul(kx).mul(invK), Vz = ihd.mul(kz).mul(invK);
+      textureStore(C, texel, vec4(Vx.x.sub(Vz.y), Vx.y.add(Vz.x), 0, 0));
     })().compute(size * size);
     const fftRows = fftKernel(A, B, A2, B2, true, size);
     const fftCols = fftKernel(A2, B2, A, B, false, size);
+    const fftRowsV = fftKernel(C, null, C2, null, true, size);
+    const fftColsV = fftKernel(C2, null, C, null, false, size);
     const merge = Fn(() => {
       const a = textureLoad(A, texel).mul(sign).toVar(), b = textureLoad(B, texel).mul(sign).toVar();
       const Dx = a.x, Dz = a.y, Dy = a.z, Dxz = a.w, Dyx = b.x, Dyz = b.y, Dxx = b.z, Dzz = b.w;
       storageTexture(displacement).depth(layer).store(texel, vec4(u.lambda.mul(Dx), Dy, u.lambda.mul(Dz), u.lambda.mul(Dxz)));
       storageTexture(derivatives).depth(layer).store(texel, vec4(Dyx, Dyz, Dxx.mul(u.lambda), Dzz.mul(u.lambda)));
+      const cv = textureLoad(C, texel).mul(sign).toVar();
+      storageTexture(velocity).depth(layer).store(texel, vec4(cv.x.mul(u.lambda), cv.y.mul(u.lambda), 0, 0));
     })().compute(size * size);
-    for (const [k, node] of Object.entries({ initial, conjugate, evolve, fftRows, fftCols, merge })) node.__giPassName = `sea${i}.${k}`;
+    for (const [k, node] of Object.entries({ initial, conjugate, evolve, fftRows, fftCols, fftRowsV, fftColsV, merge })) node.__giPassName = `sea${i}.${k}`;
     return { index: i, uniforms: c, get L() { return c.L; },
-      textures: [h0k, h0, wavesData, A, B, A2, B2],
-      kernels: { initial, conjugate, evolve, fftRows, fftCols, merge } };
+      textures: [h0k, h0, wavesData, A, B, A2, B2, C, C2],
+      kernels: { initial, conjugate, evolve, fftRows, fftCols, fftRowsV, fftColsV, merge } };
   });
 
   let settings = null, dirty = true;
   const spectrum = {
-    size, cascades, uniforms: u, noise, displacement, derivatives,
+    size, cascades, uniforms: u, noise, displacement, derivatives, velocity,
     // Bound ONCE per consumer graph and shared: the texture node is what a
     // material or kernel binds; a cascade is a LAYER of it.
-    nodes: { displacement: texture(displacement), derivatives: texture(derivatives) },
+    nodes: { displacement: texture(displacement), derivatives: texture(derivatives), velocity: texture(velocity) },
     get settings() { return settings; },
     amplitude: 0,
     /** Re-realize the spectrum from the component's wave fields. */
@@ -339,59 +400,62 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         // its own, or a fine cascade aliases across the window's texels.
         f.lods[i].value = Math.max(0, Math.log2(Math.max(1, f.texel.value / (band.L / size))));
       });
+      f.spread.value = Math.max(.2, settings.waveLength * .1);
+      f.disc.value = Math.min(2.5, Math.max(.2, settings.waveLength * .07));
+      const period = 2 * Math.PI / Math.max(1e-3, settings.peakOmega) / Math.max(1e-3, settings.timeScale);
+      f.life.value = Math.min(20, Math.max(3, 2 * period));
       dirty = true;
       return settings;
     },
     /** The sea carries no memory of its own (the solver's foam field does);
      *  a restart re-realizes nothing. Kept so the solver may call it. */
-    restart() {},
+    restart() { particlesReady = false; },
     /** The dispatches for this frame, in order; `renderer.compute(...)` them.
      *  `eye` is the camera in the sea's metres (a water's local XZ × its
      *  scale) — the foam window follows it; `foam` is the water's dial. */
     passes(dt, time, { eye = null, foam = null, current = null, seeds = null } = {}) {
-      // Foam handed in this tick (the sea's metres); the rows are consumed here.
+      const step = Math.min(.1, Math.max(0, dt));
+      // Foam handed in this tick (the sea's metres); the rows are consumed
+      // here. A seed WANTS particles in proportion to its area and value —
+      // FOAM_SEED_DENSITY per square metre per second, a fresh patch white
+      // within a second — and the pool's probes are sized to the busiest.
       const count = Math.min(f.seedRows.length, seeds?.length ?? 0);
-      for (let i = 0; i < count; i++) f.seedRows[i].fromArray(seeds[i]);
+      let maxWant = 0;
+      const wants = new Array(count);
+      for (let i = 0; i < count; i++) {
+        const [, , r, a] = seeds[i];
+        wants[i] = Math.PI * r * r * Math.min(1, a) * FOAM_SEED_DENSITY * step;
+        maxWant = Math.max(maxWant, wants[i]);
+      }
+      for (let i = 0; i < count; i++) f.seedRows[i].set(seeds[i][0], seeds[i][1], seeds[i][2], maxWant > 0 ? wants[i] / maxWant : 0);
       f.seedCount.value = count;
+      f.seedTry.value = maxWant > 0 ? Math.min(1, 1.5 * count * maxWant / particleCount) : 0;
       const queue = [];
       if (!settings) return queue;
       if (dirty) { for (const c of cascades) queue.push(c.kernels.initial, c.kernels.conjugate); dirty = false; }
       u.time.value = time * settings.timeScale; u.dt.value = Math.min(.5, Math.max(0, dt));
-      for (const c of cascades) queue.push(c.kernels.evolve, c.kernels.fftRows, c.kernels.fftCols, c.kernels.merge);
-      // The whitecap memory: window snapped to whole texels on the eye, last
-      // frame's map read at the shifted texel, this frame's written to the
-      // other map, which the lid then samples.
+      for (const c of cascades) queue.push(c.kernels.evolve, c.kernels.fftRows, c.kernels.fftCols, c.kernels.fftRowsV, c.kernels.fftColsV, c.kernels.merge);
+      // The pool's step: the window snapped to whole texels on the eye, the
+      // current, the fold threshold; the particles carry themselves.
       if (foam != null) f.gate.value = Math.max(0, Math.min(1, foam));
-      f.decay.value = Math.exp(-Math.min(.5, Math.max(0, dt)) / FOAM_LIFE_SECONDS);
+      // The fold threshold on the minimum eigenvalue: `foam` 0 opens at 0.45
+      // (a fold at the limit), 1 at 0.85 — the paper's 0.55 near 0.25.
+      f.threshold.value = .45 + .4 * f.gate.value;
       const t = f.texel.value;
-      if (eye) {
-        const cx = Math.round(eye[0] / t) * t, cz = Math.round(eye[1] / t) * t;
-        f.shift.value.set(Math.round((cx - f.center.value.x) / t), Math.round((cz - f.center.value.y) / t));
-        f.center.value.set(cx, cz);
-      } else f.shift.value.set(0, 0);
-      // The current: the sea's samples move by it, and so must the whitecap
-      // memory — foam rides the water. The window stays on the eye (world
-      // space); its CONTENTS take the value that was upstream a tick ago,
-      // whole texels at a time with the remainder carried.
+      if (eye) f.center.value.set(Math.round(eye[0] / t) * t, Math.round(eye[1] / t) * t);
       if (current && (current[0] || current[1])) {
-        const step = Math.min(.1, Math.max(0, dt));
         // ⚠ THE SCROLL DECREASES. The sea is sampled at world + scroll, so the
         // pattern at W now is what stood at W + scroll before: for the water
         // to travel WITH the current (+v), the scroll must run against it —
         // sampled at world + v·t the sea streamed backwards while the wake
-        // and the whitecaps went forward ("foam is running in the opposite
-        // direction than the current", user, 2026-09-07). `scrollAccum`
-        // tracks the WATER's displacement (+v·dt) for the memory's shift.
+        // went forward ("foam is running in the opposite direction than the
+        // current", user, 2026-09-07). The particles ride +v.
         u.scroll.value.x -= current[0] * step; u.scroll.value.y -= current[1] * step;
-        scrollAccum.x += current[0] * step; scrollAccum.y += current[1] * step;
-        const sx = Math.round(scrollAccum.x / t), sz = Math.round(scrollAccum.y / t);
-        scrollAccum.x -= sx * t; scrollAccum.y -= sz * t;
-        f.shift.value.x -= sx; f.shift.value.y -= sz;
-      }
-      queue.push(foamKernels[foamPhase]);
-      foamWritten = foamMaps[1 - foamPhase];
-      spectrum.nodes.foam.value = foamWritten;
-      foamPhase = 1 - foamPhase;
+        f.currentVel.value.set(current[0], current[1]);
+      } else f.currentVel.value.set(0, 0);
+      f.dt.value = step; f.timeScale.value = settings.timeScale; f.frame.value = (f.frame.value + 1) % 1048576;
+      if (!particlesReady) { queue.push(particleInit); particlesReady = true; }
+      queue.push(particleStep);
       return queue;
     },
     /**
@@ -406,6 +470,26 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
      * 2026-09-07). Called after the sea's dispatches and before the surface
      * reads them, so the coarse levels describe THIS frame's sea.
      */
+    /** The particles' splat into the foam map — a nested render before the
+     *  frame's own, like the caustic pass — then the mips. */
+    afterCompute(renderer) {
+      if (renderer?.isWebGPURenderer && settings && particlesReady) {
+        const nested = globalThis.__giNestedRender;
+        globalThis.__giNestedRender = true;
+        const target = renderer.getRenderTarget(), alpha = renderer.getClearAlpha();
+        renderer.getClearColor(previousClear);
+        try {
+          renderer.setRenderTarget(foamTarget);
+          renderer.setClearColor(0x000000, 1);
+          renderer.render(splatScene, splatCamera);
+        } finally {
+          renderer.setClearColor(previousClear, alpha);
+          renderer.setRenderTarget(target);
+          globalThis.__giNestedRender = nested;
+        }
+      }
+      spectrum.generateMipmaps(renderer);
+    },
     generateMipmaps(renderer) {
       if (globalThis.__waterSeaMips === false) return;   // `__waterSeaMips = false`: the harness's control arm
       // ⛔ NOT three's mipmap pass: it creates a view and a bind group per
@@ -415,11 +499,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       // once per GPU texture and only encodes passes here.
       const blitter = mipmapBlitter(renderer);
       if (!blitter) return;
-      for (const t of [displacement, derivatives, foamWritten]) if (t) blitter.generate(t);
+      for (const t of [displacement, derivatives, foamTarget.texture]) if (t) blitter.generate(t);
     },
     tick(renderer, dt, time, options) {
       const queue = spectrum.passes(dt, time, options);
-      if (queue.length && renderer?.isWebGPURenderer) { renderer.compute(queue); spectrum.generateMipmaps(renderer); }
+      if (queue.length && renderer?.isWebGPURenderer) { renderer.compute(queue); spectrum.afterCompute(renderer); }
     },
     /**
      * The displacement maps of the cascades that carry height, copied to the
@@ -432,41 +516,105 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       const maps = await Promise.all(cascades.slice(0, count).map((c, i) => renderer.backend.copyTextureToBuffer(displacement, 0, 0, size, size, i)));
       return { cascades: maps.map((map, i) => ({ size, L: cascades[i].L, displacement: map })), scroll: { x: u.scroll.value.x, z: u.scroll.value.y } };
     },
+    /** The pool, for a receipt: (x, z, age, life) per particle. */
+    async readParticles(renderer) {
+      if (!renderer?.getArrayBufferAsync || !particlesReady) return null;
+      return new Float32Array(await renderer.getArrayBufferAsync(particles.value));
+    },
     dispose(renderer) {
-      releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), ...foamKernels]);
+      releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), particleInit, particleStep]);
+      releaseStorageAttributes(renderer, [particles.value, particleAux.value].filter(Boolean));
       for (const c of cascades) for (const t of c.textures) t.dispose();
-      for (const t of foamMaps) t.dispose();
-      displacement.dispose(); derivatives.dispose(); noise.dispose();
+      foamTarget.dispose(); splatMaterial.dispose(); splatGeometry.dispose();
+      displacement.dispose(); derivatives.dispose(); velocity.dispose(); noise.dispose();
     },
   };
   spectrum.foam = f;
-  spectrum.nodes.foam = texture(foamMaps[0]);
-  // The memory's step, one kernel per ping-pong direction. A texel's world
-  // position is the window's centre plus its offset; the whitecap it holds
-  // is the same per-pixel gate the lid uses (on the composed Jacobian, at
-  // the cascades' matching levels); its past is the OTHER map at the texel
-  // that held this world position before the window moved, or — at the
-  // window's fresh edge — the present.
-  const foamKernel = (source, target) => Fn(() => {
+  spectrum.nodes.foam = texture(foamTarget.texture);
+  spectrum.particleCount = particleCount;
+  // ── THE PARTICLE STEP ────────────────────────────────────────────────────
+  // A live particle rides the surface velocity plus the current and ages. A
+  // dead one probes: a hull seed with probability `seedTry` (accepted by the
+  // seed's own want), else with probability `tryRate` a random point of the
+  // window, where a minimum eigenvalue under the threshold is a fold — it is
+  // born there, moved along the crest (the maximum eigenvector) by a random
+  // distance, the whitecap coverage rule. PCG on uint arithmetic: three's
+  // `hash` truncates its float seed, and a truncated (index + frame) hands
+  // the same probes to the next frame's neighbour.
+  const pcg = (v) => {
+    const state = v.mul(747796405).add(2891336453);
+    const word = state.shiftRight(state.shiftRight(28).add(4)).bitXor(state).mul(277803737);
+    return word.shiftRight(22).bitXor(word).toFloat().mul(1 / 2 ** 32);
+  };
+  const rnd = (salt) => pcg(instanceIndex.mul(uint(2654435761)).add(f.frame.mul(uint(2246822519))).add(uint((salt * 668265263) >>> 0)));
+  const particleInit = Fn(() => {
+    particles.element(instanceIndex).assign(vec4(0, 0, 1, 0));   // age 1 ≥ life 0: dead
+    particleAux.element(instanceIndex).assign(vec4(0));
+  })().compute(particleCount);
+  const particleStep = Fn(() => {
     const i = instanceIndex.toInt();
-    const fx = i.mod(foamSize), fy = i.div(foamSize);
-    const world = vec2(
-      fx.toFloat().add(.5).sub(foamSize / 2).mul(f.texel).add(f.center.x),
-      fy.toFloat().add(.5).sub(foamSize / 2).mul(f.texel).add(f.center.y));
-    const sea = seaDisplacementAt(spectrum, world, f.lods);
-    const now = seaFoamNode(seaJacobianAt(spectrum, world, sea.w, f.lods), f.gate).toVar();
-    Loop({ start: 0, end: f.seedCount }, ({ i }) => {
-      const seed = f.seeds.element(i);
-      const d = world.sub(seed.xy).length().div(seed.z.max(1e-4));
-      now.assign(now.max(d.mul(1.5).pow(6).min(20).negate().exp().mul(seed.w.min(1))));
+    const p = particles.element(i).toVar();
+    If(p.z.lessThan(p.w), () => {
+      const vel = seaVelocityAt(spectrum, p.xy, f.zeroLods).mul(f.timeScale).add(f.currentVel);
+      p.xy.assign(p.xy.add(vel.mul(f.dt)));
+      p.z.assign(p.z.add(f.dt));
+      particles.element(i).assign(p);
+    }).Else(() => {
+      const r0 = rnd(1), r1 = rnd(2), r2 = rnd(3), r3 = rnd(4);
+      const born = float(0).toVar(), at = vec2(0).toVar(), scale = float(1).toVar();
+      If(r0.lessThan(f.seedTry), () => {
+        const seed = f.seeds.element(r1.mul(f.seedCount.toFloat()).floor().toInt().clamp(0, 63));
+        If(r2.lessThan(seed.w), () => {
+          const angle = rnd(5).mul(6.2831853), rad = r3.sqrt().mul(seed.z);
+          at.assign(seed.xy.add(vec2(angle.cos(), angle.sin()).mul(rad)));
+          born.assign(1);
+        });
+      }).ElseIf(r0.lessThan(f.seedTry.add(f.tryRate)), () => {
+        const probe = f.center.add(vec2(r2, r3).sub(.5).mul(f.half.mul(2)));
+        const fold = seaFoldAt(spectrum, probe, f.lods);
+        If(fold.x.lessThan(f.threshold), () => {
+          // Along the crest by ±spread, a little across it.
+          const along = rnd(6).mul(2).sub(1).mul(f.spread), across = rnd(7).sub(.5).mul(f.spread.mul(.25));
+          at.assign(probe.add(fold.yz.mul(along)).add(vec2(fold.z.negate(), fold.y).mul(across)));
+          born.assign(1);
+          // Deeper folds make brighter foam.
+          scale.assign(f.threshold.sub(fold.x).div(f.threshold.max(1e-3)).mul(2).add(.5).clamp(.5, 1));
+        });
+      });
+      If(born.greaterThan(.5), () => {
+        const life = f.life.mul(.5).add(rnd(8).mul(f.life.mul(.5)));
+        particles.element(i).assign(vec4(at, 0, life));
+        particleAux.element(i).assign(vec4(scale, rnd(9).mul(.8).add(.6), 0, 0));
+      });
     });
-    const sx = fx.add(f.shift.x.toInt()), sy = fy.add(f.shift.y.toInt());
-    const inside = sx.greaterThanEqual(0).and(sx.lessThan(foamSize)).and(sy.greaterThanEqual(0)).and(sy.lessThan(foamSize));
-    const prev = select(inside, textureLoad(source, ivec2(sx.clamp(0, foamSize - 1), sy.clamp(0, foamSize - 1))).x, now);
-    textureStore(target, ivec2(fx, fy), vec4(now.max(prev.mul(f.decay)), 0, 0, 1));
-  })().compute(foamSize * foamSize);
-  const foamKernels = [foamKernel(foamMaps[0], foamMaps[1]), foamKernel(foamMaps[1], foamMaps[0])];
-  foamKernels.forEach((k, i) => { k.__giPassName = `sea.foam${i}`; });
+  })().compute(particleCount);
+  particleInit.__giPassName = "sea.foamInit"; particleStep.__giPassName = "sea.foamStep";
+  // ── THE SPLAT ────────────────────────────────────────────────────────────
+  // Every live particle is a soft disc of `f.disc` metres in the map (the
+  // window's NDC; the target's row 0 is the TOP, so z runs down as the
+  // caustic pass's does), additive, fading as 1 − e^{−remaining/(T/3)} — the
+  // paper's — times its intensity; a dead one is clipped away.
+  const splatGeometry = new THREE.InstancedBufferGeometry();
+  { const plane = new THREE.PlaneGeometry(1, 1); splatGeometry.setAttribute("position", plane.getAttribute("position")); splatGeometry.setAttribute("uv", plane.getAttribute("uv")); splatGeometry.setIndex(plane.getIndex()); }
+  splatGeometry.instanceCount = particleCount;
+  const splatMaterial = new THREE.MeshBasicNodeMaterial({ transparent: true, blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false, side: THREE.DoubleSide, fog: false });
+  const splatParticle = particles.element(instanceIndex);
+  const splatAlive = splatParticle.z.lessThan(splatParticle.w);
+  const splatAux = particleAux.element(instanceIndex);
+  const splatNdc = splatParticle.xy.sub(f.center).div(f.half).add(positionGeometry.xy.mul(f.disc.mul(splatAux.y).div(f.half)));
+  splatMaterial.vertexNode = vec4(splatNdc.x, splatNdc.y.negate(), select(splatAlive, float(0), float(2)), 1);
+  const splatIntensity = varying(
+    splatParticle.w.sub(splatParticle.z).max(0).div(f.life.div(3)).negate().exp().oneMinus().mul(splatAux.x),
+    "seaFoamSplat");
+  // A Gaussian, not a flat disc: flat tops summed leave rings where they
+  // overlap (the low shot, 2026-09-07); Gaussians sum to a smooth field.
+  const splatRadius = uvAttribute().sub(.5).length().mul(2);
+  splatMaterial.colorNode = vec3(splatRadius.mul(splatRadius).mul(-4).exp().mul(splatIntensity));
+  const splatMesh = new THREE.Mesh(splatGeometry, splatMaterial);
+  splatMesh.frustumCulled = false;
+  const splatScene = new THREE.Scene(); splatScene.add(splatMesh);
+  const splatCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const previousClear = new THREE.Color();
   return spectrum;
 }
 
@@ -566,6 +714,42 @@ export function seaFoamWindowNode(spectrum, world, level = null) {
   let s = spectrum.nodes.foam.sample(uv.clamp(.001, .999));
   if (level != null) s = s.level(level);
   return s.x.mul(margin.smoothstep(0, .04));
+}
+/**
+ * The FOLD of the composed surface: x = the minimum eigenvalue of the
+ * horizontal displacement's Jacobian (a fold along one direction reads
+ * under ~0.55 — Tessendorf's test, the paper's emission criterion — where
+ * the determinant alone could stay near 1), yz = the unit direction of the
+ * MAXIMUM eigenvector, i.e. along the crest, which the whitecap coverage
+ * rule spreads foam along.
+ */
+export function seaFoldAt(spectrum, world, lods = null) {
+  let dxx = float(0), dzz = float(0);
+  spectrum.cascades.forEach((c, i) => {
+    const uv = world.add(spectrum.uniforms.scroll).mul(c.uniforms.invL).add(texelCentre(spectrum));
+    let s = spectrum.nodes.derivatives.sample(uv).depth(i);
+    if (lods) s = s.level(lods[i]);
+    dxx = dxx.add(s.z); dzz = dzz.add(s.w);
+  });
+  const b = seaDisplacementAt(spectrum, world, lods).w;
+  const a = dxx.add(1), d = dzz.add(1);
+  const tr = a.add(d), det = a.mul(d).sub(b.mul(b));
+  const disc = tr.mul(tr).sub(det.mul(4)).max(0).sqrt();
+  const lmin = tr.sub(disc).mul(.5), lmax = tr.add(disc).mul(.5);
+  // The eigenvector of λmax: (b, λmax − a), or an axis when b vanishes.
+  const v = select(b.abs().greaterThan(1e-4), vec2(b, lmax.sub(a)), select(a.greaterThanEqual(d), vec2(1, 0), vec2(0, 1)));
+  return vec3(lmin, v.normalize());
+}
+/** Σ horizontal velocity (metres per second of the sea's time, world) over the cascades. */
+export function seaVelocityAt(spectrum, world, lods = null) {
+  let sum = vec2(0);
+  spectrum.cascades.forEach((c, i) => {
+    const uv = world.add(spectrum.uniforms.scroll).mul(c.uniforms.invL).add(texelCentre(spectrum));
+    let s = spectrum.nodes.velocity.sample(uv).depth(i);
+    if (lods) s = s.level(lods[i]);
+    sum = sum.add(s.xy);
+  });
+  return sum;
 }
 export function seaFoamNode(jacobian, foam) {
   // ⚠ THE GATE IS ON J ITSELF. It used to open at 1 − J > mix(1.3, .6, foam),

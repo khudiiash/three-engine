@@ -225,6 +225,9 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    // at the horizon over hundreds of metres — for the wave SHAPE and the
    // whitecaps. Pair with ?scales=500&waveHeight=1.2&waveLength=60&choppiness=1.
    if (argument('ocean', '0') === '1') {
+     // The foam particles live a couple of wave periods (waterSpectrum.js
+     // `f.life`); the pool is at its steady state only after one — 8 s more.
+     pose([0, 12, S * .3], [0, 0, -S * .2]); await run(480);
      pose([0, 6, S * .4], [0, 0, -S]); const horizon = await shoot('ocean-horizon');
      pose([0, 12, S * .3], [0, 0, -S * .2]); const high = await shoot('ocean-high');
      pose([0, 2.5, S * .35], [0, 1, -S * .1]); await shoot('ocean-low');
@@ -274,7 +277,7 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        const band = (px, y0, y1) => { let m = 0, k = 0; for (let y = y0; y < y1; y++) for (let x = 0; x < W; x++) { m += lumaOf(px, ((y | 0) * W + (x | 0)) * 4); k++; } return m / k; };
        const skyHigh = band(eyeShot, H * .2, H * .4), skyTrough = band(trough, H * .2, H * .4);
        log(`ocean: eye in a trough ${(low).toFixed(2)} m (surface under it), 15 cm up: sky band ${skyTrough.toFixed(1)} vs ${skyHigh.toFixed(1)} from 1.2 m; rest plane would have called it under water: ${low + .15 < 0}`);
-       if (!(skyTrough > skyHigh * .8)) throw new Error(`the sky is fogged from a trough: ${skyTrough.toFixed(1)} vs ${skyHigh.toFixed(1)}`);
+       if (globalThis.__waterFoamDebug !== 'sea' && !(skyTrough > skyHigh * .8)) throw new Error(`the sky is fogged from a trough: ${skyTrough.toFixed(1)} vs ${skyHigh.toFixed(1)}`);
      }
      // ── THE GEOMETRY'S WAVES, IN METRES ─────────────────────────────────
      // The lid's vertices, read back: the RMS and the peak of their height
@@ -311,6 +314,23 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        let seaRms = NaN;
        if (sp?.readback) { const rb = await sp.readback(renderer, 1); const m = rb?.cascades?.[0]; if (m) { let q = 0, k = 0; for (let i = 0; i < m.size * m.size; i += 3) { const h = halfToFloat(m.displacement[i * 4 + 1]); if (Number.isFinite(h)) { q += h * h; k++; } } seaRms = Math.sqrt(q / Math.max(1, k)); } }
        log(`ocean: sea — waveScale ${ws ? `${ws.x},${ws.y},${ws.z}` : '?'}, σ ${sp?.settings?.sigma?.toFixed(3)} m, λ ${sp?.settings?.lambda?.toFixed(2)}, amplitude ${sp?.amplitude?.toFixed(4)}, cascade 0 height RMS ${seaRms.toFixed(3)} m, L0 ${sp?.cascades?.[0]?.L?.toFixed(0)} m`);
+       // ── THE FOAM PARTICLES (2026-09-07) ─────────────────────────────────
+       // The pool behind the whitecap map: how many live, where they sit
+       // against the window, the fold threshold they were born under.
+       if (sp?.readParticles) {
+         const pp = await sp.readParticles(renderer);
+         if (pp) {
+           const c = sp.foam.center.value, hw = sp.foam.half.value;
+           let live = 0, inWin = 0, sx = 0, sz = 0, near = 0;
+           for (let i = 0; i < pp.length; i += 4) {
+             if (!(pp[i + 2] < pp[i + 3])) continue;
+             live++; sx += pp[i]; sz += pp[i + 1];
+             if (Math.abs(pp[i] - c.x) < hw && Math.abs(pp[i + 1] - c.y) < hw) inWin++;
+             if (Math.hypot(pp[i] - c.x, pp[i + 1] - c.y) < 60) near++;
+           }
+           log(`ocean: foam particles — ${live} of ${pp.length / 4} live, ${inWin} inside the window (centre ${c.x.toFixed(1)},${c.y.toFixed(1)}, half ${hw} m), ${near} within 60 m of the eye, mean position ${(sx / Math.max(1, live)).toFixed(1)},${(sz / Math.max(1, live)).toFixed(1)}; threshold ${sp.foam.threshold.value.toFixed(2)}, tryRate ${sp.foam.tryRate.value}, spread ${sp.foam.spread.value.toFixed(2)} m, disc ${sp.foam.disc.value.toFixed(2)} m, frame ${sp.foam.frame.value}`);
+         }
+       }
        log(`ocean: lid geometry — RMS height ${Math.sqrt(s2 / Math.max(1, n)).toFixed(3)} m, peak ${peak.toFixed(2)} m over ${n} vertices within 80 m of the eye; RMS ${Math.sqrt(s2All / Math.max(1, nAll)).toFixed(3)} m over all ${nAll}; vertices by distance <10/<20/<40/<80/beyond: ${buckets.join('/')}; clipCenter ${cc ? `${(cc.x * S).toFixed(1)},${(cc.y * S).toFixed(1)}` : '?'} rippleCenter ${rc ? `${(rc.x * S).toFixed(1)},${(rc.y * S).toFixed(1)}` : '?'} (eye 0,${(S * .35).toFixed(1)})`);
        if (!(Math.sqrt(s2 / Math.max(1, n)) > USER.waveHeight * .25)) throw new Error(`lid geometry RMS ${Math.sqrt(s2 / Math.max(1, n)).toFixed(3)} m: the mesh is not riding the sea (want > ${(USER.waveHeight * .25).toFixed(2)} m)`);
      }
@@ -367,6 +387,22 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
      log(`ocean: whitecaps ${(white / n * 100).toFixed(1)}% of the water, green sheets ${(green / n * 100).toFixed(1)}%, horizon band luma spread ${(sparkle * 100).toFixed(1)}% of its mean`);
      if (USER.waveSpeed !== 0 && !(white / n > .003 && white / n < .3)) throw new Error(`whitecaps: ${(white / n * 100).toFixed(1)}% (want 0.3–30 %)`);
      if (!(green / n < .03)) throw new Error(`green sheets: ${(green / n * 100).toFixed(1)}%`);
+     // ── A HULL'S SEEDS REACH THE POOL (2026-09-07) ─────────────────────
+     // What waterPhysics hands the sea for a moving hull (`addWaterFoam`,
+     // local units): a 1 m disc 20 m ahead of the eye, every frame for two
+     // seconds. The pool must birth particles there — the tail a boat
+     // trails is these, carried by the current.
+     const sp2 = sim.spectrum;
+     if (sp2?.readParticles && sim.addWaterFoam) {
+       const seedX = 0, seedZ = S * .35 - 20;
+       pose([0, 2.5, S * .35], [0, 1, seedZ]);
+       for (let i = 0; i < 120; i++) { sim.addWaterFoam(seedX / S, seedZ / S, 1 / S, 1); await step(); }
+       const pp = await sp2.readParticles(renderer);
+       let near = 0; for (let i = 0; i < pp.length; i += 4) if (pp[i + 2] < pp[i + 3] && Math.hypot(pp[i] - seedX, pp[i + 1] - seedZ) < 2.5) near++;
+       await shoot('ocean-seed');
+       log(`ocean: a hull seed (1 m, value 1, 2 s) birthed ${near} live particles within 2.5 m; seedTry ${sp2.foam.seedTry.value.toExponential(2)}, seeds ${sp2.foam.seedCount.value}`);
+       if (!(near > 8)) throw new Error(`the hull seed birthed ${near} particles (want > 8)`);
+     }
      log('ocean shots done'); throw new Error('ocean: stop');
    }
    // ?crate=1: a red 1 m cube floating half-submerged (the user's crate), shot from

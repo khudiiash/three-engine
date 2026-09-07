@@ -494,6 +494,44 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     against 1.18 with no current and 0.90 bilinear; the foam centroid still
     rides 1.37 m in 2.5 s. What is still lost is the wave leaving the grid
     downstream, which a current through a pool must do.
+52. ⭐ FOAM IS PARTICLES (Gao, Tessendorf & Reinhardt 2021, "Foam, Splash,
+    and Rippling for Spectrum-Based Ocean Surfaces"). The whitecap memory
+    — a grid holding max(gate, last × decay), shifted whole texels — could
+    only make patches with hard edges and smear them ("foam still looks
+    awful", user, 2026-09-07). The paper's model, now `waterSpectrum.js`:
+    a pool of foamSize²/8 particles (131 k behind a 1024² map). A dead one
+    probes a random point of the 512 m window (30 % of the dead per frame)
+    and is BORN where the MINIMUM EIGENVALUE of the horizontal
+    displacement's Jacobian is under the threshold (`seaFoldAt`: a fold
+    along one direction, which the determinant can miss; threshold
+    .45 + .4·foam, the paper's .55), moved along the crest — the maximum
+    eigenvector — by ±0.1 λp (the whitecap coverage rule); or it takes a
+    hull seed (`addWaterFoam` → `passes({seeds})`, wanted at
+    FOAM_SEED_DENSITY = 4 particles/m²/s, the probes sized on the CPU to
+    the busiest seed). A live one RIDES THE SURFACE'S OWN HORIZONTAL
+    VELOCITY — λ·∂D/∂t, one more FFT per cascade (`fftKernel` takes a
+    single texture now), times the sea's time scale — plus the current,
+    for half to a full life of twice the peak period (7.8–15.6 s at the
+    ocean preset), fading as 1 − e^{−remaining/(T/3)}. Every frame the live
+    ones are splatted (a nested render like the caustic pass, additive
+    Gaussians of 0.07 λp × a per-particle 0.6–1.4, row 0 at the top) into
+    a render target whose mip chain is allocated through `mipmaps.length`
+    with `generateMipmaps` false — three's own post-render mip pass is the
+    per-level bind-group allocation of trap 45 — and blitted by
+    gpuMipmaps.js. The lid reads the map as it read the memory
+    (`seaFoamWindowNode`); the per-pixel gate is GONE from the look — on
+    the minimum eigenvalue it painted every steep face a snow blanket, and
+    the particles whiten a breaking crest in a fifth of a second on their
+    own (9 probes/m²/s). Receipts (500 m, ocean preset, 8 s warm-up):
+    whitecaps 5.7 % of the water, far band 3.22 %, raw map mean .095, p90
+    .24, p99 1.0, above .1 20.7 %, above .5 4.4 %; 78 864 of 131 072 live at
+    the steady state; a 1 m hull seed births 67 particles in 2 s; the 5 m
+    pool arm unchanged; `test:water` 40. Traps found on the way: three's
+    `hash` TRUNCATES its float seed (a PCG on uint arithmetic keyed by
+    index × frame, or the next frame re-probes its neighbour's points);
+    flat-topped discs summed leave RINGS (Gaussians sum smooth); the pool
+    is at its steady state only after a lifetime (the harness warms 8 s
+    before the ocean shots). Splashes (Stage B) are next.
 
 ## Open
 
