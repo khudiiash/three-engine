@@ -2,7 +2,7 @@ import * as THREE from "three/webgpu";
 import {
   Fn, If, float, int, uint, ivec2, vec2, vec3, vec4, uniform, uniformArray, instanceIndex, instancedArray, texture, textureLoad, textureStore, storageTexture,
   workgroupArray, workgroupBarrier, localId, workgroupId, select, atan, cameraPosition, positionWorld, positionGeometry, mix, varying, uv as uvAttribute,
-  modelWorldMatrixInverse, normalize, cross, atomicAdd, atomicStore,
+  modelWorldMatrixInverse, modelWorldMatrix, normalize, cross, atomicAdd, atomicStore,
 } from "three/tsl";
 import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
@@ -781,6 +781,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       If(p.w.lessThan(v.w), () => {
         v.y.assign(v.y.sub(dts.mul(GRAVITY)));
         v.xyz.assign(v.xyz.mul(dts.mul(.4).oneMinus().max(0)));
+        // The BREAKUP: a sheet flies coherent for a few tenths of a second,
+        // then tears into drops — a random walk that grows with age.
+        const tear = p.w.mul(1.2).min(1).mul(dts).mul(2.5);
+        v.xyz.assign(v.xyz.add(vec3(gauss(rnd(30), rnd(31)), gauss(rnd(32), rnd(33)).mul(.6), gauss(rnd(34), rnd(35))).mul(tear)));
         p.xyz.assign(p.xyz.add(v.xyz.mul(dts)));
         p.xz.assign(p.xz.add(f.currentVel.mul(f.dt)));
         p.w.assign(p.w.add(dts));
@@ -800,8 +804,13 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
             const angle = rnd(15).mul(6.2831853), rad = r2.sqrt();
             const radial = vec2(angle.cos(), angle.sin());
             at.assign(seed.xy.add(radial.mul(rad).mul(seed.z)));
-            const up = seed.w.mul(r3.mul(.7).add(.5)), out = seed.w.mul(.35).mul(rad);
-            const turbulence = vec3(gauss(rnd(16), rnd(17)), gauss(rnd(18), rnd(19)), gauss(rnd(20), rnd(21))).mul(seed.w.mul(.15));
+            // A crown is a SHEET before it is drops: its velocity is smooth
+            // around the ring (three lobes with a phase from the seed's
+            // place), the rim fastest; the breakup comes with age, below.
+            const phase = seed.x.mul(7.3).add(seed.y.mul(3.1));
+            const lobes = angle.mul(3).add(phase).sin().mul(.5).add(.5);
+            const up = seed.w.mul(lobes.mul(.5).add(.55).mul(rad.mul(.4).add(.8))), out = seed.w.mul(.4).mul(rad).mul(lobes.mul(.4).add(.6));
+            const turbulence = vec3(gauss(rnd(16), rnd(17)), gauss(rnd(18), rnd(19)), gauss(rnd(20), rnd(21))).mul(seed.w.mul(.04));
             vel.assign(vec3(radial.x.mul(out), up, radial.y.mul(out)).add(turbulence));
             born.assign(1); strength.assign(1);
           });
@@ -858,7 +867,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   const splatNdc = splatParticle.xy.sub(f.center).div(f.half).add(splatAlong.add(splatAcross).mul(f.disc.mul(splatAux.y).mul(splatGrow).div(f.half)));
   splatMaterial.vertexNode = vec4(splatNdc.x, splatNdc.y.negate(), select(splatAlive, float(0), float(2)), 1);
   const splatIntensity = varying(
-    splatParticle.w.sub(splatParticle.z).max(0).div(f.life.div(3)).negate().exp().oneMinus().mul(splatAux.x).div(splatGrow),
+    splatParticle.w.sub(splatParticle.z).max(0).div(f.life.div(3)).negate().exp().oneMinus().mul(splatParticle.z.div(.5).clamp(0, 1)).mul(splatAux.x).div(splatGrow),
     "seaFoamSplat");
   const splatRadius = uvAttribute().sub(.5).length().mul(2);
   splatMaterial.colorNode = vec3(splatRadius.mul(splatRadius).mul(-4).exp().mul(splatIntensity));
@@ -883,19 +892,30 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     const part = splash.element(which), velocity = splashVel.element(which), aux = splashAux.element(which);
     const alive = part.w.lessThan(velocity.w);
     const j0 = pcg(instanceIndex.mul(uint(2654435761)).add(uint(11))), j1 = pcg(instanceIndex.mul(uint(2654435761)).add(uint(23))), j2 = pcg(instanceIndex.mul(uint(2654435761)).add(uint(37)));
-    const jitter = select(k.equal(uint(0)), vec3(0), vec3(j0.sub(.5), j1.sub(.5).mul(.6), j2.sub(.5)).mul(sp.size.mul(3)));
+    const spread = part.w.mul(2).clamp(.25, 1.6);   // the sheet's drops separate with age
+    const jitter = select(k.equal(uint(0)), vec3(0), vec3(j0.sub(.5), j1.sub(.5).mul(.6), j2.sub(.5)).mul(sp.size.mul(3)).mul(spread));
     const world = part.xyz.add(jitter);
     const centre = vec3(world.x.div(sp.scale.x), world.y.div(sp.scale.y), world.z.div(sp.scale.z));
-    const cameraLocal = modelWorldMatrixInverse.mul(vec4(cameraPosition, 1)).xyz;
-    const toCam = normalize(cameraLocal.sub(centre).add(vec3(0, 1e-5, 0)));
-    const along = velocity.xyz.add(vec3(0, 1e-4, 0));
-    const speed = along.length();
-    const dir = along.div(speed.max(1e-4));
+    // ⚠ THE BILLBOARD IS BUILT IN WORLD SPACE. In the water's local space
+    // (scaled 500 × 60 × 500 on an ocean) a camera-facing plane is skewed
+    // and edge-on once the scale is applied — "flat plane textures that do
+    // not billboard … hard to see even" (user, 2026-09-07). The basis is
+    // world metres; only the finished offset goes back to local through
+    // the inverse model matrix (a vector: rotation and scale, no offset).
+    const worldPos = modelWorldMatrix.mul(vec4(centre, 1)).xyz;
+    const toCam = normalize(cameraPosition.sub(worldPos).add(vec3(0, 1e-5, 0)));
+    const velLocal = vec3(velocity.x.div(sp.scale.x), velocity.y.div(sp.scale.y), velocity.z.div(sp.scale.z));
+    const along = modelWorldMatrix.mul(vec4(velLocal, 0)).xyz.add(vec3(0, 1e-4, 0));
+    const speed = velocity.xyz.length();
+    const dir = normalize(along);
     const right = normalize(cross(dir, toCam).add(vec3(1e-5, 0, 0)));
     const up = cross(toCam, right);
-    const size = select(alive, sp.size.mul(sp.sizeScale).mul(aux.y).mul(j2.mul(.6).add(.6)).div(sp.scale.x), float(0));
+    // Bigger while a sheet, smaller as drops.
+    const sheet = part.w.mul(1.5).clamp(0, 1).oneMinus().mul(.4).add(1);
+    const size = select(alive, sp.size.mul(sp.sizeScale).mul(aux.y).mul(j2.mul(.6).add(.6)).mul(sheet), float(0));
     const stretch = speed.mul(.25).add(1).min(4);
-    splashMaterial.positionNode = centre.add(right.mul(positionGeometry.x).add(up.mul(positionGeometry.y).mul(stretch)).mul(size));
+    const offsetWorld = right.mul(positionGeometry.x).add(up.mul(positionGeometry.y).mul(stretch)).mul(size);
+    splashMaterial.positionNode = centre.add(modelWorldMatrixInverse.mul(vec4(offsetWorld, 0)).xyz);
     const fade = varying(part.w.div(velocity.w.max(1e-3)).oneMinus().clamp(0, 1).mul(aux.x), "seaSplashFade");
     splashMaterial.colorNode = vec3(.85);
     splashMaterial.opacityNode = uvAttribute().sub(.5).length().mul(2).smoothstep(.3, 1).oneMinus().mul(fade).mul(.9);

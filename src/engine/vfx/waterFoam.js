@@ -292,13 +292,18 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
   // thin lace), a strong one nearly everything (a sheet with bubble holes).
   const detail = texture(foamDetailTexture());
   const rest = spectrum ? p.sub(seaDisplacementAt(spectrum, p).xz).add(spectrum.uniforms.scroll) : p;
-  const laceA = detail.sample(rest.div(2.2)).x, laceB = detail.sample(rest.div(.55).add(vec2(.37, .61))).x;
-  const bubbles = detail.sample(rest.div(.35).add(vec2(.13, .71))).y;
+  // ⚠ NO CELL FINER THAN A FEW CENTIMETRES: sampled at 0.35–0.55 m tiles
+  // the texture's finest cells were 7 mm, under a pixel a few metres out,
+  // and every motion of the mask across them shimmered ("flickery",
+  // user, 2026-09-07). The tiles are 4.5 / 1.3 / 1.6 m now (cells of
+  // 50 / 5 / 3 cm) and the dissolve's feather is wider.
+  const laceA = detail.sample(rest.div(4.5)).x, laceB = detail.sample(rest.div(1.3).add(vec2(.37, .61))).x;
+  const bubbles = detail.sample(rest.div(1.6).add(vec2(.13, .71))).y;
   const foamPatch = detail.sample(rest.div(9)).z;
   const mask = sea.max(contact.mul(.85)).mul(foamPatch.mul(.8).add(.6)).clamp(0, 1);
   const foamGrain = mix(laceA, laceB, .5).mul(bubbles.mul(.35).add(.75));
   const threshold = mask.oneMinus();
-  const realistic = foamGrain.smoothstep(threshold.sub(.12), threshold.add(.12));
+  const realistic = foamGrain.smoothstep(threshold.sub(.18), threshold.add(.18));
   // STYLIZED (the water's other mode): Sea of Thieves' own look — the soft,
   // dispersed mask with a coarse lace bite, hard-edged and flat.
   const stylized = mask.mul(laceA.mul(.5).add(.75)).smoothstep(.3, .45);

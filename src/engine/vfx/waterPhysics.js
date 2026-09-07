@@ -95,7 +95,7 @@ function localBounds(collider) {
  * Fixed-step impulses avoid persistent addForce accumulation. Volume, not a
  * mass threshold, determines displaced water; drag is integrated implicitly. */
 export class WaterPhysics {
-  constructor(component) { this.component=component;this.samples=new WeakMap();this.previousVolumes=new WeakMap();this.previousWakes=new WeakMap();this.wakeFilter=new WeakMap();this.splashAt=new WeakMap();this.time=0; }
+  constructor(component) { this.component=component;this.samples=new WeakMap();this.previousVolumes=new WeakMap();this.previousWakes=new WeakMap();this.wakeFilter=new WeakMap();this.splashAt=new WeakMap();this.surfaceMemo=new WeakMap();this.time=0; }
   /**
    * ⭐ GIVE THE WATER BACK BEFORE FORGETTING THE BODY.
    *
@@ -447,12 +447,34 @@ export class WaterPhysics {
           // waterline — bow spray — (through − 1) × 30 drops a second per
           // leading sample (waterSpectrum.js's counted seeds), at six
           // tenths of its speed through the water.
+          // Sixty drops a second per leading sample per metre a second over
+          // the first, thrown at the full speed through the water: a boat
+          // held in a 5 m/s current takes the whole sea on its bow ("there
+          // must be a huge amount of force of water hitting the front of
+          // the boat", user, 2026-09-07).
           if(through>1.5&&dt>0){
-            const rate=(through-1)*30*dt;
+            const rate=(through-1)*60*dt;
             for(let i=0;i<waterline.length;i+=2){
               const at=query(waterline[i].point);if(!at)continue;
               const lead=(at.localX-filter.x)*rvx+(at.localZ-filter.z)*rvz;
-              if(lead>0)c.simulation.addWaterSplash?.(at.localX,at.localZ,.4/flat,through*.6,rate);
+              if(lead>0)c.simulation.addWaterSplash?.(at.localX,at.localZ,.5/flat,through,rate);
+            }
+          }
+          // ── A WAVE SLAMMING THE HULL (2026-09-07) ────────────────────────
+          // The water rising against the hull counts as much as the hull
+          // falling into the water: the surface's climb at the body over
+          // the last tick plus the body's own sinking, over 1.5 m/s, throws
+          // counted spray off the whole waterline ("they don't appear on
+          // wave collisions", user).
+          const memo=this.surfaceMemo.get(body);
+          const rising=memo&&dt>0?(surface.height-memo)/dt:0;
+          this.surfaceMemo.set(body,surface.height);
+          const slam=sinking+Math.max(0,Math.min(12,rising));
+          if(slam>1.5&&dt>0){
+            const rate=(slam-1)*20*dt;
+            for(let i=0;i<waterline.length;i+=2){
+              const at=query(waterline[i].point);if(!at)continue;
+              c.simulation.addWaterSplash?.(at.localX,at.localZ,.4/flat,slam*.6,rate);
             }
           }
           // A quarter per second at full speed: the field's 2.5 s life makes a

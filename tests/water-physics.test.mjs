@@ -49,9 +49,11 @@ test('a hull in a current throws counted spray off its leading waterline; one at
 test('a body dropped into the water hands the sea one splash at its entry speed; at rest it hands none',()=>{
   const r=rig();try{
     r.add(500,2,0,4); r.step(1.5);
-    assert.ok(r.splashes.length>=1,`the entry throws spray: ${r.splashes.length}`);
-    assert.ok(r.splashes.length<=2,`one crown per entry, not one a frame: ${r.splashes.length}`);
-    const [x,z,radius,speed]=r.splashes[0];
+    // The crowns are the UNCOUNTED seeds; the slam's counted seeds ride along.
+    const crowns=r.splashes.filter((s)=>s[4]==null);
+    assert.ok(crowns.length>=1,`the entry throws spray: ${crowns.length}`);
+    assert.ok(crowns.length<=2,`one crown per entry, not one a frame: ${crowns.length}`);
+    const [x,z,radius,speed]=crowns[0];
     assert.ok(Number.isFinite(x)&&Number.isFinite(z)&&radius>0,'the seed has a place and a radius');
     assert.ok(speed>1&&speed<12,`the entry speed of a 3 m drop: ${speed.toFixed(2)} m/s`);
     r.splashes.length=0; r.step(4);
