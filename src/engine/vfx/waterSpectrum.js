@@ -2,7 +2,7 @@ import * as THREE from "three/webgpu";
 import {
   Fn, If, float, int, uint, ivec2, vec2, vec3, vec4, uniform, uniformArray, instanceIndex, instancedArray, texture, textureLoad, textureStore, storageTexture,
   workgroupArray, workgroupBarrier, localId, workgroupId, select, atan, cameraPosition, positionWorld, positionGeometry, mix, varying, uv as uvAttribute,
-  modelWorldMatrixInverse, normalize, cross,
+  modelWorldMatrixInverse, normalize, cross, atomicAdd, atomicStore,
 } from "three/tsl";
 import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
@@ -92,6 +92,24 @@ export const FOAM_WINDOW_METRES = 512;
 export const FOAM_LIFE_SECONDS = 6;
 /** Particles a hull seed asks per square metre per second at full value. */
 export const FOAM_SEED_DENSITY = 4;
+/**
+ * ⛔ PRODUCTION IS A RATE PER SQUARE METRE, NOT A SHARE OF THE POOL. As a
+ * share of the dead particles it was bounded by nothing but the pool, and
+ * the pool filled to its cap: a leopard skin from the eye to the horizon,
+ * a stationary churn of births and deaths, a hull's seeds starved (user,
+ * 2026-09-07). A fold is probed FOAM_RATE times a square metre a second,
+ * whatever the pool; the density gate stops it at white.
+ */
+export const FOAM_RATE = 16;
+/**
+ * A speck's size grows with its distance from the eye — a hundredth of it
+ * and a bit — and its birth chance falls with the square of that, so the
+ * COVERAGE per square metre is the same at 250 m as at 5 m while the pool
+ * carries a few thousand specks instead of a million: the reference is
+ * "more small dots than large white blobs" (user, 2026-09-07), and a dot
+ * finer than a pixel is a coverage the mips carry anyway.
+ */
+export const FOAM_SIZE_PER_METRE = .025;
 /**
  * ══ SPLASH (the paper's second particle system) ═════════════════════════
  * Spray is thrown where a crest folds hard (a stricter threshold than the
@@ -311,6 +329,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   const particles = instancedArray(particleCount, "vec4");
   const particleAux = instancedArray(particleCount, "vec4");
   let particlesReady = false;
+  // How many are alive (an atomic the step counts, read back every few
+  // frames): the seeds' probes are sized to the DEAD, not to the pool, so a
+  // hull's tail and a splash's foam still come when the sea is busy.
+  const liveCounter = instancedArray(new Uint32Array(4), "uint").toAtomic();
+  let liveEstimate = 0, liveReadPending = false, liveReadFrame = 0;
   // The splash pool: (x, y, z, age), (vx, vy, vz, life), (intensity, size),
   // and the RETURNS — a particle that met the surface this frame leaves
   // (x, z, intensity, 1) in its own slot, which the foam step reads.
@@ -437,7 +460,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         f.lods[i].value = Math.max(0, Math.log2(Math.max(1, f.texel.value / (band.L / size))));
       });
       f.spread.value = Math.max(.2, settings.waveLength * .1);
-      f.disc.value = Math.min(2.5, Math.max(.2, settings.waveLength * .07));
+      f.disc.value = Math.min(1, Math.max(.1, settings.waveLength * .025));   // small specks, not blobs (the reference, user 2026-09-07)
       const period = 2 * Math.PI / Math.max(1e-3, settings.peakOmega) / Math.max(1e-3, settings.timeScale);
       f.life.value = Math.min(20, Math.max(3, 2 * period));
       // Spray flies at ~1.6 √(g σ): a metre and a half up on a 1 m sea.
@@ -470,7 +493,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       }
       for (let i = 0; i < count; i++) f.seedRows[i].set(seeds[i][0], seeds[i][1], seeds[i][2], maxWant > 0 ? wants[i] / maxWant : 0);
       f.seedCount.value = count;
-      f.seedTry.value = maxWant > 0 ? Math.min(1, 1.5 * count * maxWant / particleCount) : 0;
+      const dead = Math.max(particleCount * .02, particleCount - liveEstimate);
+      f.seedTry.value = maxWant > 0 ? Math.min(1, 1.5 * count * maxWant / dead) : 0;
       // Impacts (the sea's metres, radius, entry speed): a crown of
       // 40 r² v particles, 20–600, thrown this frame.
       const impacts = Math.min(sp.seedRows.length, splashes?.length ?? 0);
@@ -509,9 +533,18 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         f.currentVel.value.set(current[0], current[1]);
       } else f.currentVel.value.set(0, 0);
       f.dt.value = step; f.timeScale.value = settings.timeScale; f.frame.value = (f.frame.value + 1) % 1048576;
+      // FOAM_RATE probes a square metre a second over the window, as a share
+      // of the pool (a dead particle's chance to probe this frame).
+      f.tryRate.value = Math.min(1, FOAM_RATE * (2 * f.half.value) ** 2 * step / particleCount);
+      {
+        const cv = f.currentVel.value, speed = Math.hypot(cv.x, cv.y), k = Math.min(1, speed / .5);
+        const ax = sp.dir.value.x * (1 - k) + (speed > 0 ? cv.x / speed : 0) * k, az = sp.dir.value.y * (1 - k) + (speed > 0 ? cv.y / speed : 0) * k;
+        const n = Math.hypot(ax, az) || 1;
+        f.streakAxis.value.set(ax / n, az / n);
+      }
       if (!particlesReady) { queue.push(particleInit, splashInit); particlesReady = true; }
       // The splash step first: its returns feed the foam step this frame.
-      queue.push(splashStep, particleStep);
+      queue.push(liveReset, splashStep, particleStep);
       return queue;
     },
     /**
@@ -545,6 +578,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         }
       }
       spectrum.generateMipmaps(renderer);
+      if (renderer?.getArrayBufferAsync && particlesReady && !liveReadPending && ++liveReadFrame >= 20) {
+        liveReadFrame = 0; liveReadPending = true;
+        renderer.getArrayBufferAsync(liveCounter.value).then((buf) => { liveEstimate = new Uint32Array(buf)[0] || 0; }).catch(() => {}).finally(() => { liveReadPending = false; });
+      }
     },
     generateMipmaps(renderer) {
       if (globalThis.__waterSeaMips === false) return;   // `__waterSeaMips = false`: the harness's control arm
@@ -584,8 +621,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       return { pos: new Float32Array(pos), vel: new Float32Array(vel) };
     },
     dispose(renderer) {
-      releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), particleInit, particleStep, splashInit, splashStep]);
-      releaseStorageAttributes(renderer, [particles.value, particleAux.value, splash.value, splashVel.value, splashAux.value, returns.value].filter(Boolean));
+      releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), particleInit, particleStep, splashInit, splashStep, liveReset]);
+      releaseStorageAttributes(renderer, [particles.value, particleAux.value, splash.value, splashVel.value, splashAux.value, returns.value, liveCounter.value].filter(Boolean));
       for (const c of cascades) for (const t of c.textures) t.dispose();
       foamTarget.dispose(); splatMaterial.dispose(); splatGeometry.dispose();
       splashMesh.removeFromParent(); splashMaterial.dispose(); splashGeometry.dispose();
@@ -622,9 +659,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       p.xy.assign(p.xy.add(vel.mul(f.dt)));
       p.z.assign(p.z.add(f.dt));
       particles.element(i).assign(p);
+      atomicAdd(liveCounter.element(uint(0)), uint(1));
     }).Else(() => {
       const r0 = rnd(1), r1 = rnd(2), r2 = rnd(3), r3 = rnd(4);
-      const born = float(0).toVar(), at = vec2(0).toVar(), scale = float(1).toVar();
+      const born = float(0).toVar(), at = vec2(0).toVar(), scale = float(1).toVar(), streak = float(0).toVar();
       If(r0.lessThan(f.seedTry), () => {
         const seed = f.seeds.element(r1.mul(f.seedCount.toFloat()).floor().toInt().clamp(0, 63));
         If(r2.lessThan(seed.w), () => {
@@ -647,19 +685,34 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
           // Along the crest by ±spread, a little across it.
           const along = rnd(6).mul(2).sub(1).mul(f.spread), across = rnd(7).sub(.5).mul(f.spread.mul(.25));
           at.assign(probe.add(fold.yz.mul(along)).add(vec2(fold.z.negate(), fold.y).mul(across)));
-          born.assign(1);
+          born.assign(1); streak.assign(1);
           // Deeper folds make brighter foam.
           scale.assign(f.threshold.sub(fold.x).div(f.threshold.max(1e-3)).mul(2).add(.5).clamp(.5, 1));
         });
       });
+      // THE DENSITY GATE. Without it production was bounded only by the
+      // pool: every fold kept spawning into foam already white, the pool
+      // filled to its cap, the window was a leopard skin from the eye to
+      // the horizon, the pattern a stationary churn of births and deaths,
+      // and a hull's seeds starved ("looks bad, not following the current",
+      // user, 2026-09-07). A particle is born only where the map is not
+      // white yet (probability 1 - the map's value), so a fold fills to a
+      // sheet and stops; the sea's drift and the decay are what refill it.
       If(born.greaterThan(.5), () => {
-        const life = f.life.mul(.5).add(rnd(8).mul(f.life.mul(.5)));
-        particles.element(i).assign(vec4(at, 0, life));
-        particleAux.element(i).assign(vec4(scale, rnd(9).mul(.8).add(.6), 0, 0));
+        const here = seaFoamWindowNode(spectrum, at, float(0));
+        // The speck's size by distance, and its chance by the inverse square.
+        const sizeFactor = at.sub(f.center).length().mul(FOAM_SIZE_PER_METRE).div(f.disc.max(1e-3)).max(1);
+        If(rnd(27).lessThan(float(.9).sub(here).max(0).div(.9).div(sizeFactor.mul(sizeFactor))), () => {
+          const life = f.life.mul(.5).add(rnd(8).mul(f.life.mul(.5)));
+          particles.element(i).assign(vec4(at, 0, life));
+          particleAux.element(i).assign(vec4(scale, rnd(9).add(.5).mul(sizeFactor), streak, 0));
+        });
       });
     });
   })().compute(particleCount);
-  particleInit.__giPassName = "sea.foamInit"; particleStep.__giPassName = "sea.foamStep";
+  const liveReset = Fn(() => { atomicStore(liveCounter.element(uint(0)), uint(0)); })().compute(1);
+  particleInit.__giPassName = "sea.foamInit"; particleStep.__giPassName = "sea.foamStep"; liveReset.__giPassName = "sea.foamLiveReset";
+  spectrum.liveCount = () => liveEstimate;
   // ── THE SPLAT ────────────────────────────────────────────────────────────
   // Every live particle is a soft disc of `f.disc` metres in the map (the
   // window's NDC; the target's row 0 is the TOP, so z runs down as the
@@ -672,7 +725,15 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   const splatParticle = particles.element(instanceIndex);
   const splatAlive = splatParticle.z.lessThan(splatParticle.w);
   const splatAux = particleAux.element(instanceIndex);
-  const splatNdc = splatParticle.xy.sub(f.center).div(f.half).add(positionGeometry.xy.mul(f.disc.mul(splatAux.y).div(f.half)));
+  // A fold's foam is a STREAK along the wind (along the current when there
+  // is one), 2.5 : 1 at the same area; a hull's and a splash's stays round.
+  // The axis is a uniform: no per-particle storage.
+  const streakAxis = uniform(new THREE.Vector2(1, 0));
+  f.streakAxis = streakAxis;
+  const splatAspect = mix(float(1), float(2.5), splatAux.z);
+  const splatAlong = streakAxis.mul(positionGeometry.x).mul(splatAspect.sqrt());
+  const splatAcross = vec2(streakAxis.y.negate(), streakAxis.x).mul(positionGeometry.y).div(splatAspect.sqrt());
+  const splatNdc = splatParticle.xy.sub(f.center).div(f.half).add(splatAlong.add(splatAcross).mul(f.disc.mul(splatAux.y).div(f.half)));
   splatMaterial.vertexNode = vec4(splatNdc.x, splatNdc.y.negate(), select(splatAlive, float(0), float(2)), 1);
   const splatIntensity = varying(
     splatParticle.w.sub(splatParticle.z).max(0).div(f.life.div(3)).negate().exp().oneMinus().mul(splatAux.x),

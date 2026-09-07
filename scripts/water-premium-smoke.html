@@ -356,7 +356,12 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        // receipt (an instantaneous gate reads nothing there).
        if (y < H * .6) { farN++; if (isWhite) farWhite++; }
      }
-     log(`ocean: far band whitecaps ${(farWhite / farN * 100).toFixed(2)}% (rows ${H * .5}–${H * .6})`);
+     // The far band's SPECKS: pixels brighter than the band's mean by 35 —
+     // the reference's far sea is fine bright specks on dark water, not
+     // white pixels (a speck at 250 m is a few pixels the mips dim).
+     let farMean = 0; for (let y = H * .5; y < H * .6; y++) for (let x = 0; x < W; x++) farMean += luma(high, ((y | 0) * W + (x | 0)) * 4); farMean /= farN;
+     let farSpeck = 0; for (let y = H * .5; y < H * .6; y++) for (let x = 0; x < W; x++) if (luma(high, ((y | 0) * W + (x | 0)) * 4) - farMean > 35) farSpeck++;
+     log(`ocean: far band whitecaps ${(farWhite / farN * 100).toFixed(2)}%, specks over the band's mean ${(farSpeck / farN * 100).toFixed(2)}% (rows ${H * .5}–${H * .6})`);
      // ?foamDebug=sea: the lid draws the RAW whitecap memory — its distribution
      // over the water (the high shot), so the look's thresholds are set on
      // numbers rather than on a picture.
@@ -370,7 +375,7 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        throw new Error('ocean: stop');
      }
      // (A frozen sea — ?waveSpeed=0, the current receipts — never folds.)
-     if (USER.waveSpeed !== 0 && !(farWhite / farN > .002)) throw new Error(`far whitecaps: ${(farWhite / farN * 100).toFixed(2)}% (want > 0.2 %)`);
+     if (USER.waveSpeed !== 0 && !(farSpeck / farN > .002)) throw new Error(`far specks: ${(farSpeck / farN * 100).toFixed(2)}% over the band's mean (want > 0.2 %)`);
      let m = 0, m2 = 0, k = 0;
      for (let y = H * .5; y < H * .62; y++) for (let x = 0; x < W; x++) { const l = luma(horizon, ((y | 0) * W + (x | 0)) * 4); m += l; m2 += l * l; k++; }
      const sparkle = Math.sqrt(Math.max(0, m2 / k - (m / k) ** 2)) / Math.max(1, m / k);
@@ -405,6 +410,18 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        await shoot('ocean-seed');
        log(`ocean: a hull seed (1 m, value 1, 2 s) birthed ${near} live particles within 2.5 m; seedTry ${sp2.foam.seedTry.value.toExponential(2)}, seeds ${sp2.foam.seedCount.value}`);
        if (!(near > 8)) throw new Error(`the hull seed birthed ${near} particles (want > 8)`);
+       // ── THE SEA'S FOAM RIDES THE CURRENT (2026-09-07) ─────────────────
+       // With ?current= set, the particles alive across a second must have
+       // moved by the current (plus the orbital wobble, which averages out).
+       if (Number(argument('current', '0')) !== 0) {
+         const a = await sp2.readParticles(renderer); await run(60); const b = await sp2.readParticles(renderer);
+         let dx = 0, dz = 0, k = 0;
+         for (let i = 0; i < a.length; i += 4) if (a[i + 2] < a[i + 3] && b[i + 2] < b[i + 3] && b[i + 2] > a[i + 2]) { dx += b[i] - a[i]; dz += b[i + 1] - a[i + 1]; k++; }
+         const v = Number(argument('current', '0')), dirC = [Math.cos((USER.currentDirection ?? 0) * Math.PI / 180), Math.sin((USER.currentDirection ?? 0) * Math.PI / 180)];
+         const along = (dx / Math.max(1, k)) * dirC[0] + (dz / Math.max(1, k)) * dirC[1];
+         log(`ocean: sea foam under a ${v} m/s current — ${k} particles alive across a second moved ${along.toFixed(2)} m along it (expected about ${v.toFixed(2)} m)`);
+         if (!(k > 100 && along > v * .6 && along < v * 1.4)) throw new Error(`the sea foam does not ride the current: ${along.toFixed(2)} m in a second at ${v} m/s (${k} particles)`);
+       }
      }
      // ── SPRAY (2026-09-07) ──────────────────────────────────────────────
      // The splash pool after the warm-up (the sea's own spray within 100 m

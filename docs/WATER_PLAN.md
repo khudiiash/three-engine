@@ -564,6 +564,35 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     not yet drive the ripple field (the paper's eWave feedback) — that is
     a readback of the return slots every few frames into
     `addWaterImpulse` pairs, deferred until the look asks for it.
+54. ⛔ PRODUCTION IS A RATE PER SQUARE METRE, NOT A SHARE OF THE POOL —
+    and the pool must never be the thing that bounds it. The first pool
+    probed 30 % of its DEAD particles a frame: bounded by nothing but the
+    pool, it filled to the cap, and the user's boat sat in a leopard skin
+    of blobs from the eye to the horizon, a stationary churn of births and
+    deaths that did not stream with the current, with the hull's own
+    seeds starved ("looks bad, not following the current", 2026-09-07).
+    Four rules now: (1) FOAM_RATE = 16 probes per square metre per
+    second over the window, whatever the pool (`tryRate` = rate × area ×
+    dt / pool); (2) THE DENSITY GATE — a birth only where the map is not
+    white yet, probability (0.9 − map)/0.9, so a fold fills to a sheet and
+    stops; (3) SIZE BY DISTANCE — a speck is max(disc, 0.025 × its
+    distance from the eye) wide and its birth chance falls with the
+    square of that, so coverage per square metre is the same at 250 m as
+    at 5 m while the far rings hold thousands of specks, not a million;
+    (4) A LIVE COUNTER (an atomic the step increments, reset before it,
+    read back every 20 frames) sizes the seeds' probes to the DEAD, so a
+    hull's tail and a splash's foam come on a busy sea. With the reference
+    ("better more small dots than large white blobs", user): the disc is
+    0.025 λp (0.6 m on the preset), specks 0.5–1.5× that, a fold's
+    specks are 2.5 : 1 streaks along the wind (or the current). Receipts
+    (ocean preset, 8 s warm-up): foam .3 — 10 k live, whitecaps 1.2 %,
+    far specks 0.94 %, hull seed 65; foam 1 — 111 k live (85 % of the
+    pool), whitecaps 26 %, hull seed still 75; a 2 m/s current — 10 486
+    particles alive across a second moved 1.97 m along it (2.00 expected:
+    THE FOAM RIDES THE CURRENT, receipt `ocean: sea foam under a …
+    current`); `test:water` 41, the 5 m pool arm passes. The far-band
+    receipt is SPECKS over the band's mean (> 0.2 %), not white pixels: at
+    250 m a speck is a few pixels the mips dim, as in the reference.
 
 ## Open
 
