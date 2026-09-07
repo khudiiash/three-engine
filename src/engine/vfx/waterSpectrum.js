@@ -94,7 +94,7 @@ export const FOAM_LIFE_SECONDS = 6;
 /** Particles a hull seed asks per square metre per second at full value
  *  (24: a hull's seeds are small discs at low values, and the foam dial's
  *  three-halves power sits on top — "still no foam tail", user, 2026-09-07). */
-export const FOAM_SEED_DENSITY = 24;
+export const FOAM_SEED_DENSITY = 8;
 /**
  * ⛔ PRODUCTION IS A RATE PER SQUARE METRE, NOT A SHARE OF THE POOL. As a
  * share of the dead particles it was bounded by nothing but the pool, and
@@ -551,7 +551,12 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       // ⛔ THE DIAL IS QUADRATIC ON THE INTERACTION SOURCES: linear, 0.1
       // still read as a tenth of a boat's tail ("still too much foam at
       // 0.1", user, 2026-09-07); squared it is a hundredth.
-      const dial = Math.pow(f.gate.value, 1.5);
+      // ⛔ THE DIAL'S SCALE: "on 0.1 it is like it should be on 0.5 … the
+      // maximum at which it looks natural" (user, 2026-09-07). The fold
+      // threshold runs .42 → .72 (0.1 barely folds; 0.5 is what 0.3 was),
+      // a hull's seeds are linear in the dial, the ripple field's births
+      // its square, the returns linear.
+      const dial = f.gate.value;
       for (let i = 0; i < count; i++) {
         const [, , r, a] = seeds[i];
         wants[i] = Math.PI * r * r * Math.min(1, a) * FOAM_SEED_DENSITY * step * dial;
@@ -593,7 +598,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       if (foam != null) f.gate.value = Math.max(0, Math.min(1, foam));
       // The fold threshold on the minimum eigenvalue: `foam` 0 opens at 0.45
       // (a fold at the limit), 1 at 0.85 — the paper's 0.55 near 0.25.
-      f.threshold.value = .45 + .4 * f.gate.value;
+      f.threshold.value = .42 + .3 * f.gate.value;
       sp.threshold.value = f.threshold.value - .1;
       sp.tryRate.value = Math.min(1, .5 * sp.amount.value);
       const t = f.texel.value;
@@ -615,7 +620,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       f.tryRate.value = Math.min(1, FOAM_RATE * (2 * f.half.value) ** 2 * step / particleCount);
       // The ripple window's foam is probed at twice the sea's rate over its own area.
       const ripple = spectrum.ripple;
-      f.rippleTry.value = ripple ? Math.min(1, 2 * FOAM_RATE * (2 * ripple.half.value.x * ripple.scale.value.x) * (2 * ripple.half.value.y * ripple.scale.value.z) * step / particleCount) * dial : 0;
+      f.rippleTry.value = ripple ? Math.min(1, 2 * FOAM_RATE * (2 * ripple.half.value.x * ripple.scale.value.x) * (2 * ripple.half.value.y * ripple.scale.value.z) * step / particleCount) * dial * dial : 0;
       sp.returnTry.value = .3 * dial;
       f.cap.value = .2 + .7 * f.gate.value;
       f.life.value = f.baseLife * (.4 + .6 * f.gate.value);

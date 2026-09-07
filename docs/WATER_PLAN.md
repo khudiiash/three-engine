@@ -808,6 +808,18 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     with a new assertion that > 90 % of a 2 m cube's foam seeds sit
     within 12 cm of a face; hull seed 63 in the ocean arm; the pool arm
     passes.
+63. THE DIAL'S SCALE. "On 0.1 it is like it should be on 0.5 — the maximum
+    at which it looks natural" (user, 2026-09-07): the whole dial was five
+    times too generous. The fold threshold runs .42 + .3 foam now (0.1
+    barely folds at .45; 0.5 is .57, what 0.3 was); a hull's seeds are
+    LINEAR in the dial at FOAM_SEED_DENSITY 8 (0.1 keeps the faint tail
+    the three-halves power at 24 gave), the ripple field's births the
+    dial's SQUARE, the returns linear; cap .2 + .7 foam, life .4 + .6
+    foam as before. Receipts: foam .5 — 8.1 k live, whitecaps 2.8 %, far
+    specks 0.80 %, hull seed 73 (the harness's ocean baseline is foam .5
+    from here on); foam .1 — 629 live, far specks 0.01 %. The ocean
+    preset's foam stays .3 — a touch calmer than it was, the direction
+    the user wants.
 
 ## Open
 
@@ -832,6 +844,6 @@ cone|capsule&fill=.75`, `?shaftMip=N`, `?crate=1` — the floating crate seen
 through the surface, with and without it; the ocean: `?scales=500&shape=
 cylinder&fill=1&depth=10&ocean=1&hdr=/artifacts/sky/user.hdr&toneMapping=
 linear&sun=3.7,19.58,-1.68&sunIntensity=4` plus the preset's fields as
-overrides), `smoke:water-surface`,
+overrides; the foam receipts' baseline is `foam=.5` since trap 63), `smoke:water-surface`,
 `smoke:water-spectrum`, `smoke:water-props`, `smoke:water-rate`,
 `scripts/water-bindings-smoke.html?msaa=1`, `npm run test:water`.
