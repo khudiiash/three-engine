@@ -532,6 +532,38 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     flat-topped discs summed leave RINGS (Gaussians sum smooth); the pool
     is at its steady state only after a lifetime (the harness warms 8 s
     before the ocean shots). Splashes (Stage B) are next.
+53. ⭐ SPRAY IS THE PAPER'S SECOND POOL (the same unit, later that day):
+    splashCount = foam pool / 8 (16 k) in `waterSpectrum.js` — (x, y, z,
+    age), (vx, vy, vz, life), (intensity, size) and a RETURNS buffer. A
+    dead one is born within 100 m of the eye at a fold under the foam
+    threshold − .1, on the crest's front face (along the crest ±0.05 λp,
+    forward along the wave), thrown with twice the surface velocity,
+    forward at 0.6 × and up at 0.7–1.5 × `speed` = 1.6 √(g σ) (3.5 m/s on
+    the ocean preset) plus Box–Muller Gaussian turbulence at 0.3–0.35 of
+    it — the paper's velocity rules, whose emission-time turbulence the
+    paper reports makes PIC/FLIP unnecessary; or at an IMPACT seed
+    (`waterPhysics.js`: a body meeting the water faster than 1 m/s at its
+    first contact, or 2.5 m/s later, half a second between crowns per
+    body → `simulation.addWaterSplash(x, z, r, speed)` → a crown of
+    40 r² v particles, 20–600, up at 0.5–1.2 × and out at 0.35 × the entry
+    speed). It flies ballistic IN THE SEA'S TIME (gravity, 0.4/s drag) and
+    where it meets `seaDisplacementAt(...).y` it dies and writes (x, z,
+    intensity, 1) into its own return slot; the foam step, which runs
+    after it in the same queue, has a third branch — 30 % of the dead foam
+    particles read a random return slot and are born where a splash
+    landed (≈ one foam particle per returning splash per frame: secondary
+    foam without atomics or a readback). Drawn as billboards
+    (`spectrum.splashMesh`, added to the lid's object by
+    GridSimulationComponent; `sp.scale` = the sea's metres per local unit,
+    set by the solver; 0.5 σ metres, a soft white dot fading with age,
+    renderOrder 100, `fog: false`). Receipts (ocean preset): 321 splash
+    particles live after the warm-up; a 1 m / 4 m/s impact throws 229 the
+    frame after and leaves 320 live foam particles within 4 m two seconds
+    on; `test:water` 41 (a 3 m drop hands ONE crown at its entry speed, a
+    body at rest none); the 5 m pool arm unchanged. Open: the returns do
+    not yet drive the ripple field (the paper's eWave feedback) — that is
+    a readback of the return slots every few frames into
+    `addWaterImpulse` pairs, deferred until the look asks for it.
 
 ## Open
 

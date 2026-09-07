@@ -9,16 +9,33 @@ function rig(extra={}) {
   const engine={playing:true,scene:new THREE.Scene(),on:()=>()=>{},onUpdate:()=>()=>{},config:{},entities:new Map()};
   const physics=new PhysicsSystem(engine,RAPIER);physics.world=new RAPIER.World({x:0,y:-9.81,z:0});physics.eventQueue=new RAPIER.EventQueue(true);
   const props={...WATER_PHYSICS_DEFAULTS,width:20,height:20,waterDepth:20,waveHeight:0,...extra};
-  const wakes=[],foams=[];const component={enabled:true,graphEnabled:true,entity:{enabled:true},props,resolvedProps:props,simulation:{mesh:new THREE.Mesh(),uniforms:{simTime:{value:0}},addWaterImpulse:(...args)=>wakes.push(args),addWaterFoam:(...args)=>foams.push(args)}};
+  const wakes=[],foams=[],splashes=[];const component={enabled:true,graphEnabled:true,entity:{enabled:true},props,resolvedProps:props,simulation:{mesh:new THREE.Mesh(),uniforms:{simTime:{value:0}},addWaterImpulse:(...args)=>wakes.push(args),addWaterFoam:(...args)=>foams.push(args),addWaterSplash:(...args)=>splashes.push(args)}};
   const water=new WaterPhysics(component);engine.waterSurfaces=new Set([{applyBuoyancy:(p,dt)=>water.step(p,dt)}]);
-  const add=(mass,size=1,x=0)=>{
-    const body=physics.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,1,0));
+  const add=(mass,size=1,x=0,y=1)=>{
+    const body=physics.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,y,0));
     physics.world.createCollider(RAPIER.ColliderDesc.cuboid(size/2,size/2,size/2).setMass(mass),body);
     const entity={object3D:new THREE.Object3D(),getComponent:()=>null};physics.dynamicBodies.push({body,entity});return body;
   };
   const step=(seconds)=>{for(let i=0;i<seconds*60;i++){component.simulation.uniforms.simTime.value+=1/60;physics.update(1/60);}};
-  return {physics,component,add,step,wakes,foams,dispose:()=>{physics.world.free();physics.eventQueue.free();}};
+  return {physics,component,add,step,wakes,foams,splashes,dispose:()=>{physics.world.free();physics.eventQueue.free();}};
 }
+
+// ── THE ENTRY THROWS SPRAY (2026-09-07) ─────────────────────────────────────
+// A body dropped from three metres meets the water at several metres a
+// second and hands the sea ONE splash seed at its entry speed; a body that
+// then floats at rest hands it none.
+test('a body dropped into the water hands the sea one splash at its entry speed; at rest it hands none',()=>{
+  const r=rig();try{
+    r.add(500,2,0,4); r.step(1.5);
+    assert.ok(r.splashes.length>=1,`the entry throws spray: ${r.splashes.length}`);
+    assert.ok(r.splashes.length<=2,`one crown per entry, not one a frame: ${r.splashes.length}`);
+    const [x,z,radius,speed]=r.splashes[0];
+    assert.ok(Number.isFinite(x)&&Number.isFinite(z)&&radius>0,'the seed has a place and a radius');
+    assert.ok(speed>1&&speed<12,`the entry speed of a 3 m drop: ${speed.toFixed(2)} m/s`);
+    r.splashes.length=0; r.step(4);
+    assert.equal(r.splashes.length,0,`a body at rest throws no spray: ${r.splashes.length}`);
+  }finally{r.dispose();}
+});
 
 // ── CONTACT FOAM IS BORN IN THE FIELD (2026-09-07) ─────────────────────────
 // The lid's waterline ring is pinned to the hull; the foam a hull sheds lives

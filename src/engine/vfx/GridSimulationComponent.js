@@ -142,6 +142,9 @@ export class GridSimulationComponent extends Component {
     this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality), worldScale });
     this.simulation.mesh.userData.entityId = this.entity.id;
     this.entity.object3D.add(this.simulation.mesh);
+    // The sea's spray sprites live in the same frame as the lid.
+    const spray = this.simulation.spectrum?.splashMesh;
+    if (spray) { spray.userData.entityId = this.entity.id; this.entity.object3D.add(spray); }
     this.syncAppearance();
     this.refreshWaterSlot();
   }

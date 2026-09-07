@@ -95,7 +95,7 @@ function localBounds(collider) {
  * Fixed-step impulses avoid persistent addForce accumulation. Volume, not a
  * mass threshold, determines displaced water; drag is integrated implicitly. */
 export class WaterPhysics {
-  constructor(component) { this.component=component;this.samples=new WeakMap();this.previousVolumes=new WeakMap();this.previousWakes=new WeakMap();this.wakeFilter=new WeakMap();this.time=0; }
+  constructor(component) { this.component=component;this.samples=new WeakMap();this.previousVolumes=new WeakMap();this.previousWakes=new WeakMap();this.wakeFilter=new WeakMap();this.splashAt=new WeakMap();this.time=0; }
   /**
    * ⭐ GIVE THE WATER BACK BEFORE FORGETTING THE BODY.
    *
@@ -341,6 +341,15 @@ export class WaterPhysics {
         const draught=volume/silhouette+sinking*IMPACT_TIME;
         const depth=finite(p.wakeStrength,.15,0,2)*draught*straddle/Math.max(.001,Math.abs(scale.y));
         const previous=this.previousWakes.get(body);
+        // ── THE ENTRY THROWS SPRAY (2026-09-07) ────────────────────────────
+        // A body meeting the water faster than a metre a second — its first
+        // contact, or a slam later — hands the sea a splash seed (local x, z,
+        // radius, entry speed): a crown of spray whose particles return as
+        // foam (waterSpectrum.js). Half a second between crowns per body.
+        if(sinking>1&&(!previous||sinking>2.5)){
+          const last=this.splashAt.get(body)??-Infinity;
+          if(this.time-last>.5){this.splashAt.set(body,this.time);c.simulation.addWaterSplash?.(surface.localX,surface.localZ,radius,sinking);}
+        }
         // ⚠ A DEADBAND, AND IT IS NOT A POLISH ITEM. The pair only cancels when
         // the two footprints are IDENTICAL. A body resting on water never is —
         // the solver leaves it micro-bobbing — so every substep emitted a dipole

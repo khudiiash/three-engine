@@ -252,6 +252,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // hull's waterline ploughing through the water; see `addWaterFoam`.
   const foamRows=Array.from({length:IMPULSE_CAPACITY},()=>new THREE.Vector4());
   const foamImpulses=uniformArray(foamRows,"vec4"),foamImpulseCount=uniform(0,"int"),pendingFoam=[];
+  // Impacts for the sea's spray (local x, z, radius, entry speed m/s) — see
+  // waterSpectrum.js's splash pool and `addWaterSplash`.
+  const pendingSplash=[];
   const collisionWorld = colliderField ? simulationWorld : null;
   const collisionInverse = colliderField ? simulationInverse : null;
   const h = 1 / 120;
@@ -1463,7 +1466,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       pendingFoam.push([x,z,Math.max(2.5*Math.max(sx,sz),radius),amount]);
       return true;
     },
-    restart() { initialized = false; accumulator = 0; elapsed = 0; u.simTime.value = 0; pendingImpulses.length=0; pendingFoam.length=0; spectrum?.restart(); updateBounds(); },
+    /** A body entering the water: local x, z, a radius in local units, the
+     *  entry speed (m/s) — a crown of spray (waterSpectrum.js). */
+    addWaterSplash(x,z,radius,speed) {
+      if(kind!=="water" || !spectrum || ![x,z,radius,speed].every(Number.isFinite) || !(speed>0))return false;
+      while(pendingSplash.length>=16)pendingSplash.shift();
+      pendingSplash.push([x,z,Math.max(2*Math.max(sx,sz),radius),speed]);
+      return true;
+    },
+    restart() { initialized = false; accumulator = 0; elapsed = 0; u.simTime.value = 0; pendingImpulses.length=0; pendingFoam.length=0; pendingSplash.length=0; spectrum?.restart(); updateBounds(); },
     tick(renderer, dt) {
       if (!renderer?.isWebGPURenderer) return;
       const queue = [];
@@ -1613,8 +1624,11 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // (in the sea's metres, a value near 1 at full speed) — the tail.
         const ws = u.waveScale.value;
         const seeds = pendingFoam.map(([x, z, r, a]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .3), Math.min(1, a * 4)]);
+        const splashes = pendingSplash.map(([x, z, r, v]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .2), v]);
+        pendingSplash.length = 0;
+        spectrum.splash?.scale.value.copy(ws);
         const seaQueue = spectrum.passes(delta, elapsed, { eye: seaEye, foam: u.foam.value,
-          current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value], seeds });
+          current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value], seeds, splashes });
         if (seaQueue.length) { renderer.compute(seaQueue); spectrum.afterCompute(renderer); }
       }
       if (foamField) {

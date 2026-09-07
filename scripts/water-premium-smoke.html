@@ -158,6 +158,9 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    const slot = pool.claim({});
    const sim = createGridSimulation('water', props, { material: authored, waterSlot: slot, anchorEngine: engine, worldScale: { x: S, z: S } });
    holder.add(sim.mesh);
+   // The sea's spray sprites — the component adds them to the entity; here
+   // there is no component, so the harness does (or the receipt is blind).
+   if (sim.spectrum?.splashMesh) holder.add(sim.spectrum.splashMesh);
    sim.mesh.matrixAutoUpdate = false;
    sim.mesh.matrix.identity();                 // origin ON the lid, at world y = 0
    sim.mesh.matrixWorldNeedsUpdate = true;
@@ -402,6 +405,35 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        await shoot('ocean-seed');
        log(`ocean: a hull seed (1 m, value 1, 2 s) birthed ${near} live particles within 2.5 m; seedTry ${sp2.foam.seedTry.value.toExponential(2)}, seeds ${sp2.foam.seedCount.value}`);
        if (!(near > 8)) throw new Error(`the hull seed birthed ${near} particles (want > 8)`);
+     }
+     // ── SPRAY (2026-09-07) ──────────────────────────────────────────────
+     // The splash pool after the warm-up (the sea's own spray within 100 m
+     // of the eye), then an impact: a 1 m body at 4 m/s, 20 m ahead — a
+     // crown of particles in the air the frame after, and foam where they
+     // land two seconds on.
+     if (sp2?.readSplashes && sim.addWaterSplash) {
+       const readLive = async () => { const { pos, vel } = await sp2.readSplashes(renderer); let live = 0, above = 0, near = 0; const seedZ = S * .35 - 20;
+         for (let i = 0; i < pos.length; i += 4) { if (!(pos[i + 3] < vel[i + 3])) continue; live++; if (pos[i + 1] > 0) above++; if (Math.hypot(pos[i], pos[i + 2] - seedZ) < 3) near++; }
+         return { live, above, near, total: pos.length / 4 }; };
+       const before = await readLive();
+       log(`ocean: spray — ${before.live} of ${before.total} splash particles live after the warm-up, ${before.above} above the rest plane; threshold ${sp2.splash.threshold.value.toFixed(2)}, speed ${sp2.splash.speed.value.toFixed(2)} m/s, size ${sp2.splash.size.value.toFixed(2)} m`);
+       const seedZ = S * .35 - 20;
+       // The eye 6 m from the impact, 2 m up: the crown is a few hundred
+       // sprites a hand wide, so the receipt is the pixels that BRIGHTENED
+       // against the same view a frame before the impact.
+       pose([0, 2, seedZ + 6], [0, .5, seedZ]); const quiet = await shoot('ocean-splash-before');
+       sim.addWaterSplash(0, seedZ / S, 1 / S, 4); await step(); await step();
+       const crown = await readLive();
+       log(`ocean: an impact (1 m, 4 m/s) threw ${crown.near} splash particles within 3 m the frame after (seedTry ${sp2.splash.seedTry.value.toExponential(2)})`);
+       await run(10); const shot = await shoot('ocean-splash');
+       let brightened = 0; for (let i = 0; i < W * H * 4; i += 4) { const l0 = quiet[i] * .2126 + quiet[i + 1] * .7152 + quiet[i + 2] * .0722, l1 = shot[i] * .2126 + shot[i + 1] * .7152 + shot[i + 2] * .0722; if (l1 - l0 > 40) brightened++; }
+       log(`ocean: the crown brightened ${brightened} pixels of ${W * H} against the frame before the impact (0.2 s after it)`);
+       if (!(brightened > 60)) throw new Error(`the spray is not drawn: ${brightened} pixels brightened (want > 60)`);
+       await run(110);
+       const pp2 = await sp2.readParticles(renderer);
+       let landed = 0; for (let i = 0; i < pp2.length; i += 4) if (pp2[i + 2] < pp2[i + 3] && Math.hypot(pp2[i], pp2[i + 1] - seedZ) < 4) landed++;
+       log(`ocean: two seconds on, ${landed} live FOAM particles within 4 m of the impact (the spray's returns)`);
+       if (!(crown.near > 20)) throw new Error(`the impact threw ${crown.near} splash particles (want > 20)`);
      }
      log('ocean shots done'); throw new Error('ocean: stop');
    }
