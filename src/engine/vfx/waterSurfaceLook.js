@@ -356,7 +356,14 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     if (u) {
       // Foam is WHITE, ROUGH AND OPAQUE — a material, not a glow, and not a
       // mirror either.
-      const soft = waterFoamNode(u, engine?.scenePass?.getTexture?.("depth") ?? null, simulation?.spectrum ?? null, simulation?.flowTexture ? texture(simulation.flowTexture) : null).toVar();
+      // ⛔ NOT THE POST CHAIN'S OWN DEPTH. The lid draws INTO that pass, and
+      // sampling its depth attachment from inside it is a read and a write
+      // of one texture in one synchronization scope: "[Texture "depth"]
+      // usage (TextureBinding|RenderAttachment) includes writable usage",
+      // the water's pipeline refused (user, 2026-09-07, post-processing on
+      // the camera). The contact foam reads the same per-target depth COPY
+      // the refraction arm reads (`depthNode`, copied before the lid draws).
+      const soft = waterFoamNode(u, depthNode, simulation?.spectrum ?? null, simulation?.flowTexture ? texture(simulation.flowTexture) : null).toVar();
       // ── ⛔ `style` EXISTED ONLY IN A MATERIAL NOBODY USES ─────────────────
       //
       // The banding and the hard foam edge that make "stylized" stylized were

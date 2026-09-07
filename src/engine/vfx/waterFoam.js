@@ -194,7 +194,9 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
   const rimContact = toRim.smoothstep(width.mul(.15), width).oneMinus();
   let contact = rimContact;
   if (sceneDepth) {
-    const behind = linearDepth(texture(sceneDepth, screenUV)).sub(linearDepth());
+    // A texture node (the lid's per-target depth copy) or a raw texture.
+    const depthSample = sceneDepth.isNode ? sceneDepth.sample(screenUV).x : texture(sceneDepth, screenUV).x;
+    const behind = linearDepth(depthSample).sub(linearDepth());
     const metres = behind.mul(cameraFar.sub(cameraNear)).max(0);
     contact = metres.smoothstep(width.mul(.15), width).oneMinus().max(rimContact);
   }
