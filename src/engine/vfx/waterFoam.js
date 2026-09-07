@@ -1,6 +1,7 @@
 import {
   Fn, attribute, cameraFar, cameraNear, cameraPosition, float, linearDepth, mix, normalWorld, positionLocal, positionWorld,
   screenUV, select, texture, vec2, vec3,
+  time,
 } from "three/tsl";
 import { waterRimDistanceNode } from "./waterShape.js";
 import { seaDisplacementAt, seaFoamWindowNode } from "./waterSpectrum.js";
@@ -297,13 +298,28 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
   // and every motion of the mask across them shimmered ("flickery",
   // user, 2026-09-07). The tiles are 4.5 / 1.3 / 1.6 m now (cells of
   // 50 / 5 / 3 cm) and the dissolve's feather is wider.
-  const laceA = detail.sample(rest.div(4.5)).x, laceB = detail.sample(rest.div(1.3).add(vec2(.37, .61))).x;
-  const bubbles = detail.sample(rest.div(1.6).add(vec2(.13, .71))).y;
+  // ⚠ THE LACE RIDES THE FLUID TOO. The particles move with the sea, the
+  // current AND the fluid's swirl (waterFoamFlow.js); the rest frame
+  // carries the first two, so the mask slid across the lace at the swirl's
+  // speed and the dissolve's edge shimmered ("still flickering", user,
+  // 2026-09-07). A FLOW MAP: two lace samples advected by the swirl over a
+  // three-second period, half a period apart, cross-faded — the standard
+  // trick (Crest, Unreal) for a texture that must follow a flow field.
+  const swirl = spectrum?.flow ? spectrum.flow.at(p) : vec2(0);
+  const PERIOD = 3;
+  const phaseA = time.div(PERIOD).fract(), phaseB = time.div(PERIOD).add(.5).fract();
+  const restA = rest.sub(swirl.mul(phaseA.sub(.5).mul(PERIOD))), restB = rest.sub(swirl.mul(phaseB.sub(.5).mul(PERIOD)));
+  const weightA = phaseA.mul(2).sub(1).abs().oneMinus(), weightB = phaseB.mul(2).sub(1).abs().oneMinus();
+  const flowSample = (scale, offset, channel) => detail.sample(restA.div(scale).add(offset))[channel].mul(weightA)
+    .add(detail.sample(restB.div(scale).add(offset))[channel].mul(weightB)).div(weightA.add(weightB).max(1e-3));
+  const laceA = flowSample(4.5, vec2(0, 0), "x"), laceB = flowSample(1.3, vec2(.37, .61), "x");
+  const bubbles = flowSample(1.6, vec2(.13, .71), "y");
   const foamPatch = detail.sample(rest.div(9)).z;
-  const mask = sea.max(contact.mul(.85)).mul(foamPatch.mul(.8).add(.6)).clamp(0, 1);
+  // The contact ring follows the foam dial too (a third at 0, all at 1).
+  const mask = sea.max(contact.mul(.85).mul(u.foam.mul(.7).add(.3))).mul(foamPatch.mul(.8).add(.6)).clamp(0, 1);
   const foamGrain = mix(laceA, laceB, .5).mul(bubbles.mul(.35).add(.75));
   const threshold = mask.oneMinus();
-  const realistic = foamGrain.smoothstep(threshold.sub(.18), threshold.add(.18));
+  const realistic = foamGrain.smoothstep(threshold.sub(.25), threshold.add(.25));
   // STYLIZED (the water's other mode): Sea of Thieves' own look — the soft,
   // dispersed mask with a coarse lace bite, hard-edged and flat.
   const stylized = mask.mul(laceA.mul(.5).add(.75)).smoothstep(.3, .45);

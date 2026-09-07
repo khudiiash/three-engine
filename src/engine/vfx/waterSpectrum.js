@@ -1,8 +1,8 @@
 import * as THREE from "three/webgpu";
 import {
-  Fn, If, float, int, uint, ivec2, vec2, vec3, vec4, uniform, uniformArray, instanceIndex, instancedArray, texture, textureLoad, textureStore, storageTexture,
+  Fn, If, float, int, uint, ivec2, ivec3, vec2, vec3, vec4, uniform, uniformArray, instanceIndex, instancedArray, texture, textureLoad, textureStore, storageTexture,
   workgroupArray, workgroupBarrier, localId, workgroupId, select, atan, cameraPosition, positionWorld, positionGeometry, mix, varying, uv as uvAttribute,
-  modelWorldMatrixInverse, modelWorldMatrix, normalize, cross, atomicAdd, atomicStore,
+  modelWorldMatrixInverse, modelWorldMatrix, normalize, cross, atomicAdd, atomicStore, atomicLoad,
 } from "three/tsl";
 import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
@@ -127,6 +127,22 @@ export const FOAM_SIZE_PER_METRE = .025;
 export const SPLASH_REACH_METRES = 80;
 /** Billboards drawn per splash particle: a drop is a cloud of drops. */
 export const SPLASH_SPRITES = 4;
+/**
+ * ══ THE SPRAY'S GRID (a PIC/FLIP-lite, after grantkot's liquid) ═══════════
+ * "Can we add a bit of fluid motion to them?" A drop flying alone is a
+ * bead; water flies as SHEETS and TENDRILS because neighbouring parcels
+ * share a velocity and pull on each other. So the spray keeps a 3D grid
+ * around the eye (SPRAY_GRID² × SPRAY_GRID_Y cells of SPRAY_CELL metres):
+ * each frame every drop scatters its velocity, its position and a count
+ * into its cell (fixed-point atomics), and then gathers its cell's and
+ * six neighbours': it blends a third of the way toward the shared
+ * velocity (PIC), is pulled toward the neighbourhood's centre of mass
+ * while the cell is loosely filled (cohesion — the tendril) and pushed
+ * away from it when it is packed (pressure — the sheet). Two dispatches
+ * of the pool and a clear a frame.
+ */
+export const SPRAY_GRID = 96, SPRAY_GRID_Y = 32, SPRAY_CELL = .25, SPRAY_GRID_FLOOR = -2;
+export const SPRAY_PIC = .35, SPRAY_COHESION = 2.5, SPRAY_PACKED = 10, SPRAY_PRESSURE = .6;
 /** Babylon's LOD scale: a cascade fades out of the shading normal past
  *  LOD_SCALE × L metres from the eye, where its texels are under a pixel. */
 export const LOD_SCALE = 7.13;
@@ -322,6 +338,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     // disc a particle splats (both metres, from the peak wavelength).
     dt: uniform(0), timeScale: uniform(1), frame: uniform(0, "uint"), currentVel: uniform(new THREE.Vector2(0, 0)),
     threshold: uniform(.55), tryRate: uniform(.3), rippleTry: uniform(0), spread: uniform(2.5), disc: uniform(1.2),
+    // The density gate's cap (how white a sheet may get), from the foam dial.
+    cap: uniform(.9),
     // A particle's full life, real seconds: twice the peak period (a crest
     // outruns the foam it made; the trail is what the wind streaks are).
     life: uniform(FOAM_LIFE_SECONDS),
@@ -345,6 +363,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   const splashVel = instancedArray(splashCount, "vec4");
   const splashAux = instancedArray(splashCount, "vec4");
   const returns = instancedArray(splashCount, "vec4");
+  // The spray's grid: per cell Σv (×256, ints), count; Σp relative to the
+  // cell's corner (×256). Fixed-point atomics.
+  const sprayCells = SPRAY_GRID * SPRAY_GRID * SPRAY_GRID_Y;
+  const sprayGridV = instancedArray(new Int32Array(sprayCells * 4), "int").toAtomic();
+  const sprayGridP = instancedArray(new Int32Array(sprayCells * 4), "int").toAtomic();
   const sp = {
     count: splashCount,
     threshold: uniform(.45), tryRate: uniform(.5), reach: uniform(SPLASH_REACH_METRES),
@@ -482,7 +505,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     },
     /** The sea carries no memory of its own (the solver's foam field does);
      *  a restart re-realizes nothing. Kept so the solver may call it. */
-    restart() { particlesReady = false; kernels?.flow.restart(); },
+    restart() { particlesReady = false; spectrum.flow?.restart(); },
     /** The dispatches for this frame, in order; `renderer.compute(...)` them.
      *  `eye` is the camera in the sea's metres (a water's local XZ × its
      *  scale) — the foam window follows it; `foam` is the water's dial. */
@@ -497,9 +520,12 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       const count = Math.min(f.seedRows.length, seeds?.length ?? 0);
       let maxWant = 0;
       const wants = new Array(count);
+      // The foam dial scales a hull's seeds too ("even on 0.1 there is too
+      // much of it", user, 2026-09-07): a fifth at 0, all at 1.
+      const dial = .2 + .8 * f.gate.value;
       for (let i = 0; i < count; i++) {
         const [, , r, a] = seeds[i];
-        wants[i] = Math.PI * r * r * Math.min(1, a) * FOAM_SEED_DENSITY * step;
+        wants[i] = Math.PI * r * r * Math.min(1, a) * FOAM_SEED_DENSITY * step * dial;
         maxWant = Math.max(maxWant, wants[i]);
       }
       for (let i = 0; i < count; i++) f.seedRows[i].set(seeds[i][0], seeds[i][1], seeds[i][2], maxWant > 0 ? wants[i] / maxWant : 0);
@@ -553,7 +579,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       f.tryRate.value = Math.min(1, FOAM_RATE * (2 * f.half.value) ** 2 * step / particleCount);
       // The ripple window's foam is probed at twice the sea's rate over its own area.
       const ripple = spectrum.ripple;
-      f.rippleTry.value = ripple ? Math.min(1, 2 * FOAM_RATE * (2 * ripple.half.value.x * ripple.scale.value.x) * (2 * ripple.half.value.y * ripple.scale.value.z) * step / particleCount) : 0;
+      f.rippleTry.value = ripple ? Math.min(1, 2 * FOAM_RATE * (2 * ripple.half.value.x * ripple.scale.value.x) * (2 * ripple.half.value.y * ripple.scale.value.z) * step / particleCount) * (.15 + .85 * f.gate.value) : 0;
+      sp.returnTry.value = .3 * (.3 + .7 * f.gate.value);
+      f.cap.value = .5 + .4 * f.gate.value;
       {
         const cv = f.currentVel.value, speed = Math.hypot(cv.x, cv.y), k = Math.min(1, speed / .5);
         const ax = sp.dir.value.x * (1 - k) + (speed > 0 ? cv.x / speed : 0) * k, az = sp.dir.value.y * (1 - k) + (speed > 0 ? cv.y / speed : 0) * k;
@@ -562,9 +590,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       }
       const k = ensureKernels();
       if (!particlesReady) { queue.push(k.particleInit, k.splashInit); particlesReady = true; }
-      // The fluid first, then the splash step (its returns feed the foam step).
+      // The fluid first, then the spray's grid, the splash step (its returns
+      // feed the foam step), the foam step.
       queue.push(...k.flow.passes(step, time, eye));
-      queue.push(k.liveReset, k.splashStep, k.particleStep);
+      queue.push(k.liveReset, k.sprayClear, k.sprayScatter, k.splashStep, k.particleStep);
       return queue;
     },
     /**
@@ -641,9 +670,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       return { pos: new Float32Array(pos), vel: new Float32Array(vel) };
     },
     dispose(renderer) {
-      releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), ...(kernels ? Object.values(kernels).filter((k) => k?.isNode !== false && k !== kernels.flow) : [])]);
-      kernels?.flow.dispose(renderer);
-      releaseStorageAttributes(renderer, [particles.value, particleAux.value, splash.value, splashVel.value, splashAux.value, returns.value, liveCounter.value].filter(Boolean));
+      releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), ...(kernels ? Object.values(kernels).filter((k) => k !== kernels.flow) : [])]);
+      spectrum.flow?.dispose(renderer);
+      releaseStorageAttributes(renderer, [particles.value, particleAux.value, splash.value, splashVel.value, splashAux.value, returns.value, liveCounter.value, sprayGridV.value, sprayGridP.value].filter(Boolean));
       for (const c of cascades) for (const t of c.textures) t.dispose();
       foamTarget.dispose(); splatMaterial.dispose(); splatGeometry.dispose();
       splashMesh.removeFromParent(); splashMaterial.dispose(); splashGeometry.dispose();
@@ -672,6 +701,15 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   // one system with one motion (the paper's), not two drawn layers.
   let kernels = null;
   const ensureKernels = () => (kernels ??= buildKernels());
+  // The foam's fluid (waterFoamFlow.js): a divergence-free perturbation on
+  // the sea's surface velocity, on a 128 m window around the eye. Made now
+  // — the lid's look reads it per pixel — its kernels at the first tick.
+  spectrum.flow = createFoamFlow({
+    size: Math.max(64, foamSize >> 2),
+    seaFold: (world, lods) => seaFoldAt(spectrum, world, lods ?? f.lods),
+    seaVelocity: (world) => seaVelocityAt(spectrum, world, f.zeroLods),
+    threshold: f.threshold, timeScale: f.timeScale, ripple: () => spectrum.ripple ?? null,
+  });
   spectrum.liveCount = () => liveEstimate;
   const buildKernels = () => {
     const ripple = spectrum.ripple ?? null;
@@ -684,14 +722,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       const sea = seaDisplacementAt(spectrum, xz, f.zeroLods).y;
       return ripple ? sea.add(ripple.at(localOf(xz)).x.mul(ripple.scale.y)) : sea;
     };
-    // The foam's fluid (waterFoamFlow.js): a divergence-free perturbation
-    // on the sea's surface velocity, on a 128 m window around the eye.
-    const flow = createFoamFlow({
-      size: Math.max(64, foamSize >> 2),
-      seaFold: (world, lods) => seaFoldAt(spectrum, world, lods ?? f.lods),
-      seaVelocity: (world) => seaVelocityAt(spectrum, world, f.zeroLods),
-      threshold: f.threshold, timeScale: f.timeScale, ripple,
-    });
+    const flow = spectrum.flow;
     // ── THE FOAM STEP ────────────────────────────────────────────────────
     // A live particle rides the surface velocity, the current and — inside
     // the ripple window — the wake's flow, and ages. A dead one probes: a
@@ -766,7 +797,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         If(born.greaterThan(.5), () => {
           const here = seaFoamWindowNode(spectrum, at, float(0));
           const sizeFactor = at.sub(f.center).length().mul(FOAM_SIZE_PER_METRE).div(f.disc.max(1e-3)).max(1);
-          If(rnd(27).lessThan(float(.9).sub(here).max(0).div(.9).div(sizeFactor.mul(sizeFactor))), () => {
+          If(rnd(27).lessThan(f.cap.sub(here).max(0).div(f.cap).div(sizeFactor.mul(sizeFactor))), () => {
             const life = f.life.mul(.5).add(rnd(8).mul(f.life.mul(.5)));
             particles.element(i).assign(vec4(at, 0, life));
             particleAux.element(i).assign(vec4(scale, rnd(9).add(.5).mul(sizeFactor), streak, 0));
@@ -790,12 +821,66 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       splashAux.element(instanceIndex).assign(vec4(0));
       returns.element(instanceIndex).assign(vec4(0));
     })().compute(splashCount);
+    // ── THE SPRAY'S GRID ───────────────────────────────────────────────
+    const gridOrigin = () => vec3(f.center.x.sub(SPRAY_GRID * SPRAY_CELL / 2), float(SPRAY_GRID_FLOOR), f.center.y.sub(SPRAY_GRID * SPRAY_CELL / 2));
+    const cellOf = (pos) => ivec3(pos.sub(gridOrigin()).div(SPRAY_CELL).floor());
+    const cellInside = (c) => c.x.greaterThanEqual(0).and(c.x.lessThan(SPRAY_GRID)).and(c.y.greaterThanEqual(0)).and(c.y.lessThan(SPRAY_GRID_Y)).and(c.z.greaterThanEqual(0)).and(c.z.lessThan(SPRAY_GRID));
+    const cellIndex = (c) => c.y.mul(SPRAY_GRID * SPRAY_GRID).add(c.z.mul(SPRAY_GRID)).add(c.x);
+    const sprayClear = Fn(() => {
+      const k = instanceIndex.toInt();
+      atomicStore(sprayGridV.element(k), int(0)); atomicStore(sprayGridP.element(k), int(0));
+    })().compute(sprayCells * 4);
+    const sprayScatter = Fn(() => {
+      const i = instanceIndex.toInt();
+      const p = splash.element(i), v = splashVel.element(i);
+      If(p.w.lessThan(v.w), () => {
+        const c = cellOf(p.xyz);
+        If(cellInside(c), () => {
+          const base = cellIndex(c).mul(4);
+          const rel = p.xyz.sub(gridOrigin()).sub(c.toFloat().mul(SPRAY_CELL));
+          atomicAdd(sprayGridV.element(base), v.x.mul(256).toInt());
+          atomicAdd(sprayGridV.element(base.add(1)), v.y.mul(256).toInt());
+          atomicAdd(sprayGridV.element(base.add(2)), v.z.mul(256).toInt());
+          atomicAdd(sprayGridV.element(base.add(3)), int(1));
+          atomicAdd(sprayGridP.element(base), rel.x.mul(256).toInt());
+          atomicAdd(sprayGridP.element(base.add(1)), rel.y.mul(256).toInt());
+          atomicAdd(sprayGridP.element(base.add(2)), rel.z.mul(256).toInt());
+        });
+      });
+    })().compute(splashCount);
     const splashStep = Fn(() => {
       const i = instanceIndex.toInt();
       const p = splash.element(i).toVar(), v = splashVel.element(i).toVar();
       const dts = f.dt.mul(f.timeScale);
       returns.element(i).assign(vec4(0));
       If(p.w.lessThan(v.w), () => {
+        // The grid's say: the neighbourhood's shared velocity and centre
+        // of mass (its cell and the six faces).
+        const c = cellOf(p.xyz);
+        If(cellInside(c), () => {
+          const sumV = vec3(0).toVar(), sumP = vec3(0).toVar(), count = float(0).toVar();
+          const gather = (dx, dy, dz) => {
+            const n = c.add(ivec3(dx, dy, dz));
+            If(cellInside(n), () => {
+              const base = cellIndex(n).mul(4);
+              const k = atomicLoad(sprayGridV.element(base.add(3))).toFloat();
+              sumV.addAssign(vec3(atomicLoad(sprayGridV.element(base)).toFloat(), atomicLoad(sprayGridV.element(base.add(1))).toFloat(), atomicLoad(sprayGridV.element(base.add(2))).toFloat()).div(256));
+              const corner = gridOrigin().add(n.toFloat().mul(SPRAY_CELL));
+              sumP.addAssign(vec3(atomicLoad(sprayGridP.element(base)).toFloat(), atomicLoad(sprayGridP.element(base.add(1))).toFloat(), atomicLoad(sprayGridP.element(base.add(2))).toFloat()).div(256).add(corner.mul(k)));
+              count.addAssign(k);
+            });
+          };
+          gather(0, 0, 0); gather(1, 0, 0); gather(-1, 0, 0); gather(0, 1, 0); gather(0, -1, 0); gather(0, 0, 1); gather(0, 0, -1);
+          If(count.greaterThan(1.5), () => {
+            const shared = sumV.div(count), com = sumP.div(count);
+            v.xyz.assign(mix(v.xyz, shared, SPRAY_PIC));
+            const toCom = com.sub(p.xyz), d = toCom.length();
+            const pull = toCom.div(d.max(1e-3));
+            // Cohesion while loose, pressure when packed.
+            const packed = count.sub(SPRAY_PACKED).max(0);
+            v.xyz.addAssign(pull.mul(float(SPRAY_COHESION).mul(d.min(SPRAY_CELL)).div(SPRAY_CELL).sub(packed.mul(SPRAY_PRESSURE))).mul(dts));
+          });
+        });
         v.y.assign(v.y.sub(dts.mul(GRAVITY)));
         v.xyz.assign(v.xyz.mul(dts.mul(.4).oneMinus().max(0)));
         // The BREAKUP: a sheet flies coherent for a few tenths of a second,
@@ -857,9 +942,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     })().compute(splashCount);
     particleInit.__giPassName = "sea.foamInit"; particleStep.__giPassName = "sea.foamStep"; liveReset.__giPassName = "sea.foamLiveReset";
     splashInit.__giPassName = "sea.splashInit"; splashStep.__giPassName = "sea.splashStep";
-    return { particleInit, particleStep, liveReset, splashInit, splashStep, flow };
+    sprayClear.__giPassName = "sea.sprayClear"; sprayScatter.__giPassName = "sea.sprayScatter";
+    return { particleInit, particleStep, liveReset, splashInit, splashStep, sprayClear, sprayScatter, flow };
   };
-  spectrum.flowField = () => kernels?.flow ?? null;
+  spectrum.flowField = () => spectrum.flow;
   // ── THE SPLAT ────────────────────────────────────────────────────────────
   // Every live particle is a Gaussian of `f.disc` metres (times its size
   // factor) in the map (the window's NDC; the target's row 0 is the TOP, so
@@ -912,7 +998,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     const part = splash.element(which), velocity = splashVel.element(which), aux = splashAux.element(which);
     const alive = part.w.lessThan(velocity.w);
     const j0 = pcg(instanceIndex.mul(uint(2654435761)).add(uint(11))), j1 = pcg(instanceIndex.mul(uint(2654435761)).add(uint(23))), j2 = pcg(instanceIndex.mul(uint(2654435761)).add(uint(37)));
-    const spread = part.w.mul(2).clamp(.25, 1.6);   // the sheet's drops separate with age
+    const spread = part.w.mul(2).clamp(.45, 1.6);   // the sheet's drops separate with age
     const jitter = select(k.equal(uint(0)), vec3(0), vec3(j0.sub(.5), j1.sub(.5).mul(.6), j2.sub(.5)).mul(sp.size.mul(3)).mul(spread));
     const world = part.xyz.add(jitter);
     const centre = vec3(world.x.div(sp.scale.x), world.y.div(sp.scale.y), world.z.div(sp.scale.z));
@@ -931,14 +1017,14 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     const right = normalize(cross(dir, toCam).add(vec3(1e-5, 0, 0)));
     const up = cross(toCam, right);
     // Bigger while a sheet, smaller as drops.
-    const sheet = part.w.mul(1.5).clamp(0, 1).oneMinus().mul(.4).add(1);
+    const sheet = part.w.mul(1.5).clamp(0, 1).oneMinus().mul(.15).add(1);
     const size = select(alive, sp.size.mul(sp.sizeScale).mul(aux.y).mul(float(2).pow(j2.mul(2).sub(1))).mul(sheet), float(0));
     const stretch = speed.mul(.25).add(1).min(4);
     const offsetWorld = right.mul(positionGeometry.x).add(up.mul(positionGeometry.y).mul(stretch)).mul(size);
     splashMaterial.positionNode = centre.add(modelWorldMatrixInverse.mul(vec4(offsetWorld, 0)).xyz);
     // A sheet is translucent water, a drop is a bright bead: the opacity
     // climbs from .45 to .9 over the first half second.
-    const fade = varying(part.w.div(velocity.w.max(1e-3)).oneMinus().clamp(0, 1).mul(aux.x).mul(part.w.mul(2).clamp(0, 1).mul(.45).add(.45)), "seaSplashFade");
+    const fade = varying(part.w.div(velocity.w.max(1e-3)).oneMinus().clamp(0, 1).mul(aux.x).mul(part.w.mul(2).clamp(0, 1).mul(.55).add(.35)), "seaSplashFade");
     splashMaterial.colorNode = vec3(.85);
     splashMaterial.opacityNode = uvAttribute().sub(.5).length().mul(2).smoothstep(.3, 1).oneMinus().mul(fade).mul(.9);
   }

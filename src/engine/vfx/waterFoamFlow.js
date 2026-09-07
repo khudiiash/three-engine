@@ -43,6 +43,9 @@ function storageMap(size, name) {
  * units) the field relaxes to inside the ripple window.
  */
 export function createFoamFlow({ size = 256, seaFold, seaVelocity, threshold, timeScale, ripple = null }) {
+  // `ripple` may be a getter: the solver hands the sea its ripple window
+  // after the sea is made, and the kernels are built at the first tick.
+  const rippleOf = () => (typeof ripple === "function" ? ripple() : ripple);
   const metres = FLOW_WINDOW_METRES, texel = metres / size, half = metres / 2;
   const field = storageMap(size, "foam flow"), shifted = storageMap(size, "foam flow shifted"), work = storageMap(size, "foam flow work");
   const curl = storageMap(size, "foam flow curl"), divergence = storageMap(size, "foam flow divergence");
@@ -72,6 +75,9 @@ export function createFoamFlow({ size = 256, seaFold, seaVelocity, threshold, ti
     }
     return vec2(kz, kx.negate());
   };
+  let built = null;
+  const build = () => {
+  const ripple = rippleOf();
   // 1. The window moved: the field at the old texel (zero where it was outside).
   const shiftKernel = Fn(() => {
     const sx = i.add(u.shift.x.toInt()), sy = j.add(u.shift.y.toInt());
@@ -147,20 +153,23 @@ export function createFoamFlow({ size = 256, seaFold, seaVelocity, threshold, ti
   kernels.forEach((k, n) => { k.__giPassName = `sea.flow${n}`; });
   const clearField = Fn(() => { textureStore(field, ivec2(i, j), vec4(0)); textureStore(pressure[0], ivec2(i, j), vec4(0)); })().compute(size * size);
   clearField.__giPassName = "sea.flowClear";
+  return { kernels, clearField };
+  };
   let ready = false;
   return {
     size, metres, texel, uniforms: u, field,
     /** The frame's dispatches; `eye` is the window's centre (sea metres). */
     passes(dt, time, eye) {
       const queue = [];
-      if (!ready) { queue.push(clearField); ready = true; }
+      built ??= build();
+      if (!ready) { queue.push(built.clearField); ready = true; }
       if (eye) {
         const cx = Math.round(eye[0] / texel) * texel, cz = Math.round(eye[1] / texel) * texel;
         u.shift.value.set(Math.round((cx - u.center.value.x) / texel), Math.round((cz - u.center.value.y) / texel));
         u.center.value.set(cx, cz);
       } else u.shift.value.set(0, 0);
       u.dt.value = Math.min(.1, Math.max(0, dt)); u.time.value = time;
-      queue.push(...kernels);
+      queue.push(...built.kernels);
       return queue;
     },
     /** The perturbation at a world point (m/s, real time), fading to zero over the window's outer tenth. */
@@ -180,7 +189,7 @@ export function createFoamFlow({ size = 256, seaFold, seaVelocity, threshold, ti
       return { rms: Math.sqrt(q / Math.max(1, n)), peak, cells: n };
     },
     dispose(renderer) {
-      releaseComputeNodes(renderer, [...kernels, clearField]);
+      if (built) releaseComputeNodes(renderer, [...built.kernels, built.clearField]);
       for (const t of [field, shifted, work, curl, divergence, ...pressure]) t.dispose();
     },
   };

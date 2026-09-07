@@ -696,6 +696,39 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     m/s over the first, at the full speed) throw counted spray. Physics
     tests 20 (crowns are the uncounted seeds), spectrum 12, the pool arm
     passes (431 foam particles from the splash).
+58. ⭐ THE SPRAY'S GRID, THE LACE ON THE FLUID, THE DIAL'S REACH. (a) "A
+    bit of fluid motion like grantkot": a PIC/FLIP-lite — a 96 × 32 × 96
+    grid of 25 cm cells around the eye (floor at −2 m); each frame the
+    grid is cleared, every drop scatters Σv, Σp (relative to its cell's
+    corner) and a count into its cell by fixed-point (×256) i32 atomics,
+    and the splash step gathers its cell and six faces: a third of the
+    way to the shared velocity (PIC), pulled toward the neighbourhood's
+    centre of mass while loose (cohesion, 2.5 m/s² across a cell) and
+    pushed away when packed (> 10 a cell, 0.6 m/s² each) — sheets and
+    tendrils instead of beads; two dispatches of the pool and a clear.
+    ⚠ `ivec3` must be imported, and `.toIVec3()` is not a TSL method —
+    `ivec3(node)` is. (b) "Still flickering": the particles ride the
+    FLUID's swirl but the lace's rest frame carried only the sea and the
+    current, so the mask slid across the lace and the dissolve's edge
+    shimmered — a FLOW MAP now: two lace samples advected by the swirl
+    over a 3 s period, half a period apart, cross-faded by triangle
+    weights (`spectrum.flow.at(p)` per pixel; the flow object is made
+    EAGERLY so the look can read it, its kernels at the first tick), the
+    dissolve feather .25. (c) "Even on 0.1 there is too much of it": the
+    dial only set the fold threshold — the hull seeds, the ripple field's
+    births, the splash returns and the contact ring ignored it. Now the
+    seeds' want × (.2 + .8 foam), the ripple probes × (.15 + .85 foam),
+    the returns' share × (.3 + .7 foam), the contact ring × (.3 + .7
+    foam), and the density cap .5 + .4 foam. Receipts: foam .3 — 11 k
+    live, whitecaps 3.5 %, far specks 1.9 %, hull seed 48, crown 47 541
+    px, 488 foam from returns; foam .1 — 2.4 k live, far specks 0.08 %
+    (the far-band gate is for the preset's .3); the pool arm passes;
+    physics 20 + spectrum 12. ⚠ The user's "Binding size for [Buffer] is
+    zero … bindGroup_object entries[5] Vertex ReadOnlyStorage" is NOT in
+    the console since their 11:04 reload and matches no water material
+    (the spray binds three storage buffers, the splat two); the spray
+    mesh opts out of batching/merging regardless — paste the lines before
+    it if it recurs.
 
 ## Open
 
