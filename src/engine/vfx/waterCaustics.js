@@ -325,7 +325,10 @@ function reportSaturation(slot, simulation) {
   // dies first, so the mean is the coefficient the sight range was authored as.
   const sigma = (s.sigma.value.x + s.sigma.value.y + s.sigma.value.z) / 3;
   const last = reported.get(slot);
-  if (last && Math.abs(last.saturation - saturation) < .01 && Math.abs(last.sigma - sigma) < sigma * .1) return;
+  // ⚠ An absolute floor on the tolerance: at saturation 0 sigma is 0, a tenth
+  // of it is 0, and "changed by less than nothing" was never true — the line
+  // printed every frame ("billions of those logs", user, 2026-09-07).
+  if (last && Math.abs(last.saturation - saturation) < .01 && Math.abs(last.sigma - sigma) < Math.max(sigma * .1, 1e-6)) return;
   reported.set(slot, { saturation, sigma });
   const column = s.half.value.y * s.rise.value;
   const range = sigma > 0 ? 3 / sigma : Infinity;
