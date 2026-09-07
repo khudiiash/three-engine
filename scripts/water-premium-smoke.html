@@ -47,10 +47,10 @@ const SHAPE_HEIGHT = SHAPE === 'capsule' ? 2 : 1;
 if (argument('shaftMip', null) != null) globalThis.__waterShaftMip = Number(argument('shaftMip', '4'));
 try {
  const adapter = await navigator.gpu.requestAdapter();
- const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+ const device = await adapter.requestDevice({ requiredFeatures: [...(argument('timing', '0') === '1' && adapter.features.has('timestamp-query') ? ['timestamp-query'] : [])], requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
  const errors = []; device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
  const W = 768, H = 512;                      // 768 * 4 = 12 * 256
- const renderer = new THREE.WebGPURenderer({ device, antialias: false });
+ const renderer = new THREE.WebGPURenderer({ trackTimestamp: argument('timing', '0') === '1', device, antialias: false });
  await renderer.init(); renderer.setSize(W, H);
 // ?toneMapping=linear|aces|agx|neutral — the user's scene runs LINEAR at exposure 1.
 { const tm = { linear: THREE.LinearToneMapping, aces: THREE.ACESFilmicToneMapping, agx: THREE.AgXToneMapping, neutral: THREE.NeutralToneMapping }[argument('toneMapping', '')];
@@ -77,6 +77,8 @@ try {
  globalThis.__waterFoamDebug = argument('foamDebug', '0') === 'sea' ? 'sea' : argument('foamDebug', '0') === '1';
  globalThis.__waterSunProbe = argument('sunProbe', '0') === '1';
 globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
+// ?tier=low|medium|ultra pins the water's device tier (waterSpectrum.js `waterDeviceTier`).
+if (argument('tier', null)) globalThis.__waterDeviceTier = argument('tier', 'ultra');
 globalThis.__waterCurrentAdvect = argument('currentAdvect', '1') !== '0';
 globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
 
@@ -224,6 +226,44 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    };
    await renderer.computeAsync(sim.init);
    await run(150);                              // 2.5 s: waves up, foam gathered
+   // ── ?timing=1: THE WATER'S GPU COST, SYSTEM BY SYSTEM (2026-09-07) ─────
+   // Timestamp queries (`resolveTimestampsAsync`) over 60 frames per arm,
+   // each arm one system switched off, so the difference is that system's
+   // share. A desktop number; a phone's is a multiple of it.
+   if (argument('timing', '0') === '1') {
+     const arms = [
+       ['everything on', {}],
+       ['no foam flow (fluid)', { __waterFoamFlow: false }],
+       ['no spray grid', { __waterSprayGrid: false }],
+       ['no foam/spray particles at all', { __waterFoamParticles: false }],
+       ['spray sprites hidden', { spray: false }],
+     ];
+     const measure = async () => {
+       let c = 0, r = 0, n = 0;
+       for (let i = 0; i < 60; i++) {
+         await step();
+         const dc = await renderer.resolveTimestampsAsync('compute'), dr = await renderer.resolveTimestampsAsync('render');
+         if (i >= 10 && Number.isFinite(dc) && Number.isFinite(dr)) { c += dc; r += dr; n++; }
+       }
+       return { compute: c / Math.max(1, n), render: r / Math.max(1, n) };
+     };
+     const base = { __waterFoamFlow: globalThis.__waterFoamFlow, __waterSprayGrid: globalThis.__waterSprayGrid, __waterFoamParticles: globalThis.__waterFoamParticles };
+     const spray = sim.spectrum?.splashMesh;
+     const results = [];
+     for (const [name, flags] of arms) {
+       Object.assign(globalThis, base);
+       for (const [k, v] of Object.entries(flags)) if (k === 'spray') { if (spray) spray.visible = v; } else globalThis[k] = v;
+       await run(20);
+       const m = await measure();
+       if (spray) spray.visible = true;
+       results.push({ name, ...m });
+       log(`timing: ${name} — compute ${m.compute.toFixed(3)} ms, render ${m.render.toFixed(3)} ms per frame (GPU, ${W}×${H})`);
+     }
+     Object.assign(globalThis, base);
+     const all = results[0];
+     for (const r of results.slice(1)) log(`timing: ${r.name} saves compute ${(all.compute - r.compute).toFixed(3)} ms, render ${(all.render - r.render).toFixed(3)} ms`);
+     throw new Error('timing: stop');
+   }
    // ?ocean=1: the demo's framing — a few metres above the surface, looking
    // at the horizon over hundreds of metres — for the wave SHAPE and the
    // whitecaps. Pair with ?scales=500&waveHeight=1.2&waveLength=60&choppiness=1.

@@ -140,7 +140,7 @@ export function createFoamFlow({ size = 256, seaFold, seaVelocity, threshold, ti
     const div = textureLoad(divergence, ivec2(i, j)).x;
     textureStore(dst, ivec2(i, j), vec4(l.add(r).add(d).add(up).sub(div.mul(texel * texel)).mul(.25), 0, 0, 0));
   })().compute(size * size);
-  const JACOBI = 12;
+  const JACOBI = 8;   // eight sweeps read the same swirl as twelve; four dispatches fewer
   const jacobiKernels = [jacobi(pressure[0], pressure[1]), jacobi(pressure[1], pressure[0])];
   // 6. Project: the field less the pressure gradient (pressure ends in A).
   const projectKernel = Fn(() => {

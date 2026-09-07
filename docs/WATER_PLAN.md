@@ -843,6 +843,41 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     target. ⚠ The steep arm's high shot is full of spray blobs (sprites up
     to ~2 m at σ 1.1 with the size jitter and the grid's clumping) — the
     spray's own scale with the sea state is the next thing to look at.
+65. ⭐ "20 FPS ON AN iPHONE, 70 ON MY PC" — THE FACTORS, MEASURED. The
+    user's PC editor, the boat scene, playing (`profile_frameStats`,
+    `profile_cpuFrame`, `profile_drawCalls`): 55 fps, cpuMs 16.3 vs gpuMs
+    5.65 — CPU-BOUND; renderEncode 10.4 ms of it for 424 DRAW CALLS a frame
+    (the boat's 85 unmerged meshes drawn three times: a ShadowMap pass of
+    169 draws, the main pass 160, the water's half-res refraction pass 84;
+    merging is OFF); the shadow map is 8000 × 8000 (the scene's light:
+    `shadowMapWidth/Height 8000` — 256 MB of depth and 64 M texels a
+    frame); textureMemMB 900, jsHeap 780 MB; GI present. The water's
+    COMPUTE on the PC is 0.93 ms of the 5.65. The harness's new
+    `?timing=1` arm (timestamp queries, `trackTimestamp` in the renderer
+    options and `timestamp-query` on the harness's own device — a device
+    made without the feature reads 0.000) times the water system by
+    system at 768 × 512 on the RTX: everything 1.13 ms compute + .36
+    render; the sea alone .29 + .11; the particle systems .83 + .25 (the
+    spray grid .37, the fluid .14, the velocity FFT ~0); the tier pin
+    (`?tier=low`) changed little — on a desktop the cost is DISPATCH
+    COUNT, not work. So: (a) the velocity FFT is a THIRD LANE of the same
+    dispatches (`fftKernel(srcs, dsts)`, 12 KB shared) — 6 dispatches a
+    frame gone; (b) the fluid's Jacobi 12 → 8; (c) the sea's mips are
+    COMPUTE (gpuMipmaps.js: one dispatch per level writes every layer of
+    an rgba16float storage array — 14 dispatches instead of 42 render
+    passes, which a tile-based GPU pays a tile load/store for each); the
+    foam map keeps the blit (a render target has no storage binding).
+    Everything on: 1.13 → 0.89 ms compute. (d) THE DEVICE CAPS THE TIER
+    (`seaQuality` → `capQualityForDevice` / `waterDeviceTier`): a phone
+    runs `low` (2 × 128² cascades, a 256² map behind 8 k particles, 2 k
+    spray × 2 billboards, a 64² fluid, a 48 × 20 × 48 spray grid), a
+    tablet `medium`, whatever the build's quality — `__waterDeviceTier`
+    pins it. Receipts: the clipmap's coarse levels still carry the sea
+    (RMS per level 1.06 … 0.20 m), fold coverage 2.16 %, whitecaps 4.6 %,
+    far specks 2.6 %, crown 43 k px; tests 32; the pool arm passes. Not
+    the water's to fix but the phone's real load: the 8000² shadow map
+    (2048 on mobile), 424 draws (merge the boat), the refraction and
+    mirror scene passes, GI.
 
 ## Open
 

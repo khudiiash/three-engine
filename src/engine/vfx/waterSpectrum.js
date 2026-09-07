@@ -46,8 +46,31 @@ export const SEA_SIZE = 256;
 /** How much sea a build quality buys: cascades × resolution. One model, sized
  *  to the device — a phone runs two 128² cascades of the same spectrum. */
 export function seaQuality(quality = "high") {
-  return { low: { size: 128, cascadeCount: 2, foamSize: 256 }, medium: { size: 128, cascadeCount: 3, foamSize: 512 } }[quality]
-    ?? { size: SEA_SIZE, cascadeCount: 3, foamSize: 1024 };
+  // ⚠ THE DEVICE CAPS THE TIER. A build's quality is a ship-time choice; a
+  // phone that opens it runs the same "ultra" — 3 × 256² cascades, a 1024²
+  // foam map behind 131 k particles, 32 k spray drops × 4 billboards, a
+  // 256² fluid and a 96 × 32 × 96 spray grid — and read 20 fps on an
+  // iPhone (user, 2026-09-07). A phone is capped at `low`, a tablet at
+  // `medium`, whatever the build says; the sea itself looks the same.
+  const capped = capQualityForDevice(quality);
+  return { low: { size: 128, cascadeCount: 2, foamSize: 256, sprayGrid: 48, sprites: 2 }, medium: { size: 128, cascadeCount: 3, foamSize: 512, sprayGrid: 64, sprites: 3 } }[capped]
+    ?? { size: SEA_SIZE, cascadeCount: 3, foamSize: 1024, sprayGrid: 96, sprites: 4 };
+}
+const QUALITY_ORDER = ["low", "medium", "high", "ultra"];
+/** The device's ceiling on a quality tier: phones `low`, tablets `medium`. */
+export function capQualityForDevice(quality) {
+  const ceiling = waterDeviceTier();
+  const want = QUALITY_ORDER.indexOf(quality), cap = QUALITY_ORDER.indexOf(ceiling);
+  if (want < 0 || cap < 0) return quality;
+  return QUALITY_ORDER[Math.min(want, cap)];
+}
+export function waterDeviceTier() {
+  if (globalThis.__waterDeviceTier) return globalThis.__waterDeviceTier;   // a harness or a test may pin it
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent || "" : "";
+  const touch = typeof navigator !== "undefined" ? navigator.maxTouchPoints || 0 : 0;
+  if (/iPhone|iPod|Android.*Mobile|Windows Phone/i.test(ua)) return "low";
+  if (/iPad|Android/i.test(ua) || (touch > 1 && /Mac/i.test(ua))) return "medium";   // an iPad reports as a Mac with touch
+  return "ultra";
 }
 /**
  * ══ THE WHITECAP MEMORY (2026-09-07) ══════════════════════════════════════
@@ -250,11 +273,16 @@ const cmul = (a, b) => vec2(a.x.mul(b.x).sub(a.y.mul(b.y)), a.x.mul(b.y).add(a.y
  * One in-place radix-2 transform over every row (or column) of two packed
  * maps, unnormalized, positive exponent. Bit reversal happens on the load.
  */
-function fftKernel(srcA, srcB, dstA, dstB, horizontal, size) {
+/**
+ * One dispatch transforms every LANE (a source/destination texture pair) at
+ * once through its own workgroup array — three lanes are 12 KB of the
+ * 16 KB shared memory. The velocity (a third lane) used to be two dispatches
+ * of its own per cascade: six a frame, ~a third of the FFT's time, gone.
+ */
+function fftKernel(srcs, dsts, horizontal, size) {
   const LOG2 = Math.log2(size), HALF = size / 2;
   return Fn(() => {
-    const shA = workgroupArray("vec4", size), shB = srcB ? workgroupArray("vec4", size) : null;
-    const lanes = shB ? [[shA, srcA, dstA], [shB, srcB, dstB]] : [[shA, srcA, dstA]];
+    const lanes = srcs.map((src, n) => [workgroupArray("vec4", size), src, dsts[n]]);
     const t = localId.x.toInt().toVar();
     const line = workgroupId.x.toInt().toVar();
     const coord = (i) => (horizontal ? ivec2(i, line) : ivec2(line, i));
@@ -294,7 +322,8 @@ function fftKernel(srcA, srcB, dstA, dstB, horizontal, size) {
  * The sea: `configure(props, depthMetres)` re-realizes the spectrum,
  * `tick(renderer, dt, time)` advances it. `cascades[i]` exposes the maps.
  */
-export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 1337, foamSize = 1024 } = {}) {
+export function createWaterSpectrum(seaQualityOptions = {}) {
+  const { size = SEA_SIZE, cascadeCount = 3, seed = 1337, foamSize = 1024 } = seaQualityOptions;
   const noiseData = gaussianNoise(size, seed);
   const noise = new THREE.DataTexture(noiseData, size, size, THREE.RGFormat, THREE.FloatType);
   noise.minFilter = noise.magFilter = THREE.NearestFilter;
@@ -392,13 +421,14 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   // and the RETURNS — a particle that met the surface this frame leaves
   // (x, z, intensity, 1) in its own slot, which the foam step reads.
   const splashCount = Math.max(1024, particleCount >> 2);
+  const sprayGridN = seaQualityOptions.sprayGrid ?? SPRAY_GRID, sprayGridY = Math.max(8, sprayGridN >> 2 | 0) + (sprayGridN >> 3 | 0), spriteCount = seaQualityOptions.sprites ?? SPLASH_SPRITES;
   const splash = instancedArray(splashCount, "vec4");
   const splashVel = instancedArray(splashCount, "vec4");
   const splashAux = instancedArray(splashCount, "vec4");
   const returns = instancedArray(splashCount, "vec4");
   // The spray's grid: per cell Σv (×256, ints), count; Σp relative to the
   // cell's corner (×256). Fixed-point atomics.
-  const sprayCells = SPRAY_GRID * SPRAY_GRID * SPRAY_GRID_Y;
+  const sprayCells = sprayGridN * sprayGridN * sprayGridY;
   const sprayGridV = instancedArray(new Int32Array(sprayCells * 4), "int").toAtomic();
   const sprayGridP = instancedArray(new Int32Array(sprayCells * 4), "int").toAtomic();
   const sp = {
@@ -478,10 +508,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       const Vx = ihd.mul(kx).mul(invK), Vz = ihd.mul(kz).mul(invK);
       textureStore(C, texel, vec4(Vx.x.sub(Vz.y), Vx.y.add(Vz.x), 0, 0));
     })().compute(size * size);
-    const fftRows = fftKernel(A, B, A2, B2, true, size);
-    const fftCols = fftKernel(A2, B2, A, B, false, size);
-    const fftRowsV = fftKernel(C, null, C2, null, true, size);
-    const fftColsV = fftKernel(C2, null, C, null, false, size);
+    const fftRows = fftKernel([A, B, C], [A2, B2, C2], true, size);
+    const fftCols = fftKernel([A2, B2, C2], [A, B, C], false, size);
     const merge = Fn(() => {
       const a = textureLoad(A, texel).mul(sign).toVar(), b = textureLoad(B, texel).mul(sign).toVar();
       const Dx = a.x, Dz = a.y, Dy = a.z, Dxz = a.w, Dyx = b.x, Dyz = b.y, Dxx = b.z, Dzz = b.w;
@@ -490,10 +518,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       const cv = textureLoad(C, texel).mul(sign).toVar();
       storageTexture(velocity).depth(layer).store(texel, vec4(cv.x.mul(u.lambda), cv.y.mul(u.lambda), 0, 0));
     })().compute(size * size);
-    for (const [k, node] of Object.entries({ initial, conjugate, evolve, fftRows, fftCols, fftRowsV, fftColsV, merge })) node.__giPassName = `sea${i}.${k}`;
+    for (const [k, node] of Object.entries({ initial, conjugate, evolve, fftRows, fftCols, merge })) node.__giPassName = `sea${i}.${k}`;
     return { index: i, uniforms: c, get L() { return c.L; },
       textures: [h0k, h0, wavesData, A, B, A2, B2, C, C2],
-      kernels: { initial, conjugate, evolve, fftRows, fftCols, fftRowsV, fftColsV, merge } };
+      kernels: { initial, conjugate, evolve, fftRows, fftCols, merge } };
   });
 
   let settings = null, dirty = true;
@@ -610,7 +638,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       if (!settings) return queue;
       if (dirty) { for (const c of cascades) queue.push(c.kernels.initial, c.kernels.conjugate); dirty = false; }
       u.time.value = time * settings.timeScale; u.dt.value = Math.min(.5, Math.max(0, dt));
-      for (const c of cascades) queue.push(c.kernels.evolve, c.kernels.fftRows, c.kernels.fftCols, c.kernels.fftRowsV, c.kernels.fftColsV, c.kernels.merge);
+      for (const c of cascades) queue.push(c.kernels.evolve, c.kernels.fftRows, c.kernels.fftCols, c.kernels.merge);
       // The pool's step: the window snapped to whole texels on the eye, the
       // current, the fold threshold; the particles carry themselves.
       if (foam != null) f.gate.value = Math.max(0, Math.min(1, foam));
@@ -654,12 +682,17 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         const n = Math.hypot(ax, az) || 1;
         f.streakAxis.value.set(ax / n, az / n);
       }
+      // The harness's cost arms: `__waterFoamParticles`, `__waterFoamFlow`,
+      // `__waterSprayGrid` = false switch a system off for a measurement.
+      if (globalThis.__waterFoamParticles === false) return queue;
       const k = ensureKernels();
       if (!particlesReady) { queue.push(k.particleInit, k.splashInit); particlesReady = true; }
       // The fluid first, then the spray's grid, the splash step (its returns
       // feed the foam step), the foam step.
-      queue.push(...k.flow.passes(step, time, eye));
-      queue.push(k.liveReset, k.sprayClear, k.sprayScatter, k.splashStep, k.particleStep);
+      if (globalThis.__waterFoamFlow !== false) queue.push(...k.flow.passes(step, time, eye));
+      queue.push(k.liveReset);
+      if (globalThis.__waterSprayGrid !== false) queue.push(k.sprayClear, k.sprayScatter);
+      queue.push(k.splashStep, k.particleStep);
       return queue;
     },
     /**
@@ -677,7 +710,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     /** The particles' splat into the foam map — a nested render before the
      *  frame's own, like the caustic pass — then the mips. */
     afterCompute(renderer) {
-      if (renderer?.isWebGPURenderer && settings && particlesReady) {
+      if (renderer?.isWebGPURenderer && settings && particlesReady && globalThis.__waterFoamParticles !== false) {
         const nested = globalThis.__giNestedRender;
         globalThis.__giNestedRender = true;
         const target = renderer.getRenderTarget(), alpha = renderer.getClearAlpha();
@@ -907,10 +940,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       returns.element(instanceIndex).assign(vec4(0));
     })().compute(splashCount);
     // ── THE SPRAY'S GRID ───────────────────────────────────────────────
-    const gridOrigin = () => vec3(f.center.x.sub(SPRAY_GRID * SPRAY_CELL / 2), float(SPRAY_GRID_FLOOR), f.center.y.sub(SPRAY_GRID * SPRAY_CELL / 2));
+    const gridOrigin = () => vec3(f.center.x.sub(sprayGridN * SPRAY_CELL / 2), float(SPRAY_GRID_FLOOR), f.center.y.sub(sprayGridN * SPRAY_CELL / 2));
     const cellOf = (pos) => ivec3(pos.sub(gridOrigin()).div(SPRAY_CELL).floor());
-    const cellInside = (c) => c.x.greaterThanEqual(0).and(c.x.lessThan(SPRAY_GRID)).and(c.y.greaterThanEqual(0)).and(c.y.lessThan(SPRAY_GRID_Y)).and(c.z.greaterThanEqual(0)).and(c.z.lessThan(SPRAY_GRID));
-    const cellIndex = (c) => c.y.mul(SPRAY_GRID * SPRAY_GRID).add(c.z.mul(SPRAY_GRID)).add(c.x);
+    const cellInside = (c) => c.x.greaterThanEqual(0).and(c.x.lessThan(sprayGridN)).and(c.y.greaterThanEqual(0)).and(c.y.lessThan(sprayGridY)).and(c.z.greaterThanEqual(0)).and(c.z.lessThan(sprayGridN));
+    const cellIndex = (c) => c.y.mul(sprayGridN * sprayGridN).add(c.z.mul(sprayGridN)).add(c.x);
     const sprayClear = Fn(() => {
       const k = instanceIndex.toInt();
       atomicStore(sprayGridV.element(k), int(0)); atomicStore(sprayGridP.element(k), int(0));
@@ -1093,11 +1126,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   // dead one has no size.
   const splashGeometry = new THREE.InstancedBufferGeometry();
   { const plane = new THREE.PlaneGeometry(1, 1); splashGeometry.setAttribute("position", plane.getAttribute("position")); splashGeometry.setAttribute("uv", plane.getAttribute("uv")); splashGeometry.setIndex(plane.getIndex()); }
-  splashGeometry.instanceCount = splashCount * SPLASH_SPRITES;
+  splashGeometry.instanceCount = splashCount * spriteCount;
   const splashMaterial = new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false, blending: THREE.NormalBlending, side: THREE.DoubleSide, fog: false });
   splashMaterial.userData.giParticle = true;
   {
-    const which = instanceIndex.div(uint(SPLASH_SPRITES)), k = instanceIndex.mod(uint(SPLASH_SPRITES));
+    const which = instanceIndex.div(uint(spriteCount)), k = instanceIndex.mod(uint(spriteCount));
     const part = splash.element(which), velocity = splashVel.element(which), aux = splashAux.element(which);
     const alive = part.w.lessThan(velocity.w);
     const j0 = pcg(instanceIndex.mul(uint(2654435761)).add(uint(11))), j1 = pcg(instanceIndex.mul(uint(2654435761)).add(uint(23))), j2 = pcg(instanceIndex.mul(uint(2654435761)).add(uint(37)));
