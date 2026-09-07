@@ -249,6 +249,17 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        log(`ocean: current ${argument('current', '0')} m/s (uniform ${sim.uniforms.current.value}) over a frozen sea (waveSpeed ${USER.waveSpeed}): the lid under a fixed point went ${g0.toFixed(3)} → ${g1.toFixed(3)} m (GPU), the query ${h0.toFixed(3)} → ${h1.toFixed(3)} m, readback scroll ${JSON.stringify(s0)} → ${JSON.stringify(s1)}`);
        if (!(Math.abs(g1 - g0) > .02)) throw new Error(`the current does not scroll the sea: lid ${g0.toFixed(3)} → ${g1.toFixed(3)} m`);
        if (!(Math.abs(h1 - h0) > .02)) throw new Error(`the buoyancy query does not follow the current: ${h0.toFixed(3)} → ${h1.toFixed(3)} m`);
+       // THE SIGN: the water at W now is the water that stood one second's
+       // current UPSTREAM of W a second ago (the sea travels with the current).
+       // Only a FROZEN sea can say so — a live one also evolves in the second.
+       if (USER.waveSpeed === 0) {
+       const v = Number(argument('current', '0')), dirC = [Math.cos((USER.currentDirection ?? 0) * Math.PI / 180), Math.sin((USER.currentDirection ?? 0) * Math.PI / 180)];
+       const upstream = surfaceAt(0 - v * dirC[0], S * .35 - v * dirC[1]), downstream = surfaceAt(0 + v * dirC[0], S * .35 + v * dirC[1]);
+       await run(60);
+       const now = surfaceAt(0, S * .35);
+       log(`ocean: current sign — the surface at the point now ${now.toFixed(3)} m; a second ago it stood ${upstream.toFixed(3)} m upstream and ${downstream.toFixed(3)} m downstream`);
+       if (!(Math.abs(now - upstream) < Math.abs(now - downstream) && Math.abs(now - upstream) < .05)) throw new Error(`the sea runs against the current: now ${now.toFixed(3)}, upstream a second ago ${upstream.toFixed(3)}, downstream ${downstream.toFixed(3)}`);
+       }
      }
      // ── THE EYE ON THE WATERLINE ───────────────────────────────────────
      // The lowest surface point near the pose, and the eye 15 cm over it —
@@ -335,7 +346,8 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        log(`ocean: whitecap MEMORY over the water — mean ${mean.toFixed(3)}, p50 ${q(.5)}, p75 ${q(.75)}, p90 ${q(.9)}, p99 ${q(.99)}, above .1: ${(vals.filter((v) => v > .1).length / vals.length * 100).toFixed(1)}%, above .5: ${(vals.filter((v) => v > .5).length / vals.length * 100).toFixed(1)}%`);
        throw new Error('ocean: stop');
      }
-     if (!(farWhite / farN > .002)) throw new Error(`far whitecaps: ${(farWhite / farN * 100).toFixed(2)}% (want > 0.2 %)`);
+     // (A frozen sea — ?waveSpeed=0, the current receipts — never folds.)
+     if (USER.waveSpeed !== 0 && !(farWhite / farN > .002)) throw new Error(`far whitecaps: ${(farWhite / farN * 100).toFixed(2)}% (want > 0.2 %)`);
      let m = 0, m2 = 0, k = 0;
      for (let y = H * .5; y < H * .62; y++) for (let x = 0; x < W; x++) { const l = luma(horizon, ((y | 0) * W + (x | 0)) * 4); m += l; m2 += l * l; k++; }
      const sparkle = Math.sqrt(Math.max(0, m2 / k - (m / k) ** 2)) / Math.max(1, m / k);
@@ -353,7 +365,7 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
      // the failure this guards against.
      if (!(skyRatio > .3)) throw new Error(`the sky is not reflected: the sea under the horizon reads ${(skyRatio * 100).toFixed(0)}% of the sky over it`);
      log(`ocean: whitecaps ${(white / n * 100).toFixed(1)}% of the water, green sheets ${(green / n * 100).toFixed(1)}%, horizon band luma spread ${(sparkle * 100).toFixed(1)}% of its mean`);
-     if (!(white / n > .003 && white / n < .3)) throw new Error(`whitecaps: ${(white / n * 100).toFixed(1)}% (want 0.3–30 %)`);
+     if (USER.waveSpeed !== 0 && !(white / n > .003 && white / n < .3)) throw new Error(`whitecaps: ${(white / n * 100).toFixed(1)}% (want 0.3–30 %)`);
      if (!(green / n < .03)) throw new Error(`green sheets: ${(green / n * 100).toFixed(1)}%`);
      log('ocean shots done'); throw new Error('ocean: stop');
    }

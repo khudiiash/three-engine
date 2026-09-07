@@ -363,7 +363,14 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       // whole texels at a time with the remainder carried.
       if (current && (current[0] || current[1])) {
         const step = Math.min(.1, Math.max(0, dt));
-        u.scroll.value.x += current[0] * step; u.scroll.value.y += current[1] * step;
+        // ⚠ THE SCROLL DECREASES. The sea is sampled at world + scroll, so the
+        // pattern at W now is what stood at W + scroll before: for the water
+        // to travel WITH the current (+v), the scroll must run against it —
+        // sampled at world + v·t the sea streamed backwards while the wake
+        // and the whitecaps went forward ("foam is running in the opposite
+        // direction than the current", user, 2026-09-07). `scrollAccum`
+        // tracks the WATER's displacement (+v·dt) for the memory's shift.
+        u.scroll.value.x -= current[0] * step; u.scroll.value.y -= current[1] * step;
         scrollAccum.x += current[0] * step; scrollAccum.y += current[1] * step;
         const sx = Math.round(scrollAccum.x / t), sz = Math.round(scrollAccum.y / t);
         scrollAccum.x -= sx * t; scrollAccum.y -= sz * t;
