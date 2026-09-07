@@ -314,7 +314,13 @@ export class WaterPhysics {
       // has. `wakeStrength` scales how much of that displacement the surface is
       // allowed to show, since a heightfield cannot actually part around a hull.
       const prior=this.previousVolumes.get(body)??volume;this.previousVolumes.set(body,volume);
-      const surface=query(new Vector3().copy(body.translation()));
+      // ⚠ THE BODY'S ORIGIN IS NOT WHERE IT IS WET. A level piece's origin
+      // can sit on land while its collider reaches into the pool; the query
+      // at the origin found no water and the whole contact block was
+      // skipped ("can't see any water reaction to fixed colliders", user,
+      // 2026-09-07). The reference point is the submerged samples' centroid.
+      const wet=new Vector3();for(const contact of contacts)wet.addScaledVector(contact.point,contact.volume);wet.multiplyScalar(1/Math.max(1e-9,volume));
+      const surface=query(wet);
       if(surface){
         const scale=mesh.getWorldScale(new Vector3());
         const flat=Math.max(.001,Math.sqrt(Math.abs(scale.x*scale.z)));
