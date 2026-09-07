@@ -410,6 +410,13 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // colour × Beer's law over the column, the authored attenuation). Only
       // the geometry changed.
       material.transmissionNode = null; material.transmission = 0; material.thicknessNode = null;
+      // ⚠ THE LID WRITES DEPTH. It composes its own refraction and mirror,
+      // so it needs no blending — and without a depth write the clipmap's
+      // far rings, drawn after the near ones, painted far crests over near
+      // ones at grazing angles and spray behind a crest showed through it
+      // ("far waves appear in front of the close ones, same with sprays",
+      // user, 2026-09-07). An authored material's flags do not decide this.
+      material.depthWrite = true; material.depthTest = true;
       const toEyeWorld = cameraPosition.sub(positionWorld).normalize();
       const lidNormalWorld = modelNormalMatrix.mul(lidNormalLocal).normalize();
       // From BELOW the ray leaves into air: the normal faces the eye and eta

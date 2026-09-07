@@ -6,7 +6,7 @@ import { PhysicsSystem, bodyDensitySI } from '../src/modules/physics-rapier/Phys
 import { WaterPhysics, WATER_PHYSICS_DEFAULTS, queryWaterSurface } from '../src/engine/vfx/waterPhysics.js';
 await RAPIER.init();
 function rig(extra={}) {
-  const engine={playing:true,scene:new THREE.Scene(),on:()=>()=>{},onUpdate:()=>()=>{},config:{},entities:new Map()};
+  const engine={playing:true,scene:new THREE.Scene(),on:()=>()=>{},onUpdate:()=>()=>{},config:{},entities:new Map(),batchHierarchy:(fn)=>fn()};
   const physics=new PhysicsSystem(engine,RAPIER);physics.world=new RAPIER.World({x:0,y:-9.81,z:0});physics.eventQueue=new RAPIER.EventQueue(true);
   const props={...WATER_PHYSICS_DEFAULTS,width:20,height:20,waterDepth:20,waveHeight:0,...extra};
   const wakes=[],foams=[],splashes=[];const component={enabled:true,graphEnabled:true,entity:{enabled:true},props,resolvedProps:props,simulation:{mesh:new THREE.Mesh(),uniforms:{simTime:{value:0}},addWaterImpulse:(...args)=>wakes.push(args),addWaterFoam:(...args)=>foams.push(args),addWaterSplash:(...args)=>splashes.push(args)}};
@@ -19,6 +19,28 @@ function rig(extra={}) {
   const step=(seconds)=>{for(let i=0;i<seconds*60;i++){component.simulation.uniforms.simTime.value+=1/60;physics.update(1/60);}};
   return {physics,component,add,step,wakes,foams,splashes,dispose:()=>{physics.world.free();physics.eventQueue.free();}};
 }
+
+// ── CONTACT SPRAY (2026-09-07) ──────────────────────────────────────────────
+// A hull held in a 3 m/s current moves through the water at 3 m/s: its
+// leading waterline hands the sea COUNTED splash seeds every frame; a hull
+// at rest in still water hands none.
+test('a hull in a current throws counted spray off its leading waterline; one at rest throws none',()=>{
+  const still=rig();try{
+    still.add(500,2); still.step(6); still.splashes.length=0; still.step(2);
+    assert.equal(still.splashes.filter((s)=>s[4]!=null).length,0,`no current, no contact spray: ${still.splashes.length}`);
+  }finally{still.dispose();}
+  const moving=rig({current:3,currentDirection:0});try{
+    moving.add(500,2); moving.step(6); moving.splashes.length=0; moving.step(2);
+    const counted=moving.splashes.filter((s)=>s[4]!=null);
+    assert.ok(counted.length>20,`a hull in a current throws contact spray every frame: ${counted.length} seeds in 2 s`);
+    assert.ok(counted.every(([x,z,r,v,n])=>r>0&&v>1&&n>0),'every seed has a radius, a speed and a count');
+    // The leading side only: seeds sit upstream of the hull's centre (the
+    // current runs along +X, so the water comes from −X … the hull's leading
+    // edge against the flow is its −X side).
+    const meanX=counted.reduce((a,s)=>a+s[0],0)/counted.length;
+    assert.ok(meanX<0,`contact spray leaves the leading side (mean local x ${meanX.toFixed(3)})`);
+  }finally{moving.dispose();}
+});
 
 // ── THE ENTRY THROWS SPRAY (2026-09-07) ─────────────────────────────────────
 // A body dropped from three metres meets the water at several metres a

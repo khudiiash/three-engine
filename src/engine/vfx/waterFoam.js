@@ -3,7 +3,8 @@ import {
   screenUV, select, texture, vec2, vec3,
 } from "three/tsl";
 import { waterRimDistanceNode } from "./waterShape.js";
-import { seaFoamWindowNode } from "./waterSpectrum.js";
+import { seaDisplacementAt, seaFoamWindowNode } from "./waterSpectrum.js";
+import { foamDetailTexture } from "./waterFoamTexture.js";
 
 /**
  * ══ WHAT A WATER SURFACE ADDS ON TOP OF BEING A MIRROR ═════════════════════
@@ -278,12 +279,37 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
   // mip-filtered coverage is the tone. The ripple field's foam is not drawn
   // here any more: it is a SOURCE for the particles (gridSimulation.js
   // `spectrum.ripple`), so a wake and a crest share one motion.
+  // ── SEA OF THIEVES' RECIPE (Ang et al., SIGGRAPH 2018) ────────────────
+  // The MASK is where foam is: the particles' map (whitecaps, wakes, a
+  // splash's returns, all riding the water) and the contact ring around
+  // an intersecting object. The LOOK is a texture blended by the mask —
+  // waterFoamTexture.js's lace, bubbles and patches — sampled in the
+  // WATER'S OWN FRAME: the surface point's rest position (the pixel's
+  // world position less the sea's horizontal displacement there) plus the
+  // sea's scroll, so the lace rides the current and the orbital motion
+  // with the foam it dresses instead of standing still under it. The mask
+  // DISSOLVES the texture: a faint mask keeps only the brightest walls (a
+  // thin lace), a strong one nearly everything (a sheet with bubble holes).
+  const detail = texture(foamDetailTexture());
+  const rest = spectrum ? p.sub(seaDisplacementAt(spectrum, p).xz).add(spectrum.uniforms.scroll) : p;
+  const laceA = detail.sample(rest.div(2.2)).x, laceB = detail.sample(rest.div(.55).add(vec2(.37, .61))).x;
+  const bubbles = detail.sample(rest.div(.35).add(vec2(.13, .71))).y;
+  const foamPatch = detail.sample(rest.div(9)).z;
+  const mask = sea.max(contact.mul(.85)).mul(foamPatch.mul(.8).add(.6)).clamp(0, 1);
+  const foamGrain = mix(laceA, laceB, .5).mul(bubbles.mul(.35).add(.75));
+  const threshold = mask.oneMinus();
+  const realistic = foamGrain.smoothstep(threshold.sub(.12), threshold.add(.12));
+  // STYLIZED (the water's other mode): Sea of Thieves' own look — the soft,
+  // dispersed mask with a coarse lace bite, hard-edged and flat.
+  const stylized = mask.mul(laceA.mul(.5).add(.75)).smoothstep(.3, .45);
+  const dressed = mix(realistic, stylized, u.stylized);
+  // Far away the texture's mips average to a tone; the mask's own coverage
+  // (the map's mips) is what the eye sees there.
   const metres = positionWorld.sub(cameraPosition).length();
-  const near = sea.smoothstep(.06, .55);
-  const far = sea.smoothstep(.03, .4).mul(.6);
-  const whitecap = mix(near, far, metres.smoothstep(60, 240));
+  const far = mask.smoothstep(.03, .4).mul(.6);
+  const whitecap = mix(dressed, far, metres.smoothstep(80, 300));
   void wake;
-  return whitecap.max(contact.mul(.5)).mul(u.foam.smoothstep(0, .15));
+  return whitecap.mul(u.foam.smoothstep(0, .15));
 }
 
 /**

@@ -440,7 +440,21 @@ export class WaterPhysics {
         if(waterline.length){
           const cur=finite(p.current,0,-10,10),curDir=finite(p.currentDirection,0,-180,180)*Math.PI/180;
           const vel=body.linvel();
-          const through=Math.hypot(vel.x-cur*Math.cos(curDir),vel.z-cur*Math.sin(curDir));
+          const rvx=vel.x-cur*Math.cos(curDir),rvz=vel.z-cur*Math.sin(curDir);
+          const through=Math.hypot(rvx,rvz);
+          // ── CONTACT SPRAY (2026-09-07) ─────────────────────────────────
+          // A hull moving through the water throws spray off its LEADING
+          // waterline — bow spray — (through − 1) × 30 drops a second per
+          // leading sample (waterSpectrum.js's counted seeds), at six
+          // tenths of its speed through the water.
+          if(through>1.5&&dt>0){
+            const rate=(through-1)*30*dt;
+            for(let i=0;i<waterline.length;i+=2){
+              const at=query(waterline[i].point);if(!at)continue;
+              const lead=(at.localX-filter.x)*rvx+(at.localZ-filter.z)*rvz;
+              if(lead>0)c.simulation.addWaterSplash?.(at.localX,at.localZ,.4/flat,through*.6,rate);
+            }
+          }
           // A quarter per second at full speed: the field's 2.5 s life makes a
           // steady band of ~0.6 — patches and streaks, not a sheet (1.5/s
           // saturated the footprint white, "still mostly a blob", 2026-09-07).

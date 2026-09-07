@@ -355,8 +355,14 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     seedRows: Array.from({ length: 16 }, () => new THREE.Vector4()), seedCount: uniform(0, "int"), seedTry: uniform(0),
     // The share of dead foam particles that probe the returns each frame.
     returnTry: uniform(.3),
+    // The water's dials: how much spray (crowns, the fold probes) and how big.
+    amount: uniform(1), sizeScale: uniform(1),
   };
   sp.seeds = uniformArray(sp.seedRows, "vec4");
+  // Each seed's share of the busiest seed's want (a counted contact seed
+  // beside an entry's crown), read by the splash step as its acceptance.
+  sp.acceptValues = new Array(16).fill(0);
+  sp.accepts = uniformArray(sp.acceptValues, "float");
 
   const cascades = Array.from({ length: cascadeCount }, (_, i) => {
     const c = { dk: uniform(1), cutLow: uniform(0), cutHigh: uniform(9999), amplitude: uniform(0), invL: uniform(1), L: 1,
@@ -479,7 +485,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     /** The dispatches for this frame, in order; `renderer.compute(...)` them.
      *  `eye` is the camera in the sea's metres (a water's local XZ × its
      *  scale) — the foam window follows it; `foam` is the water's dial. */
-    passes(dt, time, { eye = null, foam = null, current = null, seeds = null, splashes = null } = {}) {
+    passes(dt, time, { eye = null, foam = null, current = null, seeds = null, splashes = null, splash = null, splashSize = null } = {}) {
+      if (splash != null) sp.amount.value = Math.max(0, Math.min(3, splash));
+      if (splashSize != null) sp.sizeScale.value = Math.max(.3, Math.min(3, splashSize));
       const step = Math.min(.1, Math.max(0, dt));
       // Foam handed in this tick (the sea's metres); the rows are consumed
       // here. A seed WANTS particles in proportion to its area and value —
@@ -503,13 +511,16 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       let maxCrown = 0;
       const crowns = new Array(impacts);
       for (let i = 0; i < impacts; i++) {
-        const [, , r, v] = splashes[i];
-        crowns[i] = Math.min(4000, Math.max(60, 200 * r * r * v));
+        const [, , r, v, count] = splashes[i];
+        // A counted seed (contact spray, per frame) or an entry's crown.
+        crowns[i] = (count != null ? Math.max(0, count) : Math.min(4000, Math.max(60, 200 * r * r * v))) * sp.amount.value;
         maxCrown = Math.max(maxCrown, crowns[i]);
       }
       for (let i = 0; i < impacts; i++) sp.seedRows[i].set(splashes[i][0], splashes[i][1], splashes[i][2], splashes[i][3]);
       sp.seedCount.value = impacts;
       sp.seedTry.value = maxCrown > 0 ? Math.min(1, 1.5 * impacts * maxCrown / splashCount) : 0;
+      sp.crownAccept = crowns.map((c) => (maxCrown > 0 ? c / maxCrown : 0));
+      for (let i = 0; i < 16; i++) sp.acceptValues[i] = sp.crownAccept[i] ?? 0;
       const queue = [];
       if (!settings) return queue;
       if (dirty) { for (const c of cascades) queue.push(c.kernels.initial, c.kernels.conjugate); dirty = false; }
@@ -522,6 +533,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       // (a fold at the limit), 1 at 0.85 — the paper's 0.55 near 0.25.
       f.threshold.value = .45 + .4 * f.gate.value;
       sp.threshold.value = f.threshold.value - .1;
+      sp.tryRate.value = Math.min(1, .5 * sp.amount.value);
       const t = f.texel.value;
       if (eye) f.center.value.set(Math.round(eye[0] / t) * t, Math.round(eye[1] / t) * t);
       if (current && (current[0] || current[1])) {
@@ -782,14 +794,17 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         const r0 = rnd(11), r1 = rnd(12), r2 = rnd(13), r3 = rnd(14);
         const born = float(0).toVar(), at = vec2(0).toVar(), vel = vec3(0).toVar(), strength = float(1).toVar();
         If(r0.lessThan(sp.seedTry), () => {
-          const seed = sp.seeds.element(r1.mul(sp.seedCount.toFloat()).floor().toInt().clamp(0, 15));
-          const angle = rnd(15).mul(6.2831853), rad = r2.sqrt();
-          const radial = vec2(angle.cos(), angle.sin());
-          at.assign(seed.xy.add(radial.mul(rad).mul(seed.z)));
-          const up = seed.w.mul(r3.mul(.7).add(.5)), out = seed.w.mul(.35).mul(rad);
-          const turbulence = vec3(gauss(rnd(16), rnd(17)), gauss(rnd(18), rnd(19)), gauss(rnd(20), rnd(21))).mul(seed.w.mul(.15));
-          vel.assign(vec3(radial.x.mul(out), up, radial.y.mul(out)).add(turbulence));
-          born.assign(1); strength.assign(1);
+          const which = r1.mul(sp.seedCount.toFloat()).floor().toInt().clamp(0, 15);
+          const seed = sp.seeds.element(which);
+          If(rnd(28).lessThan(sp.accepts.element(which)), () => {
+            const angle = rnd(15).mul(6.2831853), rad = r2.sqrt();
+            const radial = vec2(angle.cos(), angle.sin());
+            at.assign(seed.xy.add(radial.mul(rad).mul(seed.z)));
+            const up = seed.w.mul(r3.mul(.7).add(.5)), out = seed.w.mul(.35).mul(rad);
+            const turbulence = vec3(gauss(rnd(16), rnd(17)), gauss(rnd(18), rnd(19)), gauss(rnd(20), rnd(21))).mul(seed.w.mul(.15));
+            vel.assign(vec3(radial.x.mul(out), up, radial.y.mul(out)).add(turbulence));
+            born.assign(1); strength.assign(1);
+          });
         }).ElseIf(r0.lessThan(sp.seedTry.add(sp.tryRate)), () => {
           const probe = f.center.add(vec2(r2, r3).sub(.5).mul(sp.reach.mul(2)));
           const fold = seaFoldAt(spectrum, probe, f.lods);
@@ -836,10 +851,14 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   const splatAspect = mix(float(1), float(2.5), splatAux.z);
   const splatAlong = streakAxis.mul(positionGeometry.x).mul(splatAspect.sqrt());
   const splatAcross = vec2(streakAxis.y.negate(), streakAxis.x).mul(positionGeometry.y).div(splatAspect.sqrt());
-  const splatNdc = splatParticle.xy.sub(f.center).div(f.half).add(splatAlong.add(splatAcross).mul(f.disc.mul(splatAux.y).div(f.half)));
+  // DISPERSION (Sea of Thieves blurs its foam buffer with feedback): a
+  // speck grows to two and a half times its size over its life and thins
+  // with it, so a patch spreads and dissolves rather than winking out.
+  const splatGrow = splatParticle.z.div(splatParticle.w.max(1e-3)).clamp(0, 1).mul(1.5).add(1);
+  const splatNdc = splatParticle.xy.sub(f.center).div(f.half).add(splatAlong.add(splatAcross).mul(f.disc.mul(splatAux.y).mul(splatGrow).div(f.half)));
   splatMaterial.vertexNode = vec4(splatNdc.x, splatNdc.y.negate(), select(splatAlive, float(0), float(2)), 1);
   const splatIntensity = varying(
-    splatParticle.w.sub(splatParticle.z).max(0).div(f.life.div(3)).negate().exp().oneMinus().mul(splatAux.x),
+    splatParticle.w.sub(splatParticle.z).max(0).div(f.life.div(3)).negate().exp().oneMinus().mul(splatAux.x).div(splatGrow),
     "seaFoamSplat");
   const splatRadius = uvAttribute().sub(.5).length().mul(2);
   splatMaterial.colorNode = vec3(splatRadius.mul(splatRadius).mul(-4).exp().mul(splatIntensity));
@@ -874,7 +893,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     const dir = along.div(speed.max(1e-4));
     const right = normalize(cross(dir, toCam).add(vec3(1e-5, 0, 0)));
     const up = cross(toCam, right);
-    const size = select(alive, sp.size.mul(aux.y).mul(j2.mul(.6).add(.6)).div(sp.scale.x), float(0));
+    const size = select(alive, sp.size.mul(sp.sizeScale).mul(aux.y).mul(j2.mul(.6).add(.6)).div(sp.scale.x), float(0));
     const stretch = speed.mul(.25).add(1).min(4);
     splashMaterial.positionNode = centre.add(right.mul(positionGeometry.x).add(up.mul(positionGeometry.y).mul(stretch)).mul(size));
     const fade = varying(part.w.div(velocity.w.max(1e-3)).oneMinus().clamp(0, 1).mul(aux.x), "seaSplashFade");

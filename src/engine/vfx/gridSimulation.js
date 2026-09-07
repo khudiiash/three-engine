@@ -229,6 +229,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     choppiness: uniform(.35), rippleStrength: uniform(.25),
     color: uniform(new THREE.Color()), deepColor: uniform(new THREE.Color()), waterDepth: uniform(2), absorption: uniform(0), saturation: uniform(.35),
     foam: uniform(0), foamThreshold: uniform(.15), stylized: uniform(0),
+    // The spray's dials (waterSpectrum.js's splash pool).
+    splash: uniform(1), splashSize: uniform(1),
     transmission: uniform(.75),
     // Local-space thickness for three's screen-space refraction — see
     // `updateWaterSlot`, which is the only place that knows the mesh's scale.
@@ -1315,6 +1317,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     u.saturation.value = waterSaturation(p, u.waterDepth.value);
     u.absorption.value = waterExtinction(u.saturation.value, u.waterDepth.value);
     u.foam.value = finite(p.foam, .25, 0, 1); u.foamThreshold.value = finite(p.foamThreshold, .15, 0, 5);
+    u.splash.value = finite(p.splash, 1, 0, 3); u.splashSize.value = finite(p.splashSize, 1, .3, 3);
     u.transmission.value = finite(p.transmission, .75, 0, 1);
     u.stylized.value = p.style === "stylized" ? 1 : 0;
     // ⚠ BOTH WATER COLOURS ARE PUBLISHED WHETHER OR NOT THE MATERIAL IS OURS.
@@ -1477,10 +1480,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     },
     /** A body entering the water: local x, z, a radius in local units, the
      *  entry speed (m/s) — a crown of spray (waterSpectrum.js). */
-    addWaterSplash(x,z,radius,speed) {
+    /** `count` (optional): particles this frame instead of an entry's crown
+     *  — contact spray, handed every frame by a moving hull. */
+    addWaterSplash(x,z,radius,speed,count=null) {
       if(kind!=="water" || !spectrum || ![x,z,radius,speed].every(Number.isFinite) || !(speed>0))return false;
+      if(count!=null&&!(count>0))return false;
       while(pendingSplash.length>=16)pendingSplash.shift();
-      pendingSplash.push([x,z,Math.max(2*Math.max(sx,sz),radius),speed]);
+      pendingSplash.push([x,z,Math.max(2*Math.max(sx,sz),radius),speed,count]);
       return true;
     },
     restart() { initialized = false; accumulator = 0; elapsed = 0; u.simTime.value = 0; pendingImpulses.length=0; pendingFoam.length=0; pendingSplash.length=0; spectrum?.restart(); updateBounds(); },
@@ -1633,11 +1639,12 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // (in the sea's metres, a value near 1 at full speed) — the tail.
         const ws = u.waveScale.value;
         const seeds = pendingFoam.map(([x, z, r, a]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .3), Math.min(1, a * 4)]);
-        const splashes = pendingSplash.map(([x, z, r, v]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .2), v]);
+        const splashes = pendingSplash.map(([x, z, r, v, count]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .2), v, count ?? null]);
         pendingSplash.length = 0;
         spectrum.splash?.scale.value.copy(ws);
         const seaQueue = spectrum.passes(delta, elapsed, { eye: seaEye, foam: u.foam.value,
-          current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value], seeds, splashes });
+          current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value], seeds, splashes,
+          splash: u.splash.value, splashSize: u.splashSize.value });
         if (seaQueue.length) { renderer.compute(seaQueue); spectrum.afterCompute(renderer); }
       }
       if (foamField) {

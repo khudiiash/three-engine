@@ -69,7 +69,7 @@ try {
    foam: Number(argument('foam', '1')), foamThreshold: .5 };
  // Any wave/look field can be overridden from the URL (?waveHeight=.1&choppiness=0…) to
  // reproduce a user's own pool.
- for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain', 'roughness', 'transmission', 'waterDepth', 'godRays', 'waveDirection', 'waveSpeed', 'current', 'currentDirection'])
+ for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain', 'roughness', 'transmission', 'waterDepth', 'godRays', 'waveDirection', 'waveSpeed', 'current', 'currentDirection', 'splash', 'splashSize'])
    if (argument(key, null) != null) USER[key] = Number(argument(key, '0'));
  for (const key of ['color', 'deepColor']) if (argument(key, null) != null) USER[key] = argument(key, '');
  // ?depth= for the ocean arm (60 m: no floor shows through the medium).

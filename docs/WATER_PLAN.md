@@ -620,6 +620,47 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     current — 1.97 m in a second; the 5 m pool's splash has 442 live foam
     particles within 3 m four seconds on (born from the field); the pool
     arm passes; `test:water` 41.
+56. ⭐ SEA OF THIEVES' RECIPE ("if we could copy it that would be awesome",
+    user). Its SIGGRAPH 2018 talk (Ang, Catling, Ciardi, Kozin): foam at
+    wave peaks by the Jacobian, foam around intersecting objects from
+    depth comparisons in a camera-centred window, the buffer progressively
+    BLURRED WITH FEEDBACK so the foam disperses into a soft mask, and the
+    mask "blended with artist-authored textures" — the mask is only WHERE,
+    the texture is what foam LOOKS like; calm/normal/stormy states change
+    generation, dispersion and blending. Ours now: the mask is the
+    particle map ∨ the contact ring (both ride the water), with DISPERSION
+    — a speck's splat grows 2.5× over its life and thins with it; the
+    look is `waterFoamTexture.js`, a 512² tileable texture baked once on
+    the CPU (135 ms): R the LACE (F2 − F1 walls of a warped periodic
+    lattice at two scales), G the BUBBLES (domes with dark centres), B the
+    PATCHES (a slow fractal); sampled in the WATER'S OWN FRAME — the
+    pixel's rest position (world − the sea's horizontal displacement there)
+    + the sea's scroll, so it rides the current and the orbital motion
+    with the foam — at 2.2 m, 0.55 m and 0.35 m, and DISSOLVED by the
+    mask: `grain.smoothstep(1 − mask ± .12)` keeps only the brightest
+    walls under a faint mask (thin lace) and nearly all of it under a
+    strong one (a sheet with bubble holes); the patches make the mask's
+    edge ragged. The STYLIZED mode is the talk's own look — the soft
+    dispersed mask with a coarse lace bite, hard-edged and flat
+    (`u.stylized` mixes the two). Beside it: the lid WRITES DEPTH now (an
+    authored material's `depthWrite: false` let the clipmap's far rings
+    paint far crests over near ones at grazing angles and spray behind a
+    crest show through it — "far waves appear in front of the close ones,
+    same with sprays"); the water gained two dials, `splash` (spray
+    amount 0–3: crowns, contact spray, the fold probes) and `splashSize`
+    (0.3–3); and CONTACT SPRAY: a hull moving through the water faster
+    than 1.5 m/s hands the sea COUNTED splash seeds off its LEADING
+    waterline every frame — (through − 1) × 30 drops/s per leading sample
+    at 0.6 × its speed (`addWaterSplash(x, z, r, v, count)`, each seed
+    accepted by its share of the busiest, `sp.accepts`). Receipts (ocean
+    preset): whitecaps 2.8 %, far specks 1.11 %, hull seed 77, a 1 m /
+    4 m/s impact brightens 38 349 pixels from 6 m and leaves 374 foam
+    particles; the 5 m pool's splash has 435 foam particles four seconds
+    on; `test:water` physics 20 (a hull in a 3 m/s current hands > 20
+    counted seeds in 2 s on its leading side; one at rest none), spectrum
+    12. ⚠ `tests/water-interaction.test.mjs` fails on an UNCOMMITTED
+    working-tree change to PhysicsSystem.js (`this.engine.batchHierarchy
+    is not a function` — the test's engine stub lacks it); not this unit's.
 
 ## Open
 
