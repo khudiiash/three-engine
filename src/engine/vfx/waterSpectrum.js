@@ -619,8 +619,12 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       // The dial seeds the threshold; the controller (the readback below)
       // owns it from there. A moved dial re-seeds.
       if (Math.abs(f.gate.value - lastGate) > .02) { f.threshold.value = .42 + .3 * f.gate.value; lastGate = f.gate.value; }
-      sp.threshold.value = f.threshold.value - .1;
-      sp.tryRate.value = Math.min(1, .5 * sp.amount.value);
+      // The spray's fold threshold rides the CONTROLLED one (trap 64), a
+      // little stricter, and its probes are a sixth of the pool: a fixed
+      // offset let a steep sea fly 11 k drops at once (the steep arm's
+      // blobs, 2026-09-07).
+      sp.threshold.value = f.threshold.value - .05;
+      sp.tryRate.value = Math.min(1, .15 * sp.amount.value);
       const t = f.texel.value;
       f.prevCenter.value.copy(f.center.value);
       if (eye) f.center.value.set(Math.round(eye[0] / t) * t, Math.round(eye[1] / t) * t);
