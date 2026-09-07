@@ -372,9 +372,13 @@ function crestNode(u) {
 export function waterCrestGradientNode(u) {
   return mix(vec3(1), vec3(.8, 1.4, 1.25), crestNode(u).smoothstep(.35, 1));
 }
-export function waterSubsurfaceNode(u, slot) {
+export function waterSubsurfaceNode(u, source) {
+  // `source` is the water slot (its `uniforms.toSun` / `uniforms.scatter`)
+  // or, with underwater off and no slot, the look's own { toSun, scatter }
+  // uniforms — the gradients are the surface's, not the medium's ("we lost
+  // surface colour gradients … no subsurface scattering", user, 2026-09-07).
   const toEye = cameraPosition.sub(positionWorld).normalize();
-  const toSun = vec3(slot.uniforms.toSun);
+  const toSun = vec3(source.uniforms?.toSun ?? source.toSun);
   // Light that entered the far side of a crest and scatters out toward the
   // eye — strongest looking toward the sun through the wave (the demo's
   // distorted back-light), never quite absent — in the colour thin water
@@ -383,7 +387,7 @@ export function waterSubsurfaceNode(u, slot) {
   const backlit = toEye.dot(toSun.negate().add(normalWorld.mul(.3)).normalize()).max(0).pow(4);
   const crest = crestNode(u).smoothstep(.5, 1).pow(1.5);
   const tint = vec3(.5, 1.7, 1.3);
-  return vec3(slot.uniforms.scatter).mul(tint).mul(crest).mul(backlit.mul(1.2).add(.25));
+  return vec3(source.uniforms?.scatter ?? source.scatter).mul(tint).mul(crest).mul(backlit.mul(1.2).add(.25));
 }
 
 /** Kept for the surface smoke, which asserts crest foam exists at all. */

@@ -107,13 +107,21 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
   };
   const depthTextureFor = (renderer) => {
     const current = effectiveTarget(renderer);
-    const key = current ?? renderer;
+    // ⚠ KEYED BY WHAT THE SHADER CARES ABOUT — the sample count and the
+    // depth format — never by the target's identity. Keyed by identity, every
+    // scene pass the postprocess re-created (a camera switch, a resize) left
+    // its predecessor's screen-sized depth copy in this map, and the map's
+    // strong reference kept the dead target's own textures alive with it:
+    // 14 MB per event, for the life of the water (the editor's texture
+    // census read five of them, 2026-09-07).
+    const source = current?.depthTexture;
+    const samples = Math.max(1, current ? (current.samples || 1) : (renderer.currentSamples || 1));
+    const key = `${samples}|${source?.type ?? ''}|${source?.format ?? ''}`;
     let depth = depthTextures.get(key);
     if (!depth) {
       depth = new DepthTexture(1, 1);
-      const source = current?.depthTexture;
       if (source) { depth.type = source.type; depth.format = source.format; }
-      depth.renderTarget = { samples: Math.max(1, current ? (current.samples || 1) : (renderer.currentSamples || 1)) };
+      depth.renderTarget = { samples };
       depthTextures.set(key, depth);
     }
     return depth;
@@ -141,10 +149,31 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     return camera.getWorldPosition(_eye).sub(_origin).dot(_up) >= 0;
   };
 
+  // The sun and the scatter colour the subsurface term needs when there is
+  // no slot to read them from (underwater off): the brightest directional
+  // light, and the water colour under it — the slot's own formula.
+  const sunFallback = { toSun: uniform(new Vector3(0, 1, 0)), scatter: uniform(new Color(0, 0, 0)) };
+  const _from = new Vector3(), _to = new Vector3();
+  let sunSource = null, sunSearch = 0;
   const update = () => {
     const gi = engine?.modules?.get('gi')?.system?.component;
     const setting = gi?.enabled !== false ? gi?.props?.reflections : undefined;
     gain.value = setting === false || setting === 0 ? 0 : 1;
+    if (getSlot?.() ?? slot) return;              // the slot carries the sun; nothing to search for
+    // The scene walk once a second, not per frame; the light's direction every frame.
+    if (--sunSearch <= 0 || (sunSource && !sunSource.parent)) {
+      sunSearch = 60; sunSource = null;
+      engine?.scene?.traverse?.((object) => { if (object.isDirectionalLight && object.intensity > 0 && (!sunSource || object.intensity > sunSource.intensity)) sunSource = object; });
+    }
+    const source = sunSource;
+    if (source && simulation?.uniforms?.color) {
+      source.updateWorldMatrix(true, false, true); source.target?.updateWorldMatrix?.(true, false, true);
+      source.getWorldPosition(_from); (source.target ?? source).getWorldPosition(_to);
+      const ray = _to.sub(_from).normalize();
+      sunFallback.toSun.value.copy(ray).negate();
+      const luma = source.color.r * .2126 + source.color.g * .7152 + source.color.b * .0722;
+      sunFallback.scatter.value.copy(simulation.uniforms.color.value).multiplyScalar(source.intensity * luma * Math.max(0, -ray.y) / Math.PI);
+    }
   };
 
   const build = () => {
@@ -569,9 +598,16 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(.75), foam);
       // The transmitted light, lighter and greener along the crests (thin
       // water), the body's colour in the troughs — see waterCrestGradientNode.
-      emissive = emissive.add(refracted.mul(underwater ? waterCrestGradientNode(u) : float(1)).mul(through).mul(foam.oneMinus()));
+      const subsurface = waterSubsurfaceNode(u, slot ?? sunFallback);
+      emissive = emissive.add(refracted.mul(waterCrestGradientNode(u)).mul(through).mul(foam.oneMinus()));
       emissive = emissive.add(reflected.mul(foam.oneMinus()));
-      if (slot) emissive = emissive.add(waterSubsurfaceNode(u, slot).mul(foam.oneMinus()));
+      emissive = emissive.add(subsurface.mul(foam.oneMinus()));
+      // Harness probe (`?lookDebug=reflected|refracted|subsurface|lit`): one
+      // term of the surface alone, the others black — to find which one
+      // carries an artefact.
+      const probe = globalThis.__waterLookDebug;
+      if (probe && probe !== 'lit') { emissive = { reflected, refracted: refracted.mul(waterCrestGradientNode(u)).mul(through), subsurface, fresnel: vec3(fresnel).mul(.5), facing: select(frontFacing, vec3(0, .6, 0), vec3(1, 0, 0)), gradient: waterCrestGradientNode(u).mul(.5), base: mix(vec3(u.deepColor), baseColor, .25), through: vec3(through) }[probe] ?? emissive; material.colorNode = vec3(0); }
+      if (probe === 'lit') emissive = vec3(0);
     } else {
       emissive = emissive.add(reflected);
     }
@@ -637,8 +673,19 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
 
   const onWave = () => { if (!disposed && ++rearms <= 8) queueMicrotask(() => { if (!disposed) build(); }); };
   engine?.on?.('gi-compile-wave-done', onWave);
-  // The scene pass is (re)created after the water more often than not.
-  const onPass = () => { if (!disposed) queueMicrotask(() => { if (!disposed) build(); }); };
+  // The scene pass is (re)created after the water more often than not. A
+  // rebuild is what the SAMPLE COUNT needs (the depth binding is multisampled
+  // or not at build time); the same count re-adopted by the postprocess (a
+  // camera switch, play/stop) is not worth a 90 ms freeze, a new pipeline in
+  // three's cache and a new mirror target — the same pass, the same shader.
+  let passSamples;
+  const onPass = (pass) => {
+    if (disposed) return;
+    const samples = pass ? (pass.renderTarget?.samples ?? 1) : (engine?.renderer?.currentSamples ?? 1);
+    if (samples === passSamples) return;
+    passSamples = samples;
+    queueMicrotask(() => { if (!disposed) build(); });
+  };
   engine?.on?.('scene-pass-changed', onPass);
   build(); update();
   return {

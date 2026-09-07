@@ -939,6 +939,61 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     also widens a segment seed's birth line now. Receipts: crown 49 040
     px, the segment seed 380 drops outward, 468 foam from returns; tests
     34.
+69. THE GRADIENTS WITHOUT A SLOT. "I disabled underwater, but we lost
+    surface colour gradients on the way, no subsurface scattering we had"
+    (user, 2026-09-07). The crest gradient had been dropped from the NONE
+    refraction arm, and `waterSubsurfaceNode` read its sun and scatter
+    colour from the caustic SLOT, which underwater-off does not claim. The
+    look now carries its own `toSun`/`scatter` uniforms (the brightest
+    directional light, the water colour × downwelling/π — the slot's own
+    formula, walked once a second) and the subsurface node takes either the
+    slot or that fallback; the crest gradient multiplies every arm. Receipt:
+    the OFF ocean arm keeps its whitecap/hull receipts (3.3 %, 114).
+70. ⭐ THE LEAK HUNT ("with time fps drops until the page crashed", a
+    phone, 2026-09-07). The harness gained `?soak=N` (wall ms, JS heap,
+    three's texture/geometry counts, foam alive, and a GPU-OBJECT METER —
+    every `createBuffer/Texture/BindGroup/Pipeline/ShaderModule/View` the
+    device mints, buffers and textures alive — per 300 frames, with a
+    hull's per-frame emissions and `?soakPass=1` scene-pass events). Two
+    growths found, both fixed:
+    - three's `copyTextureToBuffer` / `getArrayBufferAsync` mint a fresh
+      staging GPU buffer AND `slice()` a fresh ArrayBuffer per call: the
+      buoyancy copy was 1 MB every other frame — 240 buffers per 300
+      frames, ~30 MB/s of GPU churn and JS garbage. `gpuReadback.js` owns
+      one staging buffer and one typed array per reader for its life
+      (`createTextureReadback` for the sea, `createBufferReadback` for the
+      live counter); the soak reads buffers +0 per 300 frames now.
+    - The look's per-target depth copies were keyed by the render target's
+      IDENTITY in a strong Map: every scene pass the postprocess re-created
+      (a camera switch, play/stop, a resize) left its predecessor's
+      screen-sized DepthTexture behind and pinned the dead target's own
+      textures — the editor's texture census read five orphan 1808×1030
+      textures at 14 MB each. Keyed by sample count + format now (two
+      entries at most); and `scene-pass-changed` rebuilds the look ONLY
+      when the pass's sample count changes (the same pass re-adopted is not
+      worth a 90 ms freeze, a pipeline in three's cache and a new mirror).
+    What the soak could not see: the phone itself (thermal throttling
+    after minutes is the usual "starts at 60"), GI, physics with a hull.
+    Still to note: with underwater off the released slot's maps (42 MB)
+    stay in the engine pool.
+71. THE TIER TRIMS WHAT THE EYE CANNOT COUNT. "Have you cut the number of
+    splash particles on mobile? Please don't, it looks bad" and "foam looks
+    almost absent on mobile" (user, 2026-09-07): trap 65's phone tier had
+    cut the pools (8 k foam / 2 k spray, 2 sprites) and the foam map to
+    256² — where a texel is 2 m of sea and a near particle's disc falls
+    between texel centres, so nothing is splatted. The pools, sprites and
+    the 1024² foam map are the same on every device; the tier keeps the
+    sea's cascades (128², two on a phone) and the spray grid.
+72. ⚠ THE HARNESS-ONLY LATTICE under `?underwater=0` — OPEN. On a FLAT
+    sea (no waves, ripples, detail, foam) the lid shows a dark lattice
+    (columns near, moiré arcs far) in the REFRACTED term alone
+    (`?lookDebug=refracted|reflected|subsurface|base|gradient|through|
+    fresnel|facing|lit` paints one term); not the spray, not a second
+    coplanar mesh (`?census=1` lists every visible mesh and the lid's
+    triangle windings: 54 152 one way, 0 the other, 3 192 degenerate),
+    not three's double pass (`?singlePass=1`, `?lidSide=front`), not the
+    facing (all front). The ON arm's refracted term is smooth at the
+    same pose; the user's scene shows nothing of it. Unexplained.
 
 ## Open
 
@@ -966,3 +1021,5 @@ linear&sun=3.7,19.58,-1.68&sunIntensity=4` plus the preset's fields as
 overrides; the foam receipts' baseline is `foam=.5` since trap 63), `smoke:water-surface`,
 `smoke:water-spectrum`, `smoke:water-props`, `smoke:water-rate`,
 `scripts/water-bindings-smoke.html?msaa=1`, `npm run test:water`.
+The soak: `?scales=500&ocean=1&soak=2400` (+`&soakPass=1`, `&soakBody=0`,
+`&tier=low`, `&underwater=0`) — trap 70's leak meter.

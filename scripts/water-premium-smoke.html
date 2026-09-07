@@ -49,6 +49,15 @@ try {
  const adapter = await navigator.gpu.requestAdapter();
  const device = await adapter.requestDevice({ requiredFeatures: [...(argument('timing', '0') === '1' && adapter.features.has('timestamp-query') ? ['timestamp-query'] : [])], requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
  const errors = []; device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
+ // Every GPU object the device mints, and every buffer/texture destroyed — the soak's leak meter.
+ const gpuCount = { buffer: 0, bufferAlive: 0, texture: 0, textureAlive: 0, bindGroup: 0, pipeline: 0, shader: 0, encoder: 0, layout: 0, sampler: 0, view: 0, querySet: 0 };
+ for (const [name, key] of [['createBuffer', 'buffer'], ['createTexture', 'texture'], ['createBindGroup', 'bindGroup'], ['createRenderPipeline', 'pipeline'], ['createComputePipeline', 'pipeline'], ['createRenderPipelineAsync', 'pipeline'], ['createComputePipelineAsync', 'pipeline'], ['createShaderModule', 'shader'], ['createCommandEncoder', 'encoder'], ['createBindGroupLayout', 'layout'], ['createPipelineLayout', 'layout'], ['createSampler', 'sampler'], ['createQuerySet', 'querySet']]) {
+   if (typeof device[name] !== 'function') continue;
+   const f = device[name].bind(device);
+   device[name] = (...a) => { gpuCount[key]++; const r = f(...a); if ((key === 'buffer' || key === 'texture') && r?.destroy) { gpuCount[key + 'Alive']++; const d = r.destroy.bind(r); r.destroy = () => { gpuCount[key + 'Alive']--; d(); }; } return r; };
+ }
+ { const cv = GPUTexture.prototype.createView; GPUTexture.prototype.createView = function (...a) { gpuCount.view++; return cv.apply(this, a); }; }
+ globalThis.__gpuCount = gpuCount;
  const W = 768, H = 512;                      // 768 * 4 = 12 * 256
  const renderer = new THREE.WebGPURenderer({ trackTimestamp: argument('timing', '0') === '1', device, antialias: false });
  await renderer.init(); renderer.setSize(W, H);
@@ -80,6 +89,7 @@ try {
 globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
 // ?tier=low|medium|ultra pins the water's device tier (waterSpectrum.js `waterDeviceTier`).
 if (argument('tier', null)) globalThis.__waterDeviceTier = argument('tier', 'ultra');
+if (argument('lookDebug', null)) globalThis.__waterLookDebug = argument('lookDebug', '');
 globalThis.__waterCurrentAdvect = argument('currentAdvect', '1') !== '0';
 globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
 
@@ -122,8 +132,11 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    // ?giEnv=1: what GI does to the scene — a black environment NODE so the
    // materials' image-based lighting sees nothing while the texture stays.
    if (argument('giEnv', '0') === '1') scene.environmentNode = vec3(0);
+   const listeners = new Map();
    const engine = { scene, renderer, camera: null, onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; },
-     _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null }, waterSlots: null };
+     _tickers: [], on: (name, fn) => { (listeners.get(name) ?? listeners.set(name, new Set()).get(name)).add(fn); return () => listeners.get(name)?.delete(fn); },
+     off: (name, fn) => { listeners.get(name)?.delete(fn); }, emit: (name, ...a) => { for (const fn of listeners.get(name) ?? []) fn(...a); },
+     modules: { get: () => null }, waterSlots: null };
    const pool = waterSlotPool(engine);
    const sun = new THREE.DirectionalLight(argument('sunColor', '#fff6e0'), Number(argument('sunIntensity', '3')));
    // ?sun=x,y,z — the sun's position (its direction); the user's is 78° up.
@@ -157,7 +170,8 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    const resolution = AUTO ? waterAutoResolution(S) : 128;
    const props = { ...USER, resolution, width: 1, height: 1, waterDepth: argument('waterDepth', null) != null ? Number(argument('waterDepth', '1')) : SHAPE_HEIGHT * FILL, shapeKind: SHAPE, shapeRadius: .5, shapeHeight: SHAPE_HEIGHT, enclosed: Number(argument('enclosed', '1')) };
    const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0, ior: 1.333,
-     transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+     transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: argument('lidSide', 'double') === 'front' ? THREE.FrontSide : THREE.DoubleSide });
+   if (argument('singlePass', '0') === '1') authored.forceSinglePass = true;   // isolation: three's back-then-front double pass
    // ?underwater=0: no slot (no medium, caustics, shafts), no shell, no refraction — as the component does it.
    const UNDERWATER = USER.underwater !== false;
    const slot = pool.claim({});
@@ -230,6 +244,37 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    };
    await renderer.computeAsync(sim.init);
    await run(150);                              // 2.5 s: waves up, foam gathered
+   // ── ?soak=N: DOES ANYTHING GROW? (2026-09-07) ───────────────────────────
+   // "On mobile it starts with 60 fps, but with time drops to 15–20" (user).
+   // N frames after the warm-up, the frame's wall time, the JS heap and
+   // three's GPU allocations per 300-frame bucket: a water-side growth is a
+   // rising line here; a flat line puts it on the device (thermal) or the
+   // scene.
+   if (Number(argument('soak', '0')) > 0) {
+     const N = Number(argument('soak', '0')), BUCKET = 300;
+     let t0 = performance.now(), first = null, last = { ...gpuCount };
+     const chains = () => Object.values(renderer._renderObjects?.chainMaps ?? {}).length;
+     const sizes = () => `pipelines ${renderer._pipelines?.caches?.size ?? '?'}, builders ${renderer._nodes?.nodeBuilderCache?.size ?? '?'}, chainMaps ${chains()}`;
+     for (let i = 1; i <= N; i++) {
+       // What a floating hull hands the water every frame: a press, a foam seed, a contact spray.
+       // ?soakPass=1: the postprocess re-adopting its scene pass (a camera switch) every two seconds.
+       if (argument('soakPass', '0') === '1' && i % 120 === 0) engine.emit('scene-pass-changed', { renderTarget: { samples: 1 } });
+       if (argument('soakBody', '1') === '1') { const a = i * .05; sim.addWaterImpulse(Math.cos(a) * 2 / S, Math.sin(a) * 2 / S, .3 / S, -.002); sim.addWaterFoam?.(Math.cos(a) * 2 / S, Math.sin(a) * 2 / S, .4 / S, .5); if (i % 3 === 0) sim.addWaterSplash?.(Math.cos(a) * 2 / S, Math.sin(a) * 2 / S, .3 / S, 3, 40, Math.cos(a) * 2.5 / S, Math.sin(a) * 2.5 / S, Math.cos(a), Math.sin(a)); }
+       await step();
+       if (i % BUCKET === 0) {
+         const ms = (performance.now() - t0) / BUCKET; t0 = performance.now();
+         const heap = performance.memory ? performance.memory.usedJSHeapSize / 1048576 : NaN;
+         const mem = renderer.info.memory, live = sim.spectrum?.liveCount?.() ?? NaN;
+         const row = { frame: i, ms, heap, textures: mem.textures, geometries: mem.geometries, live };
+         first ??= row;
+         const d = Object.fromEntries(Object.keys(gpuCount).map((k) => [k, gpuCount[k] - last[k]])); last = { ...gpuCount };
+         log(`soak: frame ${i} — ${ms.toFixed(2)} ms/frame (wall, incl. readback wait), heap ${heap.toFixed(1)} MB, textures ${mem.textures}, geometries ${mem.geometries}, foam particles alive ${live}`);
+         log(`soak: gpu per ${BUCKET} frames — buffers +${d.buffer} (alive ${gpuCount.bufferAlive}), textures +${d.texture} (alive ${gpuCount.textureAlive}), bindGroups +${d.bindGroup}, views +${d.view}, pipelines +${d.pipeline}, shaders +${d.shader}, layouts +${d.layout}, samplers +${d.sampler}, encoders +${d.encoder}; three: ${sizes()}`);
+       }
+     }
+     log(`soak: verdict — heap ${first.heap.toFixed(1)} → ${(performance.memory ? performance.memory.usedJSHeapSize / 1048576 : NaN).toFixed(1)} MB, textures ${first.textures} → ${renderer.info.memory.textures}, geometries ${first.geometries} → ${renderer.info.memory.geometries}`);
+     throw new Error('soak: stop');
+   }
    // ── ?timing=1: THE WATER'S GPU COST, SYSTEM BY SYSTEM (2026-09-07) ─────
    // Timestamp queries (`resolveTimestampsAsync`) over 60 frames per arm,
    // each arm one system switched off, so the difference is that system's
@@ -287,7 +332,24 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
      pose([0, 2.5, S * .35], [0, 1, -S * .1]); await shoot('ocean-low');
      // The eye a metre over the water, as a swimmer or a deck sees it: the
      // GEOMETRY's waves, which a higher eye lets the shading normal fake.
-     pose([0, 1.2, S * .35], [0, .9, -S * .1]); const eyeShot = await shoot('ocean-eye');
+     pose([0, 1.2, S * .35], [0, .9, -S * .1]);
+     if (argument('census', '0') === '1') {   // every visible mesh in the frame, with its world y-extent and depth flags
+       const box = new THREE.Box3();
+       scene.traverse((o) => { if (!o.isMesh || !o.visible) return; let vis = true; for (let a = o.parent; a; a = a.parent) if (a.visible === false) vis = false; if (!vis) return;
+         box.setFromObject(o); const m = o.material; log(`census: ${o.name || o.type} geo=${o.geometry.type} verts=${o.geometry.attributes.position?.count} y=[${box.min.y.toFixed(2)},${box.max.y.toFixed(2)}] mat=${m?.type} transparent=${m?.transparent} depthWrite=${m?.depthWrite} side=${m?.side} offset=${m?.polygonOffset}`); });
+       log(`census: draw calls last frame ${renderer.info.render.calls}, triangles ${renderer.info.render.triangles}`);
+       // The lid's triangles by winding (seen from above) and area, from the CPU copy of the rest positions.
+       const g = sim.mesh.geometry, P = g.attributes.position.array, S3 = g.attributes.position.itemSize, I = g.index?.array; let ccw = 0, cw = 0, zero = 0, tiny = 0, ratioMax = 0;
+       if (I) for (let t = 0; t + 2 < I.length; t += 3) { const a = I[t] * S3, b = I[t + 1] * S3, c = I[t + 2] * S3;
+         const ux = P[b] - P[a], uz = P[b + 2] - P[a + 2], vx = P[c] - P[a], vz = P[c + 2] - P[a + 2]; const area = ux * vz - uz * vx;
+         const e = Math.max(Math.hypot(ux, uz), Math.hypot(vx, vz), Math.hypot(ux - vx, uz - vz)); ratioMax = Math.max(ratioMax, e > 0 ? Math.abs(area) / (e * e) : 0);
+         if (Math.abs(area) < 1e-9) zero++; else if (Math.abs(area) < 1e-4 * e * e) tiny++; else if (area > 0) ccw++; else cw++; }
+       log(`census: lid triangles ${I ? I.length / 3 : 'non-indexed'} — ccw ${ccw}, cw ${cw}, zero-area ${zero}, slivers ${tiny}`);
+       const rangeY = { min: Infinity, max: -Infinity }; for (let v = 1; v < P.length; v += S3) { rangeY.min = Math.min(rangeY.min, P[v]); rangeY.max = Math.max(rangeY.max, P[v]); }
+       log(`census: lid rest y range [${rangeY.min}, ${rangeY.max}], vertices ${P.length / S3} (itemSize ${S3}), index ${I?.length}`);
+     }
+     if (argument('hideSpray', '0') === '1' && sim.spectrum?.splashMesh) sim.spectrum.splashMesh.visible = false;
+     const eyeShot = await shoot('ocean-eye');
      // ── THE CURRENT SCROLLS THE SEA (2026-09-07) ────────────────────────
      // With the sea's clock stopped (?waveSpeed=0) and a current set, the
      // surface under a fixed point must still change — the sea streams past.

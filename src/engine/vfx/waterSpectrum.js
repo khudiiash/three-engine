@@ -7,6 +7,7 @@ import {
 import { GRAVITY, cascadeBands, cascadeScales, foldingLimit, gaussianNoise, seaSettings, spectrumMoments } from "./waterSpectrumCPU.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
 import { mipmapBlitter } from "./gpuMipmaps.js";
+import { createTextureReadback, createBufferReadback } from "./gpuReadback.js";
 import { createFoamFlow } from "./waterFoamFlow.js";
 
 /**
@@ -52,9 +53,17 @@ export function seaQuality(quality = "high") {
   // 256² fluid and a 96 × 32 × 96 spray grid — and read 20 fps on an
   // iPhone (user, 2026-09-07). A phone is capped at `low`, a tablet at
   // `medium`, whatever the build says; the sea itself looks the same.
+  // ⚠ THE PARTICLE POOLS ARE NOT TIERED. "Have you cut the number of splash
+  // particles on mobile? Please don't, it looks bad" (user, 2026-09-07): the
+  // foam and spray pools and the sprites per drop are the ultra count on
+  // every device; the tier cuts the sea's cascades, the foam map and the
+  // spray grid — the parts the eye cannot count.
   const capped = capQualityForDevice(quality);
-  return { low: { size: 128, cascadeCount: 2, foamSize: 256, sprayGrid: 48, sprites: 2 }, medium: { size: 128, cascadeCount: 3, foamSize: 512, sprayGrid: 64, sprites: 3 } }[capped]
-    ?? { size: SEA_SIZE, cascadeCount: 3, foamSize: 1024, sprayGrid: 96, sprites: 4 };
+  // The foam MAP keeps its 1024² too: at 256² a texel is 2 m of sea and a
+  // near particle's disc falls between texel centres — "foam looks almost
+  // absent on mobile" (user, 2026-09-07).
+  return { low: { size: 128, cascadeCount: 2, foamSize: 1024, sprayGrid: 48 }, medium: { size: 128, cascadeCount: 3, foamSize: 1024, sprayGrid: 64 } }[capped]
+    ?? { size: SEA_SIZE, cascadeCount: 3, foamSize: 1024, sprayGrid: 96 };
 }
 const QUALITY_ORDER = ["low", "medium", "high", "ultra"];
 /** The device's ceiling on a quality tier: phones `low`, tablets `medium`. */
@@ -378,7 +387,7 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
   let foamTarget = foamTargets[0];
   // The pool is sized to the map: 128 k particles behind a 1024² map (a
   // 4 % whitecap coverage of the window is ~10 k m², three discs deep).
-  const particleCount = (foamSize * foamSize) >> 3;
+  const particleCount = seaQualityOptions.particles ?? (1024 * 1024) >> 3;   // the ultra pool on every tier (see seaQuality)
   const f = {
     size: foamSize, center: uniform(new THREE.Vector2(0, 0)), half: uniform(FOAM_WINDOW_METRES / 2),
     texel: uniform(FOAM_WINDOW_METRES / foamSize),
@@ -415,7 +424,7 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
   // frames): the seeds' probes are sized to the DEAD, not to the pool, so a
   // hull's tail and a splash's foam still come when the sea is busy.
   const liveCounter = instancedArray(new Uint32Array(4), "uint").toAtomic();
-  let liveEstimate = 0, liveReadPending = false, liveReadFrame = 0;
+  let liveEstimate = 0, liveReadPending = false, liveReadFrame = 0, liveReader = null, seaReader = null;
   let foldProbes = 0, foldHits = 0, lastGate = -1;
   // The splash pool: (x, y, z, age), (vx, vy, vz, life), (intensity, size),
   // and the RETURNS — a particle that met the surface this frame leaves
@@ -736,10 +745,11 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
         }
       }
       spectrum.generateMipmaps(renderer);
-      if (renderer?.getArrayBufferAsync && particlesReady && !liveReadPending && ++liveReadFrame >= 20) {
+      if (renderer?.backend?.device && particlesReady && !liveReadPending && ++liveReadFrame >= 20) {
         liveReadFrame = 0; liveReadPending = true;
-        renderer.getArrayBufferAsync(liveCounter.value).then((buf) => {
-          const counts = new Uint32Array(buf);
+        liveReader ??= createBufferReadback(renderer, liveCounter.value, { byteLength: 16 });
+        (liveReader?.read() ?? Promise.resolve(null)).then((counts) => {
+          if (!counts) return;
           liveEstimate = counts[0] || 0; foldProbes = counts[1] || 0; foldHits = counts[2] || 0;
           // The coverage controller: a step in log space toward the target.
           const target = FOAM_COVERAGE * f.gate.value;
@@ -773,8 +783,13 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
      * converted at the sample (`sampleDisplacement`), never as a whole map.
      */
     async readback(renderer, count = 2) {
-      if (!renderer?.backend?.copyTextureToBuffer || !settings) return null;
-      const maps = await Promise.all(cascades.slice(0, count).map((c, i) => renderer.backend.copyTextureToBuffer(displacement, 0, 0, size, size, i)));
+      if (!renderer?.backend?.device || !settings) return null;
+      // ⚠ ONE staging buffer for the life of the sea (gpuReadback.js): three's
+      // per-call copy was a fresh 1 MB GPU buffer and a fresh 1 MB ArrayBuffer
+      // every other frame.
+      seaReader ??= createTextureReadback(renderer, displacement, { width: size, height: size, layers: cascadeCount, bytesPerTexel: 8, ArrayType: Uint16Array });
+      const maps = await (seaReader?.read(Math.min(count, cascadeCount)) ?? null);
+      if (!maps) return null;
       return { cascades: maps.map((map, i) => ({ size, L: cascades[i].L, displacement: map })), scroll: { x: u.scroll.value.x, z: u.scroll.value.y } };
     },
     /** The pool, for a receipt: (x, z, age, life) per particle. */
@@ -791,6 +806,7 @@ export function createWaterSpectrum(seaQualityOptions = {}) {
     dispose(renderer) {
       releaseComputeNodes(renderer, [...cascades.flatMap((c) => Object.values(c.kernels)), ...(kernels ? Object.values(kernels).filter((k) => k !== kernels.flow) : [])]);
       spectrum.flow?.dispose(renderer);
+      seaReader?.dispose(); seaReader = null; liveReader?.dispose(); liveReader = null;
       releaseStorageAttributes(renderer, [particles.value, particleAux.value, splash.value, splashVel.value, splashAux.value, returns.value, liveCounter.value, sprayGridV.value, sprayGridP.value].filter(Boolean));
       for (const c of cascades) for (const t of c.textures) t.dispose();
       for (const t of foamTargets) t.dispose(); splatMaterial.dispose(); splatGeometry.dispose(); carryMaterial.dispose(); carryMesh.geometry.dispose();

@@ -78,7 +78,12 @@ export function createWaterSurfaceQuery(mesh, props, time, sea = null) {
 }
 export const queryWaterSurface=(mesh,props,time,point,sea=null)=>createWaterSurfaceQuery(mesh,props,time,sea)(point);
 
+const boundsMemo=new WeakMap();   // a collider's shape does not change; a hull's vertex walk once, not per frame
 function localBounds(collider) {
+  if(boundsMemo.has(collider))return boundsMemo.get(collider);
+  const bound=computeLocalBounds(collider);boundsMemo.set(collider,bound);return bound;
+}
+function computeLocalBounds(collider) {
   const shape=collider.shape;
   if(shape.halfExtents) return new Vector3(shape.halfExtents.x,shape.halfExtents.y,shape.halfExtents.z);
   if(Number.isFinite(shape.radius)) return new Vector3(shape.radius,shape.radius+(shape.halfHeight??0),shape.radius);
