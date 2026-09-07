@@ -299,7 +299,11 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const t = rippleUv(rest);
     const margin = t.x.min(t.x.oneMinus()).min(t.y).min(t.y.oneMinus());
     const core = margin.smoothstep(.5 / w, (SPONGE_CELLS + .5) / w);
-    return ripple.w.max(farFoamAt(rest, u.seaLod).mul(core.oneMinus()));
+    // The field's foam fades over the window's outer eighth: a current
+    // streams a wake's foam out of the 32 m window, and without the fade it
+    // ended on a straight line ("a rectangle of foam", 2026-09-07).
+    const fade = windowed ? margin.smoothstep(0, .12) : float(1);
+    return ripple.w.mul(fade).max(farFoamAt(rest, u.seaLod).mul(core.oneMinus()));
   };
   // Where a LOCAL point falls in the ripple texture, and whether it is inside.
   const rippleUv = (local) => vec2(local.x.sub(u.rippleCenter.x).div(u.rippleHalf.x.mul(2)).add(.5), local.z.sub(u.rippleCenter.y).div(u.rippleHalf.y.mul(2)).add(.5));
