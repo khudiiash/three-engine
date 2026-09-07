@@ -325,6 +325,14 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
          if (fl) { log(`ocean: foam flow — rms ${fl.rms.toFixed(3)} m/s, peak ${fl.peak.toFixed(2)} m/s over ${fl.cells} cells (${sp.flowField().size}², ${sp.flowField().metres} m)`);
            if (!(fl.rms > .02 && fl.peak < 20)) throw new Error(`the foam's fluid is ${fl.rms > .02 ? 'blowing up' : 'dead'}: rms ${fl.rms.toFixed(3)}, peak ${fl.peak.toFixed(2)} m/s`); }
        }
+       // ── THE FOLD COVERAGE (2026-09-07) ──────────────────────────────────
+       // The dial is a coverage target: the share of the window that folds
+       // under the controller's threshold must sit near FOAM_COVERAGE × foam.
+       if (sp?.foldStats) {
+         const fs = sp.foldStats();
+         log(`ocean: fold coverage ${(fs.rate * 100).toFixed(2)}% of the window at threshold ${fs.threshold.toFixed(3)} (target ${(fs.target * 100).toFixed(2)}%, ${fs.probes} probes)`);
+         if (fs.probes > 200 && !(fs.rate > fs.target * .4 && fs.rate < fs.target * 2.5)) throw new Error(`the fold coverage ${(fs.rate * 100).toFixed(2)}% is off its target ${(fs.target * 100).toFixed(2)}%`);
+       }
        // ── THE FOAM PARTICLES (2026-09-07) ─────────────────────────────────
        // The pool behind the whitecap map: how many live, where they sit
        // against the window, the fold threshold they were born under.

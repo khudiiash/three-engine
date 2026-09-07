@@ -820,6 +820,29 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     from here on); foam .1 — 629 live, far specks 0.01 %. The ocean
     preset's foam stays .3 — a touch calmer than it was, the direction
     the user wants.
+64. ⛔ THE FOAM DIAL IS A COVERAGE TARGET, AND THE LIFE IS FIXED. A fixed
+    fold threshold gave the harness's preset a sparse sea at 0.5 and the
+    user's steeper sea a white one at 0.3 ("this is 0.3, which is already
+    too much"; "foam depends a lot on wave ripples and height … I don't
+    want to depend on those, only on the Foam parameter", 2026-09-07).
+    How much of a sea folds under a threshold is the sea state's business,
+    so the threshold is no longer the dial's: the foam step's probes are
+    uniform over the window and the share of them that fold IS the folding
+    fraction of the area (two more atomics beside the live counter, read
+    back every 20 frames); a controller steps the threshold in log space
+    (.03 per readback, clamped .05–.95, re-seeded when the dial moves)
+    until that fraction is FOAM_COVERAGE .04 × the dial — 4 % of the area
+    at 1, 0.4 % at 0.1 — whatever the waves. And the life is FIXED
+    (FOAM_LIFE_SECONDS 9, × (.4 + .6 foam)): tied to the peak period a
+    long swell kept its foam twice as long as a short chop and read twice
+    as foamy at the same dial. Receipts: preset sea foam .5 — fold 2.07 %
+    at threshold .64 (target 2 %), 14.6 k live, whitecaps 5.1 %, far
+    specks 2.6 %; a steep sea (H 2.2) at .3 — fold 1.3 % at threshold .15
+    (target 1.2 %); foam .1 — fold 0.42 % at .55 (target 0.4 %). Harness
+    receipt `ocean: fold coverage … (target …)`, gated to 0.4–2.5× the
+    target. ⚠ The steep arm's high shot is full of spray blobs (sprites up
+    to ~2 m at σ 1.1 with the size jitter and the grid's clumping) — the
+    spray's own scale with the sea state is the next thing to look at.
 
 ## Open
 

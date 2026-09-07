@@ -90,7 +90,7 @@ export const FOAM_WINDOW_METRES = 512;
  * whitecap map as soft discs (a render target over the window, additive),
  * and the lid reads the map exactly as it read the memory.
  */
-export const FOAM_LIFE_SECONDS = 6;
+export const FOAM_LIFE_SECONDS = 9;
 /** Particles a hull seed asks per square metre per second at full value
  *  (24: a hull's seeds are small discs at low values, and the foam dial's
  *  three-halves power sits on top — "still no foam tail", user, 2026-09-07). */
@@ -115,6 +115,20 @@ export const FOAM_RATE = 16;
 export const FOAM_SIZE_PER_METRE = .025;
 /** The share of a frame's splats the map takes; the rest is last frame's. */
 export const FOAM_CARRY = .3;
+/**
+ * ⛔ THE FOAM DIAL IS A COVERAGE TARGET, NOT A THRESHOLD. A fixed fold
+ * threshold gave the harness's preset a sparse sea at 0.5 and the user's
+ * steeper sea a white one at 0.3 ("this is 0.3, which is already too
+ * much", 2026-09-07): how much of a sea folds under a given threshold is
+ * the sea state's business. The foam step's probes are uniform over the
+ * window, so the share of them that fold IS the folding fraction of the
+ * area; a slow controller (every readback, 20 frames) moves the threshold
+ * until that fraction is FOAM_COVERAGE × the dial — 4 % of the area at 1
+ * (the trails spread it to a storm's whitecaps), 0.4 % at 0.1 — whatever
+ * the waves ("I don't want to depend on those, only on the Foam
+ * parameter", user).
+ */
+export const FOAM_COVERAGE = .04;
 /**
  * ══ SPLASH (the paper's second particle system) ═════════════════════════
  * Spray is thrown where a crest folds hard (a stricter threshold than the
@@ -373,6 +387,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   // hull's tail and a splash's foam still come when the sea is busy.
   const liveCounter = instancedArray(new Uint32Array(4), "uint").toAtomic();
   let liveEstimate = 0, liveReadPending = false, liveReadFrame = 0;
+  let foldProbes = 0, foldHits = 0, lastGate = -1;
   // The splash pool: (x, y, z, age), (vx, vy, vz, life), (intensity, size),
   // and the RETURNS — a particle that met the surface this frame leaves
   // (x, z, intensity, 1) in its own slot, which the foam step reads.
@@ -516,8 +531,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       });
       f.spread.value = Math.max(.2, settings.waveLength * .1);
       f.disc.value = Math.min(1, Math.max(.1, settings.waveLength * .025));   // small specks, not blobs (the reference, user 2026-09-07)
-      const period = 2 * Math.PI / Math.max(1e-3, settings.peakOmega) / Math.max(1e-3, settings.timeScale);
-      f.baseLife = Math.min(20, Math.max(3, 2 * period));
+      // ⛔ A FIXED LIFE, NOT THE WAVE'S PERIOD: with the life tied to the
+      // peak period a long swell kept its foam twice as long as a short
+      // chop and read twice as foamy at the same dial ("I don't want to
+      // depend on those, only on the Foam parameter", user, 2026-09-07).
+      f.baseLife = FOAM_LIFE_SECONDS;
       f.life.value = f.baseLife;
       // Spray flies at ~1.6 √(g σ): a metre and a half up on a 1 m sea.
       sp.speed.value = 1.6 * Math.sqrt(GRAVITY * Math.max(.02, settings.sigma));
@@ -598,7 +616,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       if (foam != null) f.gate.value = Math.max(0, Math.min(1, foam));
       // The fold threshold on the minimum eigenvalue: `foam` 0 opens at 0.45
       // (a fold at the limit), 1 at 0.85 — the paper's 0.55 near 0.25.
-      f.threshold.value = .42 + .3 * f.gate.value;
+      // The dial seeds the threshold; the controller (the readback below)
+      // owns it from there. A moved dial re-seeds.
+      if (Math.abs(f.gate.value - lastGate) > .02) { f.threshold.value = .42 + .3 * f.gate.value; lastGate = f.gate.value; }
       sp.threshold.value = f.threshold.value - .1;
       sp.tryRate.value = Math.min(1, .5 * sp.amount.value);
       const t = f.texel.value;
@@ -676,7 +696,17 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       spectrum.generateMipmaps(renderer);
       if (renderer?.getArrayBufferAsync && particlesReady && !liveReadPending && ++liveReadFrame >= 20) {
         liveReadFrame = 0; liveReadPending = true;
-        renderer.getArrayBufferAsync(liveCounter.value).then((buf) => { liveEstimate = new Uint32Array(buf)[0] || 0; }).catch(() => {}).finally(() => { liveReadPending = false; });
+        renderer.getArrayBufferAsync(liveCounter.value).then((buf) => {
+          const counts = new Uint32Array(buf);
+          liveEstimate = counts[0] || 0; foldProbes = counts[1] || 0; foldHits = counts[2] || 0;
+          // The coverage controller: a step in log space toward the target.
+          const target = FOAM_COVERAGE * f.gate.value;
+          if (foldProbes > 200 && target > 0) {
+            const rate = foldHits / foldProbes;
+            const move = .03 * Math.max(-1, Math.min(1, Math.log((target + 1e-4) / (rate + 1e-4))));
+            f.threshold.value = Math.max(.05, Math.min(.95, f.threshold.value + move));
+          }
+        }).catch(() => {}).finally(() => { liveReadPending = false; });
       }
     },
     generateMipmaps(renderer) {
@@ -758,6 +788,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     threshold: f.threshold, timeScale: f.timeScale, ripple: () => spectrum.ripple ?? null,
   });
   spectrum.liveCount = () => liveEstimate;
+  spectrum.foldStats = () => ({ probes: foldProbes, folds: foldHits, rate: foldProbes ? foldHits / foldProbes : 0, threshold: f.threshold.value, target: FOAM_COVERAGE * f.gate.value });
   const buildKernels = () => {
     const ripple = spectrum.ripple ?? null;
     const localOf = (world) => vec3(world.x.div(ripple.scale.x), 0, world.y.div(ripple.scale.z));
@@ -828,8 +859,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
           }
         }).ElseIf(r0.lessThan(gate4), () => {
           const probe = f.center.add(vec2(r2, r3).sub(.5).mul(f.half.mul(2)));
+          atomicAdd(liveCounter.element(uint(1)), uint(1));
           const fold = seaFoldAt(spectrum, probe, f.lods);
           If(fold.x.lessThan(f.threshold), () => {
+            atomicAdd(liveCounter.element(uint(2)), uint(1));
             // Along the crest by ±spread, a little across it.
             const along = rnd(6).mul(2).sub(1).mul(f.spread), across = rnd(7).sub(.5).mul(f.spread.mul(.25));
             at.assign(probe.add(fold.yz.mul(along)).add(vec2(fold.z.negate(), fold.y).mul(across)));
@@ -853,7 +886,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         });
       });
     })().compute(particleCount);
-    const liveReset = Fn(() => { atomicStore(liveCounter.element(uint(0)), uint(0)); })().compute(1);
+    const liveReset = Fn(() => { atomicStore(liveCounter.element(uint(0)), uint(0)); atomicStore(liveCounter.element(uint(1)), uint(0)); atomicStore(liveCounter.element(uint(2)), uint(0)); })().compute(1);
     // ── THE SPLASH STEP ──────────────────────────────────────────────────
     // In the SEA'S time (a slowed sea throws slowed spray): gravity, a
     // little drag, the current (the frame the boat sits still in), and the
