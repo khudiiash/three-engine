@@ -403,6 +403,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   // beside an entry's crown), read by the splash step as its acceptance.
   sp.acceptValues = new Array(16).fill(0);
   sp.accepts = uniformArray(sp.acceptValues, "float");
+  // A seed may be a SEGMENT (its end, its outward normal) instead of a disc.
+  sp.endRows = Array.from({ length: 16 }, () => new THREE.Vector4());
+  sp.ends = uniformArray(sp.endRows, "vec4");
+  sp.kindValues = new Array(16).fill(0);
+  sp.kinds = uniformArray(sp.kindValues, "float");
 
   const cascades = Array.from({ length: cascadeCount }, (_, i) => {
     const c = { dk: uniform(1), cutLow: uniform(0), cutHigh: uniform(9999), amplitude: uniform(0), invL: uniform(1), L: 1,
@@ -544,7 +549,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       // ⛔ THE DIAL IS QUADRATIC ON THE INTERACTION SOURCES: linear, 0.1
       // still read as a tenth of a boat's tail ("still too much foam at
       // 0.1", user, 2026-09-07); squared it is a hundredth.
-      const dial = f.gate.value * f.gate.value;
+      const dial = Math.pow(f.gate.value, 1.5);
       for (let i = 0; i < count; i++) {
         const [, , r, a] = seeds[i];
         wants[i] = Math.PI * r * r * Math.min(1, a) * FOAM_SEED_DENSITY * step * dial;
@@ -565,7 +570,13 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         crowns[i] = (count != null ? Math.max(0, count) : Math.min(4000, Math.max(60, 200 * r * r * v))) * sp.amount.value;
         maxCrown = Math.max(maxCrown, crowns[i]);
       }
-      for (let i = 0; i < impacts; i++) sp.seedRows[i].set(splashes[i][0], splashes[i][1], splashes[i][2], splashes[i][3]);
+      for (let i = 0; i < impacts; i++) {
+        const [x, z, r, v, , x1, z1, nx, nz] = splashes[i];
+        sp.seedRows[i].set(x, z, r, v);
+        const segment = x1 != null && z1 != null;
+        sp.kindValues[i] = segment ? 1 : 0;
+        sp.endRows[i].set(segment ? x1 : x, segment ? z1 : z, nx || 0, nz || 0);
+      }
       sp.seedCount.value = impacts;
       sp.seedTry.value = maxCrown > 0 ? Math.min(1, 1.5 * impacts * maxCrown / splashCount) : 0;
       sp.crownAccept = crowns.map((c) => (maxCrown > 0 ? c / maxCrown : 0));
@@ -934,8 +945,14 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
           const seed = sp.seeds.element(which);
           If(rnd(28).lessThan(sp.accepts.element(which)), () => {
             const angle = rnd(15).mul(6.2831853), rad = r2.sqrt();
-            const radial = vec2(angle.cos(), angle.sin());
+            const radial = vec2(angle.cos(), angle.sin()).toVar();
             at.assign(seed.xy.add(radial.mul(rad).mul(seed.z)));
+            // A segment seed: born uniformly along it, thrown outward.
+            const end = sp.ends.element(which), segment = sp.kinds.element(which).greaterThan(.5);
+            If(segment, () => {
+              at.assign(mix(seed.xy, end.xy, r2).add(end.zw.mul(rnd(29).sub(.5).mul(seed.z.mul(2)))));
+              radial.assign(end.zw.add(vec2(end.w.negate(), end.z).mul(rnd(15).sub(.5).mul(.8))).normalize());
+            });
             // A crown is a SHEET before it is drops: its velocity is smooth
             // around the ring (three lobes with a phase from the seed's
             // place), the rim fastest; the breakup comes with age, below.

@@ -1482,11 +1482,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
      *  entry speed (m/s) — a crown of spray (waterSpectrum.js). */
     /** `count` (optional): particles this frame instead of an entry's crown
      *  — contact spray, handed every frame by a moving hull. */
-    addWaterSplash(x,z,radius,speed,count=null) {
+    addWaterSplash(x,z,radius,speed,count=null,x1=null,z1=null,nx=0,nz=0) {
       if(kind!=="water" || !spectrum || ![x,z,radius,speed].every(Number.isFinite) || !(speed>0))return false;
       if(count!=null&&!(count>0))return false;
       while(pendingSplash.length>=16)pendingSplash.shift();
-      pendingSplash.push([x,z,Math.max(2*Math.max(sx,sz),radius),speed,count]);
+      // A segment (x, z → x1, z1) with an outward normal, or a disc.
+      const segment=Number.isFinite(x1)&&Number.isFinite(z1);
+      pendingSplash.push([x,z,Math.max(2*Math.max(sx,sz),radius),speed,count,segment?x1:null,segment?z1:null,nx,nz]);
       return true;
     },
     restart() { initialized = false; accumulator = 0; elapsed = 0; u.simTime.value = 0; pendingImpulses.length=0; pendingFoam.length=0; pendingSplash.length=0; spectrum?.restart(); updateBounds(); },
@@ -1639,7 +1641,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // (in the sea's metres, a value near 1 at full speed) — the tail.
         const ws = u.waveScale.value;
         const seeds = pendingFoam.map(([x, z, r, a]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .3), Math.min(1, a * 4)]);
-        const splashes = pendingSplash.map(([x, z, r, v, count]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .2), v, count ?? null]);
+        const splashes = pendingSplash.map(([x, z, r, v, count, x1, z1, nx, nz]) => {
+          const nm = Math.hypot(nx * ws.x, nz * ws.z) || 1;
+          return [x * ws.x, z * ws.z, Math.max(r * ws.x, .2), v, count ?? null, x1 == null ? null : x1 * ws.x, z1 == null ? null : z1 * ws.z, nx * ws.x / nm, nz * ws.z / nm];
+        });
         pendingSplash.length = 0;
         spectrum.splash?.scale.value.copy(ws);
         const seaQueue = spectrum.passes(delta, elapsed, { eye: seaEye, foam: u.foam.value,

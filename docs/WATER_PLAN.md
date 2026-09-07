@@ -771,6 +771,22 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     current ±100 m/s (schema, `finite` clamps in gridSimulation and
     waterPhysics, the spectrum's own clamps) — the pool is the only
     ceiling, and it cannot crash anything. Physics 20 + spectrum 12.
+61. SPRAY ALONG THE OUTLINE'S SEGMENTS; THE TAIL BACK. "A couple of points
+    where the splashes come from … equally on where the contact shape
+    is": the contact spray took every second waterline SAMPLE, metres
+    apart, and each was a small disc — jets from points. The ring's
+    consecutive samples are SEGMENTS now (start, end, an outward normal
+    away from the hull's centre, the length in metres), built once per
+    body in `waterPhysics.js` and shared by the contact spray (the leading
+    segments, (through − 1) × 60 drops/s PER METRE) and the slam spray
+    (all segments); `addWaterSplash(x, z, r, v, count, x1, z1, nx, nz)` →
+    `sp.ends` and `sp.kinds` uniform arrays → the GPU births a segment
+    seed uniformly along it and throws it along the normal (± 0.4 jitter
+    along the segment). Receipt: a 6 m segment seed of 300 births 393
+    drops along it, x mean −0.04 m, mean outward velocity +0.78 m/s;
+    physics 20. "The foam tail disappeared": the square of the dial
+    erased it at the user's setting — the interaction dial is foam^1.5
+    (0.1 → 3 %, 0.3 → 16 %): a faint tail at 0.1, a full one at 1.
 
 ## Open
 

@@ -452,12 +452,34 @@ export class WaterPhysics {
           // held in a 5 m/s current takes the whole sea on its bow ("there
           // must be a huge amount of force of water hitting the front of
           // the boat", user, 2026-09-07).
+          // ── THE OUTLINE AS SEGMENTS (2026-09-07) ──────────────────────
+          // Spray from a few samples jetted from a few points ("a couple of
+          // points where the splashes come from … could we fix that so the
+          // splashes occur equally on the contact shape", user). The ring's
+          // consecutive samples make SEGMENTS; the sea births spray
+          // uniformly along a segment and throws it OUTWARD (the segment's
+          // normal away from the hull's centre), the count per metre.
+          const order=[[0,0],[1,0],[2,0],[3,0],[3,1],[3,2],[3,3],[2,3],[1,3],[0,3],[0,2],[0,1]];
+          const byCollider=new Map();
+          for(const sample of waterline){if(!byCollider.has(sample.collider))byCollider.set(sample.collider,new Map());byCollider.get(sample.collider).set(`${sample.gx}:${sample.gz}`,sample);}
+          const segments=[];
+          for(const ring of byCollider.values()){
+            for(let k=0;k<order.length;k++){
+              const a=ring.get(`${order[k][0]}:${order[k][1]}`),b=ring.get(`${order[(k+1)%order.length][0]}:${order[(k+1)%order.length][1]}`);
+              if(!a||!b)continue;
+              const qa=query(a.point),qb=query(b.point);if(!qa||!qb)continue;
+              const dx=qb.localX-qa.localX,dz=qb.localZ-qa.localZ,len=Math.hypot(dx,dz);if(!(len>1e-6))continue;
+              let nx=-dz/len,nz=dx/len;
+              const mx=(qa.localX+qb.localX)/2-filter.x,mz=(qa.localZ+qb.localZ)/2-filter.z;
+              if(nx*mx+nz*mz<0){nx=-nx;nz=-nz;}
+              segments.push({ax:qa.localX,az:qa.localZ,bx:qb.localX,bz:qb.localZ,nx,nz,metres:len*flat,mx,mz});
+            }
+          }
           if(through>1.5&&dt>0){
-            const rate=(through-1)*60*dt;
-            for(let i=0;i<waterline.length;i+=2){
-              const at=query(waterline[i].point);if(!at)continue;
-              const lead=(at.localX-filter.x)*rvx+(at.localZ-filter.z)*rvz;
-              if(lead>0)c.simulation.addWaterSplash?.(at.localX,at.localZ,.5/flat,through,rate);
+            const perMetre=(through-1)*60*dt;
+            for(const s of segments){
+              if(s.mx*rvx+s.mz*rvz<=0)continue;   // the leading side only
+              c.simulation.addWaterSplash?.(s.ax,s.az,.25/flat,through,perMetre*s.metres,s.bx,s.bz,s.nx,s.nz);
             }
           }
           // ── A WAVE SLAMMING THE HULL (2026-09-07) ────────────────────────
@@ -471,11 +493,8 @@ export class WaterPhysics {
           this.surfaceMemo.set(body,surface.height);
           const slam=sinking+Math.max(0,Math.min(12,rising));
           if(slam>1.5&&dt>0){
-            const rate=(slam-1)*20*dt;
-            for(let i=0;i<waterline.length;i+=2){
-              const at=query(waterline[i].point);if(!at)continue;
-              c.simulation.addWaterSplash?.(at.localX,at.localZ,.4/flat,slam*.6,rate);
-            }
+            const perMetre=(slam-1)*20*dt;
+            for(const s of segments)c.simulation.addWaterSplash?.(s.ax,s.az,.25/flat,slam*.6,perMetre*s.metres,s.bx,s.bz,s.nx,s.nz);
           }
           // A quarter per second at full speed: the field's 2.5 s life makes a
           // steady band of ~0.6 — patches and streaks, not a sheet (1.5/s
@@ -487,9 +506,6 @@ export class WaterPhysics {
             // consecutive border samples, a disc of the band's own width
             // (0.2–1 m, in the water's local units) every two widths.
             const seed=(point,width)=>{const at=query(point);if(at)c.simulation.addWaterFoam?.(at.localX,at.localZ,width/flat,amount);};
-            const order=[[0,0],[1,0],[2,0],[3,0],[3,1],[3,2],[3,3],[2,3],[1,3],[0,3],[0,2],[0,1]];
-            const byCollider=new Map();
-            for(const sample of waterline){if(!byCollider.has(sample.collider))byCollider.set(sample.collider,new Map());byCollider.get(sample.collider).set(`${sample.gx}:${sample.gz}`,sample);}
             for(const ring of byCollider.values()){
               for(let k=0;k<order.length;k++){
                 const a=ring.get(`${order[k][0]}:${order[k][1]}`),b=ring.get(`${order[(k+1)%order.length][0]}:${order[(k+1)%order.length][1]}`);

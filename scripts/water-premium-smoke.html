@@ -454,6 +454,21 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
        let brightened = 0; for (let i = 0; i < W * H * 4; i += 4) { const l0 = quiet[i] * .2126 + quiet[i + 1] * .7152 + quiet[i + 2] * .0722, l1 = shot[i] * .2126 + shot[i + 1] * .7152 + shot[i + 2] * .0722; if (l1 - l0 > 40) brightened++; }
        log(`ocean: the crown brightened ${brightened} pixels of ${W * H} against the frame before the impact (0.2 s after it)`);
        if (!(brightened > 60)) throw new Error(`the spray is not drawn: ${brightened} pixels brightened (want > 60)`);
+       // ── A SEGMENT SEED (2026-09-07) ─────────────────────────────────
+       // A hull's outline hands the sea segments, not points: 300 drops
+       // along a 6 m segment thrown outward (+z) — the births must spread
+       // along it (their x standard deviation near a uniform 6 m's 1.7 m).
+       {
+         const before = await sp2.readSplashes(renderer);
+         const wasAlive = new Uint8Array(before.pos.length / 4); for (let i = 0; i < before.pos.length; i += 4) wasAlive[i / 4] = before.pos[i + 3] < before.vel[i + 3] ? 1 : 0;
+         sim.addWaterSplash(-3 / S, seedZ / S, .25 / S, 4, 300, 3 / S, seedZ / S, 0, 1); await step(); await step();
+         const after = await sp2.readSplashes(renderer);
+         let n = 0, sx = 0, sxx = 0, vz = 0;
+         for (let i = 0; i < after.pos.length; i += 4) { if (wasAlive[i / 4] || !(after.pos[i + 3] < after.vel[i + 3])) continue; if (Math.abs(after.pos[i + 2] - seedZ) > 2) continue; n++; sx += after.pos[i]; sxx += after.pos[i] ** 2; vz += after.vel[i + 2]; }
+         const mean = sx / Math.max(1, n), sd = Math.sqrt(Math.max(0, sxx / Math.max(1, n) - mean * mean));
+         log(`ocean: a 6 m segment seed (300 drops, outward +z) birthed ${n} drops — x mean ${mean.toFixed(2)} m, sd ${sd.toFixed(2)} m (uniform along 6 m: 1.73), mean vz ${(vz / Math.max(1, n)).toFixed(2)} m/s (outward)`);
+         if (!(n > 100 && sd > 1.2 && vz / Math.max(1, n) > 0)) throw new Error(`the segment seed is not born along the segment: ${n} drops, sd ${sd.toFixed(2)} m, vz ${(vz / Math.max(1, n)).toFixed(2)}`);
+       }
        await run(110);
        const pp2 = await sp2.readParticles(renderer);
        let landed = 0; for (let i = 0; i < pp2.length; i += 4) if (pp2[i + 2] < pp2[i + 3] && Math.hypot(pp2[i], pp2[i + 1] - seedZ) < 4) landed++;
