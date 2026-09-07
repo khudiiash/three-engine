@@ -316,6 +316,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const uv = rippleUv(local);
     return select(rippleInside(uv), texture(rippleTexture, uv).level(0), vec4(0));
   };
+  const flowAt = (local) => {
+    if (!flowTexture) return vec4(0);
+    const uv = rippleUv(local);
+    return select(rippleInside(uv), texture(flowTexture, uv).level(0), vec4(0));
+  };
+  // The sea's foam particles read the ripple window (waterSpectrum.js): the
+  // field's foam is a birth SOURCE and its flow carries the particles, so a
+  // wake's foam, a splash's and a crest's are one system with one motion.
+  if (spectrum && rippleTexture) spectrum.ripple = { at: rippleAt, flow: flowAt, scale: u.waveScale, center: u.rippleCenter, half: u.rippleHalf };
   const pinned = () => u.pin.equal(0).and(y.equal(0))
     .or(u.pin.equal(1).and(y.equal(0)).and(x.equal(0).or(x.equal(n - 1))))
     .or(u.pin.equal(2).and(x.equal(0)))

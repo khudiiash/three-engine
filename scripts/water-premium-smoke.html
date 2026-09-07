@@ -676,6 +676,16 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
      for (let i = 0; i < sim.count; i++) { const v = f[i]; sum += v; if (v > .5) sheet++; if (v > .05) any++; }
      log(`foam 4 s after the splash (foam dial ${USER.foam}): mean ${(sum / sim.count).toFixed(3)}, ${(sheet / sim.count * 100).toFixed(1)}% of the lid a sheet (> .5), ${(any / sim.count * 100).toFixed(1)}% foamed at all (> .05)`);
      if (!(sheet / sim.count < .15 * USER.foam + .02)) throw new Error(`the splash foamed the pool: ${(sheet / sim.count * 100).toFixed(1)}% sheet`);
+     // ── THE FIELD'S FOAM IS A PARTICLE SOURCE (2026-09-07) ─────────────
+     // The ripple field is not drawn any more: the sea's foam particles are
+     // born from it (waterSpectrum.js, `spectrum.ripple`). Four seconds on,
+     // the splash must have particles around it (the sea's metres).
+     if (sim.spectrum?.readParticles) {
+       const pp = await sim.spectrum.readParticles(renderer);
+       let near = 0; if (pp) for (let i = 0; i < pp.length; i += 4) if (pp[i + 2] < pp[i + 3] && Math.hypot(pp[i], pp[i + 1]) < 3) near++;
+       log(`foam particles 4 s after the splash: ${near} live within 3 m of it (born from the ripple field's foam)`);
+       if (!(near > 20)) throw new Error(`the splash's foam did not become particles: ${near} within 3 m`);
+     }
      // ── THE CURRENT CARRIES THE WAKE'S FOAM (2026-09-07) ──────────────
      // With ?current=, the splash's foam centroid must have moved along the
      // current by roughly the 2.5 s between the two readings.

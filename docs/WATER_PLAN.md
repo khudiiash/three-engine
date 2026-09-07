@@ -593,6 +593,33 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     current`); `test:water` 41, the 5 m pool arm passes. The far-band
     receipt is SPECKS over the band's mean (> 0.2 %), not white pixels: at
     250 m a speck is a few pixels the mips dim, as in the reference.
+55. ⛔ ONE PARTICLE SYSTEM, ONE MOTION — the map IS the foam. After trap 54
+    the user still saw the old foam: "flickery, unnatural, a noise pattern
+    that does not move with it", and the new dots "don't move with the
+    current". Three causes, none of them the pool: (1) the LOOK multiplied
+    the map by fractal noise sampled at the WORLD position (bubbles,
+    streak, patch) — the noise stood still while the particles streamed,
+    and its `clock` animation flickered; (2) the RIPPLE FIELD's foam was
+    still DRAWN as its own layer (sheet/torn/flecks with the same fbm) on
+    top of the particles; (3) the SPRAY did not get the current (a frame
+    trick the boat sits still in — everything on screen must ride it,
+    drops in the air included). Now `waterFoam.js` draws the map with a
+    soft threshold and nothing else (`sea.smoothstep(.06, .55)`, far the
+    mip coverage), the ripple field is a particle SOURCE — gridSimulation
+    hands the sea `spectrum.ripple` (the field's foam and flow at a local
+    point, the scale; the kernels are built at the first tick so they can
+    read it) and a dead particle probes the window at twice FOAM_RATE with
+    the field's foam × 4 as its chance, while a live one inside the window
+    rides the field's FLOW — and the splash step adds `currentVel · dt`.
+    Spray is a cloud: the pool is a quarter of the foam's (32 k), the fold
+    probe share .5 within 80 m, a crown 200 r² v (60–4000), and
+    SPLASH_SPRITES = 4 billboards per drop, jittered three sizes around
+    it. Receipts: whitecaps 3.5 %, far specks 2.07 %, hull seed 80, spray
+    761 live, a 1 m / 4 m/s impact throws 1 170 drops (4 680 sprites,
+    23 957 pixels brightened from 6 m) and leaves 428 foam particles; 2 m/s
+    current — 1.97 m in a second; the 5 m pool's splash has 442 live foam
+    particles within 3 m four seconds on (born from the field); the pool
+    arm passes; `test:water` 41.
 
 ## Open
 

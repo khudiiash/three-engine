@@ -269,27 +269,21 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
   // reversed-edge form is undefined in GLSL and not worth a doubt in WGSL.)
   // Streaks run along the wind — or along the CURRENT when there is one: a
   // hull's tail streams downstream.
-  const wind = mix(vec2(u.waveCos, u.waveSin), vec2(u.currentCos, u.currentSin), u.current.abs().smoothstep(0, .5));
-  const along = p.dot(wind), across = p.y.mul(wind.x).sub(p.x.mul(wind.y));
-  const streak = fbm(vec2(along.mul(.18), across.mul(1.6)), clock, .5);
-  const bubbles = fbm(p.mul(4.5), clock, 1.6);
+  // ⛔ THE MAP IS THE FOAM. No fractal on top of it: a noise sampled at the
+  // world position stays put while the particles stream with the current,
+  // and an animated one flickers ("a noise pattern that does not move with
+  // it", user, 2026-09-07). What the eye sees is the particles themselves —
+  // specks, streaks, lace, holes — the paper's picture. A soft threshold
+  // keeps a Gaussian's faint tail from greying the water; far away the
+  // mip-filtered coverage is the tone. The ripple field's foam is not drawn
+  // here any more: it is a SOURCE for the particles (gridSimulation.js
+  // `spectrum.ripple`), so a wake and a crest share one motion.
   const metres = positionWorld.sub(cameraPosition).length();
-  const bubbleDetail = metres.smoothstep(15, 60).oneMinus(), streakDetail = metres.smoothstep(60, 240).oneMinus();
-  // Against the real thing (a storm sea beside ours, user 2026-09-07): foam
-  // is SPARSE — a sheet only where a crest has just broken, thin streaks
-  // drawn along the crests behind it, holes in both — never patches.
-  // The particles bring the structure — filaments and holes emerge from the
-  // advection, as the paper shows — so the pixel adds only the bubbles and a
-  // soft threshold; the synthetic streak is gone.
-  const capSheet = sea.sub(bubbles.mul(.2).mul(bubbleDetail)).smoothstep(.55, .9);
-  const capPatches = sea.sub(bubbles.mul(.15).mul(bubbleDetail)).smoothstep(.15, .5).mul(.75);
-  const capTexture = mix(float(.85), bubbles.mul(.6).add(.45), bubbleDetail);
-  const near = capSheet.max(capPatches).mul(capTexture).clamp(0, 1);
-  void streak; void streakDetail;
-  // Far: the mip-filtered coverage itself, as a tone.
-  const far = sea.smoothstep(.04, .5).mul(.6);
+  const near = sea.smoothstep(.06, .55);
+  const far = sea.smoothstep(.03, .4).mul(.6);
   const whitecap = mix(near, far, metres.smoothstep(60, 240));
-  return wake.max(whitecap).mul(u.foam.smoothstep(0, .15));
+  void wake;
+  return whitecap.max(contact.mul(.5)).mul(u.foam.smoothstep(0, .15));
 }
 
 /**
