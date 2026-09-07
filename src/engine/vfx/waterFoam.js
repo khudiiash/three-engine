@@ -305,8 +305,9 @@ function waterFoamBody(u, sceneDepth, spectrum, flow) {
   // 2026-09-07). A FLOW MAP: two lace samples advected by the swirl over a
   // three-second period, half a period apart, cross-faded — the standard
   // trick (Crest, Unreal) for a texture that must follow a flow field.
-  const swirl = spectrum?.flow ? spectrum.flow.at(p) : vec2(0);
-  const PERIOD = 3;
+  const swirlRaw = spectrum?.flow ? spectrum.flow.at(p) : vec2(0), swirlSpeed = swirlRaw.length();
+  const swirl = swirlRaw.mul(swirlSpeed.min(.6).div(swirlSpeed.max(1e-3)));   // the lace follows gentle swirls only
+  const PERIOD = 4;
   const phaseA = time.div(PERIOD).fract(), phaseB = time.div(PERIOD).add(.5).fract();
   const restA = rest.sub(swirl.mul(phaseA.sub(.5).mul(PERIOD))), restB = rest.sub(swirl.mul(phaseB.sub(.5).mul(PERIOD)));
   const weightA = phaseA.mul(2).sub(1).abs().oneMinus(), weightB = phaseB.mul(2).sub(1).abs().oneMinus();

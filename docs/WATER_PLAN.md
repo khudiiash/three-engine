@@ -729,6 +729,31 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     (the spray binds three storage buffers, the splat two); the spray
     mesh opts out of batching/merging regardless — paste the lines before
     it if it recurs.
+59. ⛔ THE SPRAY MESH LIVES IN THE LID'S FRAME, AND THE MAP IS A FEEDBACK
+    BUFFER. (a) "Sprays are still sitting below the surface": the spray
+    mesh was a SIBLING of the lid under the entity, but the lid mesh's
+    matrix carries the fill level (a primitive's lid sits at +5 m local in
+    the user's scene) and a plane source's rotation — the drops were drawn
+    five metres under the lid. The spray mesh is a CHILD of the lid mesh
+    now (GridSimulationComponent and the harness alike): `modelWorldMatrix`
+    is the lid's, `sp.scale` its basis. (b) "Foam appears/disappears
+    rapidly, mostly on the boat's tail": a dense tail's mask fluttered ±20 %
+    a frame as its specks moved apart and were born, and the lace dissolve
+    flipped cells with it. Sea of Thieves blurs its foam buffer WITH
+    FEEDBACK; ours does the same — two targets ping-ponged, a carry quad
+    draws last frame's map at the same WORLD position × (1 − FOAM_CARRY .3)
+    with NoBlending first, the splats add FOAM_CARRY of this frame's on top
+    (an EMA, τ ≈ 3 frames, steady state unchanged); `spectrum.nodes.foam`
+    swaps to the written target each frame, the blitter mips it. Also
+    bounded: the swirl a particle takes (2 m/s), the ripple flow the field
+    relaxes to (1.5 m/s at τ ½ s), the swirl the lace's flow map follows
+    (0.6 m/s, period 4 s). (c) "Still too much foam at 0.1": the dial is
+    LINEAR on every interaction source now (seeds, ripple probes, returns ×
+    foam; the contact ring × (.3 + .7 foam)), the cap .3 + .6 foam, and the
+    LIFE × (.4 + .6 foam) — a low dial has short tails. Receipts: foam .3 —
+    6.6 k live, whitecaps 2.3 %, far specks 0.51 %, hull seed 64, crown
+    44 037 px, 374 foam from returns; foam .1 — 1.3 k live (11 k before
+    the dial's reach); pool arm passes (429); physics 20 + spectrum 12.
 
 ## Open
 

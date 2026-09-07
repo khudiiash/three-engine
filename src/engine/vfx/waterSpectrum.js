@@ -111,6 +111,8 @@ export const FOAM_RATE = 16;
  * finer than a pixel is a coverage the mips carry anyway.
  */
 export const FOAM_SIZE_PER_METRE = .025;
+/** The share of a frame's splats the map takes; the rest is last frame's. */
+export const FOAM_CARRY = .3;
 /**
  * ══ SPLASH (the paper's second particle system) ═════════════════════════
  * Spray is thrown where a crest folds hard (a stricter threshold than the
@@ -310,13 +312,25 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   // regenerates a render target's mips after every render with a pass that
   // allocates a view and a bind group per level (the descriptor-heap OOM of
   // gpuMipmaps.js); ours are blitted by `generateMipmaps` below instead.
-  const foamTarget = new THREE.RenderTarget(foamSize, foamSize, {
-    type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: false, stencilBuffer: false,
-    minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
+  // Two targets, ping-ponged: the map is an EXPONENTIAL MOVING AVERAGE of
+  // the splats over frames — Sea of Thieves' "progressively blur with
+  // feedback". A dense tail's mask fluttered ±20 % a frame as its specks
+  // moved and were born, and the lace dissolve flipped cells with it
+  // ("appears/disappears rapidly, mostly on the boat's tail", user,
+  // 2026-09-07); the carry holds (1 − FOAM_CARRY) of last frame's map at
+  // the same world position and the splats add FOAM_CARRY of this frame's.
+  const foamTargets = [0, 1].map((k) => {
+    const target = new THREE.RenderTarget(foamSize, foamSize, {
+      type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: false, stencilBuffer: false,
+      minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
+    });
+    target.texture.name = `sea foam ${k}`;
+    target.texture.wrapS = target.texture.wrapT = THREE.ClampToEdgeWrapping;
+    target.texture.mipmaps = Array.from({ length: Math.floor(Math.log2(foamSize)) + 1 }, (_, i) => ({ width: foamSize >> i, height: foamSize >> i }));
+    return target;
   });
-  foamTarget.texture.name = "sea foam";
-  foamTarget.texture.wrapS = foamTarget.texture.wrapT = THREE.ClampToEdgeWrapping;
-  foamTarget.texture.mipmaps = Array.from({ length: Math.floor(Math.log2(foamSize)) + 1 }, (_, i) => ({ width: foamSize >> i, height: foamSize >> i }));
+  let foamPhase = 0;
+  let foamTarget = foamTargets[0];
   // The pool is sized to the map: 128 k particles behind a 1024² map (a
   // 4 % whitecap coverage of the window is ~10 k m², three discs deep).
   const particleCount = (foamSize * foamSize) >> 3;
@@ -340,9 +354,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     threshold: uniform(.55), tryRate: uniform(.3), rippleTry: uniform(0), spread: uniform(2.5), disc: uniform(1.2),
     // The density gate's cap (how white a sheet may get), from the foam dial.
     cap: uniform(.9),
+    // Last frame's window centre (the carry samples the old map there).
+    prevCenter: uniform(new THREE.Vector2(0, 0)),
     // A particle's full life, real seconds: twice the peak period (a crest
     // outruns the foam it made; the trail is what the wind streaks are).
-    life: uniform(FOAM_LIFE_SECONDS),
+    life: uniform(FOAM_LIFE_SECONDS), baseLife: FOAM_LIFE_SECONDS,
     zeroLods: Array.from({ length: cascadeCount }, () => uniform(0)),
   };
   f.seeds = uniformArray(f.seedRows, "vec4");
@@ -494,7 +510,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       f.spread.value = Math.max(.2, settings.waveLength * .1);
       f.disc.value = Math.min(1, Math.max(.1, settings.waveLength * .025));   // small specks, not blobs (the reference, user 2026-09-07)
       const period = 2 * Math.PI / Math.max(1e-3, settings.peakOmega) / Math.max(1e-3, settings.timeScale);
-      f.life.value = Math.min(20, Math.max(3, 2 * period));
+      f.baseLife = Math.min(20, Math.max(3, 2 * period));
+      f.life.value = f.baseLife;
       // Spray flies at ~1.6 √(g σ): a metre and a half up on a 1 m sea.
       sp.speed.value = 1.6 * Math.sqrt(GRAVITY * Math.max(.02, settings.sigma));
       sp.size.value = Math.min(.3, Math.max(.04, settings.sigma * .25));
@@ -522,7 +539,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       const wants = new Array(count);
       // The foam dial scales a hull's seeds too ("even on 0.1 there is too
       // much of it", user, 2026-09-07): a fifth at 0, all at 1.
-      const dial = .2 + .8 * f.gate.value;
+      const dial = f.gate.value;
       for (let i = 0; i < count; i++) {
         const [, , r, a] = seeds[i];
         wants[i] = Math.PI * r * r * Math.min(1, a) * FOAM_SEED_DENSITY * step * dial;
@@ -562,6 +579,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       sp.threshold.value = f.threshold.value - .1;
       sp.tryRate.value = Math.min(1, .5 * sp.amount.value);
       const t = f.texel.value;
+      f.prevCenter.value.copy(f.center.value);
       if (eye) f.center.value.set(Math.round(eye[0] / t) * t, Math.round(eye[1] / t) * t);
       if (current && (current[0] || current[1])) {
         // ⚠ THE SCROLL DECREASES. The sea is sampled at world + scroll, so the
@@ -579,9 +597,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       f.tryRate.value = Math.min(1, FOAM_RATE * (2 * f.half.value) ** 2 * step / particleCount);
       // The ripple window's foam is probed at twice the sea's rate over its own area.
       const ripple = spectrum.ripple;
-      f.rippleTry.value = ripple ? Math.min(1, 2 * FOAM_RATE * (2 * ripple.half.value.x * ripple.scale.value.x) * (2 * ripple.half.value.y * ripple.scale.value.z) * step / particleCount) * (.15 + .85 * f.gate.value) : 0;
-      sp.returnTry.value = .3 * (.3 + .7 * f.gate.value);
-      f.cap.value = .5 + .4 * f.gate.value;
+      f.rippleTry.value = ripple ? Math.min(1, 2 * FOAM_RATE * (2 * ripple.half.value.x * ripple.scale.value.x) * (2 * ripple.half.value.y * ripple.scale.value.z) * step / particleCount) * f.gate.value : 0;
+      sp.returnTry.value = .3 * f.gate.value;
+      f.cap.value = .3 + .6 * f.gate.value;
+      f.life.value = f.baseLife * (.4 + .6 * f.gate.value);
       {
         const cv = f.currentVel.value, speed = Math.hypot(cv.x, cv.y), k = Math.min(1, speed / .5);
         const ax = sp.dir.value.x * (1 - k) + (speed > 0 ? cv.x / speed : 0) * k, az = sp.dir.value.y * (1 - k) + (speed > 0 ? cv.y / speed : 0) * k;
@@ -617,6 +636,11 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         const target = renderer.getRenderTarget(), alpha = renderer.getClearAlpha();
         renderer.getClearColor(previousClear);
         try {
+          // Ping-pong: read the map the lid read last frame, write the other.
+          previousFoam.value = foamTargets[foamPhase].texture;
+          foamPhase = 1 - foamPhase;
+          foamTarget = foamTargets[foamPhase];
+          spectrum.nodes.foam.value = foamTarget.texture;
           renderer.setRenderTarget(foamTarget);
           renderer.setClearColor(0x000000, 1);
           renderer.render(splatScene, splatCamera);
@@ -674,7 +698,7 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       spectrum.flow?.dispose(renderer);
       releaseStorageAttributes(renderer, [particles.value, particleAux.value, splash.value, splashVel.value, splashAux.value, returns.value, liveCounter.value, sprayGridV.value, sprayGridP.value].filter(Boolean));
       for (const c of cascades) for (const t of c.textures) t.dispose();
-      foamTarget.dispose(); splatMaterial.dispose(); splatGeometry.dispose();
+      for (const t of foamTargets) t.dispose(); splatMaterial.dispose(); splatGeometry.dispose(); carryMaterial.dispose(); carryMesh.geometry.dispose();
       splashMesh.removeFromParent(); splashMaterial.dispose(); splashGeometry.dispose();
       displacement.dispose(); derivatives.dispose(); velocity.dispose(); noise.dispose();
     },
@@ -742,7 +766,8 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
       If(p.z.lessThan(p.w), () => {
         // The sea's own velocity, the fluid's swirl on top of it (which
         // carries the ripple field's flow inside its window), the current.
-        const vel = seaVelocityAt(spectrum, p.xy, f.zeroLods).mul(f.timeScale).add(flow.at(p.xy)).add(f.currentVel).toVar();
+        const swirl = flow.at(p.xy), swirlSpeed = swirl.length();
+        const vel = seaVelocityAt(spectrum, p.xy, f.zeroLods).mul(f.timeScale).add(swirl.mul(swirlSpeed.min(2).div(swirlSpeed.max(1e-3)))).add(f.currentVel).toVar();
         p.xy.assign(p.xy.add(vel.mul(f.dt)));
         p.z.assign(p.z.add(f.dt));
         particles.element(i).assign(p);
@@ -976,10 +1001,22 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
     splatParticle.w.sub(splatParticle.z).max(0).div(f.life.div(3)).negate().exp().oneMinus().mul(splatParticle.z.div(.5).clamp(0, 1)).mul(splatAux.x).div(splatGrow),
     "seaFoamSplat");
   const splatRadius = uvAttribute().sub(.5).length().mul(2);
-  splatMaterial.colorNode = vec3(splatRadius.mul(splatRadius).mul(-4).exp().mul(splatIntensity));
+  splatMaterial.colorNode = vec3(splatRadius.mul(splatRadius).mul(-4).exp().mul(splatIntensity).mul(FOAM_CARRY));
   const splatMesh = new THREE.Mesh(splatGeometry, splatMaterial);
-  splatMesh.frustumCulled = false;
-  const splatScene = new THREE.Scene(); splatScene.add(splatMesh);
+  splatMesh.frustumCulled = false; splatMesh.renderOrder = 1;
+  // The carry: last frame's map, at the same world position, × (1 − FOAM_CARRY).
+  const previousFoam = texture(foamTargets[1].texture);
+  const carryMaterial = new THREE.MeshBasicNodeMaterial({ transparent: false, depthTest: false, depthWrite: false, blending: THREE.NoBlending, side: THREE.DoubleSide, fog: false });
+  carryMaterial.vertexNode = vec4(positionGeometry.xy, 0, 1);
+  {
+    const mapUv = vec2(uvAttribute().x, uvAttribute().y.oneMinus());
+    const prevUv = mapUv.add(f.center.sub(f.prevCenter).div(f.half.mul(2)));
+    const inside = prevUv.x.greaterThan(0).and(prevUv.x.lessThan(1)).and(prevUv.y.greaterThan(0)).and(prevUv.y.lessThan(1));
+    carryMaterial.colorNode = select(inside, previousFoam.sample(prevUv).level(0).xyz, vec3(0)).mul(1 - FOAM_CARRY);
+  }
+  const carryMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), carryMaterial);
+  carryMesh.frustumCulled = false; carryMesh.renderOrder = 0;
+  const splatScene = new THREE.Scene(); splatScene.add(carryMesh); splatScene.add(splatMesh);
   const splatCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   const previousClear = new THREE.Color();
   // ── THE SPRAY'S SPRITES ─────────────────────────────────────────────────

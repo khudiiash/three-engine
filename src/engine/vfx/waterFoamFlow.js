@@ -112,8 +112,9 @@ export function createFoamFlow({ size = 256, seaFold, seaVelocity, threshold, ti
       const local = vec2(world.x.div(ripple.scale.x), world.y.div(ripple.scale.z));
       const rin = local.x.sub(ripple.center.x).abs().lessThan(ripple.half.x).and(local.y.sub(ripple.center.y).abs().lessThan(ripple.half.y));
       const f = ripple.flow(vec4(local.x, 0, local.y, 0).xyz).xy;
-      const fm = vec2(f.x.mul(ripple.scale.x), f.y.mul(ripple.scale.z));
-      w.assign(select(rin, w.add(fm.sub(w).mul(u.dt.mul(4).min(1))), w));
+      const fmRaw = vec2(f.x.mul(ripple.scale.x), f.y.mul(ripple.scale.z)), fs = fmRaw.length();
+      const fm = fmRaw.mul(fs.min(1.5).div(fs.max(1e-3)));   // a hull's push, bounded to 1.5 m/s
+      w.assign(select(rin, w.add(fm.sub(w).mul(u.dt.mul(2).min(1))), w));
     }
     // Vorticity confinement: push the flow around the eddies it already has.
     const cl = textureLoad(curl, at(i.sub(1), j)).x.abs(), cr = textureLoad(curl, at(i.add(1), j)).x.abs();

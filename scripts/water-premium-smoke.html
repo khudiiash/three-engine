@@ -160,7 +160,7 @@ globalThis.__waterCurrentCopy = argument('currentCopy', '0') === '1';
    holder.add(sim.mesh);
    // The sea's spray sprites — the component adds them to the entity; here
    // there is no component, so the harness does (or the receipt is blind).
-   if (sim.spectrum?.splashMesh) holder.add(sim.spectrum.splashMesh);
+   if (sim.spectrum?.splashMesh) sim.mesh.add(sim.spectrum.splashMesh);
    sim.mesh.matrixAutoUpdate = false;
    sim.mesh.matrix.identity();                 // origin ON the lid, at world y = 0
    sim.mesh.matrixWorldNeedsUpdate = true;
