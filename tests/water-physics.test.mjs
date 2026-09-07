@@ -5,11 +5,11 @@ import * as THREE from 'three/webgpu';
 import { PhysicsSystem, bodyDensitySI } from '../src/modules/physics-rapier/PhysicsSystem.js';
 import { WaterPhysics, WATER_PHYSICS_DEFAULTS, queryWaterSurface } from '../src/engine/vfx/waterPhysics.js';
 await RAPIER.init();
-function rig() {
+function rig(extra={}) {
   const engine={playing:true,scene:new THREE.Scene(),on:()=>()=>{},onUpdate:()=>()=>{},config:{},entities:new Map()};
   const physics=new PhysicsSystem(engine,RAPIER);physics.world=new RAPIER.World({x:0,y:-9.81,z:0});physics.eventQueue=new RAPIER.EventQueue(true);
-  const props={...WATER_PHYSICS_DEFAULTS,width:20,height:20,waterDepth:20,waveHeight:0};
-  const wakes=[];const component={enabled:true,graphEnabled:true,entity:{enabled:true},props,resolvedProps:props,simulation:{mesh:new THREE.Mesh(),uniforms:{simTime:{value:0}},addWaterImpulse:(...args)=>wakes.push(args)}};
+  const props={...WATER_PHYSICS_DEFAULTS,width:20,height:20,waterDepth:20,waveHeight:0,...extra};
+  const wakes=[],foams=[];const component={enabled:true,graphEnabled:true,entity:{enabled:true},props,resolvedProps:props,simulation:{mesh:new THREE.Mesh(),uniforms:{simTime:{value:0}},addWaterImpulse:(...args)=>wakes.push(args),addWaterFoam:(...args)=>foams.push(args)}};
   const water=new WaterPhysics(component);engine.waterSurfaces=new Set([{applyBuoyancy:(p,dt)=>water.step(p,dt)}]);
   const add=(mass,size=1,x=0)=>{
     const body=physics.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,1,0));
@@ -17,8 +17,26 @@ function rig() {
     const entity={object3D:new THREE.Object3D(),getComponent:()=>null};physics.dynamicBodies.push({body,entity});return body;
   };
   const step=(seconds)=>{for(let i=0;i<seconds*60;i++){component.simulation.uniforms.simTime.value+=1/60;physics.update(1/60);}};
-  return {physics,component,add,step,wakes,dispose:()=>{physics.world.free();physics.eventQueue.free();}};
+  return {physics,component,add,step,wakes,foams,dispose:()=>{physics.world.free();physics.eventQueue.free();}};
 }
+
+// ── CONTACT FOAM IS BORN IN THE FIELD (2026-09-07) ─────────────────────────
+// The lid's waterline ring is pinned to the hull; the foam a hull sheds lives
+// in the ripple field, which the current carries. The physics hands the field
+// foam at the hull's waterline in proportion to the hull's speed THROUGH the
+// water — a hull held still in a 3 m/s current sheds, one bobbing at rest in
+// still water does not.
+test('a hull in a current sheds foam into the field; one at rest in still water does not',()=>{
+  const still=rig();try{
+    still.add(500,2); still.step(6); still.foams.length=0; still.step(2);
+    assert.equal(still.foams.length,0,`no current, no shed foam: ${still.foams.length}`);
+  }finally{still.dispose();}
+  const moving=rig({current:3,currentDirection:0});try{
+    moving.add(500,2); moving.step(6); moving.foams.length=0; moving.step(2);
+    assert.ok(moving.foams.length>0,'a hull in a current sheds foam');
+    assert.ok(moving.foams.every(([,,radius,amount])=>radius>0&&amount>0),'every handful has a radius and an amount');
+  }finally{moving.dispose();}
+});
 test('actual fixed-step Rapier buoyancy floats low density and sinks high density; equal mass different volume differs',()=>{
   const r=rig();try{
     const light=r.add(500,1,-4),dense=r.add(2000,1,0),small=r.add(500,.5,4),defaultMass=r.add(1,1,7);

@@ -248,6 +248,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   let authoredWaveLength = 4;
   const impulseRows=Array.from({length:IMPULSE_CAPACITY},()=>new THREE.Vector4());
   const impulses=uniformArray(impulseRows,"vec4"),impulseCount=uniform(0,"int"),pendingImpulses=[];
+  // Foam the physics hands the field (x, z, radius, amount per second) — a
+  // hull's waterline ploughing through the water; see `addWaterFoam`.
+  const foamRows=Array.from({length:IMPULSE_CAPACITY},()=>new THREE.Vector4());
+  const foamImpulses=uniformArray(foamRows,"vec4"),foamImpulseCount=uniform(0,"int"),pendingFoam=[];
   const collisionWorld = colliderField ? simulationWorld : null;
   const collisionInverse = colliderField ? simulationInverse : null;
   const h = 1 / 120;
@@ -778,7 +782,19 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // churn now: the bow wave's breaking crest foams, the dent's floor does
     // not, however fast it rises and falls.
     const breaking = steepWorld.smoothstep(.3, .7);
-    const source = u.foam.mul(breaking.mul(churn.smoothstep(.4, 1.5).mul(3).add(.3))).add(jacobianFoam.mul(3));
+    // ── CONTACT FOAM IS BORN IN THE FIELD (2026-09-07) ───────────────────
+    // The waterline ring the lid draws is pinned to the hull by construction;
+    // the foam a hull SHEDS has to live here, in the field the current
+    // carries ("the contact foam does not follow the current", user). The
+    // physics hands in each waterline sample of a hull moving through the
+    // water (waterPhysics.js `addWaterFoam`), a soft disc per sample.
+    const handed = float(0).toVar();
+    Loop({ start: 0, end: foamImpulseCount }, ({ i }) => {
+      const f = foamImpulses.element(i);
+      const t = p.x.sub(f.x).pow(2).add(p.z.sub(f.y).pow(2)).sqrt().div(f.z.max(1e-4));
+      handed.addAssign(t.mul(1.5).pow(6).min(20).negate().exp().mul(f.w));
+    });
+    const source = u.foam.mul(breaking.mul(churn.smoothstep(.4, 1.5).mul(3).add(.3))).add(jacobianFoam.mul(3)).add(handed);
     const around = scratch.element(west).w.add(scratch.element(east).w).add(scratch.element(north).w).add(scratch.element(south).w).mul(.25);
     // ⭐ THE FOAM RIDES THE FLOW: this cell's foam is what was upstream a tick
     // ago — semi-Lagrangian, bilinear over the foam copy in `scratch`.
@@ -1435,7 +1451,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       pendingImpulses.push([x,z,span,Math.max(-1,Math.min(1,capped))]);
       return true;
     },
-    restart() { initialized = false; accumulator = 0; elapsed = 0; u.simTime.value = 0; pendingImpulses.length=0; spectrum?.restart(); updateBounds(); },
+    /** Foam for the field: local x, z, a radius in local units, an amount per
+     *  second — what a hull's waterline sheds (waterPhysics.js). */
+    addWaterFoam(x,z,radius,amount) {
+      if(kind!=="water" || ![x,z,radius,amount].every(Number.isFinite) || !(amount>0))return false;
+      while(pendingFoam.length>=IMPULSE_CAPACITY)pendingFoam.shift();
+      pendingFoam.push([x,z,Math.max(2.5*Math.max(sx,sz),radius),amount]);
+      return true;
+    },
+    restart() { initialized = false; accumulator = 0; elapsed = 0; u.simTime.value = 0; pendingImpulses.length=0; pendingFoam.length=0; spectrum?.restart(); updateBounds(); },
     tick(renderer, dt) {
       if (!renderer?.isWebGPURenderer) return;
       const queue = [];
@@ -1585,7 +1609,12 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
           current: [u.current.value * u.currentCos.value, u.current.value * u.currentSin.value] });
         if (seaQueue.length) { renderer.compute(seaQueue); spectrum.generateMipmaps(renderer); }
       }
-      if (foamField) queue.push(foamField, rippleWrite);
+      if (foamField) {
+        foamImpulseCount.value = pendingFoam.length;
+        for (let i = 0; i < pendingFoam.length; i++) foamRows[i].fromArray(pendingFoam[i]);
+        pendingFoam.length = 0;
+        queue.push(foamField, rippleWrite);
+      }
       queue.push(surface);
       if (slotKernel) queue.push(...slotKernel.compute);
       renderer.compute(queue);

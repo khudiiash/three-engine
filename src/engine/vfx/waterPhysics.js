@@ -145,7 +145,7 @@ export class WaterPhysics {
     let displaced=0,bodies=0;
     for(const {body,entity} of physics.dynamicBodies) {
       if(entity===c.entity||!body.isDynamic()||!(body.mass()>0))continue;
-      const contacts=[];let volume=0,plane=0,total=0;
+      const contacts=[],waterline=[];let volume=0,plane=0,total=0;
       // ── THE FOOTPRINT IS THE HULL'S COLUMNS (2026-09-07) ─────────────────
       // One circle per body made a boat press a round dent ("the contact
       // shape is completely wrong"). An ELONGATED hull (aspect ≥ 1.8) is a
@@ -221,7 +221,15 @@ export class WaterPhysics {
           // for ever ("the surface continues to wobble as if the object is
           // entering water each frame ... must calm down when the cube
           // submerged", user 2026-09-05).
-          if(under>0&&under<1)plane+=cell/band;
+          if(under>0&&under<1){
+            plane+=cell/band;
+            // Only the hull's OUTLINE sheds foam: the quadrature's border
+            // samples (a 4 × 4 grid per collider). Every straddling sample
+            // once seeded a flat disc and a box hull became a white slab of
+            // its whole footprint ("a rectangle of foam", user, 2026-09-07).
+            const gx=Math.floor(((local.x-bcenter.x)/Math.max(1e-6,bhalf.x)*.5+.5)*4),gz=Math.floor(((local.z-bcenter.z)/Math.max(1e-6,bhalf.z)*.5+.5)*4);
+            if(gx<=0||gx>=3||gz<=0||gz>=3)waterline.push({point,spacing:Math.max(bhalf.x,bhalf.z)/2});
+          }
           const v=cell*fraction;volume+=v;contacts.push({point,volume:v,surface});
           // This point's column: the quadrature's (x, z) cell, merged to `bins`.
           const along=longX?(local.x-bcenter.x)/Math.max(1e-6,bhalf.x):(local.z-bcenter.z)/Math.max(1e-6,bhalf.z);
@@ -411,6 +419,30 @@ export class WaterPhysics {
             if(previous)for(const column of previous.columns)c.simulation.addWaterImpulse?.(column.x,column.z,column.radius,column.depth,column.cap);
             for(const column of pressed)c.simulation.addWaterImpulse?.(column.x,column.z,column.radius,-column.depth,column.cap);
             this.previousWakes.set(body,{x:filter.x,z:filter.z,radius:filter.radius,depth:filter.depth,columns:pressed});
+          }
+        }
+        // ── CONTACT FOAM IS BORN IN THE FIELD (2026-09-07) ───────────────
+        // The waterline ring the lid draws is pinned to the hull; the foam a
+        // hull sheds must live in the ripple field, which the current carries
+        // ("the contact foam does not follow the current"). Each waterline
+        // sample of the hull hands the field foam in proportion to the hull's
+        // speed THROUGH the water — its velocity against the current — with
+        // a dead zone so a hull bobbing at rest sheds nothing.
+        if(waterline.length){
+          const cur=finite(p.current,0,-10,10),curDir=finite(p.currentDirection,0,-180,180)*Math.PI/180;
+          const vel=body.linvel();
+          const through=Math.hypot(vel.x-cur*Math.cos(curDir),vel.z-cur*Math.sin(curDir));
+          const amount=finite(p.wakeStrength,.15,0,2)*Math.min(1,Math.max(0,through-.2)/3)*1.5;
+          if(amount>0){
+            const step=Math.max(1,Math.ceil(waterline.length/24));
+            for(let i=0;i<waterline.length;i+=step){
+              const {point,spacing}=waterline[i];
+              const at=query(point);if(!at)continue;
+              // Half a sample's spacing, in the water's LOCAL units (a floor
+              // meant in metres read as 25 m on a 500 m sea); the solver
+              // floors it at a few cells.
+              c.simulation.addWaterFoam?.(at.localX,at.localZ,spacing*.5/flat,amount);
+            }
           }
         }
       } else this.releaseWake(body);
