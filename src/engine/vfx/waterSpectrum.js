@@ -944,6 +944,13 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   }
   const splashMesh = new THREE.Mesh(splashGeometry, splashMaterial);
   splashMesh.frustumCulled = false; splashMesh.renderOrder = 100; splashMesh.name = "sea spray";
+  // ⛔ NEVER BATCHED OR MERGED: a GPU-driven instanced geometry whose
+  // vertices come from storage buffers has nothing a batcher can copy — the
+  // engine's batcher took it and bound an EMPTY storage buffer in the
+  // vertex stage ("Binding size for [Buffer] is zero … bindGroup_object",
+  // user, 2026-09-07). The lid and the body carry the same flags.
+  splashMesh.userData.noBatch = true; splashMesh.userData.noMerge = true;
+  splashMesh.castShadow = false; splashMesh.receiveShadow = false;
   spectrum.splashMesh = splashMesh;
   return spectrum;
 }
