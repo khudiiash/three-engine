@@ -205,6 +205,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // The current (metres per second, and its direction) — see waterSpectrum.js `scroll`;
     // `tick` is the frame's real seconds for the advection kernels.
     current: uniform(0), currentCos: uniform(1), currentSin: uniform(0), tick: uniform(0),
+    // The whole cells the current carries the ripple field by this tick (see currentKernels).
+    currentShift: uniform(new Vector2(0, 0)),
     // Per-cascade mip the surface kernel reads the sea at — the level whose
     // texel is no finer than this grid's cell (render mesh / solver). See `tick`.
     seaLod: [uniform(0), uniform(0), uniform(0)],
@@ -361,23 +363,20 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // ── THE CURRENT CARRIES THE RIPPLE FIELD (2026-09-07) ────────────────────
   // `current` scrolls the sea under a fixed lid (a boat that "moves" without
   // moving): a wake's heights and foam must stream with the water too, or the
-  // wake sits still beside a hull the sea is passing. Semi-Lagrangian, once a
-  // tick, before the substeps: each cell takes the value that was upstream —
-  // the current over the lid's scale, in cells — with the rest position kept.
+  // wake sits still beside a hull the sea is passing. ⛔ WHOLE CELLS ONLY. A
+  // semi-Lagrangian resample by a fraction of a cell every frame is a blur
+  // every frame: the wake's height RMS was down a quarter at 1.5 s and the
+  // contact ripples were gone within seconds ("can't see contact ripples at
+  // all", user, 2026-09-07). The tick accumulates the current in cells and
+  // shifts the field by the whole part — exact transport, no interpolation —
+  // as the whitecap memory and the window shift do; the remainder waits.
   const advectFrom = (source) => Fn(() => {
-    if (globalThis.__waterCurrentCopy) { scratch.element(index).assign(source.element(index)); return; }   // harness: the plumbing alone
-    const cx = u.current.mul(u.currentCos).mul(u.tick).div(u.waveScale.x).div(sx);
-    const cz = u.current.mul(u.currentSin).mul(u.tick).div(u.waveScale.z).div(sz);
-    const bx = x.toFloat().sub(cx), by = y.toFloat().sub(cz);
-    const ix0 = bx.floor().clamp(0, w - 1), iy0 = by.floor().clamp(0, w - 1);
-    const ix1 = ix0.add(1).min(w - 1), iy1 = iy0.add(1).min(w - 1);
-    const fx = bx.sub(bx.floor()).clamp(0, 1), fy = by.sub(by.floor()).clamp(0, 1);
-    const at = (ix, iy) => source.element(iy.toInt().mul(w).add(ix.toInt()));
-    const a = at(ix0, iy0), b = at(ix1, iy0), c = at(ix0, iy1), d = at(ix1, iy1);
-    const height = mix(mix(a.y, b.y, fx), mix(c.y, d.y, fx), fy);
-    const foam = mix(mix(a.w, b.w, fx), mix(c.w, d.w, fx), fy);
+    const di = u.currentShift.x.toInt(), dj = u.currentShift.y.toInt();
+    const sxi = x.sub(di), syi = y.sub(dj);   // the cell upstream
+    const valid = sxi.greaterThanEqual(0).and(sxi.lessThan(w)).and(syi.greaterThanEqual(0)).and(syi.lessThan(w));
+    const src = source.element(syi.clamp(0, w - 1).mul(w).add(sxi.clamp(0, w - 1)));
     const rest = source.element(index);
-    scratch.element(index).assign(vec4(rest.x, height, rest.z, foam));
+    scratch.element(index).assign(vec4(rest.x, select(valid, src.y, float(0)), rest.z, select(valid, src.w, float(0))));
   })().compute(wCount);
   const advectInto = (target) => Fn(() => { target.element(index).assign(scratch.element(index)); })().compute(wCount);
   const currentKernels = kind === "water" ? [advectFrom(previous), advectInto(previous), advectFrom(positions), advectInto(positions)] : [];   // positions last — see shiftKernels
@@ -1171,6 +1170,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   let targetCenter = null;
   // The eye in the sea's metres (local × scale), for the whitecap memory window.
   let seaEye = null;
+  // The current's sub-cell remainder for the ripple field's whole-cell carry.
+  const currentAccum = { x: 0, y: 0 };
   // Shallow-water momentum on the committed heights, once a substep: the
   // column accelerates down the slope, damps, and never outruns what the
   // foam advection can carry; the drift integrates the velocity and forgets.
@@ -1538,9 +1539,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
           c.x - winW / 2 > -width / 2 + sx ? 1 : 0, c.x + winW / 2 < width / 2 - sx ? 1 : 0,
           c.y - winH / 2 > -height / 2 + sz ? 1 : 0, c.y + winH / 2 < height / 2 - sz ? 1 : 0);
       }
-      // The current streams the field, once a tick, before the substeps.
+      // The current streams the field, once a tick, before the substeps —
+      // by whole cells, the remainder carried to the next tick.
       u.tick.value = delta;
-      if (kind === "water" && u.current.value !== 0 && initialized && globalThis.__waterCurrentAdvect !== false) queue.push(...currentKernels);
+      if (kind === "water" && u.current.value !== 0 && initialized && globalThis.__waterCurrentAdvect !== false) {
+        currentAccum.x += u.current.value * u.currentCos.value * delta / u.waveScale.value.x / sx;
+        currentAccum.y += u.current.value * u.currentSin.value * delta / u.waveScale.value.z / sz;
+        const kx = Math.round(currentAccum.x), kz = Math.round(currentAccum.y);
+        if (kx || kz) { currentAccum.x -= kx; currentAccum.y -= kz; u.currentShift.value.set(kx, kz); queue.push(...currentKernels); }
+      }
       if(injectWater) {
         impulseCount.value=pendingImpulses.length;
         for(let i=0;i<pendingImpulses.length;i++)impulseRows[i].fromArray(pendingImpulses[i]);

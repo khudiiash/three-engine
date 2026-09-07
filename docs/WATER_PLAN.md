@@ -483,6 +483,17 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     zero tick). Both the window shift and the advection now end on
     `positions`. Harness: `fieldProbe(label)` logs the texture's height
     RMS and foam sum beside the attribute's.
+51. ⛔ A RESAMPLE A FRAME IS A BLUR A FRAME. The current first carried the
+    ripple field semi-Lagrangian (bilinear at a fraction of a cell every
+    tick): the wake's height RMS was down a quarter at 1.5 s and the
+    contact ripples were gone within seconds ("can't see contact ripples at
+    all", user, 2026-09-07). The field is carried by WHOLE cells now — the
+    tick accumulates the current in cells and shifts by the integer part,
+    the remainder waits — exactly as the whitecap memory and the window
+    shift do. Receipt (5 m pool, 0.6 m/s): height RMS 1.05 cm at 1.5 s
+    against 1.18 with no current and 0.90 bilinear; the foam centroid still
+    rides 1.37 m in 2.5 s. What is still lost is the wave leaving the grid
+    downstream, which a current through a pool must do.
 
 ## Open
 
