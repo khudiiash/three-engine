@@ -442,7 +442,10 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
         // ── UNDERWATER OFF: nothing below the surface is looked at. The lid
         // is its deep colour under the reflection — no framebuffer read at a
         // refracted pixel, no GI ray through the water, no medium column.
-        refracted = vec3(u.deepColor).mul(fresnel.oneMinus());
+        // The body colour the medium's deep column would have given: the
+        // tuned water colour falling to the deep colour — not the deep colour
+        // alone, which read as black under a pale sky's reflection.
+        refracted = mix(vec3(u.deepColor), baseColor, .55).mul(fresnel.oneMinus());
       } else if (giTraced && !giRefraction) {
         mesh.layers.enable(WATER_REFRACTION_LAYER);
         giRefraction = giSystem.registerWaterRefraction({
