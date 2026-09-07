@@ -787,6 +787,27 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     physics 20. "The foam tail disappeared": the square of the dial
     erased it at the user's setting — the interaction dial is foam^1.5
     (0.1 → 3 %, 0.3 → 16 %): a faint tail at 0.1, a full one at 1.
+62. ⛔ THE OUTLINE IS CAST ONTO THE HULL. The quadrature's points are
+    INSIDE the collider (a 4 × 4 × 4 grid over its bounds with
+    `containsPoint`), so a ring of its border samples ran a quarter of the
+    beam inboard — spray born there rose through the deck ("it sprays
+    directly on the boat's deck ignoring the shape of the collider",
+    user, 2026-09-07; the boat's custom collision falls back to a convex
+    hull on a dynamic body, another session's fix — the cast reads
+    whatever shape Rapier has). Now per collider: horizontal rays at the
+    water's height from the bounding rectangle's four sides (a pad of
+    1.2, a ray every max(0.35 m, perimeter/28)) go in along each side's
+    normal and stop on the hull's own surface (`collider.castRay`, solid;
+    `physics.RAPIER.Ray`); the hits, in order round the rectangle, are
+    the waterline outline — a bow's curve included — and its segments
+    carry the spray (leading segments for the bow, all for a slam) AND
+    the foam seeds (a disc of the band's width every two widths along
+    each segment). The tail: a hull's seeds were small discs at low
+    values before the dial's power sat on them — FOAM_SEED_DENSITY 4 →
+    24, the seed's value min(1, 8 a). Receipts: `test:water` physics 20,
+    with a new assertion that > 90 % of a 2 m cube's foam seeds sit
+    within 12 cm of a face; hull seed 63 in the ocean arm; the pool arm
+    passes.
 
 ## Open
 

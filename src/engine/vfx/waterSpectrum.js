@@ -91,8 +91,10 @@ export const FOAM_WINDOW_METRES = 512;
  * and the lid reads the map exactly as it read the memory.
  */
 export const FOAM_LIFE_SECONDS = 6;
-/** Particles a hull seed asks per square metre per second at full value. */
-export const FOAM_SEED_DENSITY = 4;
+/** Particles a hull seed asks per square metre per second at full value
+ *  (24: a hull's seeds are small discs at low values, and the foam dial's
+ *  three-halves power sits on top — "still no foam tail", user, 2026-09-07). */
+export const FOAM_SEED_DENSITY = 24;
 /**
  * ⛔ PRODUCTION IS A RATE PER SQUARE METRE, NOT A SHARE OF THE POOL. As a
  * share of the dead particles it was bounded by nothing but the pool, and

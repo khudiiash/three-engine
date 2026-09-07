@@ -1640,7 +1640,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // The foam the physics handed the field also seeds the whitecap memory
         // (in the sea's metres, a value near 1 at full speed) — the tail.
         const ws = u.waveScale.value;
-        const seeds = pendingFoam.map(([x, z, r, a]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .3), Math.min(1, a * 4)]);
+        const seeds = pendingFoam.map(([x, z, r, a]) => [x * ws.x, z * ws.z, Math.max(r * ws.x, .3), Math.min(1, a * 8)]);
         const splashes = pendingSplash.map(([x, z, r, v, count, x1, z1, nx, nz]) => {
           const nm = Math.hypot(nx * ws.x, nz * ws.z) || 1;
           return [x * ws.x, z * ws.z, Math.max(r * ws.x, .2), v, count ?? null, x1 == null ? null : x1 * ws.x, z1 == null ? null : z1 * ws.z, nx * ws.x / nm, nz * ws.z / nm];

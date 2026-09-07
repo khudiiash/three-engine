@@ -452,27 +452,50 @@ export class WaterPhysics {
           // held in a 5 m/s current takes the whole sea on its bow ("there
           // must be a huge amount of force of water hitting the front of
           // the boat", user, 2026-09-07).
-          // ── THE OUTLINE AS SEGMENTS (2026-09-07) ──────────────────────
-          // Spray from a few samples jetted from a few points ("a couple of
-          // points where the splashes come from … could we fix that so the
-          // splashes occur equally on the contact shape", user). The ring's
-          // consecutive samples make SEGMENTS; the sea births spray
-          // uniformly along a segment and throws it OUTWARD (the segment's
-          // normal away from the hull's centre), the count per metre.
-          const order=[[0,0],[1,0],[2,0],[3,0],[3,1],[3,2],[3,3],[2,3],[1,3],[0,3],[0,2],[0,1]];
-          const byCollider=new Map();
-          for(const sample of waterline){if(!byCollider.has(sample.collider))byCollider.set(sample.collider,new Map());byCollider.get(sample.collider).set(`${sample.gx}:${sample.gz}`,sample);}
+          // ── THE OUTLINE, CAST ONTO THE HULL (2026-09-07) ──────────────
+          // The quadrature's points are INSIDE the collider (a 4 × 4 × 4 grid
+          // with containment), so a ring of its border samples ran a quarter
+          // of the beam inboard, and spray born there rose through the deck
+          // ("it sprays directly on the boat's deck ignoring the shape of the
+          // collider", user). The outline is cast now: from the collider's
+          // bounding rectangle, horizontal rays at the water's height go in
+          // along each side's normal and stop on the hull's own surface —
+          // the waterline as the collider really is, a bow's curve included.
+          // Its consecutive hits make SEGMENTS (an outward normal away from
+          // the hull's centre, the length in metres); the sea births spray
+          // uniformly along a segment and throws it outward, the count per
+          // metre, and the foam seeds walk the same segments.
           const segments=[];
-          for(const ring of byCollider.values()){
-            for(let k=0;k<order.length;k++){
-              const a=ring.get(`${order[k][0]}:${order[k][1]}`),b=ring.get(`${order[(k+1)%order.length][0]}:${order[(k+1)%order.length][1]}`);
-              if(!a||!b)continue;
-              const qa=query(a.point),qb=query(b.point);if(!qa||!qb)continue;
+          for(let i=0;i<body.numColliders();i++){
+            const collider=body.collider(i);if(collider.isSensor())continue;
+            const bound=localBounds(collider);if(!bound)continue;
+            const half=bound.half??bound,center=bound.center??new Vector3();
+            const q=new Quaternion().copy(collider.rotation()),t=new Vector3().copy(collider.translation());
+            const perimeter=4*(half.x+half.z),spacing=Math.max(.35,perimeter/28);
+            const hits=[];
+            const cast=(lx,lz,dx,dz)=>{   // a ray in the collider's local frame, at the water's height
+              const from=new Vector3(lx,center.y,lz).applyQuaternion(q).add(t),dir=new Vector3(dx,0,dz).applyQuaternion(q);dir.y=0;if(!(dir.lengthSq()>1e-9))return;dir.normalize();
+              const s=query(from);if(!s)return;
+              const ray=new physics.RAPIER.Ray({x:from.x,y:s.height,z:from.z},{x:dir.x,y:0,z:dir.z});
+              const reach=2.4*Math.max(half.x,half.z)+1;
+              const toi=collider.castRay(ray,reach,true);
+              if(toi==null||!(toi>1e-4)||toi>reach)return;
+              hits.push(new Vector3(from.x+dir.x*toi,s.height,from.z+dir.z*toi));
+            };
+            const nx=Math.max(2,Math.round(2*half.x/spacing)),nz=Math.max(2,Math.round(2*half.z/spacing)),pad=1.2;
+            for(let k=0;k<nx;k++)cast(center.x-half.x+(k+.5)/nx*2*half.x,center.z-half.z*pad,0,1);      // the −z side, rays +z
+            for(let k=0;k<nz;k++)cast(center.x+half.x*pad,center.z-half.z+(k+.5)/nz*2*half.z,-1,0);     // the +x side, rays −x
+            for(let k=nx-1;k>=0;k--)cast(center.x-half.x+(k+.5)/nx*2*half.x,center.z+half.z*pad,0,-1);  // the +z side, rays −z
+            for(let k=nz-1;k>=0;k--)cast(center.x-half.x*pad,center.z-half.z+(k+.5)/nz*2*half.z,1,0);   // the −x side, rays +x
+            if(hits.length<3)continue;
+            const locals=hits.map((h)=>query(h)).filter(Boolean);
+            for(let k=0;k<locals.length;k++){
+              const qa=locals[k],qb=locals[(k+1)%locals.length];
               const dx=qb.localX-qa.localX,dz=qb.localZ-qa.localZ,len=Math.hypot(dx,dz);if(!(len>1e-6))continue;
-              let nx=-dz/len,nz=dx/len;
+              let nx2=-dz/len,nz2=dx/len;
               const mx=(qa.localX+qb.localX)/2-filter.x,mz=(qa.localZ+qb.localZ)/2-filter.z;
-              if(nx*mx+nz*mz<0){nx=-nx;nz=-nz;}
-              segments.push({ax:qa.localX,az:qa.localZ,bx:qb.localX,bz:qb.localZ,nx,nz,metres:len*flat,mx,mz});
+              if(nx2*mx+nz2*mz<0){nx2=-nx2;nz2=-nz2;}
+              segments.push({ax:qa.localX,az:qa.localZ,bx:qb.localX,bz:qb.localZ,nx:nx2,nz:nz2,metres:len*flat,mx,mz});
             }
           }
           if(through>1.5&&dt>0){
@@ -505,15 +528,12 @@ export class WaterPhysics {
             // hull (four per side), so the waterline is drawn BETWEEN
             // consecutive border samples, a disc of the band's own width
             // (0.2–1 m, in the water's local units) every two widths.
-            const seed=(point,width)=>{const at=query(point);if(at)c.simulation.addWaterFoam?.(at.localX,at.localZ,width/flat,amount);};
-            for(const ring of byCollider.values()){
-              for(let k=0;k<order.length;k++){
-                const a=ring.get(`${order[k][0]}:${order[k][1]}`),b=ring.get(`${order[(k+1)%order.length][0]}:${order[(k+1)%order.length][1]}`);
-                if(!a){continue;}
-                if(!b){seed(a.point,a.width);continue;}
-                const n=Math.max(1,Math.ceil(a.point.distanceTo(b.point)/(2*a.width)));
-                for(let j=0;j<n;j++)seed(a.point.clone().lerp(b.point,j/n),a.width);
-              }
+            // The foam walks the cast outline's segments: a disc of the band's
+            // width every two widths, in the water's local units.
+            const width=Math.max(.2,Math.min(1,bhalfMax*.06));
+            for(const s of segments){
+              const n=Math.max(1,Math.ceil(s.metres/(2*width)));
+              for(let j=0;j<n;j++){const u=j/n;c.simulation.addWaterFoam?.(s.ax+(s.bx-s.ax)*u,s.az+(s.bz-s.az)*u,width/flat,amount);}
             }
           }
         }

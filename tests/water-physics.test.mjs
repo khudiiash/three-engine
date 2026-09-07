@@ -76,6 +76,12 @@ test('a hull in a current sheds foam into the field; one at rest in still water 
     moving.add(500,2); moving.step(6); moving.foams.length=0; moving.step(2);
     assert.ok(moving.foams.length>0,'a hull in a current sheds foam');
     assert.ok(moving.foams.every(([,,radius,amount])=>radius>0&&amount>0),'every handful has a radius and an amount');
+    // ── THE OUTLINE IS ON THE HULL (2026-09-07) ─────────────────────────
+    // The seeds walk an outline CAST onto the collider by rays, not a ring
+    // of the quadrature's inboard samples: on a 2 m cube every seed sits on
+    // a face, a metre from the centre on one axis (the water is unscaled).
+    const onFace=moving.foams.filter(([x,z])=>Math.abs(Math.max(Math.abs(x),Math.abs(z))-1)<.12).length;
+    assert.ok(onFace/moving.foams.length>.9,`the seeds sit on the hull's faces: ${onFace} of ${moving.foams.length} within 12 cm of a face`);
   }finally{moving.dispose();}
 });
 test('actual fixed-step Rapier buoyancy floats low density and sinks high density; equal mass different volume differs',()=>{
