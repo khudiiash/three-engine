@@ -214,6 +214,27 @@ function installPropAccessors(component) {
  * just calls `this.emit(...)`; its own `.d.ts` interface types the payload
  * via `ComponentBase<Props, OwnEventMap>`.
  */
+/**
+ * Whether a component takes part in per-frame frustum gating.
+ *
+ * Two ways in: the AUTHORED `viewOnly` flag (the component's own or its
+ * entity's), and `static viewGated = true` on the class — for a component
+ * whose off-screen work is pure waste by construction rather than by an
+ * author's choice.
+ *
+ * ⛔⛔ THE SECOND EXISTS BECAUSE A GATE WITHOUT IT IS DEAD CODE. `_inView` is
+ * resolved only for components in `engine.viewOnlyComponents`, and nothing
+ * else ever writes it — so `isInView()` on a component that never opted in
+ * reads `null !== false`, which is TRUE, forever. The cloth solver has gated
+ * its tick on `isInView()` since it was written and it had never once fired:
+ * ten Sponza curtains all ticked every frame at ~0.65 ms of CPU each, on a
+ * frame where cloth was 76 % of the whole CPU budget.
+ */
+function viewGatedBy(component) {
+  return !!component.props.viewOnly || !!component.entity?.viewOnly
+    || /** @type {any} */ (component.constructor).viewGated === true;
+}
+
 export class Component extends EventEmitter {
   // Default: no tags. Subclasses override with a string array (e.g.
   // `static tags = ["physics", "play-mode"]`). Pure editor metadata; the
@@ -256,7 +277,7 @@ export class Component extends EventEmitter {
     this._inView = null;
     // Cached viewOnly boolean (resolved against the entity's own flag once
     // per `setProp` cycle). Avoids re-reading the entity every frame.
-    this._viewOnlyActive = !!this.props.viewOnly || !!this.entity?.viewOnly;
+    this._viewOnlyActive = viewGatedBy(this);
     // Mirror every authored prop as `comp.intensity` / `comp.intensity = 2`
     // (routed through setProp). Scripts shouldn't have to dig into `.props`.
     installPropAccessors(this);
@@ -272,6 +293,26 @@ export class Component extends EventEmitter {
    * a nested Map iteration over the WHOLE scene every frame, which is exactly
    * the kind of per-frame O(scene) work that makes a 10k-entity scene stutter.
    */
+  /**
+   * Re-resolve frustum gating now that this component has an entity.
+   *
+   * ⛔ THE CONSTRUCTOR CANNOT REGISTER. `_viewOnlyActive`'s setter adds to
+   * `engine.viewOnlyComponents`, and at construction `this.entity` is still
+   * undefined — so the registry lookup misses and the write is silently
+   * dropped. Until this ran at attach, a component was gated only if something
+   * later wrote `viewOnly` through `setProp`, which meant an authored
+   * `viewOnly: true` in a scene file never took effect either.
+   */
+  refreshViewGate() {
+    const wanted = viewGatedBy(this);
+    // The setter early-outs when the value is unchanged, and it is already
+    // `true` from the constructor — so clear it first to force the registry
+    // write that had nowhere to go back then.
+    if (wanted && this.__viewOnlyActive === true) this.__viewOnlyActive = false;
+    this._viewOnlyActive = wanted;
+    this._inView = null;
+  }
+
   get _viewOnlyActive() {
     return this.__viewOnlyActive === true;
   }
@@ -462,7 +503,7 @@ export class Component extends EventEmitter {
       // stay O(1) per frame, and reset the cached view-decision so the
       // first per-frame test after a change picks up the new state.
       this.props.viewOnly = !!value;
-      this._viewOnlyActive = !!this.props.viewOnly || !!this.entity?.viewOnly;
+      this._viewOnlyActive = viewGatedBy(this);
       this._inView = null;
       const engine = this.entity?.engine;
       engine?.emit?.("component-changed", {

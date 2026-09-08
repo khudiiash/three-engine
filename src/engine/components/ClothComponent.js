@@ -4,6 +4,17 @@ import { simulationNodeTypes, simulationNodeDefaults } from "../vfx/simulationGr
 /** Deforms this entity's Plane Mesh; its material and dimensions belong to Mesh. */
 export class ClothComponent extends GridSimulationComponent {
   static type = "cloth";
+  // ⭐ A CLOTH NOBODY CAN SEE DOES NOT NEED SIMULATING. The tick has always
+  // been gated on `isInView()`, but `_inView` is only ever resolved for
+  // components in `engine.viewOnlyComponents`, and cloth never joined it — so
+  // the gate read `null !== false` and every cloth in the scene ran every
+  // frame. See `viewGatedBy` in Component.js.
+  //
+  // ⚠ The trade is real and deliberate: a curtain behind you does not react to
+  // something walking through it, and resumes from where it stood when you
+  // look back. Its culling sphere is TWICE the cloth's own radius, so it keeps
+  // simulating well past the edge of the screen.
+  static viewGated = true;
   static label = "Cloth";
   static tags = ["cloth", "simulation", "webgpu"];
   static defaults = { asset: "", graph: null, resolution: 32, anchors: [], ...simulationNodeDefaults("cloth", "cloth") };

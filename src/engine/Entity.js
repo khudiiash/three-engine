@@ -472,6 +472,9 @@ export class Entity extends EventEmitter {
     if (component._attached === true) return;
     component._attached = true;
     component._enabled = component.enabled;
+    // Now that it has an entity, its frustum gating can actually reach the
+    // engine's registry — see `Component.refreshViewGate`.
+    component.refreshViewGate?.();
     // A component that stops by detaching (no onDisable of its own) and is
     // disabled is not built at all; `reconcileEnabled` builds it when it is
     // enabled. One with its own hooks is built and reads `this.enabled`.

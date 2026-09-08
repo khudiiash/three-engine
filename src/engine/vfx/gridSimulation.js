@@ -1692,6 +1692,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     }
     geometry.addGroup(runStart, indices.length - runStart, previousMaterial ?? 0);
   }
+  // The cloth's own reach, for `updateBounds` — see where it is assigned.
+  let clothViewRadius = 0;
   if (meshCloth) {
     // From the source, and generous: the solver moves these vertices and a
     // sphere fitted to the REST pose would frustum-cull a cloth the moment it
@@ -1705,6 +1707,16 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     if (sourceGeometry.boundingBox) geometry.userData.__clothSourceBox = sourceGeometry.boundingBox.clone();
     const source = sourceGeometry.boundingSphere;
     geometry.boundingSphere = new THREE.Sphere(source.center.clone(), source.radius * 2);
+    // ⛔⛔ **AND `updateBounds` HAS TO USE THIS, NOT THE GRID'S width/height.**
+    // Those are the GRID solver's props and mean nothing to a mesh cloth, which
+    // takes its size from its own geometry — but they default to 4, so
+    // `hypot(4, 4) * 2` is an 11.31 m culling sphere around a 2.3 m curtain.
+    // The careful radius computed on this line was then overwritten by that
+    // number on the very next frame, and a sphere five times too wide is never
+    // outside the frustum: `GridSimulationComponent`'s `isInView()` gate, which
+    // exists precisely so an off-screen cloth costs nothing, could not fire.
+    // Ten Sponza curtains all ticked every frame at ~0.5 ms of CPU each.
+    clothViewRadius = source.radius * 2;
   } else geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, kind === "cloth" ? height / 2 : 0, 0), Math.hypot(width, height) * 2);
   const ownsMaterial=kind === "water" && !sourceMaterial;
   const material = sourceMaterial ?? new THREE.MeshPhysicalNodeMaterial({ color: "#168aab", roughness: .15, metalness: 0, side: THREE.DoubleSide });
@@ -1893,8 +1905,11 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // The skirt hangs the whole volume depth below the rest surface, so the
     // culling sphere has to reach it or a submerged camera looking up loses the
     // water it is inside.
-    let radius = Math.hypot(width, height) * 2 + excursion + (kind === "water" ? u.waterDepth.value : 0);
-    for(let i=0;i<anchorCount.value;i++) radius=Math.max(radius,new THREE.Vector3(anchorRows[i].x,anchorRows[i].y,anchorRows[i].z).distanceTo(geometry.boundingSphere.center)+Math.hypot(width,height)*2);
+    // A mesh cloth is sized by its MESH; the grid's width/height are not its
+    // size and default to 4 (see where `clothViewRadius` is set).
+    const reach = clothViewRadius || Math.hypot(width, height) * 2;
+    let radius = reach + excursion + (kind === "water" ? u.waterDepth.value : 0);
+    for(let i=0;i<anchorCount.value;i++) radius=Math.max(radius,new THREE.Vector3(anchorRows[i].x,anchorRows[i].y,anchorRows[i].z).distanceTo(geometry.boundingSphere.center)+reach);
     geometry.boundingSphere.radius = radius;
     geometry.boundingBox ??= new THREE.Box3();
     geometry.boundingBox.setFromCenterAndSize(geometry.boundingSphere.center, new THREE.Vector3(radius * 2, radius * 2, radius * 2));

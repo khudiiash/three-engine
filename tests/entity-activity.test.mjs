@@ -220,3 +220,53 @@ test("enable overrides on a detached component fire no hooks and hold once attac
   probe.setEnabled(true);
   assert.deepEqual(take(), ["enable:Pool"]);
 });
+
+/**
+ * ⛔⛔ A FRUSTUM GATE THAT NOBODY REGISTERS FOR IS DEAD CODE.
+ *
+ * `isInView()` reads `_inView`, and `_inView` is resolved once a frame ONLY for
+ * components in `engine.viewOnlyComponents`. A component that never joins that
+ * registry keeps `_inView === null`, so `isInView()` returns `null !== false`
+ * — true — forever, and any tick guarded by it runs unconditionally.
+ *
+ * The cloth solver had gated its tick on `isInView()` since it was written and
+ * it had never once fired: ten Sponza curtains each ticked every frame at
+ * ~0.65 ms of CPU, on a frame where cloth was 76 % of the whole CPU budget.
+ * `static viewGated = true` is how a component says the gate applies to it by
+ * construction rather than by an author's choice.
+ */
+test("⭐⭐ a viewGated class joins the frustum registry without an authored flag", async () => {
+  const { Component } = await import("../src/engine/components/Component.js");
+  const { registerComponent } = await import("../src/engine/components/registry.js");
+
+  class Gated extends Component { static type = "test-view-gated"; static viewGated = true; }
+  class Plain extends Component { static type = "test-view-plain"; }
+  registerComponent(Gated); registerComponent(Plain);
+
+  const engine = makeEngine();
+  const entity = engine.createEntity({ name: "Curtain" });
+  const gated = entity.addComponent("test-view-gated");
+  const plain = entity.addComponent("test-view-plain");
+
+  assert.ok(engine.viewOnlyComponents.has(gated), "a viewGated component must register itself");
+  assert.ok(!engine.viewOnlyComponents.has(plain), "an ordinary one must not");
+
+  // ⭐ THE CONSEQUENCE, stated directly: only a registered component can ever
+  // be told it is off-screen, so only it can be paused.
+  plain.updateViewVisibility(null);
+  assert.equal(plain.isInView(), true);
+  gated._inView = false;
+  assert.equal(gated.isInView(), false, "the gate can now actually close");
+});
+
+test("⛔ and the authored viewOnly flag still works on its own", async () => {
+  const { Component } = await import("../src/engine/components/Component.js");
+  const { registerComponent } = await import("../src/engine/components/registry.js");
+  class Opt extends Component { static type = "test-view-opt"; }
+  registerComponent(Opt);
+  const engine = makeEngine();
+  const c = engine.createEntity({ name: "Thing" }).addComponent("test-view-opt");
+  assert.ok(!engine.viewOnlyComponents.has(c));
+  c.setProp("viewOnly", true);
+  assert.ok(engine.viewOnlyComponents.has(c), "setting viewOnly must still register");
+});
