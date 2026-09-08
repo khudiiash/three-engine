@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { currentAccent } from "../../accent.js";
 
 /**
  * Inline widgets for node-graph params, shared by the shader and particle
@@ -286,7 +287,7 @@ export function CurveField({ value, onChange, yMin = 0, yMax = 1 }) {
       ctx.lineTo(CURVE_W, gy);
       ctx.stroke();
     }
-    ctx.strokeStyle = "#0a84ff";
+    ctx.strokeStyle = currentAccent();
     ctx.lineWidth = 1.6;
     ctx.beginPath();
     points.forEach((p, i) => {

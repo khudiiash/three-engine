@@ -41,7 +41,7 @@ import {
   Waves,
   Waypoints,
   Wind,
-} from "lucide-react";
+} from "./icons/index.jsx";
 
 /**
  * Icon + accent colour per component type, used by the Add Component menu and

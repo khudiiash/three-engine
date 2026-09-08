@@ -28,10 +28,19 @@ class MemoryStorage {
 globalThis.localStorage = new MemoryStorage();
 
 const prefs = await import("../src/editor/inspectorPrefs.js");
-const { INSPECTOR_COLLAPSED_KEY, useInspectorCollapse, toggleTypeCollapsed, setTypesCollapsed } = prefs;
+const {
+  INSPECTOR_COLLAPSED_KEY,
+  INSPECTOR_MODULE_GROUPS_KEY,
+  useInspectorCollapse,
+  toggleTypeCollapsed,
+  setTypesCollapsed,
+  toggleModuleGroupCollapsed,
+} = prefs;
 
 const collapsed = () => useInspectorCollapse.getState().collapsed;
 const stored = () => JSON.parse(globalThis.localStorage.getItem(INSPECTOR_COLLAPSED_KEY));
+const moduleGroups = () => useInspectorCollapse.getState().moduleGroups;
+const moduleGroupsStored = () => JSON.parse(globalThis.localStorage.getItem(INSPECTOR_MODULE_GROUPS_KEY));
 
 // vmSingleton hangs the store off a well-known symbol; dropping it and
 // re-importing under a new specifier simulates a second copy of the module
@@ -44,7 +53,7 @@ const freshImport = (tag) => {
 
 test.beforeEach(() => {
   globalThis.localStorage.clear();
-  useInspectorCollapse.setState({ collapsed: {} });
+  useInspectorCollapse.setState({ collapsed: {}, moduleGroups: {} });
 });
 
 test("toggling a type folds it, and toggling again unfolds it", () => {
@@ -151,4 +160,42 @@ test("a storage that throws does not stop the fold from happening", async () => 
   } finally {
     globalThis.localStorage = real;
   }
+});
+
+// ── Module groups (ModuleFieldsGroup in InspectorPanel.jsx) ──────────────────
+
+test("module groups fold and unfold like types, but live in their own map", () => {
+  toggleModuleGroupCollapsed("physics-rapier");
+  assert.deepEqual(moduleGroups(), { "physics-rapier": true });
+  assert.deepEqual(collapsed(), {}, "a module fold must never leak into the component-type folds");
+  toggleModuleGroupCollapsed("physics-rapier");
+  assert.deepEqual(moduleGroups(), {});
+});
+
+test("module group folds persist under their own key, not the v1 payload", () => {
+  toggleTypeCollapsed("mesh");
+  toggleModuleGroupCollapsed("gi");
+  assert.deepEqual(stored(), { version: 1, collapsed: { mesh: true } });
+  assert.deepEqual(moduleGroupsStored(), { version: 1, moduleGroups: { gi: true } });
+});
+
+test("a module group fold is keyed by MODULE, so it holds across components", () => {
+  // "Physics" appears on meshes, models and virtual cameras; one fold covers
+  // them all — the same papercut rule as the per-type component folds.
+  toggleModuleGroupCollapsed("physics-rapier");
+  assert.deepEqual(moduleGroups(), { "physics-rapier": true });
+});
+
+test("module groups survive a reload, and junk values read as expanded", async () => {
+  toggleModuleGroupCollapsed("gi");
+  const revived = await freshImport("module-groups-reload");
+  assert.deepEqual(revived.useInspectorCollapse.getState().moduleGroups, { gi: true });
+
+  globalThis.localStorage.setItem(INSPECTOR_MODULE_GROUPS_KEY, JSON.stringify({ version: 1, moduleGroups: { gi: true, "physics-rapier": "yes" } }));
+  const junk = await freshImport("module-groups-junk");
+  assert.deepEqual(junk.useInspectorCollapse.getState().moduleGroups, { gi: true }, "only an exact `true` is a fold this module wrote");
+
+  globalThis.localStorage.setItem(INSPECTOR_MODULE_GROUPS_KEY, "{broken");
+  const broken = await freshImport("module-groups-broken");
+  assert.deepEqual(broken.useInspectorCollapse.getState().moduleGroups, {}, "a broken payload costs only the module-group folds");
 });

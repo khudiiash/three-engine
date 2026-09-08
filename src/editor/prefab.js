@@ -27,6 +27,7 @@ import {
   UnpackPrefabCommand,
   flushPrefabWrites,
 } from "./commands/prefabCommands.js";
+import { freeze } from "../engine/freezeLedger.js";
 
 /**
  * Editor-side prefab services: the project's prefab catalog, reading/writing
@@ -58,8 +59,24 @@ function publishCatalog() {
 
 /** Reads one prefab asset into the registry. Returns the def (or null). */
 export async function loadPrefabFile(path) {
+  const entry = await readPrefabFile(path);
+  return entry ? registerPrefabText(entry.path, entry.text) : null;
+}
+
+/** The IPC half of `loadPrefabFile`, so many can be in flight at once. */
+async function readPrefabFile(path) {
   try {
-    const text = await invoke("read_text_file", { path });
+    return { path, text: await invoke("read_text_file", { path }) };
+  } catch (err) {
+    console.warn(`Couldn't load prefab ${basename(path)}: ${err}`);
+    return null;
+  }
+}
+
+/** The parse+register half. Synchronous, so the order it runs in is the order
+ *  the registry sees — see `loadProjectPrefabs`. */
+function registerPrefabText(path, text) {
+  try {
     const def = parsePrefabFile(text, { name: stemOf(path) });
     prefabRegistry.register(def, path);
     return def;
@@ -81,8 +98,49 @@ export async function loadProjectPrefabs() {
     publishCatalog();
     return;
   }
-  const paths = await listProjectAssets(root, [PREFAB_EXT, LEGACY_PREFAB_EXT], 8);
-  for (const path of paths) await loadPrefabFile(path);
+  // ⚠ THE STAGE IS 3.1 s AND THE WHOLE BOOT WAITS ON IT (measured on the
+  // user's project, 2026-09-07) — but "prefabs: load" is three different
+  // things, and the parallel-read fix below only addressed one of them. Each
+  // sub-step marks itself, so the boot table says which one to attack rather
+  // than leaving the next session to re-derive it: a recursive asset LISTING
+  // over a 3 700-asset tree is a different problem from reading 21 files.
+  const tList = performance.now();
+  const paths = await freeze.runAsync("prefabs:list", () => listProjectAssets(root, [PREFAB_EXT, LEGACY_PREFAB_EXT], 8));
+  freeze.bootMark("prefabs: list files", performance.now() - tList, `${paths.length} found`);
+  // ── PREFABS LOAD IN PARALLEL (zero-freeze plan, found by unit 0.2) ───────
+  // This was `for (const path of paths) await loadPrefabFile(path)` — one
+  // native IPC round trip at a time, serialized. The boot table measured it at
+  // **2 217 ms on the user's project for 21 prefabs** (~105 ms each, nearly
+  // all of it latency, not work), and the whole editor boot waits on this
+  // stage because a scene's prefab INSTANCES cannot expand without their defs.
+  // The reads are independent, so they go out together; registration order is
+  // restored afterwards so the catalog is deterministic (the registry is a
+  // map, but two prefabs claiming one guid must resolve the same way twice).
+  //
+  // Bounded rather than unbounded: a project with a thousand prefabs should
+  // not open a thousand simultaneous native handles.
+  const PREFAB_READ_CONCURRENCY = 16;
+  const loaded = new Array(paths.length).fill(null);
+  const tRead = performance.now();
+  await freeze.runAsync("prefabs:read", async () => {
+    let next = 0;
+    const worker = async () => {
+      for (let i = next++; i < paths.length; i = next++) {
+        loaded[i] = await readPrefabFile(paths[i]);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PREFAB_READ_CONCURRENCY, paths.length) }, worker),
+    );
+  });
+  freeze.bootMark("prefabs: read files", performance.now() - tRead, `${paths.length} at ${PREFAB_READ_CONCURRENCY} concurrent`);
+  const tRegister = performance.now();
+  freeze.run("prefabs:register", () => {
+    for (const entry of loaded) {
+      if (entry) registerPrefabText(entry.path, entry.text);
+    }
+  });
+  freeze.bootMark("prefabs: register", performance.now() - tRegister);
   publishCatalog();
   console.log(`Loaded ${prefabRegistry.all().length} prefab(s)`);
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, ChevronDown, Plug, RefreshCw, TerminalSquare, X } from "lucide-react";
+import { Activity, AlertTriangle, Check, ChevronDown, Loader2, Plug, RefreshCw, TerminalSquare, X , ShieldAlert , ShieldCheck } from "../icons/index.jsx";
 import { useMcpStore, retryMcpBridge } from "../api/mcpBridge.js";
 import { useMcpPrefs, setMcpPrefs } from "../mcpPrefs.js";
 import { useAiPrefs, setAiPrefs } from "../aiPrefs.js";
@@ -83,7 +83,7 @@ function ClientRow({ client }) {
             action === "connect" ? connectMcpClient(client.client) : disconnectMcpClient(client.client)
           }
         >
-          {busy ? "…" : action === "connect" ? "Connect" : <Check size={13} />}
+          {busy ? "…" : action === "connect" ? <Plug size={13} /> : <Check size={13} />}
         </button>
       )}
     </div>
@@ -175,6 +175,7 @@ function ProviderSection() {
   return (
     <>
       <div className="mcp-section-label">Provider</div>
+      <div className="mcp-provider-row">
       <div className="dropdown-wrap ai-provider-wrap">
         <button className="ai-provider-trigger" ref={triggerRef} onClick={() => setOpen((v) => !v)}>
           <span>{provider.label}</span>
@@ -219,26 +220,31 @@ function ProviderSection() {
             />
           </label>
         </div>
-      ) : (
-        provider.disclosure && (
-          <div className="ai-provider-disclosure">
-            <AlertTriangle size={13} />
-            <span>{provider.disclosure}</span>
-          </div>
-        )
+      ) : null}
+      {provider.id !== "ollama" && provider.disclosure && (
+        <span className="mcp-flag warn" title={provider.disclosure} role="note">
+          <AlertTriangle size={13} />
+        </span>
       )}
-
-      <div className="ai-provider-capability">
-        {provider.capabilities.scopedTools
-          ? "Tools are limited to each workflow's allowlist."
-          : "Runs with full CLI permissions — not scoped to a workflow."}
-      </div>
-
-      <div className="mcp-actions">
-        <button className="mcp-action" disabled={test?.pending} onClick={runTest}>
-          <RefreshCw size={13} className={test?.pending ? "spin" : ""} />
-          {test?.pending ? "Testing…" : "Test connection"}
-        </button>
+      <span
+        className={`mcp-flag${provider.capabilities.scopedTools ? "" : " warn"}`}
+        role="note"
+        title={
+          provider.capabilities.scopedTools
+            ? "Tools are limited to each workflow's allowlist."
+            : "Runs with full CLI permissions — not scoped to a workflow."
+        }
+      >
+        {provider.capabilities.scopedTools ? <ShieldCheck size={13} /> : <ShieldAlert size={13} />}
+      </span>
+      <button
+        className="mcp-action icon-only"
+        disabled={test?.pending}
+        title={test?.pending ? "Testing…" : "Test connection"}
+        onClick={runTest}
+      >
+        {test?.pending ? <Loader2 size={13} className="spin" /> : <Activity size={13} />}
+      </button>
       </div>
       {test && !test.pending && (
         <div className={`ai-provider-test ${test.ok ? "ok" : "error"}`}>
@@ -299,11 +305,15 @@ export function McpPanel() {
 
       <div className="mcp-section-label">Clients</div>
       {clients === null ? (
-        <div className="mcp-empty">Looking for installed CLIs…</div>
+        <div className="mcp-empty" title="Looking for installed CLIs…">
+          <Loader2 size={14} className="spin" />
+        </div>
       ) : clients.length === 0 ? (
-        <div className="mcp-empty">
-          Only available in the desktop app. Register by hand with
-          <code>claude mcp add {MCP_SERVER_NAME} -- node &lt;repo&gt;/mcp/server.mjs</code>
+        <div
+          className="mcp-empty"
+          title={`Only available in the desktop app. Register by hand with: claude mcp add ${MCP_SERVER_NAME} -- node <repo>/mcp/server.mjs`}
+        >
+          <Plug size={28} className="empty-glyph" />
         </div>
       ) : (
         clients.map((client) => <ClientRow key={client.client} client={client} />)
@@ -313,25 +323,22 @@ export function McpPanel() {
       <div className="mcp-section-label">Session</div>
       <div className="mcp-actions">
         <button
-          className="mcp-action"
+          className="mcp-action icon-only"
           title="Open a terminal inside the editor and run Claude Code or Codex there"
           onClick={() => openPanel("terminal")}
         >
           <TerminalSquare size={13} />
-          Open terminal
         </button>
         <button
-          className="mcp-action"
+          className="mcp-action icon-only"
           disabled={!enabled || status === "connected"}
-          title="Reconnect to a server on this port now, instead of waiting for the next retry"
+          title="Retry: reconnect to a server on this port now, instead of waiting for the next retry"
           onClick={() => retryMcpBridge()}
         >
           <RefreshCw size={13} />
-          Retry
         </button>
-        <button className="mcp-action" title="Re-check which CLIs are installed" onClick={() => refreshMcpClients()}>
+        <button className="mcp-action icon-only" title="Rescan: re-check which CLIs are installed" onClick={() => refreshMcpClients()}>
           <Plug size={13} />
-          Rescan
         </button>
       </div>
 

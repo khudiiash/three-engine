@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Download, ExternalLink, Globe, Hash, Info, KeyRound, Loader2, Search, Store, UploadCloud } from "lucide-react";
+import { Download, ExternalLink, Globe, Hash, Info, KeyRound, Loader2, Power, Search, Store, UploadCloud } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import {
@@ -25,9 +25,8 @@ const TABS = [
 /** Shared "connect this in the Modules panel" banner for a missing credential. */
 function CredentialBanner({ children }) {
   return (
-    <div className="sf-authbar">
+    <div className="sf-authbar" title={typeof children === "string" ? children : undefined}>
       <KeyRound size={13} />
-      <span>{children}</span>
       <button className="toolbar-btn" onClick={() => openModulesPanel()}>Open Modules</button>
     </div>
   );
@@ -59,15 +58,9 @@ export function ItchioPanel() {
     return (
       <div className="ph-panel">
         <div className="ph-gate">
-          <Globe size={28} />
-          <h3>itch.io</h3>
-          <p>
-            Browse your itch.io library and the whole store, import downloads into the project, or
-            build a publish-ready zip for one of your own games. Enable the itch.io module to get
-            started.
-          </p>
+          <Globe size={28} className="empty-glyph" />
           <button className="toolbar-btn wide" onClick={() => setModuleEnabled("itchio", true)}>
-            Enable itch.io module
+            <Power size={13} /> Enable itch.io module
           </button>
         </div>
       </div>
@@ -93,12 +86,9 @@ export function ItchioPanel() {
       {tab === "store" ? (
         <StoreTab token={token} />
       ) : !token ? (
-        <>
-          <CredentialBanner>
-            Connect your itch.io API key in the Modules panel to browse your library or publish
-          </CredentialBanner>
-          <div className="ph-status">Connect an itch.io API key in the Modules panel to continue.</div>
-        </>
+        <CredentialBanner>
+          Connect your itch.io API key in the Modules panel to browse your library or publish
+        </CredentialBanner>
       ) : tab === "library" ? (
         <LibraryTab />
       ) : (
@@ -207,9 +197,8 @@ function StoreTab({ token }) {
             title="Narrows to game assets with this itch.io tag, e.g. pixel-art"
           />
         </div>
-        <button className="toolbar-btn" disabled={busy}>
+        <button className="toolbar-btn icon-only" disabled={busy} title={busy ? "Searching…" : "Search"}>
           {busy ? <Loader2 size={13} className="ph-spin" /> : <Search size={13} />}
-          {busy ? "Searching…" : "Search"}
         </button>
         <span className="itchio-help" title={STORE_HELP}><Info size={13} /></span>
       </form>
@@ -238,7 +227,7 @@ function StoreTab({ token }) {
           {error && !items?.length ? (
             <div className="ph-status">{error}</div>
           ) : busy ? (
-            <div className="ph-status"><Loader2 size={14} className="ph-spin" /> Searching itch.io…</div>
+            <div className="ph-status"><Loader2 size={14} className="ph-spin" /></div>
           ) : items === null ? null : items.length === 0 ? (
             <div className="ph-status">No results.</div>
           ) : (
@@ -350,7 +339,7 @@ function StoreDownloads({ item, hasProject }) {
     );
   }
   if (uploads === null) {
-    return <div className="ph-status"><Loader2 size={14} className="ph-spin" /> Checking downloads…</div>;
+    return <div className="ph-status"><Loader2 size={14} className="ph-spin" /></div>;
   }
   return (
     <>
@@ -410,7 +399,7 @@ function LibraryTab() {
         {error && !games ? (
           <div className="ph-status">Couldn't reach itch.io: {error}</div>
         ) : games === null ? (
-          <div className="ph-status"><Loader2 size={14} className="ph-spin" /> Loading your library…</div>
+          <div className="ph-status"><Loader2 size={14} className="ph-spin" /></div>
         ) : games.length === 0 ? (
           <div className="ph-status">Nothing owned or purchased on this itch.io account yet.</div>
         ) : (
@@ -474,7 +463,7 @@ function GameUploads({ game, hasProject, onClose }) {
       {error ? (
         <div className="ph-error">{error}</div>
       ) : uploads === null ? (
-        <div className="ph-status"><Loader2 size={14} className="ph-spin" /> Loading files…</div>
+        <div className="ph-status"><Loader2 size={14} className="ph-spin" /></div>
       ) : uploads.length === 0 ? (
         <div className="ph-status">No downloadable files on this game.</div>
       ) : (
@@ -541,13 +530,12 @@ function UploadRow({ game, upload, hasProject }) {
         {error && <span className="ph-error">{error}</span>}
       </div>
       <button
-        className="toolbar-btn itchio-upload-btn"
+        className="toolbar-btn itchio-upload-btn icon-only"
         disabled={!hasProject || !!progress}
         onClick={run}
-        title={result ? "Download and import again" : "Download and import into the project"}
+        title={progress ? progress.label : result ? "Download and import again" : "Download and import into the project"}
       >
         {progress ? <Loader2 size={12} className="ph-spin" /> : <Download size={12} />}
-        {result ? "Again" : "Import"}
       </button>
     </div>
   );
@@ -610,7 +598,7 @@ function PublishTab() {
   if (!hasProject) return <div className="ph-status">Open a project to publish.</div>;
   if (error && !games) return <div className="ph-status">Couldn't reach itch.io: {error}</div>;
   if (games === null) {
-    return <div className="ph-status"><Loader2 size={14} className="ph-spin" /> Loading your games…</div>;
+    return <div className="ph-status"><Loader2 size={14} className="ph-spin" /></div>;
   }
 
   return (

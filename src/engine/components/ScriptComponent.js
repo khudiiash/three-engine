@@ -247,6 +247,11 @@ export class ScriptComponent extends Component {
    * lines a second and bury whatever else is wrong.
    */
   #safeCall(slot, hook, args = []) {
+    // Charged to the script file in the profiler's breakdown while a capture
+    // is armed; otherwise one boolean test.
+    const stats = this.entity?.engine?.stats;
+    const timed = !!stats?._attribArmed;
+    const t0 = timed ? performance.now() : 0;
     try {
       slot.instance[hook](...args);
       return true;
@@ -263,6 +268,8 @@ export class ScriptComponent extends Component {
         console.error(`Script "${where}" threw:`, err);
       }
       return false;
+    } finally {
+      if (timed) stats.attributeScript(slot.path, hook, performance.now() - t0);
     }
   }
 
@@ -391,13 +398,24 @@ export class ScriptComponent extends Component {
     for (let i = 0; i < (this.slots?.length ?? 0); i++) this.#reconcileSlotRunning(i);
   }
 
+  /** The component's eye (or its editing pause): every script under it stops. */
+  onDisable() {
+    for (let i = 0; i < (this.slots?.length ?? 0); i++) this.#reconcileSlotRunning(i);
+  }
+
+  onEnable() {
+    for (let i = 0; i < (this.slots?.length ?? 0); i++) this.#reconcileSlotRunning(i);
+  }
+
   /** Starts or stops one slot so it matches play state AND its enabled flag.
    *  `@executeInEditMode` classes are "running" whether or not we're playing —
    *  that's the whole point of the marker. */
   #reconcileSlotRunning(index) {
     const slot = this.slots?.[index];
     if (!slot?.instance) return;
-    const live = !!this._playing || this.#slotRunsInEditMode(index);
+    // The component's own enabled state gates every slot: a disabled Scripts
+    // component runs nothing, in either mode.
+    const live = this.enabled && (!!this._playing || this.#slotRunsInEditMode(index));
     const should = live && this.#slotEnabled(index) && !slot.off;
     if (should === slot.running) return;
     slot.running = should;
@@ -529,6 +547,7 @@ export class ScriptComponent extends Component {
   }
 
   #tick(dt) {
+    if (!this.enabled) return;
     const config = this.entity.engine.config ?? {};
     const interval = (config.scriptReloadIntervalMs ?? RELOAD_CHECK_INTERVAL * 1000) / 1000;
     // Wall clock, not game time: hot reload is editor tooling. Timing it off

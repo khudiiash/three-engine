@@ -38,8 +38,8 @@ const mirrorScene = {
         light: { enabled: true, intensity: 3.5, kind: "point" },
         collider: { enabled: true, shape: "convex" },
       },
-      enabledInEditor: true,
-      enabledInGame: true,
+      visibleInEditor: true,
+      enabled: true,
       childIds: [],
     },
     lamp2: {
@@ -47,8 +47,8 @@ const mirrorScene = {
       name: "Floor Lamp",
       tags: [],
       components: { transform: { enabled: true }, light: { enabled: true, intensity: 1 } },
-      enabledInEditor: false, // the eye icon is off
-      enabledInGame: true,
+      visibleInEditor: false, // hidden while editing; still enabled
+      enabled: true,
       childIds: [],
     },
     box: {
@@ -56,8 +56,8 @@ const mirrorScene = {
       name: "Crate",
       tags: ["enemy"],
       components: { transform: { enabled: true }, mesh: { castShadow: true } },
-      enabledInEditor: true,
-      enabledInGame: false,
+      visibleInEditor: true,
+      enabled: false, // the hierarchy's eye is off
       childIds: [],
     },
     jukebox: {
@@ -65,8 +65,8 @@ const mirrorScene = {
       name: "JukeBox",
       tags: [],
       components: { transform: { enabled: true }, sound: { volume: 0.5 } },
-      enabledInEditor: true,
-      enabledInGame: true,
+      visibleInEditor: true,
+      enabled: true,
       childIds: [],
     },
     note: {
@@ -74,8 +74,8 @@ const mirrorScene = {
       name: "Enemy spawn note",
       tags: [],
       components: { transform: { enabled: true } },
-      enabledInEditor: true,
-      enabledInGame: true,
+      visibleInEditor: true,
+      enabled: true,
       childIds: [],
     },
     empty: {
@@ -83,8 +83,8 @@ const mirrorScene = {
       name: "empty",
       tags: [],
       components: {},
-      enabledInEditor: true,
-      enabledInGame: true,
+      visibleInEditor: true,
+      enabled: true,
       childIds: ["lamp1"], // a hit inside a nested branch must still surface
     },
     redlamp: {
@@ -92,8 +92,8 @@ const mirrorScene = {
       name: "my red lamp 1",
       tags: [],
       components: { transform: { enabled: true } },
-      enabledInEditor: true,
-      enabledInGame: true,
+      visibleInEditor: true,
+      enabled: true,
       childIds: [],
     },
   },
@@ -109,8 +109,8 @@ function liveEntity(mirror) {
       Object.entries(mirror.components).map(([type, props]) => [type, { type, props }]),
     ),
     children: (mirror.childIds ?? []).map((id) => ({ id })),
-    enabledInEditor: mirror.enabledInEditor,
-    enabledInGame: mirror.enabledInGame,
+    enabled: mirror.enabled,
+    visibleInEditor: mirror.visibleInEditor,
   };
 }
 
@@ -214,16 +214,20 @@ test("a filter-only match ranks at tier 5, below every textual hit", () => {
   const index = buildSearchIndex(rootIds, entities, "?light.intensity>2");
   assert.deepEqual(Object.keys(index), ["lamp1"]);
   assert.equal(index.lamp1.tier, FILTER_ONLY_TIER);
-  assert.equal(buildSearchIndex(rootIds, entities, "?enabled=false").lamp2.tier, FILTER_ONLY_TIER);
-  assert.equal(buildSearchIndex(rootIds, entities, "?enabledingame=false").box.tier, FILTER_ONLY_TIER);
+  assert.equal(buildSearchIndex(rootIds, entities, "?visibleineditor=false").lamp2.tier, FILTER_ONLY_TIER);
+  assert.equal(buildSearchIndex(rootIds, entities, "?enabled=false").box.tier, FILTER_ONLY_TIER);
   assert.equal(buildSearchIndex(rootIds, entities, "?tag=enemy").box.tier, FILTER_ONLY_TIER);
   // Filters can also gate a name match without changing its tier.
-  assert.deepEqual(buildSearchIndex(rootIds, entities, "lamp?enabled=false"), { lamp2: { tier: 1 } });
+  assert.deepEqual(buildSearchIndex(rootIds, entities, "lamp?visibleineditor=false"), { lamp2: { tier: 1 } });
 });
 
-test("`enabled` means editor-enabled, `enabledInGame` the play flag", () => {
+test("`enabled` is the one flag (both modes); `visibleInEditor` is the editing aid; `enabledInGame` still reads enabled", () => {
   assert.deepEqual(
     buildSearchIndex(rootIds, entities, "?enabled=false"),
+    { box: { tier: FILTER_ONLY_TIER } },
+  );
+  assert.deepEqual(
+    buildSearchIndex(rootIds, entities, "?visibleInEditor=false"),
     { lamp2: { tier: FILTER_ONLY_TIER } },
   );
   assert.deepEqual(
@@ -275,17 +279,24 @@ test("highlightFor: a structured query whose FIRST term is plain text still high
   assert.equal(highlightFor(parseQuery('crate "big box"'), 'crate "big box"'), "crate");
 });
 
-test("the two adapters agree on the enabled flags they report", () => {
+test("the two adapters agree on the flags they report", () => {
   const mirror = entities.lamp2;
-  assert.equal(candidateFromMirror(mirror).enabled, false);
-  assert.equal(candidateFromMirror(mirror).enabledInGame, true);
-  assert.equal(candidateFromLive(liveEntity(mirror)).enabled, false);
-  assert.equal(candidateFromLive(liveEntity(mirror)).enabledInGame, true);
+  assert.equal(candidateFromMirror(mirror).enabled, true);
+  assert.equal(candidateFromMirror(mirror).visibleInEditor, false);
+  assert.equal(candidateFromLive(liveEntity(mirror)).enabled, true);
+  assert.equal(candidateFromLive(liveEntity(mirror)).visibleInEditor, false);
+  assert.equal(candidateFromMirror(entities.box).enabled, false);
+  assert.equal(candidateFromMirror(entities.box).enabledInGame, false);
   // Absent flags read as enabled — an older mirror that predates them must
   // not turn the whole scene invisible to `?enabled=true`.
   const legacyMirror = { name: "x", tags: [], components: {} };
   assert.equal(candidateFromMirror(legacyMirror).enabled, true);
   assert.equal(candidateFromLive({ name: "x", components: new Map() }).enabledInGame, true);
+  // A mirror still carrying the old per-mode pair: its game flag is enabled,
+  // its editor flag the viewing aid.
+  const oldMirror = { name: "y", tags: [], components: {}, enabledInEditor: false, enabledInGame: false };
+  assert.equal(candidateFromMirror(oldMirror).enabled, false);
+  assert.equal(candidateFromMirror(oldMirror).visibleInEditor, false);
 });
 
 test("the adapters hand through the props objects without copying them", () => {

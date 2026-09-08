@@ -1,7 +1,9 @@
 import { memo, useEffect } from "react";
 import { Handle, Position, NodeResizer, useUpdateNodeInternals } from "@xyflow/react";
-import { ChevronDown, ChevronRight, Eye } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye } from "../icons/index.jsx";
 import { AssetField } from "../fields/AssetField.jsx";
+import { AssetPicture } from "../fields/AssetBrowser.jsx";
+import { thumbKind } from "../assetThumbs.js";
 import { socketColor } from "./socketTypes.js";
 import { FRAME_TYPE, REROUTE_TYPE } from "./graphUtils.js";
 import {
@@ -70,7 +72,7 @@ function Widget({ spec, value, onChange }) {
     case "asset":
       return (
         <div className="gf-asset nodrag nopan">
-          <AssetField descriptor={{ exts: spec.exts }} value={v ?? ""} onCommit={(path) => onChange(path, false)} />
+          <AssetField descriptor={{ exts: spec.exts, compact: true }} value={v ?? ""} onCommit={(path) => onChange(path, false)} />
         </div>
       );
     case "code":
@@ -101,6 +103,11 @@ function GraphNodeInner({ id, data, selected }) {
   const inputs = def?.inputs ?? [];
   const outputs = def?.outputs ?? [];
   const params = def?.params ?? [];
+  // The node's picture when the shader preview is off: its asset's own
+  // thumbnail (a Texture node's texture), if it has one.
+  const assetParam = params.find((p) => p.type === "asset");
+  const assetPath = assetParam ? props[assetParam.key] : null;
+  const assetPicture = !!assetPath && !!thumbKind(assetPath);
   const set = (key, value, gesture) => data.onPropsChange(id, { [key]: value }, { gesture, param: key });
   const multiOut = outputs.length > 1;
 
@@ -214,10 +221,14 @@ function GraphNodeInner({ id, data, selected }) {
             </div>
           )}
 
-          {multiOut && thumb ? (
+          {multiOut && (thumb || assetPicture) ? (
             <div className="node-output-group">
-              <div className="node-thumb inline nodrag">
-                <canvas width={96} height={96} ref={(el) => data.registerThumb?.(id, el)} />
+              <div className={`node-thumb inline nodrag${thumb ? "" : " picture"}`}>
+                {thumb ? (
+                  <canvas width={96} height={96} ref={(el) => data.registerThumb?.(id, el)} />
+                ) : (
+                  <AssetPicture path={assetPath} glyphSize={24} />
+                )}
               </div>
               {outputPorts}
             </div>

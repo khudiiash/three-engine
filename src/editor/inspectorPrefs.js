@@ -17,6 +17,12 @@
  * type that does not exist yet needs no migration and "expand all" is simply
  * an empty object.
  *
+ * The module GROUPS inside a component section (see ModuleFieldsGroup in
+ * InspectorPanel.jsx) fold the same way, keyed by MODULE id — "Physics" is
+ * one fold whether it appears on a mesh or a virtual camera. They persist
+ * under their OWN key so the payload above stays exactly what version 1
+ * wrote; the two maps never mix in storage.
+ *
  * Persistence is best-effort, matching `hierarchyPrefs.js`: localStorage may be
  * unavailable (private mode, quota exceeded), so every access is wrapped and
  * silently no-ops — the fold still happens, it just will not survive a reload.
@@ -26,6 +32,19 @@ import { create } from "zustand";
 import { vmSingleton } from "./singleton.js";
 
 export const INSPECTOR_COLLAPSED_KEY = "engine.inspector.collapsed.v1";
+export const INSPECTOR_MODULE_GROUPS_KEY = "engine.inspector.moduleGroups.v1";
+
+/** Only an exact `true` survives the round trip — a hand-edited `false` or a
+ *  stray string must not read back as a fold this module wrote. */
+function readFolds(raw) {
+  const folds = {};
+  if (raw && typeof raw === "object") {
+    for (const [key, value] of Object.entries(raw)) {
+      if (value === true) folds[key] = true;
+    }
+  }
+  return folds;
+}
 
 /**
  * Read at module init, and the store's factory runs inside `vmSingleton` — so
@@ -37,25 +56,32 @@ export const INSPECTOR_COLLAPSED_KEY = "engine.inspector.collapsed.v1";
 function load() {
   try {
     const parsed = JSON.parse(localStorage.getItem(INSPECTOR_COLLAPSED_KEY) ?? "null");
-    const collapsed = {};
-    if (parsed && typeof parsed === "object" && parsed.collapsed && typeof parsed.collapsed === "object") {
-      // Anything that is not exactly `true` is not a fold we wrote — a
-      // hand-edited `false` or a stray string must not read back as one.
-      for (const [type, value] of Object.entries(parsed.collapsed)) {
-        if (value === true) collapsed[type] = true;
-      }
+    const collapsed = readFolds(parsed?.collapsed);
+    let moduleGroups = {};
+    try {
+      moduleGroups = readFolds(JSON.parse(localStorage.getItem(INSPECTOR_MODULE_GROUPS_KEY) ?? "null")?.moduleGroups);
+    } catch {
+      // A broken module-group payload costs only those folds.
     }
-    return { version: 1, collapsed };
+    return { version: 1, collapsed, moduleGroups };
   } catch {
     // Unparseable JSON or no storage at all: everything expanded, and the next
     // toggle overwrites the bad payload instead of preserving it.
-    return { version: 1, collapsed: {} };
+    return { version: 1, collapsed: {}, moduleGroups: {} };
   }
 }
 
 function persist(collapsed) {
   try {
     localStorage.setItem(INSPECTOR_COLLAPSED_KEY, JSON.stringify({ version: 1, collapsed }));
+  } catch {
+    // Non-fatal: the fold applies to this session only.
+  }
+}
+
+function persistModuleGroups(moduleGroups) {
+  try {
+    localStorage.setItem(INSPECTOR_MODULE_GROUPS_KEY, JSON.stringify({ version: 1, moduleGroups }));
   } catch {
     // Non-fatal: the fold applies to this session only.
   }
@@ -101,5 +127,24 @@ export function setTypesCollapsed(types, collapsed) {
 export function useComponentCollapsed(type) {
   const collapsed = useInspectorCollapse((s) => !!s.collapsed[type]);
   const toggleCollapsed = useCallback(() => toggleTypeCollapsed(type), [type]);
+  return [collapsed, toggleCollapsed];
+}
+
+/** Flips one module group's fold ("Physics", "Global Illumination" …). Keyed
+ *  by MODULE id, shared by every component that groups it and every entity —
+ *  the same "one fold, everywhere" rule as the component types above. */
+export function toggleModuleGroupCollapsed(moduleId) {
+  const { moduleGroups } = useInspectorCollapse.getState();
+  const next = { ...moduleGroups };
+  if (next[moduleId]) delete next[moduleId];
+  else next[moduleId] = true;
+  useInspectorCollapse.setState({ moduleGroups: next });
+  persistModuleGroups(next);
+}
+
+/** `[isCollapsed, toggle]` for one module group inside a component section. */
+export function useModuleGroupCollapsed(moduleId) {
+  const collapsed = useInspectorCollapse((s) => !!s.moduleGroups?.[moduleId]);
+  const toggleCollapsed = useCallback(() => toggleModuleGroupCollapsed(moduleId), [moduleId]);
   return [collapsed, toggleCollapsed];
 }

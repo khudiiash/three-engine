@@ -1,37 +1,17 @@
 import { isBuiltinMaterial } from "../../engine/builtinMaterials.js";
+import { splitGeometryIslandsWithPrompt, canSplitEntity } from "../geometrySplit.js";
 // NOTE: strict type-checking intentionally not enabled here — ~25 pre-existing
 // errors unrelated to events (JSX field prop-shape mismatches, missing
 // Entity/Engine properties like tags/viewOnly/virtualCameras), a follow-up.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
-  X,
-  Plus,
-  Crosshair,
-  Eye,
-  EyeOff,
-  ScanEye,
-  Package,
-  ChevronRight,
-  ChevronUp,
-  ChevronDown,
-  Sparkles,
-  Link,
-  Link2Off,
-  Search,
-  Pencil,
-  ExternalLink,
-  PanelsTopLeft,
-  Waypoints,
-  Layers2,
-  FilePlus,
-  Axis3d,
-} from "lucide-react";
+  X, Plus, Crosshair, Eye, EyeOff, ScanEye, Package, ChevronRight, ChevronUp, ChevronDown, Sparkles, Link, Link2Off, Search, Pencil, ExternalLink, PanelsTopLeft, Waypoints, Layers2, FilePlus, Axis3d, Play, Pin, Lock, Check, RotateCcw, GitFork, PackageOpen, Power, PencilRuler, PencilOff } from "../icons/index.jsx";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
-import { getComponentClass, getComponentTypes } from "../../engine/index.js";
+import { getComponentClass, getComponentTypes, getModuleDefinition } from "../../engine/index.js";
 import { commandBus } from "../commands/CommandBus.js";
-import { RenameEntityCommand, BatchCommand, SetEntityViewOnlyCommand, SetEntityPersistentCommand, SetEntityEnabledInEditorCommand, SetEntityEnabledInGameCommand, SetEntityTagsCommand } from "../commands/entityCommands.js";
+import { RenameEntityCommand, BatchCommand, SetEntityViewOnlyCommand, SetEntityPersistentCommand, SetEntityEnabledCommand, SetEntityVisibleInEditorCommand, SetEntityTagsCommand } from "../commands/entityCommands.js";
 import { ANCHOR_PRESETS, applyAnchorPreset } from "../../engine/ui/layout.js";
 import { collectBoneNames } from "../../engine/anim/mask.js";
 import { SetTransformCommand } from "../commands/transformCommands.js";
@@ -43,12 +23,13 @@ import {
 import { openPanel } from "../EditorShell.jsx";
 import { engine } from "../engineInstance.js";
 import { AssetField } from "../fields/AssetField.jsx";
+import { EntityField } from "../fields/EntityField.jsx";
 import { PREFAB_EXTENSIONS } from "../assetLoader.js";
 import { AssetInspector } from "./AssetInspector.jsx";
 import { useAssetDrop } from "../assetDrag.js";
 import { getEditorCameraView } from "./ViewportPanel.jsx";
 import { useModulesStore } from "../modules.js";
-import { setTypesCollapsed, useComponentCollapsed } from "../inspectorPrefs.js";
+import { setTypesCollapsed, useComponentCollapsed, useModuleGroupCollapsed } from "../inspectorPrefs.js";
 import { usePrefabStore } from "../store/prefabStore.js";
 import { prefabRegistry, diffInstance, getPrefabRoot } from "../../engine/index.js";
 import { applyPrefab, revertPrefab, unpackPrefab, openPrefabMode, createVariantFromInstance } from "../prefab.js";
@@ -229,6 +210,13 @@ function ScaleRow({ values, onCommit, locked, onToggleLock }) {
   return (
     <div className="field-row">
       <span className="field-label">Scale</span>
+      <button
+        className={`icon-btn lock-btn field-mod ${locked ? "active-toggle" : ""}`}
+        title={locked ? "Proportions locked — click to scale axes independently" : "Scale axes independently — click to lock proportions"}
+        onClick={onToggleLock}
+      >
+        {locked ? <Link size={12} /> : <Link2Off size={12} />}
+      </button>
       <div className="vector-fields">
         {AXES.map((axis, i) => (
           <AxisField
@@ -244,13 +232,6 @@ function ScaleRow({ values, onCommit, locked, onToggleLock }) {
           />
         ))}
       </div>
-      <button
-        className={`icon-btn lock-btn ${locked ? "active-toggle" : ""}`}
-        title={locked ? "Proportions locked — click to scale axes independently" : "Scale axes independently — click to lock proportions"}
-        onClick={onToggleLock}
-      >
-        {locked ? <Link size={12} /> : <Link2Off size={12} />}
-      </button>
     </div>
   );
 }
@@ -413,6 +394,27 @@ function Vec3PropField({ value, onCommit, mixed = [], axes = 3 }) {
   );
 }
 
+/**
+ * One of the four entity flags (shown in editor, enabled in game, persistent,
+ * view-only) as a glyph toggle in the entity header. Four labelled rows
+ * became one row of glyphs; the label lives in the tooltip. `mixed` is the
+ * multi-selection case where the entities disagree.
+ */
+function EntityToggle({ on, mixed = false, onIcon: On, offIcon: Off = On, labelOn, labelOff, onChange }) {
+  const Icon = on ? On : Off;
+  return (
+    <button
+      type="button"
+      className={`entity-toggle${on ? " on" : ""}${mixed ? " mixed" : ""}`}
+      title={`${on ? labelOn : labelOff}${mixed ? " (mixed)" : ""}`}
+      aria-pressed={mixed ? "mixed" : on}
+      onClick={() => onChange(!on)}
+    >
+      <Icon size={14} />
+    </button>
+  );
+}
+
 function MixedCheckbox({ checked, mixed, onChange, ...props }) {
   const ref = useRef(null);
   useEffect(() => {
@@ -465,10 +467,19 @@ function MultiTransformSection({ entities }) {
 
   return (
     <div className="inspector-section">
-      <div className="section-header">Transform</div>
+      <div className="section-header"><span className="section-title"><Axis3d size={13} />Transform</span></div>
       {rows.map(([label, key, displayScale]) => (
         <div className="field-row" key={key}>
           <span className="field-label">{label}</span>
+          {key === "scale" && (
+            <button
+              className={`icon-btn lock-btn field-mod ${uniform ? "active-toggle" : ""}`}
+              title={uniform ? "Proportions locked — click to scale axes independently" : "Scale axes independently — click to lock proportions"}
+              onClick={toggleUniform}
+            >
+              {uniform ? <Link size={12} /> : <Link2Off size={12} />}
+            </button>
+          )}
           <div className="vector-fields">
             {[0, 1, 2].map((axis) => {
               const values = entities.map((entity) => entity.transform[key][axis]);
@@ -484,15 +495,6 @@ function MultiTransformSection({ entities }) {
               );
             })}
           </div>
-          {key === "scale" && (
-            <button
-              className={`icon-btn lock-btn ${uniform ? "active-toggle" : ""}`}
-              title={uniform ? "Proportions locked — click to scale axes independently" : "Scale axes independently — click to lock proportions"}
-              onClick={toggleUniform}
-            >
-              {uniform ? <Link size={12} /> : <Link2Off size={12} />}
-            </button>
-          )}
         </div>
       ))}
     </div>
@@ -508,27 +510,9 @@ function MultiTransformSection({ entities }) {
  * instantiation (prefab expansion mints fresh ids and does not rewrite props),
  * so inside a prefab, reference an ancestor or leave it empty for "the world".
  */
-function EntityRefField({ descriptor, value, onCommit }) {
-  const entities = useSceneStore((s) => s.entities);
-  const options = Object.values(entities ?? {})
-    .filter((e) => !descriptor.filter || descriptor.filter(e))
-    .map((e) => {
-      const parent = e.parentId ? entities[e.parentId]?.name : null;
-      return { id: e.id, label: parent ? `${e.name}  ·  ${parent}` : e.name };
-    })
-    .sort((a, b) => a.label.localeCompare(b.label));
-  const missing = value && !entities?.[value];
-  return (
-    <select className="select-field" value={value ?? ""} onChange={(e) => onCommit(e.target.value)}>
-      <option value="">{descriptor.emptyLabel ?? "— None —"}</option>
-      {missing && <option value={value}>— Missing —</option>}
-      {options.map((opt) => (
-        <option key={opt.id} value={opt.id}>
-          {opt.label}
-        </option>
-      ))}
-    </select>
-  );
+/** An entity reference: a drop target for a Hierarchy row and a browser — see fields/EntityField.jsx. */
+function EntityRefField(props) {
+  return <EntityField {...props} />;
 }
 
 /** Five-point radio rail used by discrete quality selectors such as GI terms. */
@@ -598,6 +582,10 @@ function ClothAnchorsField({value,onCommit}) {
 }
 
 export function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] }) {
+  // `optionModules` (a select whose OPTION list depends on an optional module)
+  // needs the installed set — subscribed here so a module toggle re-renders
+  // every open select, not just the sections that list module rows.
+  const enabledModules = useModulesStore((s) => s.enabled);
   switch (descriptor.type) {
     case "clothAnchors":
       return <ClothAnchorsField value={mixed?[]:value} onCommit={onCommit}/>;
@@ -648,8 +636,19 @@ export function PropField({ descriptor, value, onCommit, mixed = false, mixedAxe
       // `options` may be a function so a schema can offer choices that are
       // only known at runtime — the physics Layer dropdown reads the project's
       // layer names, which load long after the component class does.
-      const options =
+      const raw =
         typeof descriptor.options === "function" ? descriptor.options() ?? [] : descriptor.options ?? [];
+      // An option mapped to a module in `optionModules` only exists while that
+      // module is installed. A value SAVED under a now-absent module is not in
+      // the list, so the existing `stale` path below shows it marked "(missing)"
+      // instead of silently rewriting the prop.
+      const moduleOfOption = descriptor.optionModules;
+      const options = moduleOfOption
+        ? raw.filter((opt) => {
+            const moduleId = moduleOfOption[String(opt)];
+            return !moduleId || enabledModules.includes(moduleId);
+          })
+        : raw;
       // A value saved before the option list changed (a renamed layer) would
       // otherwise render as a blank select that silently rewrites the prop on
       // the next change. Show it, marked, until the user picks something.
@@ -899,7 +898,7 @@ function ScriptsSection({ entityId, props }) {
           className="toolbar-btn wide"
           onClick={() => commit([...slots, emptyScriptSlot()], "Add script")}
         >
-          <Plus size={12} /> Add Script
+          <Plus size={12} /> Add script
         </button>
         <button
           className="toolbar-btn"
@@ -913,7 +912,7 @@ function ScriptsSection({ entityId, props }) {
             }
           }}
         >
-          <FilePlus size={12} /> New
+          <FilePlus size={12} />
         </button>
       </div>
     </>
@@ -1307,6 +1306,7 @@ function MaterialSlotsSection({ entityId, props }) {
             }}
             value={values[index]}
             onCommit={(value) => setSlot(index, value)}
+            thumbSize="large"
           />
           {count > 1 && (
             <button
@@ -1813,6 +1813,63 @@ function AdvancedFieldsSection({ children }) {
 }
 
 /**
+ * A collapsible group of the schema rows one optional module contributes to a
+ * core component — Physics' "Default Collider" on a mesh, GI's mobility /
+ * tracing trio. ComponentSection groups the descriptors tagged with a module
+ * (they declare `module: "<moduleId>"` in the schema) and renders one of these
+ * per module instead of inline rows, so the component's own properties stay
+ * visually separate from what another module bolted onto it. The group is
+ * only ever mounted for an INSTALLED module — the same visibility rule the
+ * rows themselves follow.
+ *
+ * Fold state is per MODULE (see inspectorPrefs.js — "Physics" is one fold
+ * whether it appears on a mesh or a virtual camera), persisted like the
+ * component-section folds.
+ */
+function ModuleFieldsGroup({ moduleId, children }) {
+  const [collapsed, toggleCollapsed] = useModuleGroupCollapsed(moduleId);
+  // Enabled ⇒ its definition loaded with the module catalog; the prettified id
+  // only covers a definition that somehow never registered a name.
+  const name = getModuleDefinition(moduleId)?.name ?? moduleId.replace(/(^|[-_])(\w)/g, (_, sep, ch) => (sep ? " " : "") + ch.toUpperCase());
+  return (
+    <div className="module-fields">
+      <button
+        type="button"
+        className="module-fields-toggle"
+        onClick={toggleCollapsed}
+        aria-expanded={!collapsed}
+        title={`${name} module — these fields come from the module, not the component`}
+      >
+        <ChevronDown size={12} className={`module-fields-chevron${collapsed ? " collapsed" : ""}`} />
+        <Package size={11} className="module-fields-icon" />
+        <span>{name}</span>
+      </button>
+      {!collapsed && <div className="module-fields-body">{children}</div>}
+    </div>
+  );
+}
+
+/**
+ * Splits a filtered schema into the rows that need no grouping and the
+ * per-module groups, preserving each module's order of first appearance.
+ * Module membership wins over `advanced` — a module field belongs in its
+ * module's group even if it is also marked advanced.
+ */
+function groupSchemaByModule(visible) {
+  const plain = [];
+  const groups = new Map();
+  for (const descriptor of visible) {
+    if (descriptor.module) {
+      if (!groups.has(descriptor.module)) groups.set(descriptor.module, []);
+      groups.get(descriptor.module).push(descriptor);
+    } else {
+      plain.push(descriptor);
+    }
+  }
+  return { plain, groups };
+}
+
+/**
  * Every section the inspector is currently showing for `entityId` — the
  * transform row plus each component on it. Read at action time rather than at
  * mount, so the menu describes the entity as it is when it was right-clicked.
@@ -1823,6 +1880,9 @@ function allInspectorTypes(entityId) {
 
 function ComponentSection({ entityId, type, props }) {
   const cls = getComponentClass(type);
+  // Schema rows tagged with a module (`descriptor.module`) only exist while
+  // that module is installed — this is the live mirror of engine.modules.
+  const enabledModules = useModulesStore((s) => s.enabled);
   // Fold state is per COMPONENT TYPE, shared by every entity carrying one —
   // inspectorPrefs.js explains why it is deliberately not per-entity.
   const [collapsed, toggleCollapsed] = useComponentCollapsed(type);
@@ -1854,6 +1914,14 @@ function ComponentSection({ entityId, type, props }) {
     if (!component) return;
     commandBus.execute(new SetComponentPropCommand(entityId, type, "viewOnly", !viewOnly));
   };
+  // "Works while editing": off, the component does nothing while the editor
+  // is stopped and resumes on play — a heavy effect or an authoring script
+  // you want quiet while placing things.
+  const editorEnabled = component ? component.props.editorEnabled !== false : props.editorEnabled !== false;
+  const toggleEditorEnabled = () => {
+    if (!component) return;
+    commandBus.execute(new SetComponentPropCommand(entityId, type, "editorEnabled", !editorEnabled));
+  };
 
   const { menu, open: openMenu, close: closeMenu } = useContextMenu();
   const setProps = (values, label) =>
@@ -1865,6 +1933,7 @@ function ComponentSection({ entityId, type, props }) {
     );
   const menuItems = [
     { label: enabled ? "Disable Component" : "Enable Component", action: toggleEnabled },
+    { label: editorEnabled ? "Pause While Editing" : "Run While Editing", action: toggleEditorEnabled },
     { label: viewOnly ? "Clear View-Only" : "Set View-Only", action: toggleViewOnly },
     { separator: true },
     {
@@ -1899,6 +1968,17 @@ function ComponentSection({ entityId, type, props }) {
     },
   ];
 
+  // ⭐ A mesh built from several disconnected surfaces can be separated into one
+  // entity per piece from here, which is where someone looking at the geometry
+  // asset field is already standing. Only shown when there is a `.geom` behind
+  // it — on a primitive there is nothing to split.
+  if (type === "mesh" && canSplitEntity(engine.getEntity(entityId))) {
+    menuItems.splice(menuItems.length - 2, 0, {
+      label: "Split into Separate Meshes…",
+      action: () => splitGeometryIslandsWithPrompt({ entityId }),
+    });
+  }
+
   // Unknown type: its module is disabled. The data survives — say so.
   if (!cls) {
     return (
@@ -1923,6 +2003,9 @@ function ComponentSection({ entityId, type, props }) {
   }
 
   const { Icon, color } = componentIcon(type);
+  // Module-contributed fields render LAST (see the bottom of the section): the
+  // component's own settings, then its editors, then what a module adds to it.
+  let moduleGroups = null;
   return (
     <div className={`inspector-section ${enabled ? "" : "disabled"}${collapsed ? " collapsed" : ""}`} onContextMenu={openMenu}>
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={closeMenu} />}
@@ -1946,8 +2029,15 @@ function ComponentSection({ entityId, type, props }) {
             <ScanEye size={12} />
           </button>
           <button
-            className="icon-btn"
-            title={enabled ? "Disable component" : "Enable component"}
+            className={`icon-btn${editorEnabled ? "" : " paused"}`}
+            title={editorEnabled ? "Works while editing — click to pause it until play" : "Paused while editing — click to let it work in the editor"}
+            onClick={toggleEditorEnabled}
+          >
+            {editorEnabled ? <PencilRuler size={12} /> : <PencilOff size={12} />}
+          </button>
+          <button
+            className={`icon-btn${enabled ? "" : " paused"}`}
+            title={enabled ? "Enabled — click to disable (it stops entirely)" : "Disabled — click to enable"}
             onClick={toggleEnabled}
           >
             {enabled ? <Eye size={12} /> : <EyeOff size={12} />}
@@ -1964,8 +2054,12 @@ function ComponentSection({ entityId, type, props }) {
       {!collapsed && (
         <>
         {(() => {
+          const installed = new Set(enabledModules);
           const visible = cls.schema.filter((descriptor) => {
             if (descriptor.hidden) return false;
+            // A field that belongs to an optional module is invisible — not
+            // disabled — until that module is installed (see Component.js).
+            if (descriptor.module && !installed.has(descriptor.module)) return false;
             if (descriptor.showIf && !descriptor.showIf(props)) return false;
             // Mesh materials render through MaterialSlotsSection below, which owns
             // the whole slot list (add / remove / renumber) rather than one row.
@@ -2006,10 +2100,16 @@ function ComponentSection({ entityId, type, props }) {
               />
             </div>
           );
-          const advanced = visible.filter((descriptor) => descriptor.advanced);
+          const { plain, groups } = groupSchemaByModule(visible);
+          const advanced = plain.filter((descriptor) => descriptor.advanced);
+          moduleGroups = [...groups].map(([moduleId, fields]) => (
+            <ModuleFieldsGroup key={moduleId} moduleId={moduleId}>
+              {fields.map(renderField)}
+            </ModuleFieldsGroup>
+          ));
           return (
             <>
-              {visible.filter((descriptor) => !descriptor.advanced).map(renderField)}
+              {plain.filter((descriptor) => !descriptor.advanced).map(renderField)}
               {advanced.length > 0 && (
                 <AdvancedFieldsSection>{advanced.map(renderField)}</AdvancedFieldsSection>
               )}
@@ -2019,8 +2119,20 @@ function ComponentSection({ entityId, type, props }) {
         {type === "cloth" && (() => {
           const cloth = engine.getEntity(entityId)?.getComponent("cloth");
           const mesh = engine.getEntity(entityId)?.getComponent("mesh");
-          const message = cloth?.surfaceError || cloth?.meshColliderField?.error || (!mesh?.mesh || mesh.props.geometry !== "plane" || mesh.props.geometryAsset ? "Cloth requires a plane mesh" : "");
-          return message ? <div className="asset-hint" role="status">{message}</div> : null;
+          // ⚠ NOT "requires a plane mesh" ANY MORE. An arbitrary mesh can be
+          // cloth if it is sheet-shaped (clothMeshTopology.js), so the message
+          // is whatever the ANALYSIS said — "this mesh is solid, not
+          // sheet-like (thickness is 48% of its longest axis)" tells the
+          // author what to change; a fixed sentence about planes does not.
+          const message = cloth?.surfaceError || cloth?.meshColliderField?.error || "";
+          const notes = message ? [] : (cloth?.surfaceNotes ?? []);
+          if (!message && !notes.length) return null;
+          return (
+            <>
+              {message && <div className="asset-hint" role="status">{message}</div>}
+              {notes.map((note) => <div key={note} className="asset-hint" role="status">{note}</div>)}
+            </>
+          );
         })()}
         {type === "uielement" && <UiElementSection entityId={entityId} props={props} />}
         {type === "script" && <ScriptsSection entityId={entityId} props={props} />}
@@ -2135,6 +2247,7 @@ function ComponentSection({ entityId, type, props }) {
         {type === "vcam" && <VirtualCameraActions entityId={entityId} />}
         {type === "navmesh" && <NavMeshActions entityId={entityId} />}
         {type === "impulsesource" && <ImpulseSourceActions entityId={entityId} />}
+        {moduleGroups}
         {type === "sound" && <SoundSection entityId={entityId} props={props} />}
         {type === "listener" && <ListenerSection entityId={entityId} />}
         {type === "timeline" && <TimelineSection entityId={entityId} props={props} />}
@@ -2153,6 +2266,13 @@ function ComponentSection({ entityId, type, props }) {
           <div className="field-row">
             <span className="field-label" style={{ opacity: 0.6 }}>
               Requires a Terrain component on this entity
+            </span>
+          </div>
+        )}
+        {type === "collider" && props.shape === "custom" && !props.geometryAsset && (
+          <div className="field-row">
+            <span className="field-label" style={{ opacity: 0.6 }}>
+              Pick a .geom asset to cut the collider from
             </span>
           </div>
         )}
@@ -2246,6 +2366,8 @@ function MultiScriptAttributeFields({ entities }) {
 
 function MultiComponentSection({ entities, type }) {
   const cls = getComponentClass(type);
+  // Schema rows tagged with a module only exist while that module is installed.
+  const enabledModules = useModulesStore((s) => s.enabled);
   // Fold state is per COMPONENT TYPE, shared by every entity carrying one —
   // inspectorPrefs.js explains why it is deliberately not per-entity.
   const [collapsed, toggleCollapsed] = useComponentCollapsed(type);
@@ -2321,8 +2443,11 @@ function MultiComponentSection({ entities, type }) {
       {!collapsed && (
         <>
         {(() => {
+          const installed = new Set(enabledModules);
           const visible = cls.schema.filter((descriptor) => {
             if (descriptor.hidden) return false;
+            // Same module gate as the single-entity section above.
+            if (descriptor.module && !installed.has(descriptor.module)) return false;
             if (descriptor.showIf && !propsList.every((props) => descriptor.showIf(props))) return false;
             return true;
           });
@@ -2366,10 +2491,16 @@ function MultiComponentSection({ entities, type }) {
               </div>
             );
           };
-          const advanced = visible.filter((descriptor) => descriptor.advanced);
+          const { plain, groups } = groupSchemaByModule(visible);
+          const advanced = plain.filter((descriptor) => descriptor.advanced);
           return (
             <>
-              {visible.filter((descriptor) => !descriptor.advanced).map(renderField)}
+              {plain.filter((descriptor) => !descriptor.advanced).map(renderField)}
+              {[...groups].map(([moduleId, fields]) => (
+                <ModuleFieldsGroup key={moduleId} moduleId={moduleId}>
+                  {fields.map(renderField)}
+                </ModuleFieldsGroup>
+              ))}
               {advanced.length > 0 && (
                 <AdvancedFieldsSection>{advanced.map(renderField)}</AdvancedFieldsSection>
               )}
@@ -2487,53 +2618,56 @@ function PrefabSection({ entityId }) {
     <div className="prefab-section">
       <div className="prefab-section-head">
         <Package size={13} />
-        <span className="prefab-section-name" title={path ?? ""}>
+        <span
+          className="prefab-section-name"
+          title={`${path ?? ""}${root !== live ? " — this entity is part of the instance" : ""}`}
+        >
           {def?.name ?? "Prefab"}
         </span>
-        {baseName && <span className="prefab-variant-tag" title={`Variant of ${baseName}`}>variant of {baseName}</span>}
-        {root !== live && <span className="prefab-section-note inline">(part of this prefab)</span>}
-      </div>
-
-      <div className="prefab-actions">
-        <button className="toolbar-btn" disabled={!path} onClick={() => openPrefabMode(path)} title="Edit the prefab asset in isolation">
-          Open
-        </button>
-        <button className="toolbar-btn" disabled={!path} onClick={() => useSelectionStore.getState().selectAsset(path)} title="Reveal the asset in the Assets panel">
-          Select
-        </button>
-        <button
-          className="toolbar-btn"
-          disabled={!overrides.length}
-          onClick={() => applyPrefab(root.id)}
-          title="Push every change on this instance into the prefab (all other instances update)"
-        >
-          Apply All
-        </button>
-        <button
-          className="toolbar-btn"
-          disabled={!overrides.length}
-          onClick={() => revertPrefab(root.id)}
-          title="Discard every change on this instance"
-        >
-          Revert All
-        </button>
-      </div>
-
-      <div className="prefab-actions">
-        <button className="toolbar-btn" onClick={() => createVariantFromInstance(root.id)} title="Make a new prefab that inherits from this one, with these changes baked in">
-          Create Variant
-        </button>
-        <button className="toolbar-btn" onClick={() => unpackPrefab(root.id)} title="Break the link, keep the entities (nested prefabs stay linked)">
-          Unpack
-        </button>
+        {baseName && <span className="prefab-variant-tag" title={`Variant of ${baseName}`}>{baseName}</span>}
+        {overrides.length > 0 && (
+          <button
+            className={`prefab-overrides-count${overridesOpen ? " open" : ""}`}
+            title={`${overrides.length} override${overrides.length === 1 ? "" : "s"} on this instance — click to list`}
+            onClick={() => setOverridesOpen((v) => !v)}
+          >
+            {overrides.length}
+          </button>
+        )}
+        <span className="prefab-section-actions">
+          <button className="icon-btn" disabled={!path} onClick={() => openPrefabMode(path)} title="Open the prefab in isolation">
+            <ExternalLink size={12} />
+          </button>
+          <button className="icon-btn" disabled={!path} onClick={() => useSelectionStore.getState().selectAsset(path)} title="Reveal the asset in the Assets panel">
+            <Crosshair size={12} />
+          </button>
+          <button
+            className="icon-btn"
+            disabled={!overrides.length}
+            onClick={() => applyPrefab(root.id)}
+            title="Apply all: push every change on this instance into the prefab (all other instances update)"
+          >
+            <Check size={12} />
+          </button>
+          <button
+            className="icon-btn"
+            disabled={!overrides.length}
+            onClick={() => revertPrefab(root.id)}
+            title="Revert all: discard every change on this instance"
+          >
+            <RotateCcw size={12} />
+          </button>
+          <button className="icon-btn" onClick={() => createVariantFromInstance(root.id)} title="Create a variant: a new prefab inheriting from this one, with these changes baked in">
+            <GitFork size={12} />
+          </button>
+          <button className="icon-btn" onClick={() => unpackPrefab(root.id)} title="Unpack: break the link, keep the entities (nested prefabs stay linked)">
+            <PackageOpen size={12} />
+          </button>
+        </span>
       </div>
 
       {overrides.length > 0 && (
         <>
-          <button className="prefab-overrides-toggle" onClick={() => setOverridesOpen((v) => !v)}>
-            <ChevronRight size={11} className={overridesOpen ? "open" : ""} />
-            {overrides.length} override{overrides.length === 1 ? "" : "s"}
-          </button>
           {overridesOpen && (
             <div className="prefab-overrides">
               {overrides.map((override, i) => (
@@ -2635,8 +2769,8 @@ function MultiEntityInspector({ entities }) {
     (type) => entities.every((entity) => type in entity.components) && !getComponentClass(type)?.internal,
   );
   const flagValues = (key, fallback = true) => liveEntities.map((entity) => entity[key] ?? fallback);
-  const editorValues = liveEntities.map((entity) => entity.enabledInEditor !== false);
-  const gameValues = liveEntities.map((entity) => entity.enabledInGame !== false);
+  const enabledValuesAll = liveEntities.map((entity) => entity.enabled !== false);
+  const editorValues = liveEntities.map((entity) => entity.visibleInEditor !== false);
   const viewOnlyValues = flagValues("viewOnly", false).map(Boolean);
   const persistentValues = flagValues("persistent", false).map(Boolean);
   const mixed = (values) => !values.every((value) => value === values[0]);
@@ -2655,14 +2789,13 @@ function MultiEntityInspector({ entities }) {
 
   return (
     <div className="inspector-panel">
-      <div className="inspector-section multi-selection-summary">
-        <div className="section-header">{entities.length} Entities Selected</div>
-        <div className="field-row">
-          <span className="field-label">Name</span>
+      <div className="inspector-section multi-selection-summary entity-header">
+        <div className="section-header">{entities.length} entities</div>
+        <div className="entity-header-row">
           <input
-            className="text-field"
+            className="text-field entity-name-field"
             type="text"
-            placeholder="— Multiple —"
+            placeholder="Multiple"
             onBlur={(event) => {
               const name = event.target.value.trim();
               if (!name) return;
@@ -2670,6 +2803,39 @@ function MultiEntityInspector({ entities }) {
               event.target.value = "";
             }}
             onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
+          />
+          <EntityToggle
+            on={enabledValuesAll[0]}
+            mixed={mixed(enabledValuesAll)}
+            onIcon={Power}
+            labelOn="Enabled — click to disable all"
+            labelOff="Disabled — click to enable all"
+            onChange={(v) => executeForAll(SetEntityEnabledCommand, v, `${v ? "Enable" : "Disable"} ${entities.length} entities`)}
+          />
+          <EntityToggle
+            on={editorValues[0]}
+            mixed={mixed(editorValues)}
+            onIcon={Eye}
+            offIcon={EyeOff}
+            labelOn="Shown while editing — click to hide all"
+            labelOff="Hidden while editing — click to show all"
+            onChange={(v) => executeForAll(SetEntityVisibleInEditorCommand, v, `Set editor visibility on ${entities.length} entities`)}
+          />
+          <EntityToggle
+            on={persistentValues[0]}
+            mixed={mixed(persistentValues)}
+            onIcon={Pin}
+            labelOn="Persistent — click to make them scene-bound"
+            labelOff="Scene-bound — click to make them persistent"
+            onChange={(v) => executeForAll(SetEntityPersistentCommand, v, `Set Persistent on ${entities.length} entities`)}
+          />
+          <EntityToggle
+            on={viewOnlyValues[0]}
+            mixed={mixed(viewOnlyValues)}
+            onIcon={Lock}
+            labelOn="View only — click to run always"
+            labelOff="Runs always — click to make them view only"
+            onChange={(v) => executeForAll(SetEntityViewOnlyCommand, v, `Set View Only on ${entities.length} entities`)}
           />
         </div>
         {(() => {
@@ -2680,43 +2846,6 @@ function MultiEntityInspector({ entities }) {
           const mixed = lists.some((list) => list.length !== shared.length);
           return <EntityTagsRow entityIds={entityIds} tags={shared} mixed={mixed} />;
         })()}
-        <div className="field-row">
-          <span className="field-label">View Only</span>
-          <MixedCheckbox
-            checked={viewOnlyValues[0]}
-            mixed={mixed(viewOnlyValues)}
-            onChange={(event) => executeForAll(SetEntityViewOnlyCommand, event.target.checked, `Set View Only on ${entities.length} entities`)}
-          />
-        </div>
-        <div className="field-row">
-          <span className="field-label">Persistent</span>
-          <MixedCheckbox
-            checked={persistentValues[0]}
-            mixed={mixed(persistentValues)}
-            onChange={(event) => executeForAll(SetEntityPersistentCommand, event.target.checked, `Set Persistent on ${entities.length} entities`)}
-          />
-        </div>
-        <div className="field-row visibility-row">
-          <span className="field-label">Enabled</span>
-          <div className="visibility-toggles">
-            <label className="visibility-toggle">
-              <MixedCheckbox
-                checked={editorValues[0]}
-                mixed={mixed(editorValues)}
-                onChange={(event) => executeForAll(SetEntityEnabledInEditorCommand, event.target.checked, `Set editor visibility on ${entities.length} entities`)}
-              />
-              <span className="visibility-toggle-label">Editor</span>
-            </label>
-            <label className="visibility-toggle">
-              <MixedCheckbox
-                checked={gameValues[0]}
-                mixed={mixed(gameValues)}
-                onChange={(event) => executeForAll(SetEntityEnabledInGameCommand, event.target.checked, `Set game visibility on ${entities.length} entities`)}
-              />
-              <span className="visibility-toggle-label">Game</span>
-            </label>
-          </div>
-        </div>
       </div>
 
       <MultiTransformSection entities={entities} />
@@ -2731,7 +2860,7 @@ function MultiEntityInspector({ entities }) {
             disabled={!availableTypes.length}
             onClick={() => setAddOpen((value) => !value)}
           >
-            <Plus size={14} /> Add Component to Selection
+            <Plus size={14} /> Add component
           </button>
           {addOpen && (
             <AddComponentMenu
@@ -2873,87 +3002,62 @@ export function InspectorPanel() {
   // Reading through the engine instance guarantees we always show the
   // current value, even after undo/redo or scene reload.
   const liveEntity = engine.getEntity(entity.id);
-  const editorEnabled = liveEntity?.enabledInEditor !== false;
-  const gameEnabled = liveEntity?.enabledInGame !== false;
+  const entityEnabled = liveEntity?.enabled !== false;
+  const editorVisible = liveEntity?.visibleInEditor !== false;
 
   return (
     <div className="inspector-panel">
       <PrefabSection entityId={entity.id} />
-      <div className="inspector-section">
-        <div className="field-row">
-          <span className="field-label">Name</span>
-          <input
-            className="text-field"
-            type="text"
-            key={entity.id + entity.name}
-            defaultValue={entity.name}
-            onBlur={(e) => commitName(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && e.target.blur()}
+      <div className="inspector-section entity-header">
+        <div className="entity-header-row">
+          <div className="entity-header-text">
+            <input
+              className="text-field entity-name-field"
+              type="text"
+              key={entity.id + entity.name}
+              defaultValue={entity.name}
+              spellCheck={false}
+              onBlur={(e) => commitName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && e.target.blur()}
+            />
+            <span className="entity-kind" title="Components">
+              {Object.keys(entity.components)
+                .filter((t) => !getComponentClass(t)?.internal)
+                .map((t) => getComponentClass(t)?.label ?? t)
+                .join(" · ") || "Empty entity"}
+            </span>
+          </div>
+          <EntityToggle
+            on={entityEnabled}
+            onIcon={Power}
+            labelOn="Enabled — click to disable (its components and children stop)"
+            labelOff="Disabled — click to enable"
+            onChange={(v) => commandBus.execute(new SetEntityEnabledCommand(entity.id, v))}
+          />
+          <EntityToggle
+            on={editorVisible}
+            onIcon={Eye}
+            offIcon={EyeOff}
+            labelOn="Shown while editing — click to hide it in the viewport (it stays enabled)"
+            labelOff="Hidden while editing — click to show"
+            onChange={(v) => commandBus.execute(new SetEntityVisibleInEditorCommand(entity.id, v))}
+          />
+          <EntityToggle
+            on={!!liveEntity?.persistent}
+            onIcon={Pin}
+            labelOn="Persistent: survives scene loads — click to make it scene-bound"
+            labelOff="Scene-bound — click to make it persistent (game managers, the audio listener, a player carried between levels)"
+            onChange={(v) => commandBus.execute(new SetEntityPersistentCommand(entity.id, v))}
+          />
+          <EntityToggle
+            on={!!liveEntity?.viewOnly}
+            onIcon={Lock}
+            labelOn="View only: components pause while it is off screen — click to run always"
+            labelOff="Runs always — click to pause its components while it is outside the camera frustum"
+            onChange={(v) => commandBus.execute(new SetEntityViewOnlyCommand(entity.id, v))}
           />
         </div>
         <EntityTagsRow entityIds={[entity.id]} tags={entity.tags ?? []} />
-        <div className="field-row">
-          <span className="field-label">View Only</span>
-          <label className="field-row inline" title="Pause this entity's components while it is outside the camera frustum">
-            <input
-              type="checkbox"
-              checked={!!engine.getEntity(entity.id)?.viewOnly}
-              onChange={(e) =>
-                commandBus.execute(new SetEntityViewOnlyCommand(entity.id, e.target.checked))
-              }
-            />
-          </label>
-        </div>
-        <div className="field-row">
-          <span className="field-label">Persistent</span>
-          <label
-            className="field-row inline"
-            title="Survive engine.loadScene — for game managers, the audio listener, or a player that carries between levels"
-          >
-            <input
-              type="checkbox"
-              checked={!!liveEntity?.persistent}
-              onChange={(e) =>
-                commandBus.execute(new SetEntityPersistentCommand(entity.id, e.target.checked))
-              }
-            />
-          </label>
-        </div>
-        <div className="field-row visibility-row">
-          <span className="field-label">Enabled</span>
-          <div className="visibility-toggles" role="group" aria-label="Visibility per mode">
-            <label
-              className="visibility-toggle"
-              title={editorEnabled ? "Visible in editor — click to hide in editor" : "Hidden in editor — click to show in editor"}
-            >
-              <input
-                type="checkbox"
-                checked={editorEnabled}
-                onChange={(e) =>
-                  commandBus.execute(
-                    new SetEntityEnabledInEditorCommand(entity.id, e.target.checked),
-                  )
-                }
-              />
-              <span className="visibility-toggle-label">Editor</span>
-            </label>
-            <label
-              className="visibility-toggle"
-              title={gameEnabled ? "Enabled in game (play) — click to disable in game" : "Disabled in game — click to enable in game"}
-            >
-              <input
-                type="checkbox"
-                checked={gameEnabled}
-                onChange={(e) =>
-                  commandBus.execute(
-                    new SetEntityEnabledInGameCommand(entity.id, e.target.checked),
-                  )
-                }
-              />
-              <span className="visibility-toggle-label">Game</span>
-            </label>
-          </div>
-        </div>
       </div>
 
       <TransformSection entity={entity} />
@@ -2973,7 +3077,7 @@ export function InspectorPanel() {
             onClick={() => setAddMenuOpen((open) => !open)}
           >
             <Plus size={14} />
-            Add Component
+            Add component
           </button>
           {addMenuOpen && (
             <AddComponentMenu

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, Pause, Play } from "lucide-react";
+import { Loader2, Pause, Play } from "../icons/index.jsx";
 import {
   subscribePreview,
   togglePreview,

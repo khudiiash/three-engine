@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { DoorOpen, Plus, Trash2 } from "lucide-react";
+import { DoorOpen, Plus, Trash2 } from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 import { addOpening, removeOpening } from "../levelBuild.js";
 import { commandBus } from "../commands/CommandBus.js";

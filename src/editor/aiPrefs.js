@@ -17,6 +17,28 @@
 import { create } from "zustand";
 import { vmSingleton } from "./singleton.js";
 
+/**
+ * What the panel's Model picker offers. Aliases rather than pinned ids, so
+ * "opus" keeps meaning the current Opus after a CLI update instead of naming a
+ * model that quietly stops existing. `""` defers to the CLI's own setting.
+ */
+export const CLAUDE_MODELS = [
+  { value: "", label: "Default" },
+  { value: "opus", label: "Opus" },
+  { value: "sonnet", label: "Sonnet" },
+  { value: "haiku", label: "Haiku" },
+];
+
+/** `--effort` levels, exactly as the CLI spells them. */
+export const CLAUDE_EFFORTS = [
+  { value: "", label: "Default" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "X-High" },
+  { value: "max", label: "Max" },
+];
+
 const STORAGE_KEY = "engine.ai.v1";
 
 export const AI_DEFAULTS = Object.freeze({
@@ -30,6 +52,12 @@ export const AI_DEFAULTS = Object.freeze({
   // are still the ONLY providers a `mutates` workflow may run on (they are
   // the ones that can close their own tool set — see providers/index.js).
   providerId: "claude-cli",
+  // Empty means "whatever the CLI is configured to use" — the honest default,
+  // since the user already picked a model in `claude` itself and silently
+  // overriding it from a game editor would be a surprise. The panel's pickers
+  // write an explicit alias here when the user wants one for this panel only.
+  claudeModel: "",
+  claudeEffort: "",
   ollamaBaseUrl: "http://localhost:11434/v1",
   ollamaModel: "qwen3.5:4b",
   openaiBaseUrl: "",
@@ -43,6 +71,8 @@ function load() {
     if (!parsed || typeof parsed !== "object") return { ...AI_DEFAULTS };
     return {
       providerId: typeof parsed.providerId === "string" && parsed.providerId ? parsed.providerId : AI_DEFAULTS.providerId,
+      claudeModel: typeof parsed.claudeModel === "string" ? parsed.claudeModel : AI_DEFAULTS.claudeModel,
+      claudeEffort: typeof parsed.claudeEffort === "string" ? parsed.claudeEffort : AI_DEFAULTS.claudeEffort,
       ollamaBaseUrl: typeof parsed.ollamaBaseUrl === "string" && parsed.ollamaBaseUrl ? parsed.ollamaBaseUrl : AI_DEFAULTS.ollamaBaseUrl,
       ollamaModel: typeof parsed.ollamaModel === "string" && parsed.ollamaModel ? parsed.ollamaModel : AI_DEFAULTS.ollamaModel,
       openaiBaseUrl: typeof parsed.openaiBaseUrl === "string" ? parsed.openaiBaseUrl : AI_DEFAULTS.openaiBaseUrl,

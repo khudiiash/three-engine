@@ -36,7 +36,7 @@ import {
   Type,
   Volume2,
   Workflow,
-} from "lucide-react";
+} from "./icons/index.jsx";
 import {
   MODEL_IMPORT_EXTENSIONS,
   TEXTURE_EXTENSIONS,
@@ -77,7 +77,7 @@ const tagsOf = (entry) => (assetFlagsModule ? assetFlagsModule.getAssetFlags(ent
  * a second place to update.
  */
 export const ASSET_TYPES = [
-  { id: "all", label: "All Assets", Icon: Files, exts: null },
+  { id: "all", label: "All", Icon: Files, exts: null },
   { id: "folder", label: "Folders", Icon: Folder, exts: [], dirs: true },
   { id: "model", label: "Models", Icon: Boxes, exts: MODEL_IMPORT_EXTENSIONS },
   { id: "texture", label: "Textures", Icon: Image, exts: TEXTURE_EXTENSIONS },

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Play, Pause, Square, Plus, Trash2, Copy, Diamond } from "lucide-react";
+import { Play, Pause, Square, Plus, Trash2, Copy, Diamond, Sparkles } from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
@@ -81,7 +81,7 @@ export function VfxTimelinePanel() {
   const addComponent = async () => {
     try { await setModuleEnabled("vfx", true); commandBus.execute(new AddComponentCommand(id, "vfx")); } catch (e) { setError(e.message); }
   };
-  if (!component) return <div className="effect-empty"><strong>VFX</strong><p>Compose sprites, rings, meshes, ribbons, lights and particles on a timeline.</p>{id ? <button onClick={addComponent}>Add VFX component</button> : <p>Select an entity or create VFX in the hierarchy.</p>}{error && <p role="alert">{error}</p>}</div>;
+  if (!component) return <div className="effect-empty" title={id ? "Compose sprites, rings, meshes, ribbons, lights and particles on a timeline" : "Select an entity or create VFX in the hierarchy"}><Sparkles className="empty-glyph" size={28} />{id ? <button onClick={addComponent} title="Add VFX component"><Plus size={13} /> Add VFX</button> : null}{error && <p role="alert">{error}</p>}</div>;
   const keyframes = element?.keys?.[channel] ?? [];
   const keyTime = Math.max(0, clock - (element?.start ?? 0));
   const insertKey = () => {
@@ -110,7 +110,7 @@ export function VfxTimelinePanel() {
             <i className="effect-playhead" style={{left:`${clock/document.duration*100}%`}} />
           </div>
         </div>)}
-        {!document.elements.length && <p className="effect-empty">Add an element to start composing.</p>}
+        {!document.elements.length && <div className="effect-empty" title="Add an element to start composing"><Plus className="empty-glyph" size={28} /></div>}
       </div>
       {element && <div className="effect-properties">
         <div className="effect-toolbar"><strong>{element.kind}</strong><button title="Duplicate element" onClick={() => { const copy = {...structuredClone(element), id:createEffectElement(element.kind).id, name:`${element.name} copy`}; commit({...document,elements:[...document.elements,copy]});select(copy.id); }}><Copy size={13}/></button><button title="Remove element" onClick={() => {commit({...document,elements:document.elements.filter((e)=>e.id!==selected)});select("");}}><Trash2 size={13}/></button></div>
@@ -125,9 +125,8 @@ export function VfxTimelinePanel() {
         {["ring","ribbon"].includes(element.kind) && <label>Width<TimelineInput type="number" min=".01" step=".01" value={element.width} onChange={(e)=>patch({width:Number(e.target.value)})}/></label>}
         {element.kind === "ring" && <label>Arc<TimelineInput type="number" min="1" max="360" value={element.arc} onChange={(e)=>patch({arc:Number(e.target.value)})}/></label>}
         {!["group","light","particles"].includes(element.kind) && <label>Texture<AssetField descriptor={{exts:["png","jpg","webp"]}} value={element.texture} onCommit={(texture)=>patch({texture})}/></label>}
-        {element.kind === "particles" && <><label>Particle graph<AssetField descriptor={{exts:["vfx"]}} value={element.asset ?? ""} onCommit={(asset)=>patch({asset})}/></label><small>Uses the Particles graph, lighting and collision settings. Scrubbing resets GPU particles; play previews their simulation.</small></>}
-        <div className="effect-toolbar"><select aria-label="Animated channel" value={channel} onChange={(e)=>setChannel(e.target.value)}>{EFFECT_CHANNELS.map((c)=><option key={c}>{c}</option>)}</select><button title="Add key at playhead" onClick={insertKey}><Diamond size={13}/><Plus size={12}/></button></div>
-        <small>Keys use seconds since this element starts.</small>
+        {element.kind === "particles" && <label title="Uses the Particles graph, lighting and collision settings. Scrubbing resets GPU particles; play previews their simulation.">Particle graph<AssetField descriptor={{exts:["vfx"]}} value={element.asset ?? ""} onCommit={(asset)=>patch({asset})}/></label>}
+        <div className="effect-toolbar"><select aria-label="Animated channel" value={channel} onChange={(e)=>setChannel(e.target.value)}>{EFFECT_CHANNELS.map((c)=><option key={c}>{c}</option>)}</select><button title="Add key at playhead — keys use seconds since this element starts" onClick={insertKey}><Diamond size={13}/><Plus size={12}/></button></div>
         {keyframes.map((key,i)=><div className="effect-key" key={i}>
           <TimelineInput aria-label={`Key ${i} time`} type="number" step=".05" value={key.time} onChange={(e)=>patch({keys:{...element.keys,[channel]:keyframes.map((k,j)=>j===i?{...k,time:Number(e.target.value)}:k)}})}/>
           <TimelineInput aria-label={`Key ${i} value`} type="number" step=".05" value={key.value} onChange={(e)=>patch({keys:{...element.keys,[channel]:keyframes.map((k,j)=>j===i?{...k,value:Number(e.target.value)}:k)}})}/>

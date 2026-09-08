@@ -1,6 +1,7 @@
 import { vmState } from "./vmState.js";
 import * as THREE from "three/webgpu";
 import { loadAssetBinary, loadAssetMeta } from "./assetResolver.js";
+import { freeze } from "./freezeLedger.js";
 
 export const GEOMETRY_ASSET_VERSION = 1;
 /**
@@ -375,6 +376,18 @@ function isBinaryGeometry(buffer) {
  * copying, no parsing, no validation loop.
  */
 export function decodeGeometryAsset(buffer) {
+  // A v1 `.geom` is a JSON number array; a v2 is typed-array views. Both are
+  // decoded on the main thread, so both are spanned — a boot that blocks here
+  // is a project that still holds v1 files.
+  const __span = freeze.begin("assets:decodeGeometry");
+  try {
+    return decodeGeometryAssetInner(buffer);
+  } finally {
+    freeze.end(__span);
+  }
+}
+
+function decodeGeometryAssetInner(buffer) {
   const backing = ArrayBuffer.isView(buffer) ? buffer.buffer : buffer;
   const byteOffset = ArrayBuffer.isView(buffer) ? buffer.byteOffset : 0;
   const view = new DataView(backing, byteOffset, buffer.byteLength);

@@ -1,4 +1,5 @@
 import { updateWaterSlot } from "./waterCaustics.js";
+import { freeze } from "../freezeLedger.js";
 import { installWaterSurfaceLook } from "./waterSurfaceLook.js";
 import { Component } from "../components/Component.js";
 import { createGridSimulation } from "./gridSimulation.js";
@@ -7,8 +8,26 @@ import { bindVfxAsset } from "./vfxAsset.js";
 import { BackSide, FrontSide, Matrix4, Vector3 } from "three/webgpu";
 import { waterAutoResolution } from "./waterVolume.js";
 import { seaQuality } from "./waterSpectrum.js";
+import { analyseClothMesh, packClothTopology } from "./clothMeshTopology.js";
 
 const _cameraWorld = new Vector3(), _waterInverse = new Matrix4();
+
+/**
+ * Shapes that fill their volume. A convex hull, a box, a sphere and a capsule
+ * are solid, so something inside their bounds really is inside them; `concave`,
+ * `mesh` and `heightfield` are surfaces and cannot contain anything.
+ */
+const SOLID_COLLIDER_SHAPES = new Set(["convex", "box", "sphere", "capsule"]);
+
+/** An entity's AUTHORED mesh bounds in world space, or null. */
+function clothWorldBox(entity) {
+  const geometry = entity?.getComponent?.("mesh")?.mesh?.geometry;
+  if (!geometry) return null;
+  const source = geometry.userData?.__clothSourceBox;
+  if (!source) { geometry.computeBoundingBox(); if (!geometry.boundingBox) return null; }
+  entity.object3D.updateWorldMatrix(true, false);
+  return (source ?? geometry.boundingBox).clone().applyMatrix4(entity.object3D.matrixWorld);
+}
 import { ParticleColliderField } from "../particleColliders.js";
 import { ClothMeshColliderField } from "../clothMeshColliders.js";
 
@@ -58,9 +77,114 @@ export class GridSimulationComponent extends Component {
    * footprint and its Y is the depth, so a cube of water is exactly the cube
    * the author drew. Cloth stays plane-only: it has no volume to fill.
    */
+  /**
+   * An arbitrary mesh, analysed as cloth.
+   *
+   * Cached on the geometry: `analyseClothMesh` walks every triangle to weld,
+   * split islands and build the constraint graph — 42 ms on Sponza's curtain —
+   * and `attachSimulation` runs again on any prop change. The key carries the
+   * pinning mode because that is the one option that changes the RESULT rather
+   * than just the solver's uniforms.
+   */
+  clothMeshAnalysis(geometry, pinning) {
+    const cache = (geometry.userData.__clothAnalysis ??= new Map());
+    const version = geometry.getAttribute("position")?.version ?? 0;
+    const key = `${pinning}|${version}`;
+    let entry = cache.get(key);
+    if (!entry) {
+      const position = geometry.getAttribute("position");
+      const index = geometry.getIndex();
+      entry = analyseClothMesh(
+        { positions: position?.array, indices: index?.array ?? null },
+        { pinning, maxParticles: Number(globalThis.__clothMaxParticles) || undefined, maxDegree: Number(globalThis.__clothMaxDegree) || undefined },
+      );
+      cache.clear();                       // one live analysis per geometry
+      cache.set(key, entry);
+    }
+    return entry;
+  }
+  /**
+   * ⭐ IS THIS CLOTH INSIDE A COLLIDER? The failure that cost an afternoon
+   * (2026-09-07): a cloth on Sponza's curtain tore into vertical threads while
+   * every number said the solver was fine — it holds its rest length to within
+   * 2 %. The cause was `Mesh_0_9`, whose auto-generated CONVEX hull spans
+   * 21.9 x 3.3 x 9.8 m and contains the curtain whole. Contact pushed all
+   * 7 174 particles out toward that hull, up to 1.1 m ABOVE the pin line —
+   * which gravity cannot do, and which was the clue nobody had.
+   *
+   * Being pushed out of a solid you start inside is arguably CORRECT, so this
+   * changes no behaviour: it says so, in the Inspector, next to the switch that
+   * turns it off. `primitiveCount: 1` was true and useless.
+   *
+   * An AABB test on the AUTHORED geometry: the real shape is a hull and the
+   * live mesh's positions belong to the GPU, but "did this cloth start inside
+   * that collider" is exactly the question, and a false positive costs a line.
+   */
+  engulfingColliderNotes() {
+    try {
+      const engine = this.entity?.engine;
+      const mine = clothWorldBox(this.entity);
+      if (!engine || !mine) return [];
+      const inside = [];
+      for (const entity of engine.entities.values()) {
+        if (entity === this.entity) continue;
+        const collider = entity.getComponent?.("collider");
+        if (!collider?.enabled || collider.props.isSensor) continue;
+        // ⛔ ONLY A SOLID SHAPE CAN SWALLOW ANYTHING. A concave/mesh collider is
+        // a SURFACE — its triangles are exactly where the geometry is, and its
+        // bounding box says nothing about what fills it. Without this the
+        // warning fired on the very fix it recommends: told to make the floor
+        // Concave, the user did, and was then told the cloth was inside it
+        // (2026-09-08). A diagnostic that cries wolf on its own advice is worse
+        // than none.
+        if (!SOLID_COLLIDER_SHAPES.has(collider.props.shape ?? "box")) continue;
+        const box = clothWorldBox(entity);
+        if (box?.containsBox(mine)) inside.push({ id: entity.id, name: entity.name, shape: collider.props.shape });
+      }
+      // Published as data too, so `vfx.cloth.status` reports the same finding
+      // from the same computation rather than a second implementation of it.
+      this.engulfedBy = inside;
+      if (!inside.length) return [];
+      return [`This cloth is INSIDE ${inside.map((e) => `"${e.name}" (${e.shape})`).join(", ")}. Contact pushes every `
+        + `particle out of a collider it starts inside, which tears the cloth apart. Disable that collider, or turn `
+        + `Scene Collision off here.`];
+    } catch {
+      this.engulfedBy = [];
+      return [];
+    }
+  }
   findPlane() {
     const component = this.entity?.getComponent?.("mesh"), mesh = component?.mesh;
-    if (!mesh || component.props.geometryAsset) return null;
+    if (!mesh) return null;
+    // ── AN ARBITRARY MESH IS CLOTH TOO, IF IT IS SHEET-SHAPED (2026-09-07) ──
+    //
+    // Until now this returned null for anything carrying a `geometryAsset` or
+    // any primitive but `plane`, so a Cloth on an imported curtain or a boat's
+    // sail attached and did nothing. The solver could not do otherwise: its
+    // constraint stencil was unrolled at shader-build time around a lattice.
+    // With `clothMeshTopology` supplying rest positions, pin flags and the
+    // spring graph as DATA, the same solver runs over the author's own mesh.
+    //
+    // The plane path is untouched and still preferred: it is cheaper, it can
+    // be re-resolutioned from a prop, and a curtain authored as a plane is
+    // both faster and better looking than a modelled one.
+    if (this.constructor.type === "cloth" && (component.props.geometryAsset || component.props.geometry !== "plane")) {
+      const geometry = mesh.geometry;
+      if (!geometry?.getAttribute?.("position")) return null;
+      const analysis = this.clothMeshAnalysis(geometry, this.props.pinning ?? "top");
+      this.clothAnalysis = analysis;
+      // Whatever the verdict. A refusal has to be remembered too, or the
+      // placeholder-box case above re-analyses every single frame.
+      this.analysedGeometry = geometry;
+      if (!analysis.ok) return null;
+      geometry.computeBoundingBox();
+      const size = geometry.boundingBox.getSize(new Vector3());
+      return {
+        component, mesh, geometry, box: false, topology: packClothTopology(analysis), analysis,
+        width: size.x, height: size.y, depth: null, center: geometry.boundingBox.getCenter(new Vector3()),
+      };
+    }
+    if (component.props.geometryAsset) return null;
     const kind = component.props.geometry;
     const geometry = mesh.geometry;
     if (WATER_SOLIDS.has(kind) && this.constructor.type === "water") {
@@ -123,11 +247,37 @@ export class GridSimulationComponent extends Component {
     // so its second extent is along the entity's Y; a Box's is along Z.
     return Math.max(plane.width * sx, plane.height * (plane.box ? sz : sy));
   }
+  /**
+   * ⭐ MARKED, BECAUSE AN UNMARKED FREEZE IS AN ANONYMOUS ONE.
+   *
+   * Building a simulation mints ~9 compute pipelines and their shader modules,
+   * and the driver parses WGSL on the calling thread — so a rebuild is a
+   * 350-400 ms main-thread BLOCK that never appears in a JS profile. Nothing
+   * marked it, so the freeze ledger charged it to `(unattributed)`: 306 blocks
+   * over 100 ms in one session, all anonymous, while the user reported
+   * "freezes every time my character contacts with it".
+   *
+   * ⚠ A large `(unattributed)` is a MISSING MARK, not an absence of work — the
+   * ledger says so in its own note, and this is the case it was warning about.
+   */
   attachSimulation() {
+    const span = freeze.begin(`vfx:attach ${this.constructor.type}`);
+    try { this.#attachSimulation(); } finally { freeze.end(span); }
+  }
+
+  #attachSimulation() {
     this.resolveGraph();
     const cloth = this.constructor.type === "cloth";
+    this.clothAnalysis = null;
     const plane = this.findPlane();
-    this.surfaceError = cloth && !plane ? "Cloth requires a Plane Mesh on this entity." : null;
+    // A mesh that was ANALYSED and refused explains itself; one that was never
+    // a candidate falls back to the old message.
+    this.surfaceError = !cloth || plane
+      ? null
+      : this.clothAnalysis?.reason
+        ? `Cloth: ${this.clothAnalysis.reason}`
+        : "Cloth requires a Plane Mesh on this entity.";
+    this.surfaceNotes = [...(plane?.analysis?.notes ?? []), ...(cloth ? this.engulfingColliderNotes() : [])];
     if (cloth && !plane) { this.simulation = null; return; }
     if (plane) {
       this.planeSource = plane;
@@ -139,7 +289,7 @@ export class GridSimulationComponent extends Component {
       this.colliderField = this.entity.engine.particleColliders ??= new ParticleColliderField(this.entity.engine);
       this.colliderField.addUser();
       this.meshColliderField = this.entity.engine.clothMeshColliders ??= new ClothMeshColliderField(this.entity.engine);
-      this.meshColliderField.addUser();
+      this.meshColliderField.addUser(this);
     }
     // The slot is claimed BEFORE the solver, because the solver builds the
     // kernel that writes into it. A scene past `MAX_WATER_SLOTS` surfaces gets
@@ -155,7 +305,7 @@ export class GridSimulationComponent extends Component {
     const quality = this.entity.engine?.project?.settings?.build?.quality ?? this.entity.engine?.projectSettings?.build?.quality ?? "high";
     // The ripple window is a size in METRES: hand the solver the box's scale.
     const worldScale = this.constructor.type === "water" && plane ? this.worldScaleOf(plane) : null;
-    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality), worldScale });
+    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, topology: plane?.topology ?? null, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality), worldScale });
     this.simulation.mesh.userData.entityId = this.entity.id;
     this.entity.object3D.add(this.simulation.mesh);
     // The sea's spray sprites live in the LID's frame — a child of the lid
@@ -232,7 +382,22 @@ export class GridSimulationComponent extends Component {
       // (A container filled to `fill`: the lid sits `depth` above its bottom.)
       mesh.matrix.multiply(new Matrix4().makeTranslation(source.center.x, source.center.y + (source.box ? source.depth - (source.fullHeight ?? source.depth) / 2 : 0), source.center.z));
       if (!source.box) mesh.matrix.multiply(new Matrix4().makeRotationX(Math.PI / 2));
-    } else mesh.matrix.multiply(new Matrix4().makeTranslation(source.center.x, source.center.y - source.height / 2, source.center.z));
+    } else if (!source.topology) {
+      // ⛔ A MESH CLOTH TAKES THE SOURCE MATRIX AND NOTHING ELSE.
+      //
+      // The GRID cloth builds its lattice around a local origin at the TOP
+      // CENTRE (`initial` is `(ix*dx - width/2, height - iy*dy, 0)`), so it has
+      // to be carried to where the source plane actually sits. A mesh cloth's
+      // geometry IS the source geometry, already in the source mesh's own
+      // coordinates, and re-centring it moves the cloth off the thing it
+      // replaces. On the user's curtain that translation is
+      // (0.97, ~0, -0.32) m — the X offset they photographed (2026-09-07).
+      //
+      // ⚠ AND SPANS DO NOT CATCH IT. Every bounds check to that point compared
+      // the cloth's SIZE against its rest size, which was correct throughout:
+      // an offset moves a box without changing its extents. It took an eye.
+      mesh.matrix.multiply(new Matrix4().makeTranslation(source.center.x, source.center.y - source.height / 2, source.center.z));
+    }
     mesh.matrixAutoUpdate = false;
     mesh.matrixWorldNeedsUpdate = true;
     if (this.constructor.type === "water" && !Array.isArray(mesh.material)) {
@@ -274,8 +439,21 @@ export class GridSimulationComponent extends Component {
     // (including a switch between the two, which mints a new geometry) falls
     // through to the rebuild below.
     const kind = component?.props.geometry;
-    const valid = mesh && !component.props.geometryAsset && (kind === "plane" || (WATER_SOLIDS.has(kind) && this.constructor.type === "water"));
-    if ((!source && valid) || (source && (!valid || mesh !== source.mesh || mesh.geometry !== source.geometry || mesh.geometry.getAttribute("position")?.version !== this.sourceGeometryVersion || JSON.stringify(mesh.geometry.groups) !== this.sourceGroups))) {
+    // ⛔ A MESH CLOTH IS A CANDIDATE TOO, AND FORGETTING THAT COST A LIVE BUG.
+    //
+    // `valid` used to require NO geometry asset, so a mesh cloth was never
+    // valid and never re-attached. That is invisible offline and obvious live:
+    // a `.geom` mesh renders a PLACEHOLDER BOX until its asset arrives, so the
+    // analysis ran on the box, refused it — "thickness is 100% of its longest
+    // axis" — and nothing ever asked again. The real curtain measures 4.8 %.
+    //
+    // Tracked by the geometry OBJECT rather than by `planeSource`, because the
+    // stuck case is precisely the one where the analysis FAILED and there is no
+    // source to compare against.
+    const clothMesh = this.constructor.type === "cloth" && mesh && (component.props.geometryAsset || kind !== "plane");
+    const valid = mesh && (clothMesh || (!component.props.geometryAsset && (kind === "plane" || (WATER_SOLIDS.has(kind) && this.constructor.type === "water"))));
+    if (clothMesh && mesh.geometry !== this.analysedGeometry) { this.detachSimulation(); this.attachSimulation(); return; }
+    if ((!source && valid && !clothMesh) || (source && (!valid || mesh !== source.mesh || mesh.geometry !== source.geometry || mesh.geometry.getAttribute("position")?.version !== this.sourceGeometryVersion || JSON.stringify(mesh.geometry.groups) !== this.sourceGroups))) {
       this.detachSimulation(); this.attachSimulation();
     } else if (source && this.constructor.type === "water" && this.simulation && this.gridOutgrown(source)) {
       this.detachSimulation(); this.attachSimulation();
@@ -306,13 +484,18 @@ export class GridSimulationComponent extends Component {
     this.detachSimulation();
   }
   detachSimulation() {
+    const span = freeze.begin(`vfx:detach ${this.constructor.type}`);
+    try { this.#detachSimulation(); } finally { freeze.end(span); }
+  }
+
+  #detachSimulation() {
     if (this.waterSlot) { this.entity?.engine?.waterSlots?.release(this); this.waterSlot = null; }
     this.releasePlane(); this.planeSource = null;
     this.waterSurfaceLook?.dispose(); this.waterSurfaceLook = null;
     this.simulation?.dispose(this.entity?.engine?.renderer); this.simulation = null;
     this.waterMaterials?.forEach(m => m.dispose()); this.waterMaterials = null; this.waterMaterialSignature = null;
     this.colliderField?.removeUser(); this.colliderField = null;
-    this.meshColliderField?.removeUser(); this.meshColliderField = null;
+    this.meshColliderField?.removeUser(this); this.meshColliderField = null;
   }
   onPropChanged(key) {
     if (key === "asset") bindVfxAsset(this, () => this.applyGraph());

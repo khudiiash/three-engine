@@ -1,6 +1,6 @@
 import { isBuiltinMaterial } from "../../engine/builtinMaterials.js";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Code, Box } from "lucide-react";
+import { Code, Box } from "../icons/index.jsx";
 import { ReactFlowProvider } from "@xyflow/react";
 import * as THREE from "three/webgpu";
 import { useSelectionStore } from "../store/selectionStore.js";
@@ -525,7 +525,6 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
       overlay={material ? <MaterialPreview material={material} /> : null}
       canPreview
       registerThumb={registerThumb}
-      hint="Right-click or drop a wire on the canvas to add a node · double-click a wire to delete it (Alt+double-click for a reroute pin) · eye icon previews a node · Ctrl+Z undoes · changes autosave"
     />
   );
 }
@@ -552,8 +551,11 @@ export function ShaderGraphPanel() {
   if (!matPath && !defaultEntity) {
     forkRef.current = null;
     return (
-      <div className="shader-graph-panel empty">
-        Select a .mat asset or an entity with a Mesh component to edit its shader graph.
+      <div
+        className="shader-graph-panel empty"
+        title="Select a .mat asset or an entity with a Mesh component to edit its shader graph"
+      >
+        <Box className="empty-glyph" size={28} />
       </div>
     );
   }

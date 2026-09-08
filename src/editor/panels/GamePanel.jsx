@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Play, Square, Pause, StepForward, Maximize2, Volume2, VolumeX } from "lucide-react";
+import { Play, Square, Pause, StepForward, Maximize2, Volume2, VolumeX, RectangleHorizontal } from "../icons/index.jsx";
 import { usePlayStore } from "../store/playStore.js";
 import { toggle as togglePlay, togglePaused, stepFrame } from "../playMode.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
@@ -222,11 +222,11 @@ export function GamePanel() {
         <div className="game-toolbar-sep" />
         <div className="dropdown-wrap">
           <button
-            className={`toolbar-btn${aspectOpen ? " active" : ""}`}
-            title="Aspect ratio / resolution"
+            className={`toolbar-btn icon-only${aspectOpen ? " active" : ""}`}
+            title={`Aspect ratio / resolution: ${preset.label}`}
             onClick={() => setAspectOpen((v) => !v)}
           >
-            {preset.label}
+            <RectangleHorizontal size={13} />
           </button>
           {aspectOpen && (
             <>
@@ -281,12 +281,8 @@ export function GamePanel() {
       <div className="game-stage-area">
         <div className="game-stage" ref={stageRef}>
           {!hasCanvas && (
-            <div className="game-placeholder">
-              <Play size={26} />
-              <span>Press Play to run the game here</span>
-              <span className="game-placeholder-hint">
-                The viewport keeps the picture until then — there is one renderer, shared.
-              </span>
+            <div className="game-placeholder" title="Press Play to run the game here">
+              <Play className="empty-glyph" size={28} />
             </div>
           )}
         </div>

@@ -21,6 +21,7 @@ import { getViewportHandle } from "../../viewportHandle.js";
 import { constantColorOf, textureValueOf } from "../../../modules/gi/materialNodeBindings.js";
 import { auditDrawCalls } from "../../../engine/drawCallAudit.js";
 import { collectViewCullingStats } from "../../../engine/culling/viewCullingStats.js";
+import { freeze } from "../../../engine/freezeLedger.js";
 
 /**
  * Named screen-chain passes, in the order they run.
@@ -1147,6 +1148,12 @@ defineOp({
   description:
     "Where the CPU half of the frame goes, broken down by engine-tick phase and measured with real wall-clock marks inside Engine.#tick. The counterpart to profile.giPasses and profile.renderPasses, which only see GPU work: when `profile.frameStats` reports cpuMs well above gpuMs the frame is CPU-bound and NO renderer setting can fix it, so use this to find which phase owns the time before touching a shader, a quality preset or a draw count. Reports the mean ms per frame over a multi-frame capture, plus the same frame's gpuMs and draw count so the two halves can be compared directly. `renderEncode` is WebGPU command encoding — high there means too many draw submissions, not expensive pixels.",
   params: {
+    attribute: {
+      type: "boolean",
+      default: true,
+      description:
+        "Also charge every per-frame callback to its owner — the component (with its entity), the module, or the script file — and return them as `owners`, mean ms per frame, costliest first. This is the 'which component / script costs what' answer; the phases say which engine stage.",
+    },
     frames: {
       type: "number",
       default: 60,
@@ -1154,11 +1161,11 @@ defineOp({
         "Frames to average over. One tick is not a measurement on a scene with GC pauses. Max 600.",
     },
   },
-  async run({ frames = 60 }) {
+  async run({ frames = 60, attribute = true }) {
     const stats = engine?.stats;
     if (!stats) throw new Error("No engine.");
     const want = Math.max(1, Math.min(600, Math.round(frames)));
-    stats.beginPhaseCapture(want);
+    stats.beginPhaseCapture(want, { attribute });
     // Wait for the capture to fill rather than for a fixed duration: on a 10
     // fps scene a 1 s wait would collect six frames and report the mean of a
     // sample too small to separate a GC pause from a phase. Capped so a
@@ -1571,6 +1578,90 @@ defineOp({
       rows: rows.slice(0, Math.max(1, Math.min(200, Math.round(limit)))),
       note:
         "A row is one MATERIAL (meshes = how many entries share it). `palette` is what reflections/bounce read. Likely causes: a compressed map whose GPU mean never landed (textureCompressed true, palette white), a colour node whose texture/constant could not be read (colorNode set, graphTexture false, colorNodeConstant null), or a genuinely white material.",
+    };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// THE FREEZE LEDGER (docs/ZERO_FREEZE_PLAN.md, Stage 0)
+//
+// Every op above measures a FRAME. None of them can see the thing the user
+// actually reports — the editor stopping dead for seconds while a shader
+// compiles, a scene parses or a rebuild runs, because during a freeze there
+// are no frames to profile. These three read the always-on ledger instead.
+// ---------------------------------------------------------------------------
+
+defineOp({
+  name: "profile.freezes",
+  readOnly: true,
+  description:
+    "Every main-thread BLOCK the editor has suffered this session, with an owner — the instrument for 'it freezes'. A freeze is a browser long task (the main thread stopped for 50 ms+), and the engine records what it was doing at the time, so each block reads as a name (`gi:rebuild/staticBvh`, `gpu:shaderModule`, `event:hierarchy-changed`, `scene:instantiate`) rather than a mystery. Unlike profile.spikeWatch this needs no window and no timing: the block that froze the editor a minute ago is still here. `byOwner` ranks the whole session; `worst` and `recent` are individual blocks with their attribution, the node-build `causes` that fired INSIDE that block, and any synchronous GPU-object creation in it. Read a block's own `causes` before the session-wide `nodeBuildCauses` — the largest cause of the session is often not the cause of the freeze the user felt. `nodeBuilds` counts every TSL graph build, and `nodeBuildCauses` says WHY each one happened — `first compile` is the unavoidable one-per-material build, `material key` is that material's own key forking, and `fog`, `lights`, `environment`, `shadowMap` or `context` mean a scene-wide input to three's cache key moved and RE-MINTED materials that were already compiled.",
+  params: {
+    limit: { type: "number", default: 20, description: "Rows per section (max 100)." },
+    sinceMs: { type: "number", default: 0, description: "Only blocks this many ms after page load. 0 = the whole session." },
+    clear: { type: "boolean", default: false, description: "Empty the ledger after reading, so the next read measures one action." },
+  },
+  run({ limit = 20, sinceMs = 0, clear = false }) {
+    const report = freeze.read({
+      limit: Math.max(1, Math.min(100, Math.round(limit))),
+      sinceMs: Math.max(0, Number(sinceMs) || 0),
+    });
+    if (clear) freeze.clear();
+    return {
+      ...report,
+      note: report.observing
+        ? "`owners` are SELF time — a nested span's ms are not also charged to its parent. `(unattributed)` is real time in code nothing marks yet; a large one is a missing mark, not an absence of work. `gpu` counts synchronous pipeline/shader-module creation inside the block: that work never appears in a JS profile because the driver parses WGSL on the calling thread. In `nodeBuildCauses`, `first compile` and `material key` are work that had to happen; a named input (`lights`, `fog`, `environment`, `shadowMap`, `context`) is a WAVE — three keys its node-builder cache partly on that scene-wide state, so one of them moving re-mints every material in the scene at once."
+        : "The long-task observer is NOT running (no PerformanceObserver, or `longtask` is unsupported here). Spans are still recorded, so profile.boot works, but nothing is attributing blocks.",
+    };
+  },
+});
+
+defineOp({
+  name: "profile.boot",
+  readOnly: true,
+  description:
+    "Where this session's startup time went, stage by stage: project open, engine import, renderer init, scene parse, asset load, entity instantiation, the GI build and its sub-stages, the material compile wave. Also reports how much of it the main thread spent BLOCKED (from profile.freezes), which is the difference between a boot that is slow and a boot that is frozen. Read it after any change that claims to make startup faster.",
+  params: {},
+  run() {
+    const boot = freeze.readBoot();
+    return {
+      ...boot,
+      note: "`ms` is WALL time per stage (stages overlap with GPU work on purpose, so they do not sum to sinceLoadMs). `blocked` is the main-thread total from the freeze ledger — a stage that is slow but not blocked is the app waiting, which the user can live with; a blocked one is the app frozen.",
+    };
+  },
+});
+
+defineOp({
+  name: "profile.edit",
+  readOnly: true,
+  description:
+    "What ONE editor edit costs, listener by listener. Arms a capture, runs the action you name (or waits `seconds` while you do it by hand), then reports every engine event that fired and how many ms each of its listeners took. This is how to see that changing a light's intensity re-ran the scene mirror, the merge system and GI's fingerprint walk — the fan-out `hierarchy-changed` produces. Pair it with profile.freezes when the edit blocks rather than merely costs.",
+  params: {
+    seconds: { type: "number", default: 3, description: "How long to capture while you perform the edit (max 30)." },
+  },
+  async run({ seconds = 3 }) {
+    if (!engine?.beginEventCapture) throw new Error("No engine, or this build predates the event capture.");
+    const secs = Math.max(0.2, Math.min(30, Number(seconds) || 3));
+    const before = freeze.tasks.length;
+    engine.beginEventCapture();
+    await new Promise((r) => setTimeout(r, secs * 1000));
+    const rows = engine.endEventCapture();
+    const total = rows.reduce((sum, r) => sum + r.ms, 0);
+    const byEvent = new Map();
+    for (const row of rows) {
+      const e = byEvent.get(row.event) ?? { event: row.event, ms: 0, listeners: 0, emits: 0 };
+      e.ms += row.ms;
+      e.listeners++;
+      e.emits = Math.max(e.emits, row.calls);
+      byEvent.set(row.event, e);
+    }
+    return {
+      seconds: secs,
+      totalListenerMs: +total.toFixed(1),
+      byEvent: [...byEvent.values()].map((e) => ({ ...e, ms: +e.ms.toFixed(1) })).sort((a, b) => b.ms - a.ms),
+      listeners: rows.slice(0, 40),
+      blocksDuringCapture: freeze.tasks.slice(before),
+      note: "`emits` is how many times that event fired during the window — a NumberField drag fires one per pointer event. A listener with a high `calls` and a small `ms` each is still a storm: the cost is that everything else in the fan-out ran too.",
     };
   },
 });

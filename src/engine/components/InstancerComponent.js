@@ -4,6 +4,20 @@ import { loadMaterialAsset, getDefaultMaterial } from "../materialAsset.js";
 import { resolveSpline } from "./SplineComponent.js";
 import { SplineFrame } from "../spline/splineMath.js";
 import { bakeMatrixIntoGeometry, relativeMatrix } from "../geometryTransform.js";
+import { InstanceMotion } from "../instancerMotion.js";
+
+/**
+ * Motion props that are read LIVE every frame by the InstanceMotion update —
+ * dragging their sliders must not pay for a full InstancedMesh rebuild (see
+ * onPropChanged). Only the toggle and the mode, which change the state
+ * machine itself, rebuild.
+ */
+const MOTION_LIVE_KEYS = new Set([
+  "motionDirection", "motionSpeed", "motionAxis",
+  "motionSpinJitter", "motionNeighborRadius", "motionSeparationRadius",
+  "motionCohesion", "motionAlignment", "motionSeparation",
+]);
+const MOTION_MODES = ["scroll", "boids", "rotation"];
 
 /**
  * Hardware-instanced duplicates of a source mesh (Blender Array modifier +
@@ -107,6 +121,31 @@ export class InstancerComponent extends Component {
     // entity) into the instanced geometry. See #resolveGeometry.
     bakeSourceTransform: false,
 
+    // ── MOTION ──────────────────────────────────────────────────────────────
+    // Per-frame animation layered on top of the static layout. Off by
+    // default: an instancer that never ticks costs nothing. See
+    // instancerMotion.js for the models. There is deliberately NO volume
+    // parameter: scroll wraps over and boids are caged in the layout's OWN
+    // bounding box — the volume the instances already fill.
+    motion: false,
+    motionMode: "scroll", // "scroll" | "boids" | "rotation"
+    // scroll: flow direction (units/s along motionSpeed); each axis of the
+    // layout's bounding box wraps independently — leave one side, re-enter
+    // the other.
+    motionDirection: [0, 0, 1],
+    // Speed, meaning depends on the mode: scroll/boids = units per second,
+    // rotation = degrees per second.
+    motionSpeed: 2,
+    // rotation: spin axis (local space) and per-instance speed spread.
+    motionAxis: [0, 1, 0],
+    motionSpinJitter: 0.5, // 0 = lockstep, 1 = speeds spread over ±100%
+    // boids: neighbour radii and the three classic weights.
+    motionNeighborRadius: 2,
+    motionSeparationRadius: 0.5,
+    motionCohesion: 1,
+    motionAlignment: 1,
+    motionSeparation: 1.5,
+
     // Material override. Empty string means "use the source mesh's material".
     material: "",
 
@@ -153,6 +192,24 @@ export class InstancerComponent extends Component {
     { key: "rotationJitter", label: "Rotation Jitter", type: "number", min: 0, max: 1, step: 0.05 },
     { key: "scaleJitter", label: "Scale Jitter", type: "number", min: 0, max: 1, step: 0.05 },
     { key: "bakeSourceTransform", label: "Bake Source Transform", type: "boolean" },
+    // ── Motion ──────────────────────────────────────────────────────────────
+    // Off, the instancer never ticks. On, it advances every frame through
+    // instancerMotion.js — see that file for what each model does.
+    { key: "motion", label: "Motion", type: "boolean" },
+    { key: "motionMode", label: "Motion Model", type: "select", options: MOTION_MODES, showIf: (p) => !!p.motion },
+    // Speed means units/s for scroll and boids, degrees/s for rotation.
+    // There is no volume control on purpose: scroll wraps over and boids are
+    // caged in the layout's own bounding box (a flat axis is no wrap for
+    // scroll, neighbour-radius thickness for boids).
+    { key: "motionSpeed", label: "Speed", type: "number", min: 0, step: 0.1, showIf: (p) => !!p.motion },
+    { key: "motionDirection", label: "Direction", type: "vec3", showIf: (p) => !!p.motion && p.motionMode === "scroll" },
+    { key: "motionAxis", label: "Spin Axis", type: "vec3", showIf: (p) => !!p.motion && p.motionMode === "rotation" },
+    { key: "motionSpinJitter", label: "Spin Jitter", type: "number", min: 0, max: 1, step: 0.05, showIf: (p) => !!p.motion && p.motionMode === "rotation" },
+    { key: "motionNeighborRadius", label: "Neighbor Radius", type: "number", min: 0.01, step: 0.1, showIf: (p) => !!p.motion && p.motionMode === "boids" },
+    { key: "motionSeparationRadius", label: "Separation Radius", type: "number", min: 0.01, step: 0.1, showIf: (p) => !!p.motion && p.motionMode === "boids" },
+    { key: "motionCohesion", label: "Cohesion", type: "number", min: 0, step: 0.1, showIf: (p) => !!p.motion && p.motionMode === "boids" },
+    { key: "motionAlignment", label: "Alignment", type: "number", min: 0, step: 0.1, showIf: (p) => !!p.motion && p.motionMode === "boids" },
+    { key: "motionSeparation", label: "Separation", type: "number", min: 0, step: 0.1, showIf: (p) => !!p.motion && p.motionMode === "boids" },
     { key: "material", label: "Material Override", type: "asset", exts: ["mat"] },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
@@ -173,6 +230,44 @@ export class InstancerComponent extends Component {
       if (loadedEntity === this.entity || (targetId && loadedEntity?.id === targetId)) {
         this.onAttach();
       }
+    });
+
+    // ── THE PLACEHOLDER TRAP (scene reload) ─────────────────────────────────
+    // Components attach synchronously in stored order, so on a scene load the
+    // MeshComponent renders its PLACEHOLDER primitive (box/plane) and this
+    // component — attached right after — builds its InstancedMesh sharing that
+    // geometry by reference. The real `.geom` then swaps in a microtask later
+    // (`acquireGeometryAsset` is always a promise, even warm-cache), and
+    // `#announceSwap("geometryAsset")` is the only announcement. Without this
+    // listener every reload re-instanced the placeholder: the source mesh
+    // looked right and every instance was a flat plane.
+    this._unsubSourceChanged?.();
+    this._unsubSourceChanged = this.entity.engine?.on?.("component-changed", (e) => {
+      if (!e || e.entityId !== this.entity?.id) return;
+      if (e.componentType !== "mesh") return;
+      if (e.key === "geometry" || e.key === "geometryAsset") {
+        // The source geometry OBJECT changed (primitive swap or .geom swap) —
+        // instances share it by reference, so this needs a full rebuild.
+        if (this._attached === false) return;
+        this.onDetach();
+        this.onAttach();
+        return;
+      }
+      // The material announce fires on every .mat notification, so follow the
+      // swap by reference instead of paying for a rebuild.
+      if (e.key === "material" && this.instancedMesh && !this.props.material) {
+        this.instancedMesh.material = getPrimarySourceMesh(this.entity)?.material ?? this.instancedMesh.material;
+      }
+    });
+
+    // An instancer dropped on an entity BEFORE its Mesh/Model component stays
+    // inert (no source yet) — this is the retry once the source arrives.
+    this._unsubComponentAdded?.();
+    this._unsubComponentAdded = this.entity.engine?.on?.("component-added", (e) => {
+      if (!e || e.entityId !== this.entity?.id) return;
+      if (e.componentType !== "mesh" && e.componentType !== "model") return;
+      if (this.instancedMesh || this._attached === false) return;
+      this.onAttach();
     });
 
     const sourceMesh = getPrimarySourceMesh(this.entity);
@@ -224,6 +319,7 @@ export class InstancerComponent extends Component {
         : null;
 
     this.#fillMatrices(maxCount);
+    this.#setupMotion();
 
     if (this.props.material) this.#loadSharedMaterial(this.props.material);
     else this.instancedMesh.material = sourceMesh.material;
@@ -235,6 +331,13 @@ export class InstancerComponent extends Component {
   onDetach() {
     this._unsubModelLoaded?.();
     this._unsubModelLoaded = null;
+    this._unsubSourceChanged?.();
+    this._unsubSourceChanged = null;
+    this._unsubComponentAdded?.();
+    this._unsubComponentAdded = null;
+    this._unsubMotion?.();
+    this._unsubMotion = null;
+    this._motion = null;
     this._unsubSpline?.();
     this._unsubSpline = null;
     this._unsubRelayout?.();
@@ -254,8 +357,43 @@ export class InstancerComponent extends Component {
     this._unsubRelayout = this.entity.engine.onPreRender(() => {
       this._unsubRelayout?.();
       this._unsubRelayout = null;
-      if (this.instancedMesh) this.#fillMatrices(Math.max(1, Math.floor(this.props.count)));
+      if (this.instancedMesh) {
+        this.#fillMatrices(Math.max(1, Math.floor(this.props.count)));
+        // The motion base was snapshotted from the OLD layout — rebuild the
+        // state from the fresh matrices. The shared clock keeps a flowing
+        // stream continuous; only the base moves.
+        this.#setupMotion();
+      }
     });
+  }
+
+  /**
+   * (Re)creates the motion state from the freshly laid-out matrices, and
+   * makes sure exactly one per-frame update is subscribed. Safe to call again
+   * after a layout re-fill (`#invalidateLayout`): the subscription is only
+   * taken when missing, so a knot drag does not reorder the preRender
+   * listener list mid-frame. `_motionClock` lives on the component, not the
+   * state, so resets never restart time.
+   */
+  #setupMotion() {
+    if (this.instancedMesh && this.props.motion && this.entity?.engine?.onPreRender && !this._unsubMotion) {
+      this._unsubMotion = this.entity.engine.onPreRender(() => this.#tickMotion());
+    }
+    this._motion = this.instancedMesh && this.props.motion
+      ? new InstanceMotion(this.instancedMesh, this.props, this.props.seed ?? 0, (this._motionClock ??= { t: 0 }))
+      : null;
+  }
+
+  #tickMotion() {
+    if (!this._motion || !this.instancedMesh) return;
+    if (!this.enabled) return;
+    // Modal modes (geometry editor) hold the scene still — see
+    // Engine.suspendSimulation. A frozen viewport should not keep advancing.
+    if (this.entity.engine?.simulationSuspended) return;
+    if (this.viewOnly && !this.isInView()) return;
+    const dt = this.entity.engine?.deltaTime ?? 0;
+    if (!dt) return; // paused, or the first frame
+    this._motion.update(dt);
   }
 
   #teardownMesh() {
@@ -341,7 +479,8 @@ export class InstancerComponent extends Component {
           key === "scatterSurfaceEntity" || key === "scatterSurfaceMode" ||
           key === "scatterProjectedShape" || key === "scatterProjectedAxis" ||
           key === "scatterProjectedSize" || key === "scatterSurfaceCenter" ||
-          key === "rotationJitter" || key === "scaleJitter" || key === "bakeSourceTransform") {
+          key === "rotationJitter" || key === "scaleJitter" || key === "bakeSourceTransform" ||
+          key === "motion" || key === "motionMode") {
         this.onAttach();
         return;
       }
@@ -361,6 +500,16 @@ export class InstancerComponent extends Component {
       this.instancedMesh[key] = !!this.props[key];
       return;
     }
+    // The toggle and the model switch change which state machine runs, so
+    // they rebuild; every other motion parameter is read live by the update
+    // each frame — a slider drag must not re-allocate the instance buffer
+    // on every pointermove.
+    if (key === "motion" || key === "motionMode") {
+      this.onDetach();
+      this.onAttach();
+      return;
+    }
+    if (MOTION_LIVE_KEYS.has(key)) return;
     // Anything that affects the layout / count: full rebuild.
     this.onDetach();
     this.onAttach();

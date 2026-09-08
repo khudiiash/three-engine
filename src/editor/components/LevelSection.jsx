@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Lock, LockOpen, Pencil, Plus, ShieldPlus, Trash2 } from "lucide-react";
+import { Lock, LockOpen, Pencil, Plus, ShieldPlus, Trash2 } from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { DeleteEntityCommand } from "../commands/entityCommands.js";

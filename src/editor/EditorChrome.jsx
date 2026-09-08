@@ -28,6 +28,11 @@ import { chordMatches, dispatchVisibilityKeyAction, getBinding } from "./keybind
 import { dispatchTerrainKeyAction } from "./terrainBrush.js";
 import { useGeometryEditStore } from "./store/geometryEditStore.js";
 import { GlobalContextMenu } from "./nativeContextMenu.jsx";
+import { freeze } from "../engine/freezeLedger.js";
+
+/** Longest an autosave may wait for a gap in the user's hands. Deferring a
+ *  save trades a hitch for a window of loss, so the trade is bounded. */
+const AUTOSAVE_MAX_DEFER_MS = 4000;
 
 /**
  * Editor "chrome": the menu bar, scene restore on first mount, keyboard
@@ -46,6 +51,7 @@ export function EditorChrome() {
 
   useEffect(() => {
     let autosave = null;
+    let inputListeners = null;
     let cancelled = false;
     ensureEngine().then(async () => {
       if (cancelled) return;
@@ -60,6 +66,7 @@ export function EditorChrome() {
         lastBootedKey = projectKey;
         // Enabled modules must register their components BEFORE the scene
         // deserializes, or module components load as inert "missing" data.
+        freeze.bootStage("modules: import + enable");
         const { syncProjectModules } = await import("./modules.js");
         await syncProjectModules().catch((err) => console.error(`Modules: ${err.message ?? err}`));
         // Apply saved input config (if any) before scene load so scripts
@@ -76,7 +83,15 @@ export function EditorChrome() {
         for (const err of eventErrors) console.warn(`Events: ${err}`);
         // Prefabs must be in the registry before the scene loads: a scene
         // stores instances as links, and a link with no def can't expand.
+        freeze.bootStage("prefabs: load");
+        // The dynamic import is inside the stage and is NOT free: under the
+        // dev server it is a fetch per module in prefab.js's graph. The stage
+        // measured ~3 s while its three marked sub-steps summed to ~1.1 s, and
+        // an unnamed second is one nobody can fix — so the import is marked
+        // like everything else.
+        const tImport = performance.now();
         const { loadProjectPrefabs } = await import("./prefab.js");
+        freeze.bootMark("prefabs: import module", performance.now() - tImport);
         await loadProjectPrefabs().catch((err) => console.error(`Prefabs: ${err.message ?? err}`));
         // engine.assets' name/tag catalog — not load-bearing for the scene
         // itself, so it doesn't block boot, but scripts should find it
@@ -90,7 +105,13 @@ export function EditorChrome() {
         // spawned stray "Main 1.scene"/"Main 2.scene" files whenever the
         // saved main/last scene was missing or moved.
         void restored;
+        freeze.bootStage(null);
         console.log("Editor ready");
+        // THE BOOT TABLE (zero-freeze plan unit 0.2). One line per stage plus
+        // how much of the boot the main thread spent BLOCKED — the difference
+        // between a boot that is slow and a boot that is frozen. `profile.boot`
+        // returns the same thing on demand, and GI logs it again at first light.
+        freeze.logBoot("Editor ready");
         // Serving is sticky per project: if the preview server was running
         // when this project was last closed, bring it back. Deliberately not
         // awaited — a build takes seconds and nothing below depends on it,
@@ -109,11 +130,57 @@ export function EditorChrome() {
       // Autosave: dirty scenes write themselves on the configured interval
       // (when not playing and when there's a destination on disk). A 1s tick
       // checks elapsed time so interval changes apply without a restart.
+      //
+      // ── AND IT WAITS FOR A GAP IN THE USER'S HANDS (2026-09-07) ──────────
+      // A save is a full engine walk plus a `JSON.stringify` of the whole
+      // scene; the freeze ledger measured it at ~57 ms and it was landing on
+      // the interval REGARDLESS of what the user was doing — including in the
+      // middle of a drag, which is exactly when 57 ms is felt as a snag. The
+      // work has to happen, but nothing about it is urgent to the millisecond:
+      // it now waits for ~600 ms of no pointer or key activity.
+      //
+      // ⚠ DEFERRING A SAVE WIDENS THE WINDOW OF LOSS, so the wait is capped
+      // hard: never more than `AUTOSAVE_MAX_DEFER_MS` past the interval, and
+      // the scene is also written whenever the window loses focus or is
+      // hidden — the two moments a person expects their work to be safe.
+      // `__editorAutosaveIdleGap = 0` saves on the tick again.
       let lastSave = performance.now();
+      let lastInput = 0;
+      const noteInput = () => { lastInput = performance.now(); };
+      // Losing focus or hiding the window is the moment a person stops
+      // watching, so it is the moment their work has to be on disk — and it is
+      // also, conveniently, a moment no frame is being felt.
+      const saveNow = () => {
+        const canPersist = hasScenePath() || useProjectStore.getState().rootPath;
+        if (canPersist && useSceneStore.getState().dirty && !engine.playing) {
+          lastSave = performance.now();
+          saveScene();
+        }
+      };
+      const onHide = () => { if (document.visibilityState === "hidden") saveNow(); };
+      window.addEventListener("blur", saveNow);
+      document.addEventListener("visibilitychange", onHide);
+      for (const type of ["pointerdown", "pointermove", "wheel", "keydown"]) {
+        window.addEventListener(type, noteInput, { passive: true, capture: true });
+      }
+      inputListeners = () => {
+        for (const type of ["pointerdown", "pointermove", "wheel", "keydown"]) {
+          window.removeEventListener(type, noteInput, { capture: true });
+        }
+        window.removeEventListener("blur", saveNow);
+        document.removeEventListener("visibilitychange", onHide);
+      };
       autosave = setInterval(() => {
         const seconds = getProjectSettings().editor.autosaveSeconds;
         if (!seconds) return; // 0 = disabled
-        if (performance.now() - lastSave < seconds * 1000) return;
+        const since = performance.now() - lastSave;
+        if (since < seconds * 1000) return;
+        const idleGap = Number(globalThis.__editorAutosaveIdleGap ?? 600);
+        const busy = performance.now() - lastInput < idleGap;
+        // …unless the deferral has run past its cap, in which case save anyway:
+        // an autosave that keeps waiting is a data-loss bug, and a 57 ms hitch
+        // is not.
+        if (busy && since < seconds * 1000 + AUTOSAVE_MAX_DEFER_MS) return;
         lastSave = performance.now();
         const canPersist = hasScenePath() || useProjectStore.getState().rootPath;
         if (canPersist && useSceneStore.getState().dirty && !engine.playing) saveScene();
@@ -123,6 +190,7 @@ export function EditorChrome() {
     return () => {
       cancelled = true;
       if (autosave) clearInterval(autosave);
+      inputListeners?.();
     };
   }, [projectKey]);
 

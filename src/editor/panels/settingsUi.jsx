@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, TriangleAlert } from "../icons/index.jsx";
 
 /**
  * The layout language shared by the two settings panels (Project and Scene).
@@ -53,12 +53,20 @@ export function Toggle({ checked, onChange, disabled = false }) {
   );
 }
 
-/** The one line of prose a section is allowed. `footer` is the panel-level
- *  variant that sits outside every section and carries its own padding. */
+/**
+ * A note is a warning or nothing. Explanatory prose is gone from every panel
+ * (docs/EDITOR_UI_PLAN.md §1, "Words"): what a row does is its `hint`, shown
+ * on hover. The one thing that still earns a place in the sheet is a warning
+ * that would cost the user something to miss — and that is an amber glyph
+ * carrying the text as its tooltip, not a paragraph.
+ */
 export function Note({ danger = false, footer = false, children = null }) {
+  if (!danger) return null;
+  const text = typeof children === "string" ? children : null;
   return (
-    <div className={`settings-note${danger ? " danger" : ""}${footer ? " footer" : ""}`}>
-      {children}
+    <div className={`settings-note danger${footer ? " footer" : ""}`} title={text ?? undefined} role="note">
+      <TriangleAlert size={13} aria-hidden="true" />
+      {text ? null : <span className="settings-note-body">{children}</span>}
     </div>
   );
 }

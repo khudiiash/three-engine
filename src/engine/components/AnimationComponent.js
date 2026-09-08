@@ -57,7 +57,13 @@ export class AnimationComponent extends Component {
     this.runtime = null;
     this.editorAudition = false;
     this.pendingPreview = null;
-    this.unsubUpdate = this.entity.engine.onUpdate((dt) => this.#tick(dt));
+    this.unsubUpdate = this.entity.engine.onUpdate((dt) => {
+      // Held while a modal editor mode owns the viewport (the geometry
+      // editor). See Engine.suspendSimulation: advancing the rest of the
+      // scene while the user is inside one mesh is pure interference.
+      if (this.entity.engine.simulationSuspended === true) return;
+      this.#tick(dt);
+    });
     // The model loads async — rebuild once its clips exist.
     this.unsubModel = this.entity.engine.on("model-loaded", (entity) => {
       if (entity === this.entity) this.#rebuild();

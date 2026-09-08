@@ -1,5 +1,6 @@
 import * as THREE from "three/webgpu";
-import { Fn, If, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, texture, ivec2 } from "three/tsl";
+import { CLOTH_SOLVE_PASSES, clothSolveSplit, clothSubsteps, clothVelocityScale } from "./clothHealth.js";
+import { Fn, If, Break, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, texture, ivec2 } from "three/tsl";
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
 import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt, seaFoldNode } from "./waterSpectrum.js";
 import { GRAVITY } from "./waterSpectrumCPU.js";
@@ -70,7 +71,27 @@ export const SPONGE_CELLS = 16, SPONGE_STRENGTH = .08;
 export const CLIP_ABOVE_METRES = 64, CLIP_SIZE = 65;
 import { waterExtinction, waterSaturation } from "./waterVolume.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
-import { projectClothMeshContact, projectClothClosedContact } from "./clothMeshContact.js";
+import { projectClothMeshContact, projectClothClosedContact as projectClosed } from "./clothMeshContact.js";
+// ⛔ REFUTED (2026-09-08), AND THE ARM IS KEPT SO THE NEXT PERSON NEED NOT
+// GUESS EITHER. `projectClothClosedContact` treats a CERTIFIED CLOSED
+// sub-shell inside an otherwise open collider as a solid volume and ejects
+// whatever is inside it, and Sponza's `Mesh_0_6` really does carry such
+// shells (192 of its 4 026 cooked triangles). The story wrote itself: the
+// curtains are modelled wrapped over their rod, so the hem would start life
+// inside a solid and be pushed out of it every frame.
+//
+// It is not what happens. Certifying the shells offline puts them at
+// [-8.386, 3.944, -2.545] -> [7.341, 4.062, 1.948] and the same box at
+// y 7.324-7.442: two 15.7 x 0.12 x 4.5 m slabs, the gallery FLOORS, and
+// **not one curtain vertex of Mesh_0_18/19/20 lies inside either of them.**
+// The rods are not closed shells at all.
+//
+// `__clothClosedContact = false` removes the recovery so the claim stays
+// measurable — island billow in `vfx.cloth.status` is the readout.
+const projectClothClosedContact = (args) => {
+  if (globalThis.__clothClosedContact === false) return;
+  projectClosed(args);
+};
 import { createWaterCausticPass, createWaterSlotKernel } from "./waterSlots.js";
 
 // Room for many bodies' displacement PAIRS in one frame.
@@ -85,11 +106,32 @@ export function gridConfig(props = {}) {
   return { resolution: Math.round(finite(props.resolution, 32, 4, 512)), width: finite(props.width, 4, .1, 1000), height: finite(props.height, 4, .1, 1000) };
 }
 
+/**
+ * How many incident edges a mesh cloth sweeps for contact per particle.
+ *
+ * The grid solver uses exactly three (a primary, a lateral and a diagonal),
+ * chosen by index arithmetic away from the pinned side. Three is enough there
+ * and enough here: contact runs on every substep, and a vertex with sixteen
+ * springs would otherwise cost five times what a lattice vertex does for a
+ * result that is already resolved by its neighbours' own sweeps.
+ */
+const MESH_CONTACT_EDGES = 3;
+
+/**
+ * Particle-substeps per frame a cloth may spend.
+ *
+ * 6 144 = the 1 024-particle grid cloth's six substeps, so that path is
+ * untouched. A 7 000-particle mesh cloth lands on the floor of two, which is
+ * exactly what 60 fps asks for at h = 1/120 — and cuts its dispatch count,
+ * the thing that actually costs, by three.
+ */
+const SUBSTEP_PARTICLE_BUDGET = 6144;
+
 /** Bounded GPU surface solvers. Cloth uses Jacobi distance constraints; water
  * uses the damped wave equation, not a volumetric liquid solver. All neighbor
  * reads are from a separate buffer: no cross-workgroup read/write races.
  * Largest compute graph binds four storage buffers, within portable WebGPU. */
-export function createGridSimulation(kind, props = {}, { colliderField = null, meshColliderField = null, colliderEntityId = null, material: sourceMaterial = null, sourceGeometry = null, anchorEngine = null, waterSlot = null, spectrum: givenSpectrum = null, seaQuality = null, worldScale = null } = {}) {
+export function createGridSimulation(kind, props = {}, { colliderField = null, meshColliderField = null, colliderEntityId = null, material: sourceMaterial = null, sourceGeometry = null, anchorEngine = null, waterSlot = null, spectrum: givenSpectrum = null, seaQuality = null, worldScale = null, topology = null } = {}) {
   if (kind === "cloth" && !sourceMaterial) throw new Error("Cloth requires the existing plane material.");
   const { resolution: n, width, height } = gridConfig(props);
   // ── THE SOLVER'S OWN GRID: A WINDOW IN METRES ─────────────────────────────
@@ -132,6 +174,29 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const ownsSpectrum = kind === "water" && !givenSpectrum;
   const spectrum = kind === "water" ? (givenSpectrum ?? createWaterSpectrum(seaQuality ?? {})) : null;
   const count = clip ? clipLevels * CLIP_SIZE * CLIP_SIZE : n * n, dx = width / (n - 1), dy = height / (n - 1);
+  // ── A MESH CLOTH IS THE SAME SOLVER OVER A DIFFERENT NEIGHBOURHOOD ────────
+  //
+  // `topology` (see clothMeshTopology.js) replaces the three things the grid
+  // supplied for free: rest positions, which particles are pinned, and who is
+  // next to whom. Nothing else about the cloth path changes — the integrator,
+  // the anchors, the collider fields and the commit are all per-particle
+  // already, and `constrain` is Jacobi, so an arbitrary graph needs no
+  // colouring or ordering.
+  //
+  // ⚠ PARTICLES AND RENDER VERTICES ARE DIFFERENT COUNTS. Welding collapses
+  // the mesh's UV seams (Sponza's curtain: 7 739 render vertices, 7 174
+  // particles) and the render mesh must KEEP its seams, so the solver kernels
+  // dispatch over particles and the surface kernel over render vertices,
+  // reading each one's particle through `simIndex`.
+  const meshCloth = kind === "cloth" && topology ? topology : null;
+  // ⚠ EVERY per-particle kernel dispatches over THIS, not over `wCount` or
+  // `count`. For water and for a grid cloth it IS `wCount` (and, for cloth,
+  // `count` too, since `w === n` there), so those paths are unchanged; a mesh
+  // cloth is the only case where the three differ, and a kernel left on the
+  // old size would run over the grid's 32x32 = 1 024 threads while the buffers
+  // hold 7 174 particles — five sixths of the cloth would simply never be
+  // integrated, and the rest would look like it worked.
+  const particleCount = meshCloth ? meshCloth.count : wCount;
   // The rim ring's vertices per edge: the flat grid's own, or the outer
   // level's lattice (so the shell's top meets the lid's boundary exactly).
   const rimN = clip ? CLIP_SIZE : n;
@@ -158,7 +223,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // wall is flat to its own normal and the corner is the hard edge it is.
   const ringLength = kind === "water" ? 4 * rimN : 0;
   const WALL_TOP = count, WALL_BOTTOM = count + ringLength * (SHELL_RINGS - 1), FLOOR = count + ringLength * SHELL_RINGS;
-  const total = kind === "water" ? FLOOR + (round ? 1 : 4) : count;
+  const total = kind === "water" ? FLOOR + (round ? 1 : 4) : (meshCloth ? meshCloth.renderCount : count);
   const ringCell = (k) => {
     const e = Math.floor(k / rimN), i = k % rimN;
     return e === 0 ? [i, 0] : e === 1 ? [rimN - 1, i] : e === 2 ? [rimN - 1 - i, rimN - 1] : [0, rimN - 1 - i];
@@ -167,9 +232,92 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const e = Math.floor(k / rimN);
     return e === 0 ? [0, 0, -1] : e === 1 ? [1, 0, 0] : e === 2 ? [0, 0, 1] : [-1, 0, 0];
   };
-  const positions = instancedArray(wCount, "vec4");
-  const previous = instancedArray(wCount, "vec4");
-  const scratch = instancedArray(wCount, "vec4");
+  const positions = instancedArray(particleCount, "vec4");
+  const previous = instancedArray(particleCount, "vec4");
+  const scratch = instancedArray(particleCount, "vec4");
+  // (x, y, z, pinned) and (neighbour, restLength, weight, fanSuccessor). One
+  // binding each: the graph uses a FIXED STRIDE with a sentinel rather than
+  // CSR ranges, because this solver already binds positions, previous,
+  // scratch, anchors and both collider fields, and WebGPU only guarantees
+  // eight storage buffers per stage.
+  const clothRest = meshCloth ? instancedArray(meshCloth.rest, "vec4") : null;
+  const clothSprings = meshCloth ? instancedArray(meshCloth.springs, "vec4") : null;
+  const clothSimIndex = meshCloth ? instancedArray(meshCloth.simIndex, "float") : null;
+  // ⭐ HOW FAR THIS RENDER VERTEX SITS OFF THE SIMULATED SURFACE, signed
+  // along the normal. A shell is simulated as its MID-SURFACE — one particle
+  // per front/back pair — and both faces are rebuilt from this. Null when the
+  // cloth is a single surface, and then nothing is added.
+  const clothOffset = meshCloth?.shellOffset ? instancedArray(meshCloth.shellOffset, "float") : null;
+  // ⛔ PER PARTICLE, because shell thickness is a property of ONE PIECE and a
+  // `.geom` holds several. Sponza's curtain file carries a 5.47 cm shell and a
+  // 2.74 cm shell; a single figure for the file gave every curtain the
+  // thinnest one's cap — half the contact two of them needed, because of a
+  // different curtain elsewhere in the same asset. 0 means "no shell, no cap".
+  const clothRadius = meshCloth?.contactRadius ? instancedArray(meshCloth.contactRadius, "float") : null;
+  /**
+   * ⭐⭐⭐ THE LAST PLACE THIS PARTICLE WAS KNOWN TO BE CLEAR OF THE GEOMETRY,
+   * and the origin the contact sweep uses instead of `previous`.
+   *
+   * ⛔ THE FAULT IS DETECTION, NOT SIDE SELECTION — which took a CPU model of
+   * the contact to establish, after two side-selection fixes had already been
+   * shipped and reverted. A particle further behind a wall than the contact
+   * radius is not pushed back to the wrong side; **it is not touched at all**.
+   * The swept test finds no crossing (it did not cross during this step) and
+   * the face test finds it outside the slab, so contact simply abandons it,
+   * and the only thing still acting on it is the spring to its neighbours in
+   * front — which then spans the wall for good.
+   *
+   * Sweeping from the last known-good position instead closes it. In ordinary
+   * motion this value IS the previous position, so the sweep is bit-for-bit
+   * the one that shipped before and there is no second traversal; the two
+   * diverge exactly when a particle has been moved somewhere invalid without
+   * contact seeing it — which is the case that needs recovering, and which the
+   * substep can inflict on itself through the relaxation passes that follow
+   * the last `collide`.
+   *
+   * ⭐ It consults NO winding and makes no global decision. The seed is the
+   * cloth's REST pose, so "which side does this cloth belong on" is answered
+   * by how the asset was authored. That is the actual question, and a triangle
+   * normal was the wrong way to ask it: `__clothOneSidedContact` wrecked even
+   * the pristine island because cooked colliders are not consistently wound.
+   *
+   * ⛔ IT IS A FALLBACK, NOT A REPLACEMENT, AND THAT DISTINCTION IS THE WHOLE
+   * FIX. Sweeping from `safe` INSTEAD of `previous` split the live scene
+   * exactly in half — free-hanging cloth reached strain 0.015-0.020, the best
+   * of the session, while every wind-pressed curtain was hoisted to a centre
+   * height of ~3.0 m against 1.13 m. A longer sweep reaches triangles the
+   * short one never came near, `remember` keeps the EARLIEST crossing, and the
+   * push is then measured against THAT triangle's plane: against a
+   * perpendicular alcove wall, a metre-sized shove. So the ordinary sweep
+   * keeps first refusal and this is consulted only when it finds nothing.
+   *
+   * `__clothSafeSweep = false` turns the recovery off.
+   */
+  const clothSafe = meshCloth && globalThis.__clothSafeSweep !== false
+    ? instancedArray(new Float32Array(particleCount * 4), "vec4")
+    : null;
+  // xyz = the nearest pin's rest position, w = the length of fabric between —
+  // see `longRangeAttachments`. w == 0 means "no pin reaches here".
+  //
+  // ⛔ OFF BY DEFAULT, AND IT SHIPPED ON ONCE. The constraint is a hard
+  // projection applied inside EVERY Jacobi pass — 8 per substep — with no
+  // relaxation, and Jacobi has no idea the other particles are projecting at
+  // the same time. Live result: all three Sponza islands HOISTED, centres at
+  // y 2.56-2.66 against 1.11 hanging correctly, each squashed to ~0.96 m of a
+  // 2.26 m drop. Strictly worse than the divergence it was meant to bound.
+  //
+  // ⚠ The maths is not what is wrong: the analysis satisfies the real
+  // curtain's rest pose at every one of its 7 174 vertices, with and without
+  // the structural-edge filter. The suspect is the APPLICATION — a hard
+  // projection eight times per substep is an over-relaxation, and over-relaxing
+  // a constraint that always pulls toward one point pumps energy toward that
+  // point. Applying it once per substep, or with a relaxation factor, is the
+  // next thing to measure. `__clothLra = true` turns it on.
+  // ⭐ BUILT WHENEVER THE DATA EXISTS, ARMED BY A UNIFORM. The relaxation
+  // factor is the whole question (see `u.lraRelax`), and a build-time flag
+  // cannot be turned until you have already decided — which is how the first
+  // attempt shipped hard-projected and hoisting.
+  const clothLra = meshCloth?.lra ? instancedArray(meshCloth.lra, "vec4") : null;
   // The flow: .xy the column's horizontal velocity (local units per second),
   // .zw the accumulated drift the wake pattern rides (local units).
   const flow = kind === "water" ? instancedArray(wCount, "vec4") : null;
@@ -198,9 +346,45 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const positionAttribute = new THREE.StorageBufferAttribute(total, 3);
   const output = storage(positionAttribute, "vec3", total);
   const waterSurfaceTexture = rippleTexture;
-  const u = { damping: uniform(.99), gravity: uniform(9.81), wind: uniform(1), stiffness: uniform(.9), speed: uniform(2), amplitude: uniform(.3) };
+  const u = { damping: uniform(.99), gravity: uniform(9.81),
+    // ⚠ WIND IS A VECTOR, not a magnitude on +Z. A curtain could only ever
+    // be blown one way before this ("our wind is only Z, we must be able to
+    // choose any direction", user). Saved scenes holding a NUMBER still
+    // load — `applyProps` reads one as [0, 0, wind], its old meaning.
+    wind: uniform(new THREE.Vector3(0, 0, 2)),
+    stiffness: uniform(.9), speed: uniform(2), amplitude: uniform(.3) };
   Object.assign(u, {
     shear: uniform(1), bend: uniform(.1), gust: uniform(0), gustFrequency: uniform(1), simTime: uniform(0), pin: uniform(0),
+    // 1 = the stranded-particle recovery sweep is armed. A UNIFORM rather
+    // than a build-time flag so it can be turned off and on against a live
+    // cloth, which is the only way to judge what it feels like.
+    safeRecovery: uniform(1),
+    // ⭐⭐⭐ HOW HARD THE LONG-RANGE ATTACHMENT PULLS. **A PIECE OF FABRIC
+    // CANNOT BE FURTHER FROM ITS ROD THAN THERE IS FABRIC**, and until this was
+    // armed nothing in the solver said so: a character walking through a
+    // curtain dragged it into a cone several metres long (user's screenshot,
+    // 2026-09-08 — "it still stretches obviously").
+    //
+    // Measured on that curtain, a character carrying 1 345 particles 3 m:
+    //
+    //   relax   furthest particle from its pin   fabric allows   over by
+    //   0       3.05 m                           1.14 m          1.91 m
+    //   0.12    1.90 m                           1.29 m          0.61 m
+    //   0.25    1.31 m                           1.14 m          0.18 m
+    //   0.50    1.32 m                           1.30 m          0.01 m
+    //
+    // ⭐ AND IT COSTS NOTHING AT REST: on the hanging curtain, **0 of 2 434
+    // vertices move** at any relaxation, because a cloth that is not stretched
+    // is already inside its own geodesic reach (`LRA_SLACK` is 1.02). The cap
+    // can only ever act on genuine over-stretch, which is why it is safe on by
+    // default where the first attempt was not.
+    //
+    // ⛔ THE FIRST ATTEMPT SHIPPED AT 1, ASSIGNED (not mixed), EIGHT TIMES A
+    // SUBSTEP, and hoisted every curtain to y 2.56-2.66 against 1.11 hanging.
+    // Over-relaxing a constraint that always pulls toward ONE point pumps
+    // energy at that point. Half, mixed rather than assigned, is the whole
+    // difference. `__clothLraRelax = 0` restores the old unbounded behaviour.
+    lraRelax: uniform(.5),
     waveHeight: uniform(0), waveLength: uniform(4), waveCos: uniform(1), waveSin: uniform(0),
     // The current (metres per second, and its direction) — see waterSpectrum.js `scroll`;
     // `tick` is the frame's real seconds for the advection kernels.
@@ -236,6 +420,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // `updateWaterSlot`, which is the only place that knows the mesh's scale.
     refraction: uniform(0), collisionSkip: uniform(-1, "int"), meshCollisionSkip: uniform(-1, "int"),
     collisionRadius: uniform(.03), friction: uniform(.2),
+
     // World metres per local unit, published every tick from the mesh matrix.
     waveScale: uniform(new THREE.Vector3(1, 1, 1)),
     rippleLimit: uniform(1), viscosity: uniform(.02), rippleSpeed: uniform(2), roughness: uniform(.12),
@@ -260,6 +445,31 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const collisionWorld = colliderField ? simulationWorld : null;
   const collisionInverse = colliderField ? simulationInverse : null;
   const h = 1 / 120;
+  /**
+   * ⛔⛔ A CLOTH MUST NOT CHANGE SPEED WITH THE FRAME RATE, AND THIS ONE DID.
+   *
+   * The substep loop advanced a FIXED `h` and threw away whatever the frame
+   * could not afford, so the cloth ran in slow motion whenever the budget bit:
+   *
+   *     editor ~38 fps   wants 3.2 substeps, allowed 2   ->  0.63x speed
+   *     play mode 120    1 substep is enough             ->  1.00x speed
+   *
+   * The user watched it in the editor for a whole session and then hit play:
+   * "cloth started moving unnatural, like gravity is super strong or it is
+   * made of rubber". Nothing about the cloth had changed — only how much of
+   * each second it was allowed to simulate.
+   *
+   * So the step SIZE adapts instead: the frame's time is divided by however
+   * many substeps the budget allows, and all of it is simulated. `h` remains
+   * the reference the authored `damping` is defined against, so the same
+   * damping is applied per SECOND however the steps are sized.
+   *
+   * ⚠ Verlet stores velocity as a DISPLACEMENT over the previous step, so when
+   * the step size changes that displacement has to be rescaled by the ratio —
+   * otherwise a frame-rate change reads as an impulse.
+   */
+  const stepSq = uniform(h * h);      // hEff², the integration term
+  const velocityScale = uniform(.99); // (hEff / hPrev) * damping^(hEff / h)
   const index = instanceIndex.toInt();
   // Solver cell coordinates (w×w); the render mesh has its own below.
   const x = index.mod(w), y = index.div(w);
@@ -275,9 +485,11 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     return vec3(rest.x.mul(k), rest.y, rest.z.mul(k));
   };
   const insideLid = (x, z) => waterRimDistanceNode(u.shape, u.halfExtent, x, z).greaterThan(0);
-  const initial = (ix, iy) => kind === "cloth"
-    ? vec3(ix.toFloat().mul(dx).sub(width / 2), float(height).sub(iy.toFloat().mul(dy)), 0)
-    : lidClamp(gridRest(ix, iy));
+  const initial = (ix, iy) => meshCloth
+    ? clothRest.element(index).xyz
+    : kind === "cloth"
+      ? vec3(ix.toFloat().mul(dx).sub(width / 2), float(height).sub(iy.toFloat().mul(dy)), 0)
+      : lidClamp(gridRest(ix, iy));
   // A solver cell's rest position in LOCAL units: the window's centre plus
   // the cell's offset from the window's middle.
   const cellLocal = (ix, iy) => vec3(u.rippleCenter.x.add(ix.toFloat().sub((w - 1) / 2).mul(sx)), 0, u.rippleCenter.y.add(iy.toFloat().sub((w - 1) / 2).mul(sz)));
@@ -327,10 +539,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // field's foam is a birth SOURCE and its flow carries the particles, so a
   // wake's foam, a splash's and a crest's are one system with one motion.
   if (spectrum && rippleTexture) spectrum.ripple = { at: rippleAt, flow: flowAt, scale: u.waveScale, center: u.rippleCenter, half: u.rippleHalf };
-  const pinned = () => u.pin.equal(0).and(y.equal(0))
-    .or(u.pin.equal(1).and(y.equal(0)).and(x.equal(0).or(x.equal(n - 1))))
-    .or(u.pin.equal(2).and(x.equal(0)))
-    .or(u.pin.equal(3).and(x.equal(0)).and(y.equal(0).or(y.equal(n - 1))));
+  // A mesh has no rows, so which particles are held is decided on the CPU by
+  // geometry (`clothPinFlags`) and arrives in `rest.w`. The grid keeps its
+  // predicate: it is free there, and `u.pin` still switches modes live.
+  const pinned = () => meshCloth
+    ? clothRest.element(index).w.greaterThan(.5)
+    : u.pin.equal(0).and(y.equal(0))
+      .or(u.pin.equal(1).and(y.equal(0)).and(x.equal(0).or(x.equal(n - 1))))
+      .or(u.pin.equal(2).and(x.equal(0)))
+      .or(u.pin.equal(3).and(x.equal(0)).and(y.equal(0).or(y.equal(n - 1))));
   const applyEntityAnchor = (point) => {
     Loop({start:0,end:anchorCount},({i})=>{
       const anchor=anchors.element(i);
@@ -346,8 +563,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     positions.element(index).assign(vec4(p, 0));
     previous.element(index).assign(vec4(p, 0));
     scratch.element(index).assign(vec4(p, 0));
+    // The authored pose is by definition on the side the cloth belongs.
+    if (clothSafe) clothSafe.element(index).assign(vec4(p, 0));
     if (flow) flow.element(index).assign(vec4(0));
-  })().compute(wCount);
+  })().compute(particleCount);
   // ── THE WINDOW MOVES IN WHOLE CELLS, AND THE FIELD MOVES WITH IT ───────────
   //
   // `rippleShift` is the step in cells. Each cell takes the height, velocity
@@ -405,12 +624,22 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const integrate = Fn(() => {
     const p = positions.element(index).xyz.toVar();
     const old = previous.element(index).xyz;
-    const next = p.add(p.sub(old).mul(u.damping)).toVar();
+    // ⚠ `velocityScale` carries BOTH the damping and the step-ratio correction
+    // for cloth; water keeps the plain authored damping and its fixed step.
+    const next = p.add(p.sub(old).mul(kind === "cloth" ? velocityScale : u.damping)).toVar();
     if (kind === "cloth") {
-      const gust = u.simTime.mul(u.gustFrequency).mul(Math.PI * 2).add(p.x.mul(.8)).add(p.y.mul(.6)).sin().mul(u.gust.add(u.wind.abs().mul(.35)))
-        .add(u.simTime.mul(.731).add(p.y.mul(1.4)).sin().mul(u.wind.abs()).mul(.15));
-      const localForce = simulationInverse.mul(vec4(0, u.gravity.negate(), u.wind.add(gust), 0)).xyz;
-      next.addAssign(localForce.mul(h * h));
+      // ⚠ THE GUST RIDES THE WIND'S OWN DIRECTION. It used to be a scalar added
+      // to +Z; with a vector wind it has to be a modulation ALONG the wind, or
+      // a sideways breeze would still gust north.
+      const speed = u.wind.length();
+      const gust = u.simTime.mul(u.gustFrequency).mul(Math.PI * 2).add(p.x.mul(.8)).add(p.y.mul(.6)).sin().mul(u.gust.add(speed.mul(.35)))
+        .add(u.simTime.mul(.731).add(p.y.mul(1.4)).sin().mul(speed).mul(.15));
+      // A still wind has no direction to gust along, so the gust is carried on
+      // the normalised wind and vanishes with it rather than dividing by zero.
+      const heading = u.wind.div(speed.max(1e-4));
+      const world = vec3(0, u.gravity.negate(), 0).add(u.wind).add(heading.mul(gust));
+      const localForce = simulationInverse.mul(vec4(world, 0)).xyz;
+      next.addAssign(localForce.mul(stepSq));
       If(pinned(), () => { next.assign(initial(x, y)); });
       applyEntityAnchor(next);
     } else {
@@ -491,7 +720,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     }
     previous.element(index).assign(vec4(p, 0));
     scratch.element(index).assign(vec4(next, positions.element(index).w));
-  })().compute(wCount);
+  })().compute(particleCount);
   // ── A BODY DISPLACES WATER; IT DOES NOT PUMP IT ───────────────────────────
   //
   // The profile is a near-flat-topped bump, `exp(-(1.5t)^6)`, taken from the
@@ -532,7 +761,174 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     previous.element(index).y.addAssign(displacement);
     if (flow) { const f = flow.element(index).toVar(); flow.element(index).assign(vec4(f.xy.add(push), f.zw)); }
   })().compute(wCount) : null;
-  const constrain = (source, target) => Fn(() => {
+  /**
+   * ── THE MESH CONSTRAINT SOLVE ────────────────────────────────────────────
+   *
+   * The same Jacobi relaxation as the grid's, over a neighbourhood that is
+   * DATA rather than an unrolled stencil. Each thread walks its own slice of
+   * the spring buffer — `stride` slots, ending early at the sentinel — and
+   * accumulates the same distance correction the grid version applies.
+   *
+   * ⭐ THE DENOMINATOR IS THE WEIGHT SUM, NOT A CONSTANT. The grid divides by
+   * `4 + shear*4 + bend*4` because it knows it has exactly twelve neighbours.
+   * A mesh vertex has between three and sixteen, so the same constant would
+   * over-correct a boundary vertex (fewer springs, same divisor) and
+   * under-correct a dense one — the sheet would ripple along its own
+   * topology. Summing the weights actually applied makes the relaxation
+   * independent of valence, which is what keeps an irregular mesh as stable as
+   * a lattice.
+   *
+   * `weight` is 0 for a structural spring and 1 for a dihedral one, so one
+   * `mix` picks `stiffness` or `bend` without a branch in the inner loop.
+   */
+  /**
+   * How far past its rest length a structural edge may be stretched. Chosen
+   * from the live populations rather than a round number: the healthy Sponza
+   * curtain's worst spring measured **1.30x**, while the two broken ones sat
+   * at 2.41x and 8.24x. 1.5 falls in that gap, so an intact cloth never feels
+   * it and a torn one is caught immediately. `__clothMaxStretch` overrides.
+   */
+  const CLOTH_MAX_STRETCH = 1.5;
+  // ⛔⛔ OFF BY DEFAULT — IT PRODUCED NaN ON THE LIVE SCENE. One reload with
+  // this on and `vfx.cloth.status` reported **2 128 of 7 174 particles
+  // non-finite**: a whole island reduced to its 306 pinned vertices, the rest
+  // with no position at all.
+  //
+  // ⚠ The arithmetic says how. Both endpoints of a violated spring move by
+  // HALF the excess in the same Jacobi pass, which exactly closes it — but
+  // when `len` is far past `rest * maxStretch` the excess approaches `len`
+  // itself, so the two ends travel half the gap EACH, meet, and the soft
+  // spring correction applied in the same pass carries them through one
+  // another. Flip, grow, repeat.
+  //
+  // ⛔ AND THE CPU TEST DID NOT CATCH IT, because its fixture HOLDS one end
+  // (that was the point — modelling a contact that keeps re-pushing a
+  // particle). With one end fixed only half the closure happens and it
+  // converges neatly. A free-free pair at large stretch is the diverging case,
+  // and there is no fixture for it. `__clothMaxStretch` opts back in.
+  const strainLimit = Number(globalThis.__clothMaxStretch) > 1;
+  const maxStretch = float(Math.max(1.01, Number(globalThis.__clothMaxStretch) || CLOTH_MAX_STRETCH));
+  const constrainMesh = (source, target) => Fn(() => {
+    const p = source.element(index).xyz.toVar();
+    const correction = vec3(0).toVar();
+    const total = float(0).toVar();
+    // The hard strain limit is accumulated separately from the soft spring
+    // correction — see below; it is a projection, not a force.
+    const limit = vec3(0).toVar();
+    const limited = float(0).toVar();
+    const base = index.mul(int(meshCloth.stride));
+    Loop({ start: 0, end: int(meshCloth.stride) }, ({ i }) => {
+      const spring = clothSprings.element(base.add(i));
+      // ⭐ THE EARLY EXIT IS BACK, AND NOW IT IS ONLY AN OPTIMISATION. The
+      // stride is the mesh's WORST degree (20 on the user's curtains) while the
+      // median is 13, so running it to the end costs ~1.5x the constraint
+      // solve — the dominant term in a 30 ms compute frame. It was removed
+      // while the padding was live data and putting it back would have been a
+      // silent correctness bet; with the tail filled with `SPRING_END` the
+      // guard below already makes the result right, and this only stops early.
+      If(spring.x.lessThan(0), () => { Break(); });
+      // ⛔ AND THE GUARD STAYS. The unused tail of a particle's stride is
+      // filled with `SPRING_END`, and skipping it here is what makes the
+      // result independent of whether the loop actually stops early. The first
+      // version relied on `Break()` and left the tail ZERO-filled — which is a
+      // spring to particle 0 with a rest length of zero, so every particle was
+      // dragged toward particle 0 and the cloth tore into vertical threads
+      // (user, 2026-09-07). Measured on the CPU over the real curtain: 2 114x
+      // stretch against 1.58x. Correctness does not get to depend on control
+      // flow when the data can carry it.
+      If(spring.x.greaterThanEqual(0), () => {
+        const other = source.element(spring.x.toInt()).xyz;
+        const delta = other.sub(p);
+        const len = delta.length().max(.00001);
+        // ⛔⛔ **THE FAMILY RATIO ONLY — `stiffness` MUST NOT BE THE WEIGHT.**
+        //
+        // This used to be `mix(u.stiffness, u.bend, spring.z)`, and because the
+        // same `w` is summed into `total` and then divided out below, a value
+        // shared by every one of a particle's springs CANCELS EXACTLY. With
+        // bend at 0 every active spring carries `stiffness`, so the control did
+        // nothing whatsoever: measured on the user's curtain, dragging a patch
+        // 1.5 m and relaxing eight passes leaves the worst spring at 8.4770x
+        // its rest length at stiffness 0.10, 0.50, 0.95 AND 1.00 — identical to
+        // four decimal places.
+        //
+        // "see it stretches when player walked through it? it must not do that,
+        // I set stretching to 0" (user, 2026-09-08). The setting was at maximum
+        // and inert, which is the worst way for a control to fail: it invites
+        // exactly the conclusion that the solver is broken.
+        //
+        // So the weight now carries only what it is FOR — how much a fold
+        // resists relative to a seam — and `stiffness` scales the averaged
+        // correction, where it survives the division and means what it says.
+        // At stiffness 1 this is bit-for-bit the old behaviour.
+        const w = mix(float(1), u.bend, spring.z);
+        correction.addAssign(delta.mul(len.sub(spring.y).div(len)).mul(w));
+        total.addAssign(w);
+        // ⭐⭐⭐ STRAIN LIMITING (Provot 1995) — THE PART THAT IS NOT OPTIONAL.
+        //
+        // The soft spring above is scaled by `stiffness`, so it only ever
+        // removes a FRACTION of the error per pass. That is fine for the
+        // millimetres gravity adds, and useless against the metres a bad
+        // contact adds: measured live, one structural spring at **8.2x its
+        // rest length**, and rising between readings.
+        //
+        // ⛔ AND THE STRETCH IS SELF-SUSTAINING, WHICH IS WHY IT NEVER HEALS.
+        // A two-sided contact against an open trimesh wall is BISTABLE: it
+        // pushes a particle back to whichever side it came from, so a particle
+        // that once ended up behind the wall is held there, perfectly stably,
+        // while its neighbours stay in front. The spring between them then
+        // spans the wall for good. Every curtain that breaks in Sponza is one
+        // being pressed into a wall by the wind; the ones hanging free are
+        // clean.
+        //
+        // So the excess beyond the limit is removed OUTRIGHT, not softly — a
+        // sheet may not stretch past `CLOTH_MAX_STRETCH` whatever is holding
+        // it. Structural edges only: a bend spring is MEANT to be far from
+        // rest, and a thickness spring measures the shell, not the sheet.
+        //
+        // ⚠ LOCAL, and that is the whole safety argument. `__clothLra` pulled
+        // every particle toward ONE point and hoisted the entire curtain; this
+        // only ever equalises a particle with its own neighbour, so it has no
+        // attractor to collapse toward. Halved because both endpoints move in
+        // the same Jacobi pass.
+        if (strainLimit) If(spring.z.lessThan(.5).and(spring.w.greaterThan(-1.5)), () => {
+          const excess = len.sub(spring.y.mul(maxStretch)).max(0);
+          If(excess.greaterThan(0), () => {
+            limit.addAssign(delta.mul(excess.div(len)));
+            limited.addAssign(1);
+          });
+        });
+      });
+    });
+    p.addAssign(correction.div(total.max(1e-4)).mul(u.stiffness));
+    if (strainLimit) If(limited.greaterThan(0), () => { p.addAssign(limit.div(limited).mul(.5)); });
+    // ⭐⭐⭐ THE LONG-RANGE ATTACHMENT. A Jacobi pass moves a constraint one
+    // ring; the pin is ~60 rings from this curtain's hem, so it can never
+    // arrive within a frame and the error compounds instead — measured
+    // diverging live, a spring going from 4.7x to 15x rest length while it was
+    // being watched. This caps the distance from the pin at the length of
+    // fabric in between, which is known before the first frame and enforced in
+    // ONE step however far away the pin is. No extra dispatch.
+    if (clothLra) {
+      const lra = clothLra.element(index);
+      If(lra.w.greaterThan(0).and(u.lraRelax.greaterThan(0)), () => {
+        const away = p.sub(lra.xyz);
+        const far = away.length();
+        // ⚠ MIXED TOWARD the cap, never assigned to it. The first version
+        // assigned, i.e. relaxation 1, eight times a substep — an
+        // over-relaxation of a constraint that always pulls toward ONE point,
+        // which pumps energy at that point and hoisted every curtain.
+        If(far.greaterThan(lra.w), () => {
+          const capped = lra.xyz.add(away.mul(lra.w.div(far.max(1e-6))));
+          p.assign(p.add(capped.sub(p).mul(u.lraRelax)));
+        });
+      });
+    }
+    If(pinned(), () => { p.assign(initial(x, y)); });
+    applyEntityAnchor(p);
+    target.element(index).assign(vec4(p, 0));
+  })().compute(particleCount);
+
+  const constrain = (source, target) => meshCloth ? constrainMesh(source, target) : Fn(() => {
     const p = source.element(index).xyz.toVar();
     const correction = vec3(0).toVar();
     for (const [ox, oy] of [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [1, -1], [-1, 1], [1, 1], [-2, 0], [2, 0], [0, -2], [0, 2]]) {
@@ -579,7 +975,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       previous.element(index).y.mulAssign(f);
     }
     positions.element(index).assign(next);
-  })().compute(wCount);
+  })().compute(particleCount);
   // Final authoritative pins also run when dt is zero: editor gizmo motion
   // updates the attachment immediately, and collision cannot dislodge it.
   const pinEntities = kind === "cloth" ? Fn(()=>{
@@ -591,14 +987,27 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         scratch.element(index).assign(vec4(anchor.xyz,0));
       });
     });
-  })().compute(count) : null;
+  })().compute(particleCount) : null;
   // One-way contact, after each fixed-step constraint solve. Four bound storage
   // buffers: current/previous positions and the primitive/triangle collider fields.
+  // The authored radius, bounded by what THIS particle's own shell can hold
+  // apart. A uniform alone cannot express it — see `clothRadius`.
+  const contactRadius = clothRadius
+    ? (() => { const own = clothRadius.element(index); return select(own.greaterThan(0), u.collisionRadius.min(own), u.collisionRadius); })()
+    : u.collisionRadius;
   const collide = kind === "cloth" && colliderField ? Fn(() => {
     {
       const point = collisionWorld.mul(vec4(positions.element(index).xyz, 1)).xyz.toVar();
       const old = collisionWorld.mul(vec4(previous.element(index).xyz, 1)).xyz;
+      // `previous` still supplies the VELOCITY — that is this step's real
+      // motion. Only the sweep ORIGIN comes from the safe position.
+      const sweepFrom = clothSafe
+        ? collisionWorld.mul(vec4(clothSafe.element(index).xyz, 1)).xyz
+        : old;
       const velocity = point.sub(old).toVar();
+      // The position before any contact ran, so the recovery sweep below can
+      // tell whether the ordinary one did anything.
+      const entering = vec3(point).toVar();
       const resolve = (normal, push) => {
         point.addAssign(normal.mul(push));
         const normalVelocity = dot(velocity, normal);
@@ -619,17 +1028,17 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
           const closest = center.add(b.xyz.mul(clamped.x)).add(c.xyz.mul(clamped.y)).add(d.xyz.mul(clamped.z));
           const delta = point.sub(closest), distance = delta.length();
           If(distance.greaterThan(.00001), () => {
-            If(distance.lessThan(u.collisionRadius), () => resolve(delta.div(distance), u.collisionRadius.sub(distance)));
+            If(distance.lessThan(contactRadius), () => resolve(delta.div(distance), contactRadius.sub(distance)));
           }).Else(() => {
             const penetration = extent.sub(local.abs());
             If(penetration.x.lessThanEqual(penetration.y).and(penetration.x.lessThanEqual(penetration.z)), () => {
-              resolve(b.xyz.mul(local.x.greaterThanEqual(0).select(1, -1)), penetration.x.add(u.collisionRadius));
+              resolve(b.xyz.mul(local.x.greaterThanEqual(0).select(1, -1)), penetration.x.add(contactRadius));
             }).ElseIf(penetration.y.lessThanEqual(penetration.z), () => {
-              resolve(c.xyz.mul(local.y.greaterThanEqual(0).select(1, -1)), penetration.y.add(u.collisionRadius));
-            }).Else(() => resolve(d.xyz.mul(local.z.greaterThanEqual(0).select(1, -1)), penetration.z.add(u.collisionRadius)));
+              resolve(c.xyz.mul(local.y.greaterThanEqual(0).select(1, -1)), penetration.y.add(contactRadius));
+            }).Else(() => resolve(d.xyz.mul(local.z.greaterThanEqual(0).select(1, -1)), penetration.z.add(contactRadius)));
           });
         }).Else(() => {
-          const delta = point.sub(center), distance = delta.length(), radius = b.w.add(u.collisionRadius);
+          const delta = point.sub(center), distance = delta.length(), radius = b.w.add(contactRadius);
           If(distance.lessThan(radius), () => {
             const normal = distance.greaterThan(.00001).select(delta.div(distance.max(.00001)), vec3(0, 1, 0));
             resolve(normal, radius.sub(distance));
@@ -638,14 +1047,69 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         });
       });
       if (meshColliderField) Loop({ start: 0, end: 3 }, () => {
-        projectClothMeshContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, old, velocity, radius: u.collisionRadius, friction: u.friction });
+        projectClothMeshContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, old, velocity, radius: contactRadius, friction: u.friction });
       });
+      // ⭐⭐⭐ AND THE RECOVERY SWEEP, ONLY WHEN THE ORDINARY ONE FOUND NOTHING.
+      //
+      // ⛔ REPLACING the origin with `safe` was tried and over-fired: a longer
+      // sweep reaches triangles the short one never came near, `remember`
+      // keeps the EARLIEST crossing, and the push is then measured against
+      // THAT triangle's plane — `radius - dot(point - anchor, normal)` against
+      // a perpendicular alcove wall is a metre-sized shove. Live, it fixed
+      // every free-hanging curtain (0.015-0.020, best of the session) and
+      // hoisted every wall-pressed one to y ~3.0. The model reproduces it:
+      // 5x the displacement in a corner fixture.
+      //
+      // So the ordinary sweep keeps first refusal and is untouched. This runs
+      // only when it found NOTHING — the stranded case — and only when the
+      // particle has drifted from its certified position by more than a
+      // contact radius, which on a settled cloth is sub-millimetre and never
+      // fires, and which a relaxation pass shoving a particle through a wall
+      // always exceeds.
+      // ⛔⛔ **`drift` IS ONE STEP'S DISPLACEMENT, NOT A MEASURE OF STRAYING** —
+      // and the comment above is only true of a cloth that is holding still.
+      // `clothSafe` is rewritten at the end of EVERY collide (below), and
+      // `previous` is written in the same place as `point - velocity`, so next
+      // step `sweepFrom - old` is exactly the last step's motion. The gate
+      // therefore asks "is this particle moving faster than a contact radius
+      // per substep?" — 1.2 cm here, about 1.4 m/s at two substeps. A shoved
+      // curtain passes that everywhere, and so does a freely swinging one.
+      //
+      // That matters because the second sweep starts from a DIFFERENT origin
+      // and so can find a triangle the first never came near, and the push is
+      // measured against THAT triangle's plane — "a metre-sized shove", as the
+      // note above says. On a fast-moving particle that is not touching
+      // anything, that reads as a force pulling it back toward where it was,
+      // growing with distance: "like a rubber band ... pulling its bottom edge
+      // to its original position, and pulls harder when the cloth gets further
+      // from where it wants to be (upon contact with character collider)"
+      // (user, 2026-09-08).
+      //
+      // ⚠ NOT YET RE-GATED, because the right threshold is a measurement and
+      // not a guess: a genuinely stranded particle differs from a fast one by
+      // having been moved WITHOUT contact seeing it, which this test cannot
+      // express. `__clothSafeSweep = false` disarms it live — read every tick,
+      // so it takes effect on the next frame with no rebuild.
+      if (meshColliderField && clothSafe) {
+        const drift = sweepFrom.sub(old);
+        If(u.safeRecovery.greaterThan(.5)
+          .and(point.sub(entering).dot(point.sub(entering)).lessThan(1e-12))
+          .and(dot(drift, drift).greaterThan(contactRadius.mul(contactRadius))), () => {
+          projectClothMeshContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, old: sweepFrom, velocity, radius: contactRadius, friction: u.friction });
+        });
+      }
       });
-      if (meshColliderField) projectClothClosedContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, velocity, radius: u.collisionRadius, friction: u.friction });
-      positions.element(index).assign(vec4(collisionInverse.mul(vec4(point, 1)).xyz, 0));
+      if (meshColliderField) projectClothClosedContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, velocity, radius: contactRadius, friction: u.friction });
+      const local = collisionInverse.mul(vec4(point, 1)).xyz;
+      positions.element(index).assign(vec4(local, 0));
       previous.element(index).assign(vec4(collisionInverse.mul(vec4(point.sub(velocity), 1)).xyz, 0));
+      // ⚠ THE RESOLVED POINT, never merely wherever the particle ended up. The
+      // sweep has just certified this position; recording an UNCHECKED one
+      // would poison the origin after a single undetected tunnel and recovery
+      // could never fire again.
+      if (clothSafe) clothSafe.element(index).assign(vec4(local, 0));
     }
-  })().compute(count) : null;
+  })().compute(particleCount) : null;
   // Resolve spatial cloth edges as well as temporal vertex motion. In a cloth
   // initially cutting through an open collider, every vertex can be well away
   // from its surface while a grid edge crosses it. Propagate the side of the
@@ -656,6 +1120,45 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     If(pinned().not(), () => {
       const old = simulationWorld.mul(vec4(previous.element(index).xyz, 1)).xyz;
       const velocity = point.sub(old).toVar();
+      if (meshCloth) {
+        // ── EDGE CONTACT OVER A MESH ────────────────────────────────────────
+        //
+        // Same idea as the grid's: resolve the SPATIAL edge as well as the
+        // vertex's own motion, because a cloth cutting through an open
+        // collider can have every vertex clear of the surface while an edge
+        // between them crosses it. The grid picks three neighbours by index
+        // arithmetic away from the pinned side; a mesh takes its incident
+        // springs, which is the same set expressed as data.
+        //
+        // Structural springs only (`z < 0.5`): a dihedral spring jumps across
+        // a triangle, so it is not an edge of the surface and sweeping along
+        // it would resolve contact against a chord that does not exist. The
+        // walk is capped because contact runs every substep and a high-valence
+        // vertex would otherwise cost its whole ring here.
+        const base = index.mul(int(meshCloth.stride));
+        const used = int(0).toVar();
+        Loop({ start: 0, end: int(meshCloth.stride) }, ({ i }) => {
+          const spring = clothSprings.element(base.add(i));
+          If(spring.x.lessThan(0), () => { Break(); });
+          // ⛔ SURFACE EDGES ONLY. `z < 0.5` is "structural", which since
+          // thickness springs arrived also matches the springs that BIND THE
+          // SHELL'S TWO FACES — and sweeping contact along one of those runs a
+          // segment straight through the cloth to the other side. `w > -1.5`
+          // excludes them (they carry SPRING_THICKNESS = -2) while still
+          // admitting a boundary edge, whose successor is -1.
+          If(spring.x.greaterThanEqual(0).and(spring.z.lessThan(.5)).and(spring.w.greaterThan(-1.5))
+            .and(used.lessThan(int(MESH_CONTACT_EDGES))), () => {
+            used.addAssign(int(1));
+            const anchor = simulationWorld.mul(vec4(positions.element(spring.x.toInt()).xyz, 1)).xyz.toVar();
+            projectClothMeshContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, old: anchor, velocity, radius: contactRadius, friction: u.friction });
+          });
+        });
+        projectClothClosedContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, velocity, radius: contactRadius, friction: u.friction });
+        previous.element(index).assign(vec4(simulationInverse.mul(vec4(point.sub(velocity), 1)).xyz, 0));
+        // `scratch` is written unconditionally after the branch, exactly as the
+        // grid path does — writing it here too would emit the same store twice.
+        return;
+      }
       const sideX = int(0).toVar(), sideY = int(0).toVar();
       If(x.lessThan(int(n / 2)), () => { sideX.assign(x.sub(int(1)).max(int(0))); }).Else(() => { sideX.assign(x.add(int(1)).min(int(n - 1))); });
       If(y.lessThan(int(n / 2)), () => { sideY.assign(y.sub(int(1)).max(int(0))); }).Else(() => { sideY.assign(y.add(int(1)).min(int(n - 1))); });
@@ -675,14 +1178,14 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       for (const predecessor of [lateral, diagonal, primary]) {
         If(predecessor.notEqual(index), () => {
           const anchor = simulationWorld.mul(vec4(positions.element(predecessor).xyz, 1)).xyz.toVar();
-          projectClothMeshContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, old: anchor, velocity, radius: u.collisionRadius, friction: u.friction });
+          projectClothMeshContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, old: anchor, velocity, radius: contactRadius, friction: u.friction });
         });
       }
-      projectClothClosedContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, velocity, radius: u.collisionRadius, friction: u.friction });
+      projectClothClosedContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, velocity, radius: contactRadius, friction: u.friction });
       previous.element(index).assign(vec4(simulationInverse.mul(vec4(point.sub(velocity), 1)).xyz, 0));
     });
     scratch.element(index).assign(vec4(simulationInverse.mul(vec4(point, 1)).xyz, 0));
-  })().compute(count) : null;
+  })().compute(particleCount) : null;
   // ── THE SEA IS SAMPLED IN WORLD METRES; THE RIPPLES ARE LOCAL ─────────────
   //
   // The vertex's rest XZ in world metres addresses the spectral cascades,
@@ -838,6 +1341,64 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     textureStore(flowTexture, ivec2(x, y), flow.element(index));
   })().compute(wCount) : null;
   const heightfieldVertex = () => {
+    if (meshCloth) {
+      // ── ONE RENDER VERTEX ────────────────────────────────────────────────
+      //
+      // This kernel runs over RENDER vertices, not particles: the render mesh
+      // keeps the UV seams welding collapsed, so several of its vertices can
+      // read the same particle. `simIndex` is that mapping.
+      //
+      // The normal is the area-weighted sum of `cross(a - p, b - p)` over the
+      // triangles around the particle, walked through each structural spring's
+      // FAN SUCCESSOR (clothMeshTopology.js packs it into the spring's spare
+      // `w` lane). A dihedral spring and a boundary edge both store -1: neither
+      // closes a triangle around this vertex, and inventing one would fold a
+      // phantom triangle in from outside the sheet and tilt the whole border.
+      //
+      // Validated on Sponza's curtain against the asset's OWN authored
+      // normals: median dot 1.000, and every one of the 1.9 % that disagree
+      // sits on a welded rim position where the shell's two sides genuinely
+      // oppose.
+      const particle = clothSimIndex.element(index).toInt();
+      const p = positions.element(particle).xyz.toVar();
+      const base = particle.mul(int(meshCloth.stride));
+      const normal = vec3(0).toVar();
+      Loop({ start: 0, end: int(meshCloth.stride) }, ({ i }) => {
+        const spring = clothSprings.element(base.add(i));
+        If(spring.x.lessThan(0), () => { Break(); });
+        // Both lanes guarded: `x < 0` is padding, `w < 0` is a boundary edge or
+        // a dihedral spring, and neither closes a triangle around this vertex.
+        If(spring.x.greaterThanEqual(0).and(spring.w.greaterThanEqual(0)), () => {
+          const a = positions.element(spring.x.toInt()).xyz.sub(p);
+          const b = positions.element(spring.w.toInt()).xyz.sub(p);
+          normal.addAssign(a.cross(b));
+        });
+      });
+      // A particle whose fan never closed (an isolated or wholly-boundary
+      // vertex) would normalize a zero and light as a black speck.
+      const len = normal.length();
+      const unit = select(len.greaterThan(1e-9), normal.div(len.max(1e-9)), vec3(0, 0, 1));
+      // ⭐ REBUILD THE SHELL. The solver moved the mid-surface; each face steps
+      // back out along the SAME normal the lighting uses, so the thickness
+      // follows the cloth as it folds instead of being frozen into it.
+      //
+      // ⛔⛔ AND THE BACK FACE MUST HAVE ITS NORMAL FLIPPED. The fan normal
+      // belongs to the MID-SURFACE, which is right for the face on the +offset
+      // side and exactly backwards for the one on the -offset side. Shipped
+      // without this, half of every curtain was lit inside-out — the user saw
+      // it immediately ("lighting on those also got broken") on a change that
+      // every geometric test in the suite had passed, because not one of them
+      // looks at a normal. The offset's SIGN is which side this vertex is on.
+      if (clothOffset) {
+        const shell = clothOffset.element(index);
+        normals.element(index).assign(unit.mul(select(shell.lessThan(0), float(-1), float(1))));
+        output.element(index).assign(p.add(unit.mul(shell)));
+      } else {
+        normals.element(index).assign(unit);
+        output.element(index).assign(p);
+      }
+      return;
+    }
     if (kind !== "water") {
       const at = (ix, iy) => iy.mul(n).add(ix);
       const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(n - 1), y);
@@ -1001,6 +1562,30 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         indices.push(v, v + CLIP_SIZE, v + 1, v + 1, v + CLIP_SIZE, v + CLIP_SIZE + 1);
       }
     }
+  } else if (meshCloth) {
+    // ── THE RENDER MESH IS THE AUTHOR'S OWN ─────────────────────────────────
+    //
+    // Not a generated lattice: the source triangles, the source UVs and the
+    // source seams, so the material maps exactly as it did before the cloth
+    // was added. Only the POSITIONS become live, written by the surface kernel
+    // through `simIndex`.
+    //
+    // The CPU copies of position and normal still have to be right even though
+    // the kernel overwrites them: editor picking, the bounding box and the very
+    // first frame all read the attribute before any compute has run.
+    const srcPos = sourceGeometry.getAttribute("position");
+    const srcNrm = sourceGeometry.getAttribute("normal");
+    const srcUv = sourceGeometry.getAttribute("uv");
+    for (let v = 0; v < total; v++) {
+      positionAttribute.setXYZ(v, srcPos.getX(v), srcPos.getY(v), srcPos.getZ(v));
+      if (srcNrm) normalAttribute.setXYZ(v, srcNrm.getX(v), srcNrm.getY(v), srcNrm.getZ(v));
+      else normalAttribute.setXYZ(v, 0, 0, 1);
+      uv[v * 2] = srcUv ? srcUv.getX(v) : 0;
+      uv[v * 2 + 1] = srcUv ? srcUv.getY(v) : 0;
+    }
+    const srcIndex = sourceGeometry.getIndex();
+    if (srcIndex) for (let i = 0; i < srcIndex.count; i++) indices.push(srcIndex.getX(i));
+    else for (let i = 0; i < total; i++) indices.push(i);
   } else for (let iy = 0; iy < n; iy++) for (let ix = 0; ix < n; ix++) {
     const i = iy * n + ix; uv[i * 2] = ix / (n - 1); uv[i * 2 + 1] = 1 - iy / (n - 1);
     // Keep an authored rest surface on the CPU for editor picking/bounds.
@@ -1107,7 +1692,20 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     }
     geometry.addGroup(runStart, indices.length - runStart, previousMaterial ?? 0);
   }
-  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, kind === "cloth" ? height / 2 : 0, 0), Math.hypot(width, height) * 2);
+  if (meshCloth) {
+    // From the source, and generous: the solver moves these vertices and a
+    // sphere fitted to the REST pose would frustum-cull a cloth the moment it
+    // swung. `computeBoundingSphere` on the live attribute every frame is what
+    // this replaces, and it is not worth a readback.
+    sourceGeometry.computeBoundingSphere();
+    sourceGeometry.computeBoundingBox();
+    // Kept for diagnostics: once this cloth is live its own geometry carries a
+    // GPU-owned StorageBufferAttribute that three cannot derive a box from, so
+    // "did this cloth start inside a collider" has nothing to ask otherwise.
+    if (sourceGeometry.boundingBox) geometry.userData.__clothSourceBox = sourceGeometry.boundingBox.clone();
+    const source = sourceGeometry.boundingSphere;
+    geometry.boundingSphere = new THREE.Sphere(source.center.clone(), source.radius * 2);
+  } else geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, kind === "cloth" ? height / 2 : 0, 0), Math.hypot(width, height) * 2);
   const ownsMaterial=kind === "water" && !sourceMaterial;
   const material = sourceMaterial ?? new THREE.MeshPhysicalNodeMaterial({ color: "#168aab", roughness: .15, metalness: 0, side: THREE.DoubleSide });
 
@@ -1149,7 +1747,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // The LID: the medium (scene.fogNode) treats it as the interface — no water
   // path to it from above, the whole path from below (waterMedium.js).
   if (kind === "water") mesh.userData.waterLid = true;
-  mesh.userData.giGpuGrid = { positionAttribute, resolution: n };
+  // GI reads this to sample a deformed surface on its own lattice; a mesh
+  // cloth has no lattice, so it is left off and GI treats it as ordinary
+  // geometry rather than indexing a grid that does not exist.
+  if (!meshCloth) mesh.userData.giGpuGrid = { positionAttribute, resolution: n };
   if(waterSurfaceTexture)mesh.userData.waterSurfaceTexture=waterSurfaceTexture;
   mesh.userData.noBatch = true;
   mesh.userData.noMerge = true;
@@ -1233,17 +1834,52 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const drift = f.zw.mul(float(1).sub(dt.div(FLOW_DRIFT_SECONDS))).add(v.mul(dt)).add(currentLocal.mul(h));
     flow.element(index).assign(vec4(v, drift));
   })().compute(wCount) : null;
-  const steps = kind === "cloth" ? [integrate, solveA, solveB, solveA, solveB, solveA, solveB, solveA, solveB, commit] : [integrate, commit, momentum];
+  // ⛔ CONTACT WAS THE LAST THING THAT HAPPENED TO A PARTICLE, AND NOTHING
+  // RELAXED IT.
+  //
+  // The substep ran all eight Jacobi relaxation passes, THEN committed, THEN
+  // collided. A contact moves a particle directly — the character capsule
+  // pushing into a curtain, or a wall ejecting a vertex that started inside
+  // it — and the structural springs tying it to its neighbours were not
+  // solved again until the NEXT substep. The stretch had nowhere to go, so it
+  // accumulated: measured on the live Sponza scene, two curtain islands at
+  // 1.7x and 2.2x their own rest height and 15-18x their rest thickness,
+  // while every island on the one cloth with `sceneCollision` off was within
+  // 3 % of rest ("after I interact with the cloth via my character, they get
+  // broken as well", user 2026-09-08).
+  //
+  // ⭐ AND THE PASSES WERE SPENT ON THE WRONG END. Before collision the only
+  // displacement in the buffer is one integration step of gravity: at
+  // h = 1/120 that is g·h² ≈ 0.7 MILLIMETRES. Eight passes were smoothing
+  // sub-millimetre error and none addressed a contact that can move a vertex
+  // tens of centimetres in the same substep.
+  //
+  // So the passes are SPLIT rather than added — the dispatch count is
+  // unchanged, which matters because this solver is launch-bound (see the
+  // substep budget below). Parity is what makes it free: solveA reads
+  // `scratch` and writes `positions`, solveB the reverse, so the passes must
+  // stay in A/B pairs and the tail pair must leave the newest data in
+  // `positions` where `integrate` and the render surface read it. `previous`
+  // is deliberately NOT rewritten after the tail — a position projection is
+  // supposed to change the implied velocity. `__clothSolveSplit` sets how many
+  // of the eight run before contact, for bisecting.
+  const split = clothSolveSplit(globalThis.__clothSolveSplit);
+  const steps = kind === "cloth"
+    ? [integrate, ...Array.from({ length: split }, (_, i) => (i % 2 === 0 ? solveA : solveB)), commit]
+    : [integrate, commit, momentum];
   if (collide) steps.push(collide);
   if (collideEdges) steps.push(collideEdges, commit, collideEdges, commit, collide);
+  // The tail starts from `positions` (what `collide` last wrote), so it leads
+  // with solveB; an even count returns it to `positions`.
+  if (kind === "cloth") steps.push(...Array.from({ length: CLOTH_SOLVE_PASSES - split }, (_, i) => (i % 2 === 0 ? solveB : solveA)));
   if (pinEntities) steps.push(pinEntities);
-  let initialized = false, accumulator = 0, elapsed = 0;
+  let initialized = false, accumulator = 0, elapsed = 0, lastStep = h;
   // The sea's settings and its CPU copy (for buoyancy), see `tick`.
   let lastProps = props, configuredDepth = 0, seaSample = null, seaReadbackPending = false, seaFrame = 0;
   const updateBounds = () => {
     // GPU positions cannot be read synchronously by the culler/GI tracker.
     // Cover the maximum ballistic excursion, including completely unpinned cloth.
-    const excursion = kind === "cloth" ? (u.pin.value === 4 || u.stiffness.value < .1 ? .5 * Math.hypot(u.gravity.value, Math.abs(u.wind.value) * 1.5 + u.gust.value) * elapsed * elapsed : 0) : u.amplitude.value + u.waveHeight.value * 1.75 + 2;
+    const excursion = kind === "cloth" ? (u.pin.value === 4 || u.stiffness.value < .1 ? .5 * Math.hypot(u.gravity.value, u.wind.value.length() * 1.5 + u.gust.value) * elapsed * elapsed : 0) : u.amplitude.value + u.waveHeight.value * 1.75 + 2;
     // The skirt hangs the whole volume depth below the rest surface, so the
     // culling sphere has to reach it or a submerged camera looking up loses the
     // water it is inside.
@@ -1282,9 +1918,25 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // damping gives a pond that settles.
     u.viscosity.value = Math.min(.25, Math.max(0, (1 - u.damping.value) * 30));
     u.gravity.value = finite(p.gravity, 9.81, -100, 100);
-    u.wind.value = finite(p.wind, 2, -100, 100);
+    // ⚠ A SCALAR IN A SAVED SCENE STILL LOADS. `wind: 2` meant "2 along +Z", so
+    // that is exactly what it becomes — no migration pass, no broken projects.
+    const windVec = Array.isArray(p.wind)
+      ? [finite(p.wind[0], 0, -100, 100), finite(p.wind[1], 0, -100, 100), finite(p.wind[2], 0, -100, 100)]
+      : [0, 0, finite(p.wind, 2, -100, 100)];
+    u.wind.value.set(windVec[0], windVec[1], windVec[2]);
     u.stiffness.value = finite(p.stiffness, .95, 0, 1);
-    u.collisionRadius.value = finite(p.collisionRadius, .03, .001, 1); u.friction.value = finite(p.friction, .2, 0, 1);
+    // ⛔⛔ A CONTACT CANNOT BE THICKER THAN THE CLOTH IT PUSHES. A shell's two
+    // faces are pushed to `radius` clear of a collider INDEPENDENTLY, so a
+    // shell thinner than 2 x radius has its near face driven through its far
+    // one — and the thickness springs are distance-only, equally happy with
+    // the shell inside-out, so it never recovers. Measured on Sponza: 68 % of
+    // every curtain's shell is under the 0.06 m the authored radius demands.
+    // See `clothContactRadiusLimit`.
+    // The authored value stands here; the per-particle shell cap is applied in
+    // the kernel through `contactRadius`, because shell thickness varies
+    // BETWEEN THE PIECES of one geometry and a uniform cannot say that.
+    u.collisionRadius.value = finite(p.collisionRadius, .03, .001, 1);
+    u.friction.value = finite(p.friction, .2, 0, 1);
     const fabric = p.fabric === "silk" ? .35 : p.fabric === "canvas" ? 1.5 : 1;
     u.shear.value = finite(p.shear, 1, 0, 1);
     u.bend.value = Math.min(1, finite(p.bend, .1, 0, 1) * fabric);
@@ -1364,7 +2016,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     updateBounds();
   };
   update(props);
-  const simulation = { mesh, skirtMesh, skirtMaterial, positions, count, resolution: n, vertexCount: total, init, surface, steps, uniforms: u,waterSurfaceTexture,slotKernel,causticPass,
+  // ⚠ `count` IS THE PARTICLE COUNT, and for a mesh cloth that is not `count`
+  // the grid variable. `vfx.cloth.status` reads back `positions` over this to
+  // report the solver's bounds, and publishing the grid's 1 024 there made it
+  // sample ONE SEVENTH of a 7 174-particle cloth — bounds that looked healthy
+  // while the rest of the sheet was free to be anywhere. An instrument that
+  // silently measures a subset reports a fix that is not there.
+  const simulation = { mesh, skirtMesh, skirtMaterial, positions, count: particleCount, resolution: n, vertexCount: total, init, surface, steps, uniforms: u,waterSurfaceTexture,slotKernel,causticPass,
     spectrum, rippleTexture, flowTexture,
     /** The solver's grid and its window, in local units. */
     ripple: { resolution: w, cellX: sx, cellZ: sz, windowWidth: winW, windowHeight: winH, windowed },
@@ -1611,8 +2269,91 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         pendingImpulses.length=0;
       }
       accumulator += delta; elapsed += delta; u.simTime.value = elapsed;
+      // One uniform write, so the recovery can be disarmed against a running
+      // cloth rather than only at build time.
+      if (kind === "cloth") {
+        u.safeRecovery.value = globalThis.__clothSafeSweep === false ? 0 : 1;
+        const lraOverride = Number(globalThis.__clothLraRelax);
+        u.lraRelax.value = Number.isFinite(lraOverride) ? Math.min(1, Math.max(0, lraOverride)) : .5;
+      }
       updateBounds();
-      for (let i = 0; accumulator + 1e-9 >= h && i < 6; i++, accumulator -= h) queue.push(...steps);
+      // ── ⭐ THE SUBSTEP CAP IS A WORK BUDGET, NOT A CONSTANT ───────────────
+      //
+      // Measured on the user's Sponza (2026-09-08): three mesh cloths, 23 828
+      // particles, `gpuRenderMs 2.23` against `gpuComputeMs 30.69` — drawing
+      // the scene cost two milliseconds and the cloth solver cost thirty, at
+      // 15 fps.
+      //
+      // ⛔ AND IT IS NOT ARITHMETIC. Seventeen steps x six substeps x three
+      // cloths is **306 compute dispatches per frame**, each over only ~7 000
+      // threads: 79 MILLION invocations per second where the GPU does tens of
+      // billions. Almost all of that time is pipeline binds and barriers
+      // between tiny dispatches. Making the maths cheaper cannot help; making
+      // the DISPATCHES fewer is the only lever.
+      //
+      // Worse, six was self-sustaining. The cap is only reached when a frame is
+      // already slow enough for the accumulator to demand it, so a slow frame
+      // bought the most expensive solve, which kept the frame slow. At 60 fps
+      // a cloth needs exactly two substeps of h=1/120, so budgeting to two is
+      // also what real time asks for — it is the SIX that was aspirational.
+      //
+      // The budget is in particle-substeps, so a 32x32 grid cloth (1 024) keeps
+      // all six and nothing about the old path changes. `__clothSubstepBudget`
+      // overrides it.
+      const budget = Number(globalThis.__clothSubstepBudget) || SUBSTEP_PARTICLE_BUDGET;
+      const maxSubsteps = kind === "cloth"
+        ? Math.max(2, Math.min(6, Math.floor(budget / Math.max(particleCount, 1))))
+        : 6;
+      // ⛔⛔ **THE REAL-TIME STEP IS OPT-IN, AND THE FIXED STEP IS THE DEFAULT.**
+      // Dividing the frame between the substeps the budget allows is right for
+      // the CLOCK and wrong for this SOLVER, and the second beats the first.
+      //
+      // A mesh curtain in Sponza is far past the 6 144-particle budget, so it
+      // gets `maxSubsteps` = 2 — always. At 60 fps that division lands exactly
+      // on 1/120 and costs nothing, which is why this looked fine. Below 60 it
+      // does not: at 30 fps hEff is 1/60, and from 20 fps down the frame is
+      // clamped first so hEff stops at 1/40 — THREE times the reference step,
+      // NINE times the force term.
+      //
+      // The relaxation that has to clean that up is a fixed EIGHT Jacobi
+      // passes, and Jacobi removes a fixed FRACTION of a violation per pass,
+      // never a fixed distance. So the residual stretch scales with h², and a
+      // hanging chain measures it doing exactly that (`cloth-health`, the
+      // rubber test): 1.006 % at 1/120, 4.024 % at 1/60, 9.053 % at 1/40. On a
+      // 2.3 m curtain that is 2 cm of sag at 120 Hz and 21 cm at 20 fps.
+      //
+      // That is not an abstraction, it is the report. "cloth started moving
+      // unnatural, like gravity is super strong or it is made of rubber"
+      // (user, 2026-09-08) — sagging too far AND springing back soft are the
+      // same 9x number seen twice, and nothing else in the solver does both.
+      //
+      // Making it step-size-invariant needs the pass count to rise with h, or
+      // an implicit solve. Until then, honest slow motion under load is the
+      // better failure: the cloth lags real time on a slow frame and looks
+      // like cloth. `__clothRealtimeStep = true` restores the division.
+      if (kind === "cloth" && globalThis.__clothRealtimeStep === true) {
+        // ⭐ CONSUME THE WHOLE FRAME. However many substeps the budget allows,
+        // they divide the frame's real time between them — so the cloth runs
+        // at 1x at every frame rate instead of slowing down when the budget
+        // bites. A long hitch is CLAMPED rather than simulated, because a
+        // 300 ms step is not cloth motion at any step size.
+        const { count: n, step: hEff } = clothSubsteps(accumulator, maxSubsteps, h);
+        accumulator = 0;
+        if (n > 0) {
+          velocityScale.value = clothVelocityScale(hEff, lastStep, u.damping.value, h);
+          stepSq.value = hEff * hEff;
+          lastStep = hEff;
+          for (let i = 0; i < n; i++) queue.push(...steps);
+        }
+      } else {
+        stepSq.value = h * h;
+        velocityScale.value = u.damping.value;
+        lastStep = h;
+        for (let i = 0; accumulator + 1e-9 >= h && i < maxSubsteps; i++, accumulator -= h) queue.push(...steps);
+        // A cloth too big to keep up must not hoard time it will never spend,
+        // or the next frame starts already owing six substeps again.
+        if (accumulator > h * maxSubsteps) accumulator = h * maxSubsteps;
+      }
       if(pinEntities)queue.push(pinEntities);
       // ⚠ THE CAUSTIC DRAW GOES FIRST, AND NOT AFTER THE DISPATCH.
       //
@@ -1681,7 +2422,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       geometry.dispose();
       waterSurfaceTexture?.dispose();
 
-      releaseStorageAttributes(renderer, [positions.value, previous.value, scratch.value, flow?.value, normalAttribute, positionAttribute, foamAttribute].filter(Boolean));
+      releaseStorageAttributes(renderer, [positions.value, previous.value, scratch.value, flow?.value, clothSafe?.value, clothRadius?.value, clothLra?.value, clothOffset?.value, normalAttribute, positionAttribute, foamAttribute].filter(Boolean));
       flowTexture?.dispose();
     },
   };

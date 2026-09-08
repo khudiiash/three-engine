@@ -11,6 +11,30 @@ import {
   postGraphSignature,
   loadAddonsForGraph,
 } from "./postGraph.js";
+import { freeze } from "../../engine/freezeLedger.js";
+
+/**
+ * Disposes one stashable pipeline bundle — the live pipeline's, a stashed
+ * one's, it makes no difference: a RenderPipeline, its PassNode (which owns
+ * the render targets), and the overlay pass + its depth-seed quad that the
+ * bundle's output graph samples. Anything short of all four leaks GPU memory
+ * or leaves objects parented into the editor scene.
+ */
+function disposePipelineBundle(bundle) {
+  for (const key of ["pipeline", "scenePass", "editorOverlayPass"]) {
+    try {
+      bundle[key]?.dispose?.();
+    } catch (err) {
+      console.warn(`PostprocessComponent: bundle ${key} dispose failed: ${err?.message ?? err}`);
+    }
+  }
+  const quad = bundle._overlaySeedQuad;
+  if (quad) {
+    quad.removeFromParent();
+    quad.geometry?.dispose?.();
+    quad.material?.dispose?.();
+  }
+}
 
 /**
  * The value a material ACTUALLY SHADES WITH for `metalness` / `roughness`,
@@ -285,6 +309,14 @@ export class PostprocessComponent extends Component {
     // recreation (MSAA/alpha changes) must rebuild the pipeline.
     this.rendererRebuildHandle = null;
     this.playChangedHandle = null;
+    // True while a `#ensurePipeline` is in flight; `ownsCamera`'s self-heal
+    // reads it so a pending build is never double-kicked.
+    this._buildInFlight = false;
+    this._lastSelfHealKick = -Infinity;
+    // The compiled graph wanted god rays but no shadow-mapped light existed
+    // at compile time; render() polls until one materializes, then rebuilds.
+    this._godraysAwaitingLight = false;
+    this._lastGodraysWatchKick = -Infinity;
   }
 
   onAttach() {
@@ -292,7 +324,7 @@ export class PostprocessComponent extends Component {
     this.rendererRebuildHandle = this.entity.engine.on?.("renderer-rebuilt", () => {
       this.generation++;
       this.#disposePipeline();
-      void this.#ensurePipeline();
+      void this.#ensurePipeline("renderer-rebuilt");
     });
     this.playChangedHandle?.();
     this.playChangedHandle = this.entity.engine.on?.("play-changed", () => this.#syncRenderCamera());
@@ -368,7 +400,7 @@ export class PostprocessComponent extends Component {
     }
     // `graph` is the only other mutable prop; force a recompile.
     this.generation++;
-    void this.#ensurePipeline();
+    void this.#ensurePipeline("graph-prop-changed");
   }
 
   /**
@@ -393,7 +425,7 @@ export class PostprocessComponent extends Component {
     this.assetGeneration++;
     this.assetGraph = graph ? normalizePostGraph(graph) : null;
     this.generation++;
-    void this.#ensurePipeline();
+    void this.#ensurePipeline("applyGraph");
   }
 
   /** Re-read the assigned `.post` from disk (an external edit changed it). */
@@ -410,7 +442,7 @@ export class PostprocessComponent extends Component {
       if (generation !== this.assetGeneration) return;
       this.assetGraph = normalizePostAsset(json).graph;
       this.generation++;
-      void this.#ensurePipeline();
+      void this.#ensurePipeline("asset-loaded");
     } catch (err) {
       if (generation !== this.assetGeneration) return;
       console.error(`Failed to load post-process graph "${path}": ${err?.message ?? err}`);
@@ -494,13 +526,68 @@ export class PostprocessComponent extends Component {
     const next = this.#desiredRenderCamera();
     if (!next) return;
     if (next === this.renderCamera) {
-      if (!this.pipeline) void this.#ensurePipeline();
+      if (!this.pipeline) void this.#ensurePipeline("no-pipeline-yet");
       return;
     }
+    // ── SWAPPING CAMERAS MUST NOT COST A REBUILD (2026-09-07) ──────────────
+    //
+    // Snapping to a front/top/side view swaps the editor's PERSPECTIVE camera
+    // for an ORTHOGRAPHIC one (ViewportPanel `useEditorCamera`), and coming
+    // back swaps it again. Each swap used to dispose this pipeline and build a
+    // new one: the freeze ledger measured 150-380 ms here plus a ~500 ms
+    // `material:nodeBuild` wave immediately after — because a fresh PassNode
+    // means a fresh render target, a fresh RenderContext, and therefore a new
+    // program cache key for EVERY material the scene draws through it. Four
+    // view snaps a minute cost about three seconds of frozen editor.
+    //
+    // The recompile is genuinely required across a projection change (three's
+    // PassNode bakes perspective-vs-orthographic depth, and the post effects
+    // capture `ctx.camera` when they are built), so this does not try to
+    // repoint anything. It KEEPS the pipeline it built for each camera and
+    // swaps whole bundles instead: the editor only ever alternates between two
+    // cameras, so the second visit to each is free.
+    //
+    // ⚠ Every field `#disposePipeline` clears is in the bundle. If one is
+    // added there it must be added here, or a swap restores a half-pipeline —
+    // which is the failure mode that file's comments already record twice
+    // (a PassNode's render targets outliving their reference, and SSGI coming
+    // up invalid against a stale target).
+    // `__ppCameraPipelineCache = false` restores the dispose-and-rebuild path.
+    if (globalThis.__ppCameraPipelineCache !== false && this.pipeline && this.renderCamera) {
+      this.#stashPipelineFor(this.renderCamera);
+      this.renderCamera = next;
+      this.generation++;
+      if (this.#adoptPipelineFor(next)) return;
+      void this.#ensurePipeline("render-camera-changed (cache miss)");
+      return;
+    }
+    // ⭐ SAY WHICH CAMERA, NOT JUST "IT CHANGED" (2026-09-07). The freeze
+    // ledger caught this firing FOUR TIMES A MINUTE on the user's scene while
+    // they were simply editing, each rebuild costing ~150-380 ms here plus a
+    // ~500 ms `material:nodeBuild` wave immediately after it. "The render
+    // camera changed" is not a lead; the pair of camera identities is.
+    const describe = (cam) => {
+      if (!cam) return "none";
+      const engine = this.entity?.engine;
+      const which = cam === engine?.camera ? "engine.camera" : cam === this.camera ? "own camera" : "other";
+      return `${which}#${cam.id}(${cam.type}${cam.name ? ` "${cam.name}"` : ""})`;
+    };
+    console.log(
+      `[postprocessing] render camera changed: ${describe(this.renderCamera)} → ${describe(next)} ` +
+        `(showInEditor ${this.props.showInEditor}, playing ${this.entity?.engine?.playing}) — ` +
+        `this disposes the pipeline and re-mints every material that shares a program with its passes`,
+    );
     this.renderCamera = next;
     this.generation++;
-    this.#disposePipeline();
-    void this.#ensurePipeline();
+    // Reached with a live pipeline only when the cache is disabled; reached
+    // with a NULL pipeline when a swap lands mid-build (or before the first
+    // build finished). Either way a camera swap does NOT invalidate the other
+    // camera's stashed bundle — same graph, same renderer, same scene — so
+    // dispose keeps it, and adoption gets the next word: swapping back to a
+    // camera we already built for must reuse, not rebuild.
+    if (this.pipeline) this.#disposePipeline({ keepStashes: true });
+    if (this.#adoptPipelineFor(next)) return;
+    void this.#ensurePipeline("render-camera-changed");
   }
 
   /**
@@ -526,7 +613,33 @@ export class PostprocessComponent extends Component {
     const allowed = engine.playing
       ? engine.camera === this.camera
       : !!this.props.showInEditor && engine.camera === this.renderCamera;
-    return allowed && !!this.pipeline;
+    if (!allowed) return false;
+    if (!this.pipeline) {
+      // ── SELF-HEAL: ELIGIBLE BUT PIPELINELESS (2026-09-07) ────────────────
+      // This runs every frame the engine consults its render overrides, so
+      // it is the one place that can notice "this camera SHOULD be
+      // post-processed and isn't". A load-time build that aborted (a
+      // generation bump mid-await) or rejected (an addon fetch lost to the
+      // boot storm) used to leave the component here PERMANENTLY — the
+      // editor showed a direct frame until an unrelated edit forced a
+      // rebuild, and an exported build never recovered at all. Retry,
+      // throttled to once a second so a genuinely broken graph cannot turn
+      // into a rebuild storm.
+      const now = performance.now();
+      if (!this._buildInFlight && now - (this._lastSelfHealKick ?? -Infinity) > 1000) {
+        this._lastSelfHealKick = now;
+        if (!this._selfHealWarned) {
+          this._selfHealWarned = true;
+          console.warn(
+            "[postprocessing] this camera is eligible for post-processing but has no pipeline — rebuilding. " +
+              "An earlier build was aborted or failed; before the self-heal it stayed missing until an edit.",
+          );
+        }
+        void this.#ensurePipeline("self-heal (eligible, no pipeline)");
+      }
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -545,6 +658,31 @@ export class PostprocessComponent extends Component {
    */
   render(engine) {
     if (!this.pipeline || !this.outputNode) return;
+    // ── THE GOD RAYS LIGHT IS A SNAPSHOT, ITS MAP IS NOT (2026-09-07) ──────
+    // God rays compile against a light captured at BUILD time, but at boot
+    // that light usually has NO shadow map yet — three renders maps after the
+    // first frame, and scene settings (the shadow source itself) can apply
+    // after the components attach. `findGodraysLight` correctly refuses a
+    // mapless light, the node compiles marching nothing, and — because
+    // nothing ever re-runs the resolution — the effect stayed EMPTY until an
+    // unrelated parameter edit forced a rebuild (the report: god rays only
+    // appeared after touching a post param, and never in the preview build,
+    // where nobody touches anything). This runs every frame the override
+    // owns; poll for the light to materialize and rebuild exactly once it
+    // has a real map to march.
+    if (this._godraysAwaitingLight) {
+      const now = performance.now();
+      if (now - (this._lastGodraysWatchKick ?? -Infinity) > 1000) {
+        this._lastGodraysWatchKick = now;
+        // Only a REAL map counts (the GI-fallback effect map is resolved at
+        // compile time; polling it back here would loop rebuilds).
+        if (findGodraysLight(engine)) {
+          this._godraysAwaitingLight = false;
+          this.generation++;
+          void this.#ensurePipeline("godrays light appeared");
+        }
+      }
+    }
     // Refresh the output node + scene/camera references every frame so the
     // pipeline always sees the latest graph output (post-edit recompiles
     // change this.outputNode). The pass(scene, camera) identity is stable
@@ -568,7 +706,56 @@ export class PostprocessComponent extends Component {
   // Internals
   // -------------------------------------------------------------------------
 
-  async #ensurePipeline() {
+  /**
+   * @param {string} reason Why the pipeline is being (re)built.
+   *
+   * ⭐ THE REASON IS NOT DECORATION (2026-09-07). The freeze ledger caught this
+   * rebuilding TWICE in a two-minute editing session on the user's scene, and
+   * each time it was followed within milliseconds by a ~600 ms block of
+   * `material:nodeBuild` — a post rebuild re-mints the pass materials, which
+   * invalidates the programs every lit material shares with them. So a rebuild
+   * here is not a 150 ms event, it is a 750 ms one, and there are SIX call
+   * sites. Without a reason on each, "why did the editor freeze for most of a
+   * second while I was doing nothing" has six equally plausible answers.
+   */
+  async #ensurePipeline(reason = "unspecified") {
+    this._buildInFlight = true;
+    const __ppSpan = freeze.begin(`postprocess:buildPipeline (${reason})`);
+    const t0 = performance.now();
+    let built = false;
+    try {
+      built = await this.#ensurePipelineInner(reason) !== false;
+    } catch (err) {
+      // ⛔ A build that REJECTS used to die silently in a `void` — no
+      // pipeline, no retry, and the camera rendered direct frames forever
+      // (the report: post missing after load AND missing in the exported
+      // build, until an unrelated parameter edit happened to force a
+      // rebuild). `loadAddonsForGraph` can legitimately fail during the boot
+      // fetch storm and succeed a second later — so surface it, and let
+      // `ownsCamera`'s self-heal retry. The warn is once per component: the
+      // self-heal retries every second, and a build that never succeeds must
+      // not turn into console spam.
+      if (!this._buildFailWarned) {
+        this._buildFailWarned = true;
+        console.warn(`[postprocessing] pipeline build failed (${reason}): ${err?.message ?? err} — will retry each second`);
+      }
+    } finally {
+      this._buildInFlight = false;
+      freeze.end(__ppSpan);
+      const ms = performance.now() - t0;
+      // Only worth a line when it actually cost something; a no-op early
+      // return inside is the common case and must stay silent (and a FAILED
+      // build must not announce itself as rebuilt).
+      if (built && ms >= 40) {
+        console.log(
+          `[postprocessing] pipeline rebuilt in ${ms.toFixed(0)} ms — reason: ${reason}. ` +
+            `Every material that shares a program with the pass nodes rebuilds its graph after this.`,
+        );
+      }
+    }
+  }
+
+  async #ensurePipelineInner(reason = "unspecified") {
     if (globalThis.__ppForceDisabled === true) return; // §12.66 bisect hatch — see ownsCamera
     if (!this.renderCamera) return;
     const engine = this.entity.engine;
@@ -594,7 +781,15 @@ export class PostprocessComponent extends Component {
     // params are declared `kind: "hot"`. Returning without it (what this did
     // before) meant a slider moved nothing until some structural edit
     // happened to force a recompile.
-    if (signature === this.signature && envKey === this._ssrEnvKey && this.pipeline) {
+    //
+    // ⚠ The godrays-light reappearance must NOT take this exit: its graph
+    // signature is IDENTICAL (same nodes) — the whole point is that only the
+    // light RESOLUTION changed — and an early return here would leave the
+    // compiled node marching nothing forever (observed live: the watcher
+    // fired, the flag reset, the early return ate the rebuild, god rays
+    // stayed dark).
+    const reresolveGodraysLight = reason === "godrays light appeared";
+    if (!reresolveGodraysLight && signature === this.signature && envKey === this._ssrEnvKey && this.pipeline) {
       try {
         this.compiled?.updateParams?.(graph);
       } catch (err) {
@@ -605,6 +800,21 @@ export class PostprocessComponent extends Component {
         console.warn(`Post-process hot params failed to apply: ${err?.message ?? err}`);
       }
       return;
+    }
+
+    // A structural rebuild invalidates every STASHED bundle too — they were
+    // built from the same graph/asset this one was — EXCEPT the camera-swap
+    // reasons, whose whole point is that the other camera's bundle is still
+    // good ("cache miss" has JUST stashed it; dropping it here would turn the
+    // cache into a pure dispose). `no-pipeline-yet` and the self-heal are
+    // resumes after a build that never landed, not invalidations.
+    if (
+      reason !== "render-camera-changed" &&
+      reason !== "render-camera-changed (cache miss)" &&
+      reason !== "no-pipeline-yet" &&
+      reason !== "self-heal (eligible, no pipeline)"
+    ) {
+      this.#dropStashedPipelines();
     }
 
     this.generation++;
@@ -809,6 +1019,12 @@ export class PostprocessComponent extends Component {
         seedQuad.frustumCulled = false;
         seedQuad.renderOrder = -1e9;
         seedQuad.layers.set(PP_OVERLAY_SEED_LAYER);
+        // Each pipeline bundle owns one of these, and every overlay pass draws
+        // the whole seed layer — so a quad must be visible ONLY during its own
+        // pass's render, or a stashed bundle's quad writes the OTHER camera's
+        // stale depth into a live overlay (helpers occlude against a view
+        // nobody is looking through). The patched updateBefore toggles it.
+        seedQuad.visible = false;
         engine.scene.add(seedQuad);
         this._overlaySeedQuad = seedQuad;
         // PassNode overrides camera.layers with the pass's own set, so mirror
@@ -846,9 +1062,14 @@ export class PostprocessComponent extends Component {
           // Liveness counter for harness probes: "is this pass actually
           // rendering every frame" is otherwise unanswerable from outside.
           globalThis.__ppOverlayTicks = (globalThis.__ppOverlayTicks ?? 0) + 1;
+          const seedQuad = this._overlaySeedQuad;
           try {
+            // Only THIS pass may see its own seed quad — see the quad's
+            // construction for the cross-camera depth poisoning this prevents.
+            if (seedQuad) seedQuad.visible = true;
             originalUpdateBefore(frame);
           } finally {
+            if (seedQuad) seedQuad.visible = false;
             scene.background = bg;
             clearColor.setRGB(r, g, b);
             renderer.setClearColor(clearColor, alpha);
@@ -936,6 +1157,11 @@ export class PostprocessComponent extends Component {
       // nodes would point at orphaned textures. Wipe and let the new
       // compile re-register whatever it needs.
       this.keepaliveTemps.clear();
+      // Resolved BEFORE the compile and remembered: a graph that wants god
+      // rays but found no light (the map-less boot-time light — see render()'s
+      // watcher) arms the watch-and-rebuild.
+      const godraysLight = this.#resolveGodraysLight(engine, graph);
+      this._godraysAwaitingLight = !godraysLight && (graph?.nodes ?? []).some((n) => n.type === "godrays");
       const compiled = compilePostGraph(graph, {
         camera: this.renderCamera,
         beautyNode,
@@ -959,7 +1185,7 @@ export class PostprocessComponent extends Component {
         bloom,
         godrays,
         depthAwareBlend,
-        godraysLight: this.#resolveGodraysLight(engine, graph),
+        godraysLight,
         dof,
         chromaticAberration,
         film,
@@ -1096,7 +1322,84 @@ export class PostprocessComponent extends Component {
     }
   }
 
-  #disposePipeline() {
+  /**
+   * The exact field set `#disposePipeline` clears — and the exact set a stash
+   * hands to a bundle. ONE list, three readers; the warning inside
+   * `#syncRenderCamera` is only true while it stays complete.
+   *
+   * `editorOverlayPass` / `_overlaySeedQuad` / `_overlayLiveU` belong here as
+   * much as the pass itself: the overlay PassNode is built alongside — and its
+   * texture is baked into — the bundle's `outputNode` (`#applyEditorHelpers`
+   * samples it). A stash that leaves the overlay "live" lets the NEXT camera's
+   * build `#disposeEditorOverlayPass()` it out from under the stashed graph,
+   * so the adopt later restored a pipeline sampling a disposed pass. And
+   * `_passCamera` must travel: left stale it makes the next build treat the
+   * freshly adopted scenePass as foreign and throw it away.
+   */
+  static PIPELINE_BUNDLE_FIELDS = [
+    "pipeline", "scenePass", "postprocessLayers", "scene", "signature",
+    "_ssrEnvKey", "compiled", "outputNode", "_passNeedsKey", "keepaliveTemps",
+    "editorOverlayPass", "_overlaySeedQuad", "_overlayLiveU", "_passCamera",
+  ];
+
+  /** Puts the live pipeline aside under the camera it was compiled for. */
+  #stashPipelineFor(camera) {
+    if (!camera || !this.pipeline) return;
+    const bundle = {};
+    for (const key of PostprocessComponent.PIPELINE_BUNDLE_FIELDS) bundle[key] = this[key];
+    (this._pipelineByCamera ??= new Map());
+    // An overwrite means the previous bundle was never adopted — dead weight.
+    const prev = this._pipelineByCamera.get(camera);
+    if (prev) disposePipelineBundle(prev);
+    this._pipelineByCamera.set(camera, bundle);
+    // Detach WITHOUT disposing: the bundle owns these now. Fields are nulled
+    // BEFORE the unpublish — `#unpublishScenePass` only withdraws when
+    // `this.scenePass` is already null, so the published pass must leave the
+    // live slot first or the withdraw is a silent no-op and `engine.scenePass`
+    // keeps pointing at a pass a bundle owns.
+    for (const key of PostprocessComponent.PIPELINE_BUNDLE_FIELDS) this[key] = null;
+    this.keepaliveTemps = new Set();
+    this.#unpublishScenePass();
+  }
+
+  /** Restores a previously-built pipeline for `camera`. True when it hit. */
+  #adoptPipelineFor(camera) {
+    const bundle = this._pipelineByCamera?.get(camera);
+    if (!bundle?.pipeline) return false;
+    for (const key of PostprocessComponent.PIPELINE_BUNDLE_FIELDS) this[key] = bundle[key];
+    this._pipelineByCamera.delete(camera);
+    const engine = this.entity?.engine;
+    if (engine && this.scenePass) {
+      engine.scenePass = this.scenePass;
+      engine.emit?.("scene-pass-changed", this.scenePass);
+    }
+    console.log(`[postprocessing] reused the pipeline already compiled for this camera — no rebuild, no material re-mint`);
+    return true;
+  }
+
+  /** Throws away every stashed bundle. Any change that invalidates the LIVE
+   *  pipeline invalidates the stashed ones too — they were built from the same
+   *  graph, the same renderer and the same scene. A mere CAMERA swap does not
+   *  qualify, which is why the camera-switch paths pass `keepStashes`. */
+  #dropStashedPipelines() {
+    if (!this._pipelineByCamera?.size) return;
+    const droppedPasses = new Set();
+    for (const bundle of this._pipelineByCamera.values()) {
+      disposePipelineBundle(bundle);
+      if (bundle.scenePass) droppedPasses.add(bundle.scenePass);
+    }
+    this._pipelineByCamera.clear();
+    // A dropped bundle may still be the published one (the consumer of
+    // `engine.scenePass` must not render into a disposed target).
+    const engine = this.entity?.engine;
+    if (engine && engine.scenePass && droppedPasses.has(engine.scenePass)) {
+      engine.scenePass = null;
+      engine.emit?.("scene-pass-changed", null);
+    }
+  }
+
+  #disposePipeline({ keepStashes = false } = {}) {
+    if (!keepStashes) this.#dropStashedPipelines();
     if (this.pipeline) {
       this.pipeline.dispose();
       this.pipeline = null;

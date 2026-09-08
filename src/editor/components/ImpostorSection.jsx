@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw } from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 
 /**

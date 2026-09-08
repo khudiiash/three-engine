@@ -35,6 +35,8 @@ import { engine } from "../../engineInstance.js";
 import { vmSingleton } from "../../singleton.js";
 import { useGeometryEditStore } from "../../store/geometryEditStore.js";
 import { useProjectStore } from "../../store/projectStore.js";
+import { commandBus } from "../../commands/CommandBus.js";
+import { CreateEntityCommand, DeleteEntityCommand, BatchCommand } from "../../commands/entityCommands.js";
 
 /**
  * The one open edit session, VM-wide for the same reason everything else in
@@ -721,6 +723,187 @@ defineOp({
       // parameterisation. Saying so is the difference between an agent
       // re-unwrapping and an agent shipping an untextured model.
       uvsLost: true,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/* Splitting a multi-piece mesh into one entity per piece                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * ⭐ WHY THIS EXISTS. An imported model routinely packs several unrelated
+ * surfaces into one mesh — Sponza ships its curtains three and four to a
+ * `.geom` — and every per-object decision then has to be made for the GROUP
+ * instead of the thing: one cloth component for three curtains, one collider,
+ * one material slot, one enabled flag. Anything DERIVED from the mesh is
+ * derived from all of them at once, which is a whole class of bug on its own
+ * (one thin curtain in a file dragged every other curtain's cloth contact
+ * radius to half what it needed).
+ *
+ * The geometry editor can separate pieces by hand. This is the same result
+ * without opening it, and it carries the ENTITY across too: each piece keeps
+ * the original's components, transform, parent and tags, so a split curtain is
+ * three curtains that already have their cloth and collider set up.
+ */
+defineOp({
+  name: "geometry.splitIslands",
+  undoable: true,
+  description:
+    "Split a mesh made of disconnected pieces into one entity per piece, without opening the geometry editor. "
+    + "This is an ASSET-level operation: the .geom becomes one file per piece, and EVERY entity in the scene using that asset is replaced by one entity per piece under its own parent — an asset instanced five times becomes five sets of pieces, not one. "
+    + "Each new entity keeps its original's components, transform, parent and tags, so a curtain asset holding three curtains becomes three curtains that already have their cloth and collider set up — and every per-mesh quantity (a cloth's shell thickness, a collider's hull, a material slot) is finally derived from ONE surface instead of all of them at once. "
+    + "Reports and changes NOTHING unless `apply` is true: a mesh that looks like a few pieces can be hundreds (Sponza's vines are 671), and that is worth seeing before it becomes 671 entities per user. "
+    + "Pieces are found by connected geometry on WELDED positions, so UV seams and split normals do not divide a surface. "
+    + "Edit-mode topology (polygons, per-corner UVs, edge flags) is not carried over — the pieces re-derive it the way any imported mesh does.",
+  params: {
+    entityId: { type: "string", description: "An entity whose mesh asset should be split. Give this or `path`." },
+    path: { type: "string", description: "The .geom asset to split. Every entity using it is split too." },
+    apply: { type: "boolean", default: false, description: "false reports what WOULD happen and changes nothing." },
+    maxPieces: { type: "number", default: 32, description: "Refuse to apply beyond this many pieces. Raise it deliberately." },
+  },
+  async run({ entityId, path, apply = false, maxPieces = 32 }) {
+    let assetPath = path ?? null;
+    if (!assetPath) {
+      if (!entityId) throw new Error("Give either an entityId or a .geom path to split.");
+      const entity = engine.getEntity(entityId);
+      if (!entity) throw new Error(`No entity with id "${entityId}".`);
+      assetPath = entity.getComponent("mesh")?.props?.geometryAsset;
+      if (!assetPath) throw new Error(`"${entity.name}" has no mesh component with a geometry asset to split.`);
+    }
+
+    const [
+      { loadGeometryAsset, encodeGeometryAsset, geometryAssetFromBufferGeometry },
+      { geometryIslands, splitGeometryIslands },
+    ] = await Promise.all([
+      import("../../../engine/geometryAsset.js"),
+      import("../../../engine/geometryIslands.js"),
+    ]);
+    // ⛔ `loadGeometryAsset` returns a THREE.BufferGeometry, NOT the asset
+    // definition. Handing the geometry straight to the splitter gave it an
+    // object with no `positions`, which reported a confident "single connected
+    // surface" for a mesh that is three — a wrong ANSWER rather than an error,
+    // which is the worst shape for a bug to take. The instance is private and
+    // the caller owns it, so it is disposed once converted.
+    const geometry = await loadGeometryAsset(assetPath);
+    let definition;
+    try { definition = geometryAssetFromBufferGeometry(geometry); }
+    finally { geometry.dispose?.(); }
+
+    // ⚠ Stored asset paths MIX SEPARATORS — the scene holds
+    // `C:\Users\...\GAME/sponza2/Geometry/Mesh_0_20.geom` — so a plain string
+    // compare would miss the very entities this is supposed to update.
+    const norm = (value) => String(value ?? "").replace(/\\/g, "/").toLowerCase();
+    const target = norm(assetPath);
+    const users = [...engine.entities.values()].filter(
+      (candidate) => norm(candidate.getComponent("mesh")?.props?.geometryAsset) === target,
+    );
+
+    const { count } = geometryIslands(definition);
+    const summary = {
+      path: assetPath,
+      pieces: count,
+      entitiesUsing: users.map((entity) => ({ id: entity.id, name: entity.name })),
+    };
+    if (count <= 1) {
+      return { ...summary, applied: false, reason: "this mesh is a single connected surface — nothing to split" };
+    }
+
+    const pieces = splitGeometryIslands(definition);
+    summary.sizes = pieces.map((piece) => ({ vertices: piece.positions.length / 3, triangles: piece.indices.length / 3 }));
+    summary.droppedEditTopology = pieces.some((piece) => piece.droppedEditTopology);
+    if (!apply) {
+      return {
+        ...summary,
+        applied: false,
+        wouldCreate: count * users.length,
+        hint: users.length
+          ? `call again with apply: true — ${users.length === 1
+              ? `1 entity would become ${count}`
+              : `${users.length} entities would each become ${count}`}`
+          : "call again with apply: true to split the asset (no entity in this scene uses it)",
+      };
+    }
+    if (count > maxPieces) {
+      throw new Error(
+        `This mesh is ${count} disconnected pieces, over the ${maxPieces} limit. `
+        + `That would create ${count * Math.max(users.length, 1)} entities. Raise maxPieces if you mean it.`,
+      );
+    }
+
+    // Write one asset per piece, beside the original.
+    const { invoke, uniqueName } = await import("../../assetOps.js");
+    const { writeBinaryFile } = await import("../../assetLoader.js");
+    const dir = String(assetPath).replace(/[\\/][^\\/]+$/, "");
+    const stem = String(assetPath).split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
+    const siblings = await invoke("list_dir", { path: dir }).catch(() => []);
+    // ⚠ `uniqueName` reads `.name` off each entry, so the running list has to
+    // hold ENTRIES, not the strings this loop produces.
+    const taken = Array.isArray(siblings) ? [...siblings] : [];
+    const written = [];
+    for (let i = 0; i < pieces.length; i++) {
+      const name = uniqueName(`${stem}_${i + 1}.geom`, taken);
+      taken.push({ name });
+      const file = `${dir}/${name}`;
+      await writeBinaryFile(file, encodeGeometryAsset({ ...pieces[i], version: 2 }));
+      written.push(file);
+    }
+
+    // ⭐ EVERY ENTITY USING THE ASSET SPLITS, each under ITS OWN parent. An
+    // asset instanced five times is five sets of pieces — splitting the file
+    // and updating only the entity that was clicked would leave the others
+    // pointing at a mesh that no longer describes what they are.
+    //
+    // Components are copied verbatim except the mesh's geometry, which points
+    // at that piece. That is the whole value: a split curtain arrives with its
+    // cloth and collider already configured, rather than bare meshes to set up
+    // again.
+    const commands = [];
+    const creates = [];
+    for (const source of users) {
+      // ⚠ `entity.components` is a Map, and `CreateEntityCommand` takes no tags.
+      const components = [...source.components.values()].map((component) => ({
+        type: component.type,
+        props: structuredClone(component.props),
+      }));
+      const transform = source.getTransform();
+      const parentId = source.parent?.id ?? null;
+      const tags = [...(source.tags ?? [])];
+      for (let i = 0; i < pieces.length; i++) {
+        const create = new CreateEntityCommand({
+          name: `${source.name}_${i + 1}`,
+          parentId,
+          transform,
+          components: components.map((component) => (component.type === "mesh"
+            ? { ...component, props: { ...component.props, geometryAsset: written[i] } }
+            : component)),
+        });
+        creates.push(create);
+        commands.push(create);
+        if (tags.length) {
+          commands.push({
+            label: "Tag piece",
+            do() { if (create.entityId) engine.getEntity(create.entityId)?.setTags?.([...tags]); },
+            undo() { if (create.entityId) engine.getEntity(create.entityId)?.setTags?.([]); },
+          });
+        }
+      }
+      commands.push(new DeleteEntityCommand(source.id));
+    }
+    if (commands.length) {
+      commandBus.execute(new BatchCommand(
+        commands,
+        `Split ${users.length} mesh${users.length === 1 ? "" : "es"} into ${pieces.length} pieces`,
+      ));
+    }
+
+    try { await useProjectStore.getState().refresh?.(); } catch { /* the assets panel catches up on its own */ }
+    return {
+      ...summary,
+      applied: true,
+      assets: written,
+      entitiesSplit: users.length,
+      created: creates.map((create) => create.entityId),
     };
   },
 });

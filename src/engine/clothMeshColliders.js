@@ -1,8 +1,26 @@
 import * as THREE from 'three/webgpu';
 import { instancedArray, uniform } from 'three/tsl';
 import { collectCollisionMesh } from '../modules/physics-rapier/collisionGeometry.js';
+import { freeze } from './freezeLedger.js';
 
 export const CLOTH_MESH_COLLIDER_MAX_TRIANGLES = 8192;
+/** How far past a cloth's own culling sphere a collider still counts. */
+const REACH_MARGIN = 0.25;
+const reachBox = new THREE.Box3();
+
+/** Does this object's world box come within any cloth's reach? */
+function withinReach(root, reach) {
+  // ⚠ NOT `precise`: that walks every VERTEX, which is the cost this test
+  // exists to avoid. The default uses each child's geometry bounding box —
+  // looser, and looser is the safe direction for a cull.
+  reachBox.setFromObject(root);
+  if (reachBox.isEmpty()) return true;      // nothing measurable — keep it
+  for (const { centre, radius } of reach) {
+    if (reachBox.distanceToPoint(centre) <= radius) return true;
+  }
+  return false;
+}
+
 export const CLOTH_MESH_COLLIDER_NODE_FLOATS = 20;
 const ids = new WeakMap();
 let nextId = 1;
@@ -145,9 +163,14 @@ export class ClothMeshColliderField {
     this.revision = 0;
     this._signature = null;
     this._sources = new Map();
+    // The frame this field last scanned the scene on. See `refresh`.
+    this._scannedFrame = -1;
+    this._users = new Set();
+    this._reach = [];
   }
-  addUser() { this.activeUsers++; }
-  removeUser() {
+  addUser(user = null) { this.activeUsers++; if (user) this._users.add(user); }
+  removeUser(user = null) {
+    if (user) this._users.delete(user);
     this.activeUsers = Math.max(0, this.activeUsers-1);
     if (!this.activeUsers) {
       this._sources.clear(); this._signature=null; this.entityIndices.clear();
@@ -159,8 +182,72 @@ export class ClothMeshColliderField {
     this._sources.clear(); this.entityIndices.clear();
     if (this.engine.clothMeshColliders === this) delete this.engine.clothMeshColliders;
   }
+  /**
+   * ⚠ THIS RUNS EVERY FRAME, and it has two very different costs.
+   *
+   * The cheap half is the SIGNATURE: a walk of every entity, a world-matrix
+   * update per collider and a `JSON.stringify` of the result, done each frame
+   * to notice that nothing moved. The expensive half is everything after it —
+   * re-collecting every collider's triangles and rebuilding the BVH — and that
+   * runs whenever the signature differs, which is EVERY FRAME A COLLIDER IS
+   * MOVING.
+   *
+   * Both halves are marked separately because "freezes every time my character
+   * contacts with it" (user, 2026-09-08) is a report this ledger has to be able
+   * to answer, and an unmarked block lands in `(unattributed)` where it says
+   * nothing. `colliders:signature` being large means the per-frame check itself
+   * is the cost; `colliders:rebuild` being large means a moving collider is
+   * rebuilding the whole triangle set every frame, which is a different fix.
+   */
   refresh() {
     if (this.activeUsers <= 0) return;
+    // ⛔⛔ **ONCE A FRAME, NOT ONCE PER CLOTH.** This field is SHARED — one
+    // `engine.clothMeshColliders` serves every cloth in the scene — but it was
+    // refreshed from each cloth's own tick, so the scan below ran once per
+    // cloth per frame and produced the identical answer every time. The cost
+    // was therefore CLOTHS x COLLIDERS: on the user's Sponza, eleven cloths
+    // meant eleven full scene walks, eleven sets of recursive world-matrix
+    // updates and eleven `JSON.stringify`s of every collider's matrix, every
+    // frame.
+    //
+    // That is exactly the reported shape: "adding more colliders to the scene
+    // automatically make cloth a lot more expensive, even if the colliders do
+    // not interact with the cloth" (user, 2026-09-08) — the collider count is
+    // one factor of a product, and the cloth count is the other.
+    //
+    // `renderer.info.frame` increments once per rendered frame, so the first
+    // cloth to ask does the work and the other ten read what it published.
+    const frame = this.engine?.renderer?.info?.frame;
+    if (frame !== undefined && frame === this._scannedFrame) return;
+    this._scannedFrame = frame ?? -1;
+    const span = freeze.begin("colliders:signature");
+    // ⭐⭐⭐ **A COLLIDER NOTHING CAN TOUCH MUST COST NOTHING.** Every
+    // mesh/concave collider in the scene was collected, transformed and packed
+    // into one BVH regardless of where it was, so a collider on the far side of
+    // the level was paid for by every cloth: "adding more colliders to the
+    // scene automatically make cloth a lot more expensive, even if the
+    // colliders do not interact with the cloth" (user, 2026-09-08).
+    //
+    // Each cloth already maintains a bounding sphere that covers its ballistic
+    // excursion (`updateBounds`), so the union of those spheres is the only
+    // region any cloth can reach. A collider whose world box misses all of them
+    // is skipped before its triangles are ever touched.
+    //
+    // ⚠ The sphere is the CULLING sphere, deliberately generous — it already
+    // includes how far the cloth could be thrown — and `REACH_MARGIN` adds the
+    // contact thickness on top. This is a conservative test: it can only ever
+    // keep a collider that turns out to be unnecessary, never drop one that was
+    // needed.
+    this._reach.length = 0;
+    for (const user of this._users) {
+      const mesh = user?.simulation?.mesh;
+      const sphere = mesh?.geometry?.boundingSphere;
+      if (!mesh || !sphere || !(sphere.radius > 0)) { this._reach.length = 0; break; }
+      const centre = sphere.center.clone().applyMatrix4(mesh.matrixWorld);
+      const scale = new THREE.Vector3().setFromMatrixScale(mesh.matrixWorld);
+      this._reach.push({ centre, radius: sphere.radius * Math.max(scale.x, scale.y, scale.z) + REACH_MARGIN });
+    }
+    const reach = this._reach;
     const candidates = [], signature = [];
     for (const entity of this.engine.entities.values()) {
       const collider = entity.getComponent?.('collider');
@@ -169,6 +256,12 @@ export class ClothMeshColliderField {
       if (p.shape !== 'concave' && p.shape !== 'mesh') continue;
       const root = entity.object3D;
       root.updateWorldMatrix(true, true, true);
+      // Out of every cloth's reach: not scanned, not collected, not packed.
+      // `reach` empty means "could not measure", which keeps everything.
+      if (reach.length && !withinReach(root, reach)) {
+        this._sources.delete(entity);
+        continue;
+      }
       const cooked = this.engine.physics?.getCookedColliderGeometry?.(entity);
       const source = p.shape === 'concave' ? cooked?.concave ?? cooked : cooked;
       const sourceSignature = [p.shape, !!p.autoGenerated, objectId(source), objectId(source?.vertices), objectId(source?.indices)];
@@ -190,8 +283,11 @@ export class ClothMeshColliderField {
       signature.push(entity.id, sourceKey, ...root.matrixWorld.elements, ...(p.offset ?? [0,0,0]), ...(p.rotation ?? [0,0,0]));
     }
     const key = JSON.stringify(signature);
+    freeze.end(span);
     if (key === this._signature) return;
     this._signature = key;
+    const rebuild = freeze.begin("colliders:rebuild");
+    try {
     const alive = new Set(candidates.map(({entity})=>entity));
     for (const entity of this._sources.keys()) if (!alive.has(entity)) this._sources.delete(entity);
     this.entityIndices.clear();
@@ -244,5 +340,6 @@ export class ClothMeshColliderField {
     this.countUniform.value = packClothCollisionBVH(triangles, this.data);
     this.buffer.value.needsUpdate = true;
     this.revision++;
+    } finally { freeze.end(rebuild); }
   }
 }

@@ -426,11 +426,44 @@ export function installWaterMedium(engine) {
       opted ? ` (no underwater at all on: ${names.join(", ")}${opted > names.length ? ", …" : ""})` : ""}`);
   }, 4000);
 
+  // ── ONE REBUILD PER SETTLED CHANGE, NOT ONE PER CLAIM ─────────────────
+  // `scene.fogNode` is in EVERY material's graph, so replacing it invalidates
+  // every material's program: three re-runs `nodeBuilder.build()` for each one
+  // on its next draw, and the freeze ledger prices that at **150-210 ms per
+  // material** (user's Pool scene, 2026-09-07 — `material:nodeBuild
+  // MeshPhysicalNodeMaterial 209 ms` inside a 500 ms block). A scene that
+  // loads two pools used to grow the claim twice and rebuild twice, so the
+  // whole material set was re-minted once per water entity as the scene
+  // streamed in — visible as the `[water] … fragment binds …` census printing
+  // four and six times in one boot.
+  //
+  // Growth is therefore SETTLED: the claim has to hold still before the node
+  // is rebuilt, which collapses a scene load's burst into one build. A fog
+  // KIND change is a deliberate project edit and stays immediate, and so does
+  // the very first arm — waiting there would render the water unfogged for no
+  // reason. `__waterMediumSettleMs = 0` restores the old per-claim rebuild.
+  const GROWTH_SETTLE_MS = 250;
+  let pendingKey = null;
+  let pendingSince = 0;
   const stop = engine.onUpdate?.(() => {
     const fog = engine.scene.fog ?? null;
     const key = fog ? (fog.isFogExp2 ? "exp2" : "range") : "none";
     const want = pool.compileShape();
-    if (key !== fogKey || want.count > compiled.count || (want.round && !compiled.round)) { fogKey = key; build(fog); }
+    const grew = want.count > compiled.count || (want.round && !compiled.round);
+    if (key !== fogKey || (grew && fogKey === null)) {
+      // First arm, or the author changed the fog kind: build now.
+      fogKey = key;
+      pendingKey = null;
+      build(fog);
+    } else if (grew) {
+      const settleMs = Number(globalThis.__waterMediumSettleMs ?? GROWTH_SETTLE_MS);
+      const wantKey = `${want.count}|${want.round}`;
+      const now = performance.now();
+      if (wantKey !== pendingKey) { pendingKey = wantKey; pendingSince = now; }
+      if (now - pendingSince >= settleMs) { pendingKey = null; build(fog); }
+    } else {
+      pendingKey = null;
+    }
     if (fog) {
       atmosphere.color.value.copy(fog.color);
       if (fog.isFogExp2) atmosphere.density.value = fog.density;

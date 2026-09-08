@@ -1,6 +1,13 @@
 // Surface graphs resolve solver settings; the solver itself runs on the GPU.
 // Kept independent of three/React so saved documents can be validated headlessly.
 const number = (key, label, value, min, max, step = .1) => ({ key, label, type: "number", default: value, min, max, step });
+/**
+ * ⚠ A DIRECTION, NOT A MAGNITUDE. Wind was a single number added to +Z, so a
+ * curtain could only ever be blown one way — "our wind is only Z, we must be
+ * able to choose any direction" (user). A scalar in a saved scene still loads:
+ * `applyProps` reads it as [0, 0, wind], which is exactly what it used to mean.
+ */
+const vector = (key, label, value) => ({ key, label, type: "vec3", default: value });
 const input = (key, type = "float") => ({ key, label: key, type });
 const select = (key, label, value, options) => ({ key, label, type: "select", default: value, options });
 const output = (type) => [{ key: "out", label: "out", type }];
@@ -8,7 +15,7 @@ export function simulationNodeTypes(kind) {
   if (!["cloth", "water"].includes(kind)) throw new Error(`Unknown simulation ${kind}`);
   const cloth = kind === "cloth";
   const solverParams = [number("damping", "Velocity retention", cloth ? .99 : .998, 0, 1, .001), ...(cloth
-    ? [number("gravity", "Gravity", 9.81, -100, 100), number("wind", "Wind (+Z)", 2, -100, 100), number("stiffness", "Stretch stiffness", .95, 0, 1, .01),
+    ? [number("gravity", "Gravity", 9.81, -100, 100), vector("wind", "Wind (m/s²)", [0, 0, 2]), number("stiffness", "Stretch stiffness", .95, 0, 1, .01),
       number("shear", "Shear stiffness", 1, 0, 1, .01), number("bend", "Bend resistance", .1, 0, 1, .01),
       number("gust", "Wind gust strength", 0, 0, 100), number("gustFrequency", "Wind gust frequency", 1, 0, 10),
       select("pinning", "Pinned vertices", "top", ["top", "topCorners", "left", "leftCorners", "none"]),

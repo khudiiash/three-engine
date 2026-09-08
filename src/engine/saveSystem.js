@@ -298,11 +298,16 @@ export class SaveSystem {
     const entities = [];
     for (const entity of this.engine.entities.values()) {
       const component = entity.getComponent?.("script");
-      if (!component) continue;
-      const keys = scriptKeys(component);
+      // A disabled entity is recorded whatever its scripts: disabled, its
+      // components are detached (no script instance is live to opt in), and
+      // "disabled" is exactly the state gameplay needs back — the picked-up
+      // item, the defeated boss.
+      const disabled = entity.enabled === false;
+      if (!component && !disabled) continue;
+      const keys = component ? scriptKeys(component) : [];
       const data = {};
       let opted = false;
-      (component.slots ?? []).forEach((slot, index) => {
+      (component?.slots ?? []).forEach((slot, index) => {
         if (typeof slot?.instance?.onSave !== "function") return;
         opted = true;
         try {
@@ -312,7 +317,7 @@ export class SaveSystem {
           console.warn(`[saves] onSave threw on "${entity.name}":`, error?.message ?? error);
         }
       });
-      if (!opted) continue;
+      if (!opted && !disabled) continue;
       const entry = {
         id: entity.id,
         name: entity.name,
@@ -320,10 +325,9 @@ export class SaveSystem {
         scripts: data,
       };
       if (entity.parent) entry.parent = entity.parent.id;
-      // "Enabled in game" is the flag gameplay actually toggles (a picked-up
-      // item, a defeated boss); the editor flag is authoring state and has no
-      // business in a save.
-      if (entity.enabledInGame === false) entry.enabled = false;
+      // The one enabled flag; the editor's viewing aid is authoring state and
+      // has no business in a save.
+      if (disabled) entry.enabled = false;
       // Only a prefab instance can be recreated from a save; a plain runtime
       // entity has no recipe to rebuild it from, so it is recorded but will
       // only restore if the scene still provides it.
@@ -405,7 +409,7 @@ export class SaveSystem {
       applyTransform(entity, entry.transform);
       // Absent `enabled` means "was enabled when saved" — restore it either
       // way, so loading twice in a session can't leave a disabled entity off.
-      entity.setEnabledInGame?.(entry.enabled !== false);
+      entity.setEnabled?.(entry.enabled !== false);
 
       const component = entity.getComponent?.("script");
       if (!component) continue;

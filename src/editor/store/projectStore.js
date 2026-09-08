@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { freeze } from "../../engine/freezeLedger.js";
 import { vmSingleton } from "../singleton.js";
 import { scaffoldProjectTypes } from "../projectTypes.js";
 
@@ -221,6 +222,13 @@ export const useProjectStore = vmSingleton("projectStore", () => create((set, ge
   },
 
   async refresh() {
+    // ⭐ MARKED: the watcher calls this, and on a large project it re-lists the
+    // whole tree. Anonymous, it is just another `(unattributed)` block.
+    const span = freeze.begin("assets:refresh");
+    // ⚠ `get()`, not `this` — inside a zustand creator `this` is not the store.
+    try { return await get().__refresh(); } finally { freeze.end(span); }
+  },
+  async __refresh() {
     const { currentPath } = get();
     // Always bump so the tree can re-list its cached children, even when the
     // current grid view is unaffected by the change (deleting a sibling

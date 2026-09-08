@@ -1535,6 +1535,24 @@ declare module "engine" {
     mode: string;
     count: number;
     seed: number;
+    /** Per-frame motion layer over the layout. Off, the component never ticks. */
+    motion: boolean;
+    motionMode: "scroll" | "boids" | "rotation";
+    /** scroll: flow direction; each axis of the LAYOUT's bounding box wraps
+     *  independently (scroll) or gets neighbour-radius thickness if flat
+     *  (boids). There is no separate volume parameter. */
+    motionDirection: [number, number, number];
+    /** units/s for scroll and boids, degrees/s for rotation. */
+    motionSpeed: number;
+    /** rotation: local spin axis and per-instance speed spread (0..1). */
+    motionAxis: [number, number, number];
+    motionSpinJitter: number;
+    /** boids: neighbour/separation radii and the three classic weights. */
+    motionNeighborRadius: number;
+    motionSeparationRadius: number;
+    motionCohesion: number;
+    motionAlignment: number;
+    motionSeparation: number;
     [key: string]: unknown;
   }> {
     /** Re-rolls the seeded RNG and rebuilds the instance transforms. */
@@ -1639,11 +1657,13 @@ declare module "engine" {
    * nearest ancestor. Shape/size/friction/etc. live in `props`.
    */
   export interface ColliderComponent extends ComponentBase<{
-    /** `concave` is a reduced triangle surface; `mesh` preserves exact source triangles. Dynamic bodies use convex fallback for both. */
-    shape: "box" | "sphere" | "capsule" | "convex" | "concave" | "heightfield" | "mesh";
+    /** `concave` is a reduced triangle surface; `mesh` preserves exact source triangles; `custom` builds from `geometryAsset`. Dynamic bodies use convex fallback for all three. */
+    shape: "box" | "sphere" | "capsule" | "convex" | "concave" | "heightfield" | "mesh" | "custom";
     size: [number, number, number];
     radius: number;
     height: number;
+    /** `.geom` asset the `custom` shape is cut from (empty for other shapes). */
+    geometryAsset: string;
     offset: [number, number, number];
     /** Euler rotation in degrees, XYZ order. */
     rotation: [number, number, number];

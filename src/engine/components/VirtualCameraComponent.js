@@ -110,11 +110,14 @@ export class VirtualCameraComponent extends Component {
     { key: "positionDamping", label: "Position Damping", type: "number", min: 0, step: 0.02 },
     { key: "verticalDamping", label: "Vertical Damping", type: "number", min: 0, step: 0.02 },
     { key: "aimDamping", label: "Aim Damping", type: "number", min: 0, step: 0.02 },
-    { key: "collision", label: "Avoid Walls", type: "boolean", showIf: (p) => p.body === "orbital" },
-    { key: "collisionRadius", label: "Camera Radius", type: "number", min: 0.01, step: 0.05, showIf: (p) => p.body === "orbital" && p.collision },
-    { key: "collisionPadding", label: "Wall Padding", type: "number", min: 0, step: 0.01, showIf: (p) => p.body === "orbital" && p.collision },
-    { key: "collisionLayers", label: "Collide With", type: "text", showIf: (p) => p.body === "orbital" && p.collision },
-    { key: "collisionRecovery", label: "Recovery", type: "number", min: 0, step: 0.05, showIf: (p) => p.body === "orbital" && p.collision },
+    // The whole wall-avoidance cluster sweeps through `engine.physics`
+    // (rigidbody module), so without that module these rows are inert — the
+    // inspector groups them under Physics and hides them until it is enabled.
+    { key: "collision", label: "Avoid Walls", type: "boolean", showIf: (p) => p.body === "orbital", module: "physics-rapier" },
+    { key: "collisionRadius", label: "Camera Radius", type: "number", min: 0.01, step: 0.05, showIf: (p) => p.body === "orbital" && p.collision, module: "physics-rapier" },
+    { key: "collisionPadding", label: "Wall Padding", type: "number", min: 0, step: 0.01, showIf: (p) => p.body === "orbital" && p.collision, module: "physics-rapier" },
+    { key: "collisionLayers", label: "Collide With", type: "text", showIf: (p) => p.body === "orbital" && p.collision, module: "physics-rapier" },
+    { key: "collisionRecovery", label: "Recovery", type: "number", min: 0, step: 0.05, showIf: (p) => p.body === "orbital" && p.collision, module: "physics-rapier" },
     { key: "fov", label: "FOV Override", type: "number", min: 0, max: 179, step: 1 },
     { key: "blendTime", label: "Blend In (s)", type: "number", min: -1, step: 0.05 },
   ];

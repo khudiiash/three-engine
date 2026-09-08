@@ -1,4 +1,5 @@
 import { createVfxIrradianceField } from "./vfxIrradiance.js";
+import { freeze } from "../../engine/freezeLedger.js";
 // GISystem — engine runtime for the Radiance Cascades GI module.
 //
 // VOXEL-FREE ARCHITECTURE: per-mesh SDFs are the sole authored scene
@@ -38,6 +39,7 @@ import { canStartGiRebuild, giBroadReflectionReadinessNodes, giPropInvalidation,
 import {
   captureGiMaterialLightShape,
   copyGiLightState,
+  giMaterialLightShapeDiff,
   giMaterialLightShapeMatches,
 } from "./giMaterialLightLifecycle.js";
 import { GiPathTracerView } from "./giPathTracer.js";
@@ -591,15 +593,163 @@ function giBuildBudgetSpent() {
   return giFrameBuildMs >= (Number(globalThis.__giFrameBuildBudgetMs) || 12);
 }
 
-function giCompileVariantKey(object) {
+/**
+ * Properties three's own material cache key ignores. Copied from
+ * `RenderObject.getMaterialCacheKey` (three r185) so this key forks exactly
+ * where a PROGRAM forks and nowhere else.
+ */
+const GI_VARIANT_IGNORED_PROPS = /^(is[A-Z]|_)|^(visible|version|uuid|name|opacity|userData)$/;
+
+/**
+ * ── THE WAVE'S VARIANT KEY (zero-freeze plan unit 2.4) ─────────────────────
+ *
+ * This used to key on `material.uuid`, which is the ONE field three's own
+ * program key explicitly ignores. Every material INSTANCE was therefore a
+ * "variant", so the wave walked 164-172 objects on Bistro and 92 on the
+ * user's Pool scene while three compiled far fewer programs — and each of
+ * those walks is a `compileAsync` whose `createShaderModule` parses the
+ * material's WGSL on the calling thread. The wave was paying per instance for
+ * work that happens per program.
+ *
+ * The key now mirrors `RenderObject.getMaterialCacheKey`: the material's own
+ * `customProgramCacheKey()` (which is where NODE IDENTITY enters, and where
+ * GI's roughness bucket is appended — so a material with wired node slots is
+ * still its own variant, correctly), then the same property walk with the
+ * same normalisation (numbers reduced to on/off, `side` kept exact, textures
+ * reduced to mapping+sampler state), then the geometry attribute/morph/index
+ * key, the skeleton's bone count, instancing and `receiveShadow`.
+ *
+ * ⚠ TWO PARTS OF THREE'S KEY ARE DELIBERATELY LEFT OUT, and both are
+ * constant across one wave: `clippingContextCacheKey` and `context.id`. If a
+ * wave ever compiles into two different render contexts, they have to come
+ * back in — a merged key across contexts would leave one context's pipeline
+ * uncompiled, which is a sync compile on first sight, i.e. the freeze this
+ * whole file exists to prevent.
+ *
+ * ⚠ UNDER-COUNTING IS THE DANGEROUS DIRECTION. Merging two objects that do
+ * NOT share a program means one is never warmed. Everything in three's key is
+ * reproduced here for that reason; `__giWaveVariantKey = "uuid"` restores the
+ * old per-instance behaviour for an A/B.
+ */
+function giMaterialVariantKey(material, renderer) {
+  if (!material) return "?";
+  let key;
+  try {
+    key = material.customProgramCacheKey?.() ?? material.type ?? "?";
+  } catch {
+    // A material whose cache key throws must not take the wave down with it;
+    // fall back to per-instance, which is only ever too CONSERVATIVE.
+    return material.uuid ?? "?";
+  }
+  const webgpu = renderer?.backend?.isWebGPUBackend === true;
+  for (const property of Object.keys(material)) {
+    if (GI_VARIANT_IGNORED_PROPS.test(property)) continue;
+    const value = material[property];
+    if (value === null || value === undefined) {
+      key += `${String(value)},`;
+      continue;
+    }
+    const type = typeof value;
+    if (type === "number") {
+      key += property === "side" ? `${value},` : `${value !== 0 ? "1" : "0"},`;
+    } else if (type === "object") {
+      let v = "{";
+      if (value.isTexture) {
+        v += value.mapping;
+        if (webgpu) v += `${value.magFilter}${value.minFilter}${value.wrapS}${value.wrapT}${value.wrapR}`;
+      }
+      key += `${v}},`;
+    } else {
+      key += `${String(value)},`;
+    }
+  }
+  return key;
+}
+
+function giGeometryVariantKey(geometry) {
+  if (!geometry) return "";
+  let key = "";
+  for (const name of Object.keys(geometry.attributes ?? {}).sort()) {
+    const attribute = geometry.attributes[name];
+    key += `${name},`;
+    if (attribute.data) key += `${attribute.data.stride},`;
+    if (attribute.offset) key += `${attribute.offset},`;
+    if (attribute.itemSize) key += `${attribute.itemSize},`;
+    if (attribute.normalized) key += "n,";
+  }
+  for (const name of Object.keys(geometry.morphAttributes ?? {}).sort()) {
+    key += `morph-${name},`;
+    for (const attribute of geometry.morphAttributes[name]) key += `${attribute.id},`;
+  }
+  if (geometry.index) key += "index,";
+  return key;
+}
+
+/**
+ * Exported for `tests/gi-compile-variant-key.test.mjs`. The DANGEROUS
+ * direction here is under-counting — two objects merged onto one key means one
+ * of them is never warmed and pays a synchronous compile the first time the
+ * camera turns onto it, which is the freeze this whole wave exists to prevent.
+ * A unit test is the only thing that can hold that line, because the failure is
+ * invisible until a specific camera angle.
+ */
+/**
+ * Has this lamp's world matrix actually MOVED since the last frame? Updates
+ * `row` in place with the new elements and returns the verdict.
+ *
+ * ⛔ THE TOLERANCE IS RELATIVE, AND AN ABSOLUTE ONE IS A BUG AT SCENE SCALE
+ * (2026-09-07). This compared `Math.abs(row[k] - e[k]) > 1e-5` — and `row` is a
+ * Float32Array, so a translation of a few hundred metres cannot even be
+ * REPRESENTED to 1e-5: float32 carries ~7 significant digits, so the quantum at
+ * 500 m is already ~3e-5, past the gate. Every stationary lamp in a large scene
+ * therefore read as MOVED on every frame that recomputed its world matrix.
+ *
+ * The cost is out of all proportion to a rounding error. A "moved" lamp sets
+ * `lampsChanged`, which calls `srcProbes.invalidateVisCache()` — so GI threw
+ * its world visibility cache away sixty times a second and could never
+ * converge. Measured on the user's Level scene (content 28.2 x 502.5 x 38.2 m):
+ * **2 554 light-tree refreshes and 2 554 invalidations** with `camMotionEma` at
+ * 1e-72 and `worldRested` true. Nothing in the scene was moving. The report was
+ * "GI takes more than a minute to init" and "no GI still" — it was never
+ * initialising, it was restarting.
+ *
+ * Scaling the tolerance by the magnitude keeps the old behaviour for a lamp
+ * near the origin and makes it meaningful far from it.
+ *
+ * @param {Float32Array} row The cached pose (at least 16 entries).
+ * @param {ArrayLike<number>} elements `Matrix4.elements`, column-major.
+ * @param {number} eps Relative tolerance.
+ */
+export function giLightTreePoseMoved(row, elements, eps = 1e-5) {
+  let moved = false;
+  for (let k = 0; k < 16; k++) {
+    const scale = Math.max(1, Math.abs(elements[k]), Math.abs(row[k]));
+    if (Math.abs(row[k] - elements[k]) > eps * scale) moved = true;
+    row[k] = elements[k];
+  }
+  return moved;
+}
+
+export function giCompileVariantKey(object, renderer = null) {
   const mat = object.material;
   const mats = Array.isArray(mat) ? mat : [mat];
   const geo = object.geometry;
-  const attrs = geo?.attributes ? Object.keys(geo.attributes).sort().join(",") : "";
-  const skin = object.isSkinnedMesh ? "s" : "";
-  const morph = geo?.morphAttributes && Object.keys(geo.morphAttributes).length ? "m" : "";
-  const ids = mats.map((m) => m?.uuid ?? m?.type ?? "?").join("+");
-  return `${ids}|${attrs}|${skin}|${morph}`;
+  if (globalThis.__giWaveVariantKey === "uuid") {
+    const attrs = geo?.attributes ? Object.keys(geo.attributes).sort().join(",") : "";
+    const skin = object.isSkinnedMesh ? "s" : "";
+    const morph = geo?.morphAttributes && Object.keys(geo.morphAttributes).length ? "m" : "";
+    return `${mats.map((m) => m?.uuid ?? m?.type ?? "?").join("+")}|${attrs}|${skin}|${morph}`;
+  }
+  let key = mats.map((m) => giMaterialVariantKey(m, renderer)).join("+");
+  key += `|${giGeometryVariantKey(geo)}`;
+  // three keys a skinned program on the BONE COUNT, not the skeleton.
+  if (object.skeleton) key += `|bones:${object.skeleton.bones.length}`;
+  // ⚠ three appends `object.uuid` for an InstancedMesh (its own TODO), so every
+  // instanced mesh really is its own program and must stay its own variant.
+  if (object.isInstancedMesh || object.count > 1) key += `|inst:${object.uuid}`;
+  if (object.isBatchedMesh) key += `|batched:${object._matricesTexture?.uuid ?? ""}`;
+  key += `|shadow:${object.receiveShadow}`;
+  return key;
 }
 
 // The occupancy chain's per-frame window (see the chunked-chain site in the
@@ -625,7 +775,17 @@ const OCC_SLICE_TARGET_MS = 8;
  */
 let giDispatchLog = [];
 
-function giCompute(renderer, nodes, { deferrable = false } = {}) {
+/**
+ * Exported for `tests/gi-compute-dispatch.test.mjs`. This function is on the
+ * per-frame hot path — `#refreshDynamicObjects` calls it every tick and
+ * `#compileWave` calls it throughout a rebuild — and it wraps every dispatch in
+ * a `try/finally`. A `finally` that can itself throw is uniquely destructive
+ * here: it replaces the real error with its own and fires on EVERY dispatch,
+ * which is exactly what happened on 2026-09-07 (`ReferenceError: kernelSpan is
+ * not defined`, hundreds of identical stacks, GI never committed). Nothing
+ * short of driving the real function catches that, so the test drives it.
+ */
+export function giCompute(renderer, nodes, { deferrable = false } = {}) {
   giDispatchDepth++;
   try {
     const list = Array.isArray(nodes) ? nodes : [nodes];
@@ -646,6 +806,15 @@ function giCompute(renderer, nodes, { deferrable = false } = {}) {
       const t0 = unbuilt ? performance.now() : 0;
       giCurrentComputeNode = node;
       giDispatchLog.push(node.__giPassName ?? node.name ?? "?");
+      // ⛔ DECLARED HERE, NOT IN THE `try`. The `finally` below ends this span,
+      // and a `const` inside the try block is a SIBLING scope to it — so the
+      // finally threw `ReferenceError: kernelSpan is not defined` on EVERY
+      // dispatch. That is the worst place for a throw in this function: it
+      // fires from `#refreshDynamicObjects` every frame and from `#compileWave`
+      // during the rebuild, so GI was never committed and the editor logged
+      // the same stack hundreds of times (user, 2026-09-07). A `finally` that
+      // can itself throw replaces the real error with its own.
+      let kernelSpan = 0;
       try {
         // Published for the boot ledger's per-submit GPU clock (a probe reads
         // it at `queue.submit` time): which GI pass a submission belongs to.
@@ -663,6 +832,13 @@ function giCompute(renderer, nodes, { deferrable = false } = {}) {
           }
         }
         globalThis.__giCurrentComputeName = node.__giPassName || node.name || "gi:unnamed";
+        // A kernel's FIRST dispatch synchronously builds its TSL graph and
+        // generates its WGSL — the "prewarm loop … node-graph build + WGSL
+        // codegen" the wave reports in aggregate. Spanned per kernel so the
+        // freeze ledger can name the one that blocked, not just the phase.
+        kernelSpan = unbuilt
+          ? freeze.begin(`gi:kernel build ${node.__giPassName || node.name || "unnamed"}`)
+          : 0;
         try {
           renderer.compute(node);
         } catch (error) {
@@ -682,6 +858,7 @@ function giCompute(renderer, nodes, { deferrable = false } = {}) {
         }
         giBuiltNodes.add(node);
       } finally {
+        freeze.end(kernelSpan);
         globalThis.__giCurrentComputeName = null;
         giCurrentComputeNode = null;
         if (unbuilt) giFrameBuildMs += performance.now() - t0;
@@ -1596,7 +1773,18 @@ export class GISystem {
     this._giPendingDetach = [];
     this.pathTracer = new GiPathTracerView(engine);
     this._unsubs = [
-      engine.onPreRender(() => this.#tick()),
+      engine.onPreRender(() => {
+        // ── HELD BY A MODAL EDITOR MODE (2026-09-07) ──────────────────────
+        // GI's tick is the most expensive per-frame thing in the editor: the
+        // g-buffer prepass is a whole extra scene render, and the world chain
+        // is tens of milliseconds of compute. While the geometry editor has
+        // the user inside one mesh, none of it is being looked at. Skipping
+        // the tick is a HOLD, not a teardown — the screen targets keep the
+        // last picture the way every other GI hold does, and the field
+        // resumes from where it stood when the mode ends.
+        if (engine.simulationSuspended === true) return;
+        this.#tick();
+      }),
       engine.onPostRender(() => this.pathTracer?.tick()),
       engine.on?.("hierarchy-changed", () => {
         this.#queueRebakeCheck();
@@ -5825,6 +6013,7 @@ export class GISystem {
       compileTarget.fog = engine.scene.fog;
       engine.scene.updateMatrixWorld(true);
       const compileSeen = new Set();
+      let walked = 0;
       engine.scene.traverseVisible((object) => {
         if (object.isLight) {
           // Keep the ORIGINAL identity and sorted id/uuid order. LightsNode's
@@ -5846,7 +6035,8 @@ export class GISystem {
         // new pipeline — it just re-walks 180–250 kB of GI-injected WGSL on
         // the main thread. A real interior is hundreds of meshes over a
         // handful of materials; that walk WAS the 30 s init.
-        const key = giCompileVariantKey(object);
+        walked += 1;
+        const key = giCompileVariantKey(object, renderer);
         if (compileSeen.has(key)) return;
         compileSeen.add(key);
         compileObjects.push(object);
@@ -5854,7 +6044,8 @@ export class GISystem {
       if (compileObjects.length) {
         console.log(
           `[gi] compile wave: ${compileObjects.length} unique material variants ` +
-            `(duplicate meshes that share a pipeline are not re-walked)`,
+            `of ${walked} drawable objects ` +
+            `(duplicate meshes that share a PROGRAM are not re-walked — unit 2.4)`,
         );
       }
     }
@@ -6045,9 +6236,17 @@ export class GISystem {
             // cull for the compile only; the flag is restored whatever happens.
             const prevCulled = object.frustumCulled;
             object.frustumCulled = false;
+            // The span names the MATERIAL, because `compileAsync` runs
+            // `createShaderModule` on 180-250 kB of WGSL synchronously and a
+            // block here reads as "(program)" in every JS profile. With this
+            // the freeze ledger says which material froze the editor.
+            const matSpan = freeze.begin(
+              `gi:wave/material ${object.material?.name || object.material?.type || "?"}`,
+            );
             try {
               await renderer.compileAsync(object, engine.camera, compileTarget);
             } finally {
+              freeze.end(matSpan);
               object.frustumCulled = prevCulled;
             }
             objTimings.push({
@@ -13130,7 +13329,14 @@ export class GISystem {
     // on the BVH and no occupancy pyramid is allocated. `__giFieldless = false`
     // keeps the pyramid beside the BVH transport for an A/B.
     this._fieldless = rayHitConfig.bvhTransport === true && globalThis.__giFieldless !== false;
-    const meshes = this.#collectMeshes();
+    // ── FREEZE LEDGER (zero-freeze plan Stage 0) ──────────────────────────
+    // `#rebuild` is one synchronous call inside a preRender callback with no
+    // yield anywhere in it, so the whole thing is ONE main-thread block. Every
+    // stage below carries its own span, which is what turns "the editor froze
+    // for 1.3 s" into "gi:rebuild/staticBvh 812 ms".
+    const rebuildSpan = freeze.begin("gi:rebuild");
+    this._rebuildSpan = rebuildSpan;
+    const meshes = freeze.run("gi:rebuild/collectMeshes", () => this.#collectMeshes());
     // §12.90 — BEFORE the transport is built; see the method's header.
     this.#chooseAdaptiveLattice(meshes);
 
@@ -13191,6 +13397,7 @@ export class GISystem {
         console.log("[gi] auto-fit: no mesh bounds to fit yet (scene switching or empty) — the build waits for meshes");
       }
       this._fingerprint = this.#computeFingerprint(meshes);
+      freeze.end(rebuildSpan);
       return;
     }
     this._autoFitEmptyLogged = false;
@@ -13294,9 +13501,9 @@ export class GISystem {
     // (this is where the mesh list lives) and BEFORE the volume, because the
     // composite graph and every trace close over it. Null only means the
     // explicit diagnostic backend hatch disabled occupancy.
-    const occField = this.#buildOccupancyField(
+    const occField = freeze.run("gi:rebuild/occupancyField", () => this.#buildOccupancyField(
       props, meshes, bounds, { sizeX, sizeY, sizeZ }, quality, rayHitConfig,
-    );
+    ));
     if (!occField) {
       console.warn("[gi] occupancy was disabled by the diagnostic backend hatch; GI has no geometry transport");
     }
@@ -13342,7 +13549,7 @@ export class GISystem {
     // is still the outgoing build's at that point.
     this._surfaceCellSize = volume.minCell ?? 0;
     // Entries + slot assignment + emitter promotion + SDF load-or-bake.
-    const entries = this.#buildEntries(meshes);
+    const entries = freeze.run("gi:rebuild/entries", () => this.#buildEntries(meshes));
 
     // ── LIGHT TREE W1 (§12.62): BUILD + UPLOAD, NO CONSUMER YET ───────────
     // AFTER #buildEntries (it stashes the candidate meshes) and after the
@@ -13841,14 +14048,14 @@ export class GISystem {
     // compiles the per-slot cone unconditionally and each slot's `giShadow`
     // uniform decides per frame whether it marches, so flipping a light's
     // Shadow Source is a uniform write, never a GI rebuild.
-    const lightShadow = this.#buildLightShadow({
+    const lightShadow = freeze.run("gi:rebuild/lightShadowGraph", () => this.#buildLightShadow({
       volume,
       lightSlots,
       quality,
       hasEmitterTrace: !!light.shadowTraceFn,
       span: diagU,
-    });
-    const screen = this.#buildScreenResolve({
+    }));
+    const screen = freeze.run("gi:rebuild/screenGraphs", () => this.#buildScreenResolve({
       gather, light, emitterSlots, radianceLookup: deferredRadianceLookup, ao, lightShadow,
       // The punctual light slots. `#buildScreenResolve` has always destructured
       // them (`lightSlots = null`) and the caller never passed them, so SRC's hit
@@ -13896,7 +14103,7 @@ export class GISystem {
       // dim emitters.
       emitterCutoff:
         { low: 0.012, medium: 0.006, high: 0.003, ultra: 0.0015 }[quality] ?? 0.003,
-    });
+    }));
     if (screen) {
       // ── NAME EVERY PASS'S COMPUTE NODE (§13.14.8) ────────────────────────
       //
@@ -14105,10 +14312,20 @@ export class GISystem {
     this._occLastTickAt = undefined;
     this._pendingFit = null; // refit debounce restarts against fresh bounds
     this.#syncSlots(entries);
-    this.#syncBvhScene(entries);
-    const materialWarm = !reusableMaterialLight ||
-      !giMaterialLightShapeMatches(previousMaterialShape, light);
+    freeze.run("gi:rebuild/bvhScene", () => this.#syncBvhScene(entries));
+    const shapeDiff = reusableMaterialLight
+      ? giMaterialLightShapeDiff(previousMaterialShape, light)
+      : "light not reusable";
+    const materialWarm = !reusableMaterialLight || shapeDiff !== null;
     if (reusableMaterialLight && materialWarm) {
+      // NAME THE FIELD. This branch re-mints every material's node graph at
+      // 150-210 ms a piece; a rebuild that takes it for a field that did not
+      // have to move is the difference between a one-second GI edit and a
+      // twenty-second one, and until this line nothing said which field it was.
+      console.log(
+        `[gi] material re-warm REQUIRED — the light's ${shapeDiff} changed ` +
+          `(every lit material rebuilds its node graph; read profile.freezes for the cost)`,
+      );
       // A capability boundary changed a node/flag read while materials build.
       // Commit through a fresh Light id so Three cannot reuse the old graph.
       const replacement = copyGiLightState(new GICascadeLight(), light);
@@ -14129,6 +14346,10 @@ export class GISystem {
     // every material's pipeline in one frame — a 20-30s hard freeze on real
     // scenes (the init / config-change / refit hang reports). Must run
     // AFTER this.state is assigned (the wave prewarms the compute queue).
+    // The wave is async and carries its own spans; the synchronous build is
+    // over here, so this is where the block ends.
+    freeze.end(rebuildSpan);
+    freeze.bootMark("gi: build (synchronous)", performance.now() - t0, `${meshes.length} meshes`);
     this.#compileWave({ materialWarm });
     const resident = atlas.assignments.filter(Boolean).length;
     const analyticCount = atlas.assignments.filter((a) => a?.analytic).length;
@@ -17317,6 +17538,7 @@ export class GISystem {
     // found by the W5a gate, which saw two records jump 8.5 units on a 2.5
     // unit move (a permutation, not a motion).
     const STRIDE = 20;
+    const LIGHT_TREE_POSE_EPS = Number(globalThis.__giLightTreePoseEps ?? 1e-5);
     const cache = (this._lightTreePoseCache ??= new WeakMap());
     let changed = this._lightTreePoseCount !== meshes.length;
     // §11.44: what invalidates the world visibility cache is a LAMP that
@@ -17337,13 +17559,18 @@ export class GISystem {
         lampsChanged = true;
         tally.newMesh++;
       }
-      const e = mesh.matrixWorld.elements;
-      let moved = false;
-      for (let k = 0; k < 16; k++) {
-        if (Math.abs(row[k] - e[k]) > 1e-5) moved = true;
-        row[k] = e[k];
+      const moved = giLightTreePoseMoved(row, mesh.matrixWorld.elements, LIGHT_TREE_POSE_EPS);
+      if (moved) {
+        changed = true;
+        lampsChanged = true;
+        tally.matrix++;
+        // Name the first mover once. "The light tree refreshed 2 554 times" is
+        // a symptom; "this lamp is what moves" is the thing to go and look at.
+        if (!this._lightTreeMoverNamed) {
+          this._lightTreeMoverNamed = true;
+          tally.firstMover = mesh.name || mesh.uuid;
+        }
       }
-      if (moved) { changed = true; lampsChanged = true; tally.matrix++; }
       const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
       const emissive = material?.emissive;
       const gain = material?.emissiveIntensity ?? 1;
@@ -19162,8 +19389,8 @@ export class GISystem {
     if (dynObjectsOn && globalThis.__giShadowStaticBvh !== false) {
       const t0 = performance.now();
       const wantsUv = this.#staticBvhWantsUv();
-      items = this.#staticBvhItems(geometries, placements);
-      const built = this.#buildStaticBvhPacked(items, wantsUv);
+      items = freeze.run("gi:rebuild/staticBvhItems(simplify)", () => this.#staticBvhItems(geometries, placements));
+      const built = freeze.run("gi:rebuild/staticBvhBuild(SAH)", () => this.#buildStaticBvhPacked(items, wantsUv));
       staticBvhPacked = built.packed;
       this._staticBvhFormat = staticBvhPacked?.format ?? STATIC_BVH_FORMAT_WORLD;
       // SBV2's live TLAS is the CPU refit mirror. Unlike the legacy diagnostic

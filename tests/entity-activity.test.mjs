@@ -65,17 +65,17 @@ function makeEngine() {
 test("a component added to a disabled entity waits, detached, until the entity is enabled", () => {
   const engine = makeEngine();
   const pool = engine.createEntity({ name: "Pool" });
-  pool.setEnabledInEditor(false);
+  pool.setEnabled(false);
   const probe = pool.addComponent("test-activity-probe");
   assert.deepEqual(take(), []);
   assert.equal(probe._attached, false);
   assert.equal(pool.activeInHierarchy, false);
 
-  pool.setEnabledInEditor(true);
+  pool.setEnabled(true);
   assert.deepEqual(take(), ["attach:Pool"]);
   assert.equal(probe._attached, true);
 
-  pool.setEnabledInEditor(false);
+  pool.setEnabled(false);
   assert.deepEqual(take(), ["detach:Pool"]);
   engine.walk(); engine.walk();
   assert.deepEqual(take(), [], "the walk is idempotent");
@@ -84,7 +84,7 @@ test("a component added to a disabled entity waits, detached, until the entity i
 test("a prop change on a detached component is stored and does not attach it", () => {
   const engine = makeEngine();
   const pool = engine.createEntity({ name: "Pool" });
-  pool.setEnabledInEditor(false);
+  pool.setEnabled(false);
   const probe = pool.addComponent("test-activity-probe");
   const self = pool.addComponent("test-activity-self");
   probe.setProp("n", 3);
@@ -93,7 +93,7 @@ test("a prop change on a detached component is stored and does not attach it", (
   assert.equal(probe.props.n, 3);
   assert.equal(self.props.n, 4);
 
-  pool.setEnabledInEditor(true);
+  pool.setEnabled(true);
   assert.deepEqual(take().sort(), ["attach:Pool", "attach:Pool/self"]);
   self.setProp("n", 5);
   assert.deepEqual(take(), ["detach:Pool/self", "attach:Pool/self"], "attached: reacts as before");
@@ -103,11 +103,11 @@ test("a disabled ancestor disables the subtree whatever the children's flags say
   const engine = makeEngine();
   const root = engine.createEntity({ name: "Root" });
   const pool = engine.createEntity({ name: "Pool" });
-  pool.setEnabledInEditor(false);
+  pool.setEnabled(false);
   const child = engine.createEntity({ name: "Child", parent: pool });
   child.addComponent("test-activity-probe");
   assert.deepEqual(take(), []);
-  assert.equal(child.enabledInEditor, true);
+  assert.equal(child.enabled, true);
   assert.equal(child.activeInHierarchy, false);
 
   child.setParent(root);
@@ -118,9 +118,9 @@ test("a disabled ancestor disables the subtree whatever the children's flags say
   const grandchild = engine.createEntity({ name: "Grandchild", parent: child });
   grandchild.addComponent("test-activity-probe");
   assert.deepEqual(take(), []);
-  pool.setEnabledInEditor(true);
+  pool.setEnabled(true);
   assert.deepEqual(take(), ["attach:Child", "attach:Grandchild"]);
-  child.setEnabledInEditor(false);
+  child.setEnabled(false);
   assert.deepEqual(take(), ["detach:Child", "detach:Grandchild"]);
 });
 
@@ -130,7 +130,7 @@ test("removing a component from a disabled entity fires no onDetach; dispose lik
   pool.addComponent("test-activity-probe");
   pool.addComponent("test-activity-self");
   take();
-  pool.setEnabledInEditor(false);
+  pool.setEnabled(false);
   assert.deepEqual(take().sort(), ["detach:Pool", "detach:Pool/self"]);
   pool.removeComponent("test-activity-probe");
   pool.dispose();
@@ -138,38 +138,82 @@ test("removing a component from a disabled entity fires no onDetach; dispose lik
   assert.equal(pool.components.size, 0);
 });
 
-test("play mode reads the game flag: attached on play, detached on stop", () => {
+test("one enabled flag, both modes; visibleInEditor is a viewing aid that never detaches", () => {
   const engine = makeEngine();
   const playground = engine.createEntity({ name: "Playground" });
-  playground.setEnabledInEditor(false);
-  playground.setEnabledInGame(true);
+  playground.setEnabled(false);
   playground.addComponent("test-activity-probe");
   assert.deepEqual(take(), []);
 
   engine.playing = true; engine.walk();
+  assert.deepEqual(take(), [], "disabled stays detached in play mode");
+  assert.equal(playground.activeInHierarchy, false);
+  playground.setEnabled(true);
   assert.deepEqual(take(), ["attach:Playground"]);
-  assert.equal(playground.activeInHierarchy, true);
-  playground.setEnabledInGame(false);
-  assert.deepEqual(take(), ["detach:Playground"]);
-  playground.setEnabledInGame(true);
-  assert.deepEqual(take(), ["attach:Playground"]);
-
   engine.playing = false; engine.walk();
-  assert.deepEqual(take(), ["detach:Playground"]);
+  assert.deepEqual(take(), [], "enabled stays attached back in edit mode");
+
+  playground.setVisibleInEditor(false);
+  assert.deepEqual(take(), [], "hiding in the editor detaches nothing");
+  assert.equal(playground.visibleInEditor, false);
+  assert.equal(playground.enabledInEditor, false, "the old name reads the viewing aid");
+  assert.equal(playground.enabledInGame, true, "the old game name reads enabled");
   playground.setEnabledInGame(false);
-  assert.deepEqual(take(), [], "the game flag is inert while editing");
+  assert.deepEqual(take(), ["detach:Playground"], "the old game setter is setEnabled");
+});
+
+test("a component with no hooks of its own stops by detaching, and rebuilds on enable", () => {
+  const engine = makeEngine();
+  const box = engine.createEntity({ name: "Box" });
+  const self = box.addComponent("test-activity-self");
+  assert.deepEqual(take(), ["attach:Box/self"]);
+  assert.equal(self.stopsByDetaching, true);
+  self.setProp("enabled", false);
+  assert.deepEqual(take(), ["detach:Box/self"], "disabled = detached");
+  self.setProp("n", 3);
+  assert.deepEqual(take(), [], "a prop change while disabled builds nothing");
+  self.setProp("enabled", true);
+  assert.deepEqual(take(), ["attach:Box/self"], "enabled = built again, from its props");
+  assert.equal(self.props.n, 3);
+  // Disabled when its entity goes inactive and active again: never built.
+  self.setProp("enabled", false);
+  take();
+  box.setEnabled(false);
+  assert.deepEqual(take(), [], "nothing to detach");
+  box.setEnabled(true);
+  assert.deepEqual(take(), [], "not built while disabled");
+  self.setProp("enabled", true);
+  assert.deepEqual(take(), ["attach:Box/self"]);
+});
+
+test("editorEnabled pauses a component while editing and resumes it on play", () => {
+  const engine = makeEngine();
+  const fx = engine.createEntity({ name: "Fx" });
+  const probe = fx.addComponent("test-activity-probe");
+  assert.deepEqual(take(), ["attach:Fx"]);
+  probe.setProp("editorEnabled", false);
+  assert.deepEqual(take(), ["disable:Fx"]);
+  assert.equal(probe.enabled, false);
+  engine.playing = true;
+  probe.reconcileEnabled();
+  assert.deepEqual(take(), ["enable:Fx"], "play mode: the pause lifts");
+  engine.playing = false;
+  probe.reconcileEnabled();
+  assert.deepEqual(take(), ["disable:Fx"], "stopped again: paused again");
+  probe.setProp("editorEnabled", true);
+  assert.deepEqual(take(), ["enable:Fx"]);
 });
 
 test("enable overrides on a detached component fire no hooks and hold once attached", () => {
   const engine = makeEngine();
   const pool = engine.createEntity({ name: "Pool" });
-  pool.setEnabledInEditor(false);
+  pool.setEnabled(false);
   const probe = pool.addComponent("test-activity-probe");
   probe.setEnabledOverride(false);
   probe.setEnabled(false);
   assert.deepEqual(take(), []);
   assert.equal(probe.enabled, false);
-  pool.setEnabledInEditor(true);
+  pool.setEnabled(true);
   assert.deepEqual(take(), ["attach:Pool"]);
   assert.equal(probe.enabled, false);
   probe.setEnabledOverride(null);

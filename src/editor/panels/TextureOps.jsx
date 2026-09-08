@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Blend, Image as ImageIcon, Layers, SlidersHorizontal, WandSparkles } from "../icons/index.jsx";
 import { ContextMenu } from "../ContextMenu.jsx";
 import { SelectField } from "../fields/SelectField.jsx";
 import { AssetField } from "../fields/AssetField.jsx";
@@ -19,7 +20,13 @@ import { CHANNEL_SOURCES } from "../texture/channels.js";
  * the document, the selection and the undo stack.
  */
 
-const MENUS = ["Image", "Layer", "Adjust", "Filter", "Channels"];
+const MENUS = [
+  { name: "Image", Icon: ImageIcon },
+  { name: "Layer", Icon: Layers },
+  { name: "Adjust", Icon: SlidersHorizontal },
+  { name: "Filter", Icon: WandSparkles },
+  { name: "Channels", Icon: Blend },
+];
 
 export function OperationMenus({ onCommand, hasSelection, disabled }) {
   const [menu, setMenu] = useState(null);
@@ -109,14 +116,15 @@ export function OperationMenus({ onCommand, hasSelection, disabled }) {
   return (
     <>
       <div className="tx-group">
-        {MENUS.map((name) => (
+        {MENUS.map(({ name, Icon }) => (
           <button
             key={name}
-            className={`tx-btn ${menu?.name === name ? "on" : ""}`}
+            className={`tx-btn icon ${menu?.name === name ? "on" : ""}`}
             disabled={disabled}
+            title={name}
             onClick={(event) => open(name, event)}
           >
-            {name}
+            <Icon size={14} />
           </button>
         ))}
       </div>
@@ -180,7 +188,6 @@ export function OperationDialog({ spec, docSize, onPreview, onApply, onCancel })
         {(spec.params ?? []).map((param) => (
           <ParamRow key={param.key} param={param} value={params[param.key]} onChange={(v) => set(param.key, v)} />
         ))}
-        {!spec.params?.length && <p className="texture-dialog-note">Applies to the active layer.</p>}
         <div className="texture-dialog-actions">
           <button className="tx-btn quiet" onClick={onCancel}>
             Cancel
@@ -350,10 +357,7 @@ export function CanvasSizeDialog({ docSize, onApply, onCancel }) {
   return (
     <div className="texture-dialog-backdrop" onPointerDown={onCancel}>
       <div className="texture-dialog" onPointerDown={(e) => e.stopPropagation()}>
-        <h3>Canvas Size</h3>
-        <p className="texture-dialog-note">
-          The artwork keeps its pixel size; the frame around it changes.
-        </p>
+        <h3 title="The artwork keeps its pixel size — only the frame around it changes">Canvas Size</h3>
         <div className="texture-dialog-row">
           <label>
             Width
@@ -435,10 +439,7 @@ export function PackChannelsDialog({ docSize, onApply, onCancel }) {
   return (
     <div className="texture-dialog-backdrop" onPointerDown={busy ? undefined : onCancel}>
       <div className="texture-dialog wide" onPointerDown={(e) => e.stopPropagation()}>
-        <h3>Pack Channels</h3>
-        <p className="texture-dialog-note">
-          Sources of a different size are resampled to the output size.
-        </p>
+        <h3 title="Sources of a different size are resampled to the output size">Pack Channels</h3>
         {PACK_SLOTS.map((slot) => (
           <div key={slot.key} className="texture-pack-row">
             <span className={`texture-pack-chip ch-${slot.key}`}>{slot.label}</span>
@@ -539,10 +540,10 @@ export function PackAtlasDialog({ count, defaultName = "Atlas", onApply, onCance
   return (
     <div className="texture-dialog-backdrop" onPointerDown={busy ? undefined : onCancel}>
       <div className="texture-dialog" onPointerDown={(e) => e.stopPropagation()}>
-        <h3>Pack into Atlas</h3>
-        <p className="texture-dialog-note">
-          {count} image{count === 1 ? "" : "s"} → one sheet plus a `.atlas` naming each region after its file.
-        </p>
+        <h3 title="One sheet plus a .atlas naming each region after its file">
+          Pack into Atlas
+          <span className="cnt" title={`${count} image${count === 1 ? "" : "s"}`}>{count}</span>
+        </h3>
         <label>
           Name
           <input value={name} onChange={(e) => setName(e.target.value)} />
@@ -713,8 +714,7 @@ export function SwizzleDialog({ onApply, onCancel }) {
   return (
     <div className="texture-dialog-backdrop" onPointerDown={onCancel}>
       <div className="texture-dialog" onPointerDown={(e) => e.stopPropagation()}>
-        <h3>Swizzle Channels</h3>
-        <p className="texture-dialog-note">Rewrites the active layer&apos;s channels from its own.</p>
+        <h3 title="Rewrites the active layer's channels from its own">Swizzle Channels</h3>
         {SWIZZLE_TARGETS.map((target) => (
           <div key={target} className="texture-pack-row">
             <span className={`texture-pack-chip ch-${target}`}>{target.toUpperCase()}</span>

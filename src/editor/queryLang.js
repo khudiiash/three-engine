@@ -137,7 +137,7 @@ export const SCOPE_TOKEN = ">";
  */
 const BARE_FILTER_FIELDS = new Set([
   // entity (queryEvalEntity.resolveEntityPath)
-  "name", "tag", "tags", "enabled", "enabledingame", "childcount",
+  "name", "tag", "tags", "enabled", "enabledingame", "visibleineditor", "childcount",
   // asset (queryEvalAsset.resolveAssetPath)
   "path", "ext", "size", "modified", "dir", "is_dir", "kind", "type",
   "width", "height", "roughness", "metalness", "color", "graph", "map",

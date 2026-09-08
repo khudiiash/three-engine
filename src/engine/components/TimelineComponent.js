@@ -88,7 +88,13 @@ export class TimelineComponent extends Component {
     this._direction = 1;
     this._pendingAutoPlay = false;
     this._firstAdvance = true;
-    this.unsubUpdate = this.entity.engine.onUpdate((dt) => this.#tick(dt));
+    this.unsubUpdate = this.entity.engine.onUpdate((dt) => {
+      // Held while a modal editor mode owns the viewport (the geometry
+      // editor). See Engine.suspendSimulation: advancing the rest of the
+      // scene while the user is inside one mesh is pure interference.
+      if (this.entity.engine.simulationSuspended === true) return;
+      this.#tick(dt);
+    });
     this.unsubPlay = this.entity.engine.on("play-changed", (playing) => {
       if (playing) {
         if (this.props.playOnStart) this.play(this.props.startTime ?? 0);

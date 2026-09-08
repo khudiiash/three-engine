@@ -25,6 +25,7 @@ import { AudioSystem } from "./audio/AudioSystem.js";
 import { prefabRegistry } from "./prefab/registry.js";
 import { instantiatePrefabNode } from "./prefab/expand.js";
 import { StatsSystem, PHASE } from "./StatsSystem.js";
+import { freeze, installFreezeObserver, installGpuCallLedger, installNodeBuildLedger } from "./freezeLedger.js";
 import { SaveSystem, PreferenceStore } from "./saveSystem.js";
 import { Tween, TweenSystem } from "./tween.js";
 import { TimeSystem } from "./time.js";
@@ -53,6 +54,41 @@ import { math } from "./math/index.js";
  * Runtime core: owns the renderer, the three.js scene (source of truth)
  * and the entity tree. No React, no editor state — a built game ships this.
  */
+/**
+ * ⛔ NEVER LET THREE FALL BACK TO WebGL ON A CANVAS THAT WAS WebGPU.
+ *
+ * three installs `getFallback` inside the WebGPURenderer constructor — it
+ * overwrites whatever the caller passes — so ANY failure inside `init()`,
+ * including `requestDevice` running out of GPU memory, is retried as
+ * `new WebGLBackend(...)`. A canvas that has already handed out a WebGPU
+ * context returns null for `getContext('webgl2')` by spec, so that second
+ * attempt dies on `getSupportedExtensions` of null, and THAT is the error the
+ * caller sees. The real cause is gone.
+ *
+ * Observed exactly this on a live device loss (2026-09-07): four rebuild
+ * attempts all reported "Cannot read properties of null (reading
+ * 'getSupportedExtensions')" while the actual message —
+ * `ID3D12Device::CreateDescriptorHeap failed with E_OUTOFMEMORY` — reached
+ * only the raw console. Clearing the hook makes `init()` reject with the
+ * original error, which is both the truth and the only thing the retry can
+ * make a decision from.
+ *
+ * A canvas that was never WebGPU (an explicit `forceWebGL` build) keeps its
+ * fallback: there the WebGL backend is the point, not a trap.
+ *
+ * @param {object} renderer A freshly constructed WebGPURenderer.
+ * @param {boolean} wasWebGPU Whether the canvas previously held a WebGPU context.
+ */
+export function refuseWebGLFallback(renderer, wasWebGPU) {
+  if (renderer && wasWebGPU) renderer._getFallback = null;
+  return renderer;
+}
+
+/** Stamps the registering component or module on a per-frame callback (once). */
+function tagOwner(fn, owner) {
+  if (owner && typeof fn === "function" && fn.__owner === undefined) fn.__owner = owner;
+}
+
 export class Engine extends EventEmitter {
   constructor() {
     super();
@@ -71,6 +107,12 @@ export class Engine extends EventEmitter {
     this.rootEntities = [];
     this.timer = new THREE.Timer();
     this.updateCallbacks = new Set();
+    // Who is registering per-frame callbacks right now: the component being
+    // attached (Entity.#attachComponent) or the module being set up
+    // (modules.js). `onUpdate` and its siblings stamp it on the callback as
+    // `__owner`, which is how the profiler's breakdown names a callback's
+    // time after the fact without every call site passing itself in.
+    this._registrant = null;
     // Ordered post-update stage, for work that must observe the *final* pose of
     // the frame. Unlike `updateCallbacks` (a Set, so ordered only by when each
     // subscriber happened to attach) these carry an explicit `order`, because
@@ -338,6 +380,37 @@ export class Engine extends EventEmitter {
     // Set to true by `emit("hierarchy-changed")` while a coalescing microtask
     // is pending. See the `emit` override below.
     this._hierarchyDirty = false;
+
+    /** True while a modal editor mode holds simulation down. See suspendSimulation. */
+    this.simulationSuspended = false;
+    this._simulationHolds = new Set();
+
+    // THE FREEZE LEDGER (docs/ZERO_FREEZE_PLAN.md Stage 0). Armed for the
+    // engine's whole life, not for a capture window: the freezes worth naming
+    // are the ones nobody was watching for. Costs a browser-side observer that
+    // only calls back when the main thread actually blocked.
+    installFreezeObserver();
+  }
+
+  /**
+   * Per-event listener timings, accumulated only while `profile.edit` is
+   * armed. Answers "changing X cost Y ms, in which listener" — the question
+   * the plan's §2.4 fan-out table exists for.
+   */
+  beginEventCapture() {
+    this._eventCapture = new Map();
+  }
+
+  readEventCapture() {
+    return [...(this._eventCapture ?? new Map()).values()]
+      .map((row) => ({ ...row, ms: +row.ms.toFixed(2) }))
+      .sort((a, b) => b.ms - a.ms);
+  }
+
+  endEventCapture() {
+    const rows = this.readEventCapture();
+    this._eventCapture = null;
+    return rows;
   }
 
   /**
@@ -355,6 +428,40 @@ export class Engine extends EventEmitter {
    * `flushHierarchyChanged()` when a caller genuinely needs listeners to have
    * run before it continues.
    */
+  /**
+   * Times one listener while `profile.edit` is armed. See EventEmitter._invoke.
+   * The listener's own name is usually anonymous, so a listener registered
+   * through `engine.on(event, fn, label)` carries `fn.__label`; everything else
+   * falls back to `fn.name` and then to its position.
+   */
+  _invoke(fn, event, args) {
+    const capture = this._eventCapture;
+    if (!capture) {
+      fn(...args);
+      return;
+    }
+    // A listener registered as `engine.on(event, fn, label)` carries
+    // `fn.__label`; otherwise its own name, and finally "anonymous" — most
+    // editor listeners are arrow functions, which is why `__label` exists.
+    const label = fn.__label ?? (fn.name || "anonymous");
+    const key = `${event} :: ${label}`;
+    const t0 = performance.now();
+    try {
+      fn(...args);
+    } finally {
+      let row = capture.get(key);
+      if (row === undefined) {
+        // Stored whole rather than re-split out of the joined key later: a
+        // listener label may legitimately contain a space, and parsing it back
+        // is how `event` silently became the entire key.
+        row = { event, listener: label, ms: 0, calls: 0 };
+        capture.set(key, row);
+      }
+      row.ms += performance.now() - t0;
+      row.calls++;
+    }
+  }
+
   emit(event, ...args) {
     if (event !== "hierarchy-changed") {
       super.emit(event, ...args);
@@ -386,7 +493,14 @@ export class Engine extends EventEmitter {
     if (this._hierarchyFlushCount === 30 && this._hierarchyStormStack) {
       console.warn(`[engine] hierarchy-changed storm: 30 flushes within a second. The last emitter:\n${this._hierarchyStormStack}`);
     }
-    super.emit("hierarchy-changed");
+    // Its own span: the fan-out is ~20 O(scene) listeners and it is the single
+    // most common owner of an edit-time block.
+    const token = freeze.begin("event:hierarchy-changed");
+    try {
+      super.emit("hierarchy-changed");
+    } finally {
+      freeze.end(token);
+    }
   }
 
   /**
@@ -429,7 +543,14 @@ export class Engine extends EventEmitter {
   }
 
   /** Merges + applies a scene-settings patch; emits "settings-changed". */
-  async applySettings(patch) {
+  /**
+   * @param {object} patch
+   * @param {{fromSceneLoad?: boolean}} [options] `fromSceneLoad` says this
+   *   patch is a scene's authored settings arriving because the user OPENED
+   *   that scene, not because they edited anything. See the renderer note
+   *   below for why that distinction is worth a parameter.
+   */
+  async applySettings(patch, { fromSceneLoad = false } = {}) {
     const before = this.settings;
     // The build's quality preset is a ceiling over whatever each scene
     // authored, and it has to be re-applied on every settings change — not
@@ -465,9 +586,44 @@ export class Engine extends EventEmitter {
     // coalesces to "unchanged" and no rebuild happens at all; a real
     // antialias/samples/transparent change still rebuilds, once, with the
     // final values.
+    //
+    // ── AND A SCENE SWITCH DOES NOT REBUILD AT ALL (2026-09-07, zero-freeze
+    //    plan unit 3.4) ─────────────────────────────────────────────────────
+    //
+    // The renderer block is authored PER SCENE, so opening a scene whose
+    // antialias differs from the running renderer's used to destroy the device
+    // — and a destroyed device means GI rebuilds from nothing and every
+    // material is compiled again. Measured elsewhere in this file at ~40 s.
+    // That is the whole of "switching scenes freezes the editor", and nobody
+    // asked for it: the user opened a scene, they did not change a setting.
+    //
+    // So a scene load APPLIES the value and defers the rebuild to the next
+    // launch, saying so once. The difference the user sees is multisampling on
+    // the scene they just opened; the difference they no longer sees is a
+    // forty-second stall. A deliberate EDIT still rebuilds immediately —
+    // that path does not pass `fromSceneLoad`, and a setting you just changed
+    // has to take effect or the control is broken.
+    // `__engineSceneSwitchRebuildsRenderer = true` restores the old behaviour.
     const optionCheckScheduled = this.renderer
       && rendererNeedsRebuild(before.renderer, this.settings.renderer);
-    if (optionCheckScheduled) this.#scheduleRendererOptionCheck();
+    if (optionCheckScheduled && fromSceneLoad && globalThis.__engineSceneSwitchRebuildsRenderer !== true) {
+      const built = this._rendererBuiltWith ?? {};
+      const wanted = rendererConstructorOptions(this.settings);
+      const diff = Object.keys(wanted)
+        .filter((key) => wanted[key] !== built[key])
+        .map((key) => `${key} ${String(built[key])}→${String(wanted[key])}`)
+        .join(", ");
+      if (diff) {
+        console.log(
+          `[gpu] this scene asks for ${diff}, which is fixed when the renderer is created. ` +
+            `Keeping the current renderer: rebuilding it here would destroy the GPU device, ` +
+            `and GI would rebuild and recompile every material (~40 s). Reload the editor ` +
+            `(Ctrl+R) to open this scene with its own renderer options.`,
+        );
+      }
+    } else if (optionCheckScheduled) {
+      this.#scheduleRendererOptionCheck();
+    }
     applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
     // A manual render-scale change resizes the canvas backing store. Only
     // re-apply when the value actually moved — renderer.setSize reallocates
@@ -634,22 +790,99 @@ export class Engine extends EventEmitter {
       this.renderer.setAnimationLoop(null);
       this.renderer = null;
       this.rendererReady = false;
-      void this.#rebuildRenderer(canvas);
+      // Retried: a device loss is usually transient — the GPU process
+      // restarts and the next attempt succeeds. A settings-driven rebuild
+      // gets ONE attempt, because its failures are not transient and four
+      // of them would only delay the error the caller needs to see.
+      void this.#rebuildRenderer(canvas, { retry: true });
     }).catch(() => {});
   }
 
-  async #rebuildRenderer(canvas) {
+  /**
+   * ── A REBUILD THAT FAILS MUST NOT LEAVE A DEAD EDITOR (2026-09-07) ────────
+   *
+   * OBSERVED: after `ID3D12Device::CreateDescriptorHeap failed with
+   * E_OUTOFMEMORY`, the automatic rebuild threw
+   * `Cannot read properties of null (reading 'getSupportedExtensions')` from
+   * `WebGLBackend.init` — three had fallen back to WebGL because WebGPU was
+   * still unavailable a few milliseconds after the loss, and a canvas that has
+   * already handed out a WebGPU context CANNOT hand out a WebGL one, so the
+   * fallback got `null` and died. The old code logged that and stopped: no
+   * renderer, no loop, no message the user could act on. The editor looked
+   * frozen and only a manual page reload brought it back.
+   *
+   * Two rules, both learned from that one line:
+   *   · A device loss is usually TRANSIENT — the GPU process restarts. Retry
+   *     with backoff before giving up on the session.
+   *   · A WebGL fallback on a canvas that was WebGPU is not a degraded mode,
+   *     it is a broken one. Refuse it and retry rather than "succeeding" into
+   *     a renderer that cannot draw.
+   */
+  async #rebuildRenderer(canvas, { retry = false } = {}) {
     // Capture the token + publish the in-flight promise so a newer
     // applySettings() can await this one before tearing the renderer down.
     const token = ++this._rendererRebuildSeq;
+    const wasWebGPU = this._rendererWasWebGPU !== false;
     const work = (async () => {
-      try {
+      // ── THE BACKOFF IS SECONDS, NOT MILLISECONDS (2026-09-07) ──────────
+      //
+      // It was [0, 250, 750, 2000] — about three seconds of trying — and it
+      // was measured failing all four attempts on a real device loss whose
+      // cause was `ID3D12Device::CreateDescriptorHeap failed with
+      // E_OUTOFMEMORY`. That is the GPU being out of memory, not a transient
+      // hiccup: the driver has to reclaim the lost device's heaps before a new
+      // one can be created, and it does not do that inside three seconds while
+      // other clients still hold memory. Twenty seconds of blank viewport
+      // beats a dead editor that only Ctrl+R can fix.
+      const attemptDelays = retry ? [0, 500, 2000, 5000, 12000] : [0];
+      for (let attempt = 0; attempt < attemptDelays.length; attempt++) {
+        if (attemptDelays[attempt] > 0) {
+          await new Promise((resolve) => setTimeout(resolve, attemptDelays[attempt]));
+          if (token !== this._rendererRebuildSeq) return;
+        }
+        const failure = await this.#rebuildRendererOnce(canvas, token, wasWebGPU, attempt);
+        if (failure === null) return; // built, or superseded
+        if (attempt === attemptDelays.length - 1) {
+          this.renderer = null;
+          this.rendererReady = false;
+          const outOfMemory = /OUTOFMEMORY|out of memory|CreateDescriptorHeap/i.test(failure);
+          console.error(
+            `[gpu] the renderer could not be rebuilt` +
+              `${attemptDelays.length > 1 ? ` after ${attemptDelays.length} attempts over ` +
+                `${(attemptDelays.reduce((sum, ms) => sum + ms, 0) / 1000).toFixed(0)}s` : ""} ` +
+              `(${failure}). The viewport will stay blank until the editor is reloaded — ` +
+              (outOfMemory
+                ? `press Ctrl+R. THE GPU IS OUT OF MEMORY: the driver could not allocate a descriptor ` +
+                  `heap for a new device. Close other GPU clients (a second editor window, a browser ` +
+                  `running the harness, a game) before reloading, or the reload hits the same wall.`
+                : `press Ctrl+R. This is usually a GPU device loss the driver did not recover from.`),
+          );
+          this.emit("renderer-rebuild-failed", failure);
+        }
+      }
+    })();
+    this._rendererRebuildInFlight = work;
+    try {
+      await work;
+    } finally {
+      // Only clear the in-flight slot if we're still the most recent one.
+      if (token === this._rendererRebuildSeq) this._rendererRebuildInFlight = null;
+    }
+  }
+
+  /**
+   * One rebuild attempt. Returns `null` when it built (or was superseded), or a
+   * short reason string when it failed and is worth retrying.
+   */
+  async #rebuildRendererOnce(canvas, token, wasWebGPU, attempt) {
+    try {
         const opts = rendererConstructorOptions(this.settings);
         // Adapter-clamped limit bump — see resolveRendererLimits. Awaited
         // BEFORE construction because `requiredLimits` is a constructor
         // parameter three forwards straight to requestDevice.
         const limits = await resolveRendererLimits();
         this.renderer = new THREE.WebGPURenderer({ canvas, ...opts, ...limits });
+        refuseWebGLFallback(this.renderer, wasWebGPU);
         // What this renderer actually froze — the baseline the coalesced
         // option check compares against (see #applyRendererOptionsIfChanged).
         this._rendererBuiltWith = opts;
@@ -659,9 +892,22 @@ export class Engine extends EventEmitter {
         // `this.renderer` now and will run its own post-init wiring — skip
         // ours so we don't run configureTextureAssetLoader / start the
         // animation loop against a renderer that isn't ours yet.
-        if (token !== this._rendererRebuildSeq) return;
+        if (token !== this._rendererRebuildSeq) return null;
+        // A WebGL backend on a canvas that was WebGPU cannot draw — see this
+        // method's header. Treat it as a failure so the retry gets a chance at
+        // a recovered device instead of us wiring up a renderer that is dead.
+        if (wasWebGPU && this.renderer.backend?.isWebGPUBackend !== true) {
+          this.renderer = null;
+          this.rendererReady = false;
+          return "WebGPU was unavailable and the WebGL fallback cannot bind a canvas that already had a WebGPU context";
+        }
         // The replacement device needs its own error listener — see #watchDevice.
         this.#watchDevice();
+        // …and its own freeze-ledger wrappers: the wrappers live on the
+        // GPUDevice, so a swap silently loses them.
+        installGpuCallLedger(this.renderer?.backend?.device);
+        installNodeBuildLedger(this.renderer);
+        this.emit("renderer-ready", this.renderer);
         configureTextureAssetLoader(this.renderer);
     // Sub-LSB dither on the output transform — without it every smooth GI
     // gradient bands into hard-edged contour rings on the 8-bit canvas.
@@ -682,18 +928,65 @@ export class Engine extends EventEmitter {
         // Notify renderer-owning consumers before the new animation loop can
         // render. Pipelines and timestamp query sets belong to the old device.
         this.emit("renderer-rebuilt");
+        this._rendererWasWebGPU = this.renderer.backend?.isWebGPUBackend === true;
         if (this.loopActive) this.renderer.setAnimationLoop(() => this.#tick());
+        if (attempt > 0) console.log(`[gpu] renderer rebuilt on attempt ${attempt + 1}`);
+        return null;
       } catch (err) {
-        console.error("Renderer rebuild failed:", err);
-      }
-    })();
-    this._rendererRebuildInFlight = work;
-    try {
-      await work;
-    } finally {
-      // Only clear the in-flight slot if we're still the most recent one.
-      if (token === this._rendererRebuildSeq) this._rendererRebuildInFlight = null;
+        const reason = String(err?.message ?? err);
+        console.warn(`[gpu] renderer rebuild attempt ${attempt + 1} failed: ${reason}`);
+        // Never leave a half-built renderer in the slot: `rendererReady` is
+        // false, but every `engine.renderer?.…` in the codebase would still
+        // find an object and reach into a backend that never initialised.
+      this.renderer = null;
+      this.rendererReady = false;
+      return reason;
     }
+  }
+
+  /**
+   * ── SUSPENDING SIMULATION (2026-09-07) ────────────────────────────────────
+   *
+   * A modal editor sub-mode — the geometry editor above all — puts the user
+   * inside ONE mesh, and everything else the viewport is simulating becomes
+   * pure interference: the water solver dispatches its whole FFT chain every
+   * frame whether or not anyone can see the water, VFX advance, and the
+   * rebuild systems (batching, merging, shadow merging, impostors, occlusion)
+   * keep re-grouping a scene nobody is editing. The user's report was exactly
+   * this: "when entering geometry editing mode, all the components currently
+   * ticking in the editor viewport must be stopped, because they must be
+   * causing freezes and lags in the geometry editor".
+   *
+   * REF-COUNTED BY REASON, not a boolean, because two things can want the same
+   * suspension at once (the geometry editor and, later, a modal bake) and
+   * whichever finishes first must not resume for the other. A reason resumed
+   * twice is a no-op rather than an underflow.
+   *
+   * ⚠ WHAT THIS IS NOT: it does not pause game time (`paused`), it does not
+   * stop rendering (`renderSuspended`), and it does not detach anything. The
+   * frame still draws, the camera still moves, gizmos and the geometry
+   * editor's own overlays still run. Only work that ADVANCES OR REBUILDS the
+   * rest of the scene stands down, so leaving the mode resumes exactly where
+   * it left off.
+   */
+  suspendSimulation(reason) {
+    (this._simulationHolds ??= new Set()).add(reason);
+    this.simulationSuspended = true;
+    this.emit("simulation-suspended", [...this._simulationHolds]);
+    return () => this.resumeSimulation(reason);
+  }
+
+  /** Releases one hold. Simulation resumes when the last one is gone. */
+  resumeSimulation(reason) {
+    if (!this._simulationHolds?.delete(reason)) return;
+    if (this._simulationHolds.size) return;
+    this.simulationSuspended = false;
+    this.emit("simulation-resumed");
+  }
+
+  /** Why simulation is suspended right now, for a receipt or a panel. */
+  get simulationHolds() {
+    return [...(this._simulationHolds ?? [])];
   }
 
   /** Toggles game-logic execution (ScriptComponent onStart/onUpdate/onDestroy). */
@@ -704,6 +997,12 @@ export class Engine extends EventEmitter {
     // editor attaches its components now, ahead of "play-changed" and the
     // first update, and the reverse detaches — see Entity.reconcileActivity.
     for (const entity of this.rootEntities) entity.reconcileActivity(true);
+    // A component paused for editing (`editorEnabled` false) resumes on play
+    // and pauses again on stop: its effective enabled state depends on the
+    // mode, so every component re-reads it here.
+    for (const entity of this.entities.values()) {
+      for (const component of entity.components.values()) component.reconcileEnabled();
+    }
     if (!playing) {
       this.input.reset();
       // Game time is game state. A script that paused the game or slowed it to
@@ -866,6 +1165,7 @@ export class Engine extends EventEmitter {
     ++this._rendererRebuildSeq;
     // See #applyRendererOptionsIfChanged for why the built options are kept.
     this._rendererBuiltWith = rendererConstructorOptions(this.settings);
+    freeze.bootStage("renderer: construct");
     this.renderer = new THREE.WebGPURenderer({
       canvas,
       ...this._rendererBuiltWith,
@@ -873,7 +1173,18 @@ export class Engine extends EventEmitter {
     });
     this.#applyRendererSize();
     await this.renderer.init();
+    freeze.bootStage(null);
     this.#watchDevice();
+    // Every synchronous pipeline/shader-module creation from here on is a
+    // named span in the freeze ledger. Installed on the DEVICE (not the
+    // renderer) so it survives three's internal re-wrapping, and re-armed
+    // after every device swap because a rebuild hands us a new one.
+    installGpuCallLedger(this.renderer?.backend?.device);
+    installNodeBuildLedger(this.renderer);
+    // What this session actually got. A rebuild after a device loss insists on
+    // the same backend rather than accepting a WebGL fallback the canvas
+    // cannot serve — see #rebuildRenderer's header.
+    this._rendererWasWebGPU = this.renderer.backend?.isWebGPUBackend === true;
     configureTextureAssetLoader(this.renderer);
     // Sub-LSB dither on the output transform — without it every smooth GI
     // gradient bands into hard-edged contour rings on the 8-bit canvas.
@@ -882,6 +1193,17 @@ export class Engine extends EventEmitter {
     // Renderer-side settings (tone mapping, shadows) couldn't apply earlier.
     applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
     this.rendererReady = true;
+    // ── "renderer-ready" (zero-freeze plan unit 2.1) ──────────────────────
+    // Anything that must wrap the RENDERER OR ITS DEVICE has to do it before
+    // the first thing that uses them, and until this event the only hook was
+    // "whenever my own system first ticks". That is how the async COMPUTE
+    // pipeline path — which GI installs — ended up not installed at all on a
+    // scene where GI is waiting for assets: the water module then compiled 41
+    // compute pipelines synchronously inside one 667 ms frame (freeze ledger,
+    // 2026-09-07), and its surface appeared 40 s after the editor was ready.
+    // Emitted after init and after every rebuild, so a device swap re-arms
+    // every interception.
+    this.emit("renderer-ready", this.renderer);
     // Wire input once the canvas exists (the manager listens on it directly).
     if (!this.input.attached) {
       this.input.attach(canvas);
@@ -1045,12 +1367,12 @@ export class Engine extends EventEmitter {
     // wrote the flags or the tree without going through them. One boolean
     // compare per entity on a frame where nothing changed.
     for (const entity of this.rootEntities) entity.reconcileActivity(true);
-    const modeFlag = this.playing ? "enabledInGame" : "enabledInEditor";
     for (const entity of this.entities.values()) {
       // `_lodHidden` and `_occluded` are vetoes, not overrides: a level the
       // author disabled stays hidden even when the camera asks for it, and
-      // nothing either system does can make a disabled entity draw.
-      const authored = entity[modeFlag] !== false;
+      // nothing either system does can make a disabled entity draw. While
+      // editing, `visibleInEditor` (the viewing aid) hides too.
+      const authored = entity.enabled !== false && (this.playing || entity.visibleInEditor !== false);
       const next = authored && entity._lodHidden !== true && entity._occluded !== true;
       // CAMERA-HIDDEN ≠ ABSENT. `_lodHidden`/`_occluded` are VIEW decisions,
       // so `visible === false` alone cannot tell a world-space consumer
@@ -1099,12 +1421,30 @@ export class Engine extends EventEmitter {
     // runs. See spline/PathSystem.js.
     this.paths.update(dt);
     this.stats.markPhase(PHASE.scripts);
-    for (const fn of this.updateCallbacks) fn(dt);
+    // With a breakdown armed every callback is timed and charged to its owner
+    // (see `_registrant`); otherwise the loop is the bare loop it always was.
+    if (this.stats._attribArmed) {
+      for (const fn of this.updateCallbacks) {
+        const t0 = performance.now();
+        fn(dt);
+        this.stats.attribute(fn, "update", performance.now() - t0);
+      }
+    } else {
+      for (const fn of this.updateCallbacks) fn(dt);
+    }
     // Snapshot: a late callback that unsubscribes itself (an IK component
     // detaching on the frame its target is destroyed) would otherwise mutate
     // the array being iterated.
     if (this.lateUpdateCallbacks.length) {
-      for (const entry of [...this.lateUpdateCallbacks]) entry.fn(dt);
+      if (this.stats._attribArmed) {
+        for (const entry of [...this.lateUpdateCallbacks]) {
+          const t0 = performance.now();
+          entry.fn(dt);
+          this.stats.attribute(entry.fn, "lateUpdate", performance.now() - t0);
+        }
+      } else {
+        for (const entry of [...this.lateUpdateCallbacks]) entry.fn(dt);
+      }
     }
     // Audio updates go after the script tick so per-frame transforms are
     // up to date (sound positions + listener pose). Deliberately UNSCALED:
@@ -1162,35 +1502,58 @@ export class Engine extends EventEmitter {
       this.stats.markPhase(PHASE.matrixWorld);
       this.#installRenderMarks();
       this.#walkSceneOnce();
+      const rebuildsHeld = this.simulationSuspended === true;
       this.stats.markPhase(PHASE.batching);
-      this.batching.sync();
+      if (!rebuildsHeld) this.batching.sync();
       // After batching, and for the same reason batching runs before the
       // pre-render passes: a GI/postprocess prepass and the main draw must
       // agree on what is on screen. Merging skips anything batching already
       // claimed, so the order also settles which system owns a mesh both
       // could take.
+      //
+      // ⚠ ALL OF THESE STAND DOWN UNDER `simulationSuspended` (see the method).
+      // They are REBUILD systems: while a modal mode has the user inside one
+      // mesh, re-grouping the rest of the scene is pure interference, and each
+      // of them is an O(scene) walk that can mint geometry and materials.
       this.stats.markPhase(PHASE.merging);
-      this.merging.sync();
+      if (!rebuildsHeld) this.merging.sync();
       // ⚠ AFTER `merging.sync()`, and that is structural rather than ordering
       // taste: the set the shadow merge replaces is whatever the depth pass
       // draws TODAY, which includes merging's own batch proxies. Running it
       // first would merge the originals merging is about to hide, and merging
       // would then hide meshes this system had already taken `castShadow` from.
-      this.shadowMerge.sync();
+      if (!rebuildsHeld) this.shadowMerge.sync();
       // Impostor bakes are nested renders, so they belong here — after the
       // scene's transforms are final and before the main draw. At most one
       // atlas is baked per frame; the rest of this call just refreshes the
       // instance buffers.
       this.stats.markPhase(PHASE.impostors);
-      this.impostors.update();
+      if (!rebuildsHeld) this.impostors.update();
       // The occluder depth pass reads the same finished transforms the main
       // draw is about to. It renders and starts an async readback; the result
       // is applied at the top of a later tick, which is what keeps this off the
       // critical path.
       this.stats.markPhase(PHASE.occlusionRender);
-      this.occlusion.render();
+      if (!rebuildsHeld) this.occlusion.render();
       this.stats.markPhase(PHASE.preRender);
-      for (const fn of this.preRenderCallbacks) fn();
+      // Spanned for the freeze ledger: GI's rebuild and its g-buffer prepass
+      // both live here, and this phase has owned every boot freeze this
+      // project has diagnosed. GI marks its own stages inside, so an
+      // attributed block reads `gi:rebuild/staticBvh` rather than `preRender`.
+      const preRenderSpan = freeze.begin("frame:preRender");
+      try {
+        if (this.stats._attribArmed) {
+          for (const fn of this.preRenderCallbacks) {
+            const t0 = performance.now();
+            fn();
+            this.stats.attribute(fn, "preRender", performance.now() - t0);
+          }
+        } else {
+          for (const fn of this.preRenderCallbacks) fn();
+        }
+      } finally {
+        freeze.end(preRenderSpan);
+      }
       // After the preRender callbacks, so the editor's own gizmo pass — which
       // runs there and may itself draw through `engine.debug` — is included in
       // this frame's upload rather than the next one's.
@@ -1250,6 +1613,7 @@ export class Engine extends EventEmitter {
       // is exactly this call (nested one-shot renders must stay sync).
       const asyncPipelines = installAsyncRenderPipelines(this.renderer);
       if (asyncPipelines) asyncPipelines.active = true;
+      const encodeSpan = freeze.begin("frame:renderEncode");
       try {
         if (override) {
           // The override (typically a PostprocessComponent) runs the scene
@@ -1264,6 +1628,7 @@ export class Engine extends EventEmitter {
           this.renderer.render(this.scene, this.camera);
         }
       } finally {
+        freeze.end(encodeSpan);
         if (asyncPipelines) asyncPipelines.active = false;
         // Query flags are render-context state. Do not let a post-render
         // screenshot/debug/GI render consume them with another camera.
@@ -1303,7 +1668,15 @@ export class Engine extends EventEmitter {
     // must temporarily disable `autoClear` (and re-enable it) to preserve
     // the main scene underneath.
     this.stats.markPhase(PHASE.postRender);
-    for (const fn of this.postRenderCallbacks) fn();
+    if (this.stats._attribArmed) {
+      for (const fn of this.postRenderCallbacks) {
+        const t0 = performance.now();
+        fn();
+        this.stats.attribute(fn, "postRender", performance.now() - t0);
+      }
+    } else {
+      for (const fn of this.postRenderCallbacks) fn();
+    }
     this.stats.endPhaseFrame();
     this.stats.recordFrameWorkMs(performance.now() - frameStarted);
   }
@@ -1394,6 +1767,7 @@ export class Engine extends EventEmitter {
 
   /** Register a per-frame callback; returns an unsubscribe function. */
   onUpdate(fn) {
+    tagOwner(fn, this._registrant);
     this.updateCallbacks.add(fn);
     return () => this.updateCallbacks.delete(fn);
   }
@@ -1407,6 +1781,7 @@ export class Engine extends EventEmitter {
    * Ties keep insertion order, so equal-order callbacks behave like `onUpdate`.
    */
   onLateUpdate(fn, order = 0) {
+    tagOwner(fn, this._registrant);
     const entry = { fn, order };
     // Stable insert: scan to the first entry that sorts after this one rather
     // than push-then-sort, which Array#sort would leave unstable for ties.
@@ -1431,6 +1806,7 @@ export class Engine extends EventEmitter {
    * deferred prepass). Returns an unsubscribe function.
    */
   onPreRender(fn) {
+    tagOwner(fn, this._registrant);
     this.preRenderCallbacks.add(fn);
     return () => this.preRenderCallbacks.delete(fn);
   }
@@ -1443,6 +1819,7 @@ export class Engine extends EventEmitter {
    * the main render's pixels survive.
    */
   onPostRender(fn) {
+    tagOwner(fn, this._registrant);
     this.postRenderCallbacks.add(fn);
     return () => this.postRenderCallbacks.delete(fn);
   }

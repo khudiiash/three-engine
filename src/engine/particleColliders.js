@@ -62,6 +62,45 @@ export function writeParticleCollider(entity, collider, data, base = 0) {
   return true;
 }
 
+/**
+ * ⭐ A CHARACTER IS A COLLIDER TOO, and this field could not see one.
+ *
+ * `PhysicsSystem.#createColliders` returns early for a character-controller
+ * entity — "owns its own capsule" — so the character's shape never comes from a
+ * `collider` component, and a walk that looks only for that component misses
+ * the one thing in the scene the player actually moves. Reported 2026-09-08:
+ * cloth *"does not react to character collider"*. It reacted to everything
+ * else, which is what made it look like a cloth bug.
+ *
+ * Presented as the capsule the controller builds, so the field's existing
+ * capsule handling applies unchanged.
+ *
+ * ⚠ AND THAT HANDLING IS AN ENCLOSING SPHERE (see this file's header): a
+ * capsule of radius r and height h becomes a sphere of radius r + h/2. For a
+ * 1.8 m character that is a 1.2 m ball, so cloth reacts about a body's width
+ * early. Crude, but it is what every other capsule collider here already does,
+ * and a tighter fit means a real capsule type in the field rather than a
+ * special case for one entity.
+ */
+function characterAsCollider(entity) {
+  const cc = entity.getComponent?.("charactercontroller");
+  if (!cc || cc.enabled === false) return null;
+  const p = cc.props;
+  return {
+    enabled: true,
+    props: {
+      shape: "capsule",
+      radius: p.radius,
+      height: p.height,
+      offset: p.offset,
+      rotation: [0, 0, 0],
+      autoFit: false,
+      autoCenter: false,
+      isSensor: false,
+    },
+  };
+}
+
 function enabledInHierarchy(entity, playing) {
   const flag = playing ? "enabledInGame" : "enabledInEditor";
   for (let current = entity; current; current = current.parent) if (current[flag] === false) return false;
@@ -90,7 +129,7 @@ export class ParticleColliderField {
     let count = 0;
     for (const entity of this.engine.entities.values()) {
       if (count >= MAX_COLLIDERS) break;
-      const collider = entity.getComponent?.("collider");
+      const collider = characterAsCollider(entity) ?? entity.getComponent?.("collider");
       if (!collider || collider.enabled === false || collider.props.isSensor || !enabledInHierarchy(entity, this.engine.playing)) continue;
       if (!writeParticleCollider(entity, collider, this.data, count * FLOATS_PER_COLLIDER)) continue;
       this.entityIndices.set(entity.id, count++);

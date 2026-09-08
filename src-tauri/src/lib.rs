@@ -485,7 +485,11 @@ struct DirEntryInfo {
 }
 
 /// Lists the immediate children of `path` (directories first, then files, both A-Z).
-#[tauri::command]
+///
+/// `async` so it runs on the async pool: a sync command runs on the main
+/// thread, and the folder the user just clicked waited there behind any walk
+/// still in flight (see `dir_sizes`).
+#[tauri::command(async)]
 fn list_dir(path: String) -> Result<Vec<DirEntryInfo>, String> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(&path).map_err(|e| e.to_string())? {
@@ -522,6 +526,122 @@ fn list_dir(path: String) -> Result<Vec<DirEntryInfo>, String> {
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
     Ok(entries)
+}
+
+/// Lists everything under `path`, up to `depth` levels down, in ONE call.
+///
+/// ⭐ WHY THIS EXISTS: the frontend used to walk the tree itself, one
+/// `list_dir` per directory. On the user's project that is 575 directories,
+/// and the boot table measured the prefab search — which finds 22 files and
+/// which the whole editor boot waits on — at **2 453 ms**. Reading those 22
+/// files afterwards took 99 ms. Making the JS walk concurrent (16 at a time)
+/// changed the figure by 35 ms: the cost is not the filesystem and not
+/// latency-per-level, it is ~4 ms of IPC round trip multiplied by the
+/// directory count, and the IPC does not parallelise. The same walk in one
+/// native call touches the same 575 directories in tens of milliseconds.
+///
+/// `exts` filters FILES by lowercase extension when present; directories are
+/// always returned, because the callers that want the whole tree (the asset
+/// catalog, project search) need them. `engine-types` is skipped whole — it
+/// holds editor-scaffolded declarations, never project assets.
+#[tauri::command(async)]
+fn list_dir_recursive(
+    path: String,
+    depth: Option<u32>,
+    exts: Option<Vec<String>>,
+) -> Result<Vec<DirEntryInfo>, String> {
+    let max_depth = depth.unwrap_or(8);
+    let wanted: Option<Vec<String>> = exts.map(|list| list.iter().map(|e| e.to_lowercase()).collect());
+    let mut out = Vec::new();
+    // Breadth-first with an explicit queue rather than recursion: a project
+    // with a pathological symlink loop should hit the depth cap, not the stack.
+    let mut level: Vec<String> = vec![path];
+    let mut d = 0;
+    while d <= max_depth && !level.is_empty() {
+        let mut next = Vec::new();
+        for dir in &level {
+            let read = match fs::read_dir(dir) {
+                Ok(read) => read,
+                // An unreadable directory is skipped, not fatal: a project can
+                // contain a folder the user has no permission for, and the
+                // listing must still return everything else.
+                Err(_) => continue,
+            };
+            for entry in read.flatten() {
+                let Ok(file_type) = entry.file_type() else { continue };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = file_type.is_dir();
+                if is_dir && name.eq_ignore_ascii_case("engine-types") {
+                    continue;
+                }
+                let ext = Path::new(&name)
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let path_string = entry.path().to_string_lossy().into_owned();
+                if is_dir {
+                    next.push(path_string.clone());
+                } else if let Some(list) = &wanted {
+                    if !list.contains(&ext) {
+                        continue;
+                    }
+                }
+                let meta = entry.metadata().ok();
+                let size = match (&meta, is_dir) {
+                    (Some(m), false) => m.len(),
+                    _ => 0,
+                };
+                let modified = meta
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|t| t.as_secs_f64())
+                    .unwrap_or(0.0);
+                out.push(DirEntryInfo { name, path: path_string, is_dir, ext, size, modified });
+            }
+        }
+        level = next;
+        d += 1;
+    }
+    Ok(out)
+}
+
+/// Total bytes under each folder, however deep — the Assets list's Size
+/// column for a folder.
+///
+/// ⭐ WHY THIS EXISTS: the first cut summed sizes in JS from a
+/// `list_dir_recursive` of the open folder. Walking a project root with a
+/// `.git` of thousands of objects took hundreds of milliseconds, serialised
+/// tens of thousands of entries over IPC, and — being a sync command — ran on
+/// the MAIN thread, where the `list_dir` for the folder the user had just
+/// clicked queued behind it: "after clicking on the folder, it takes around a
+/// second to load the view". This walks natively, returns one number per
+/// folder, and runs on the async pool. Symlinks are not followed; a tree
+/// deeper than 64 levels stops there.
+#[tauri::command(async)]
+fn dir_sizes(paths: Vec<String>) -> Vec<u64> {
+    paths.iter().map(|p| dir_size(Path::new(p), 0)).collect()
+}
+
+fn dir_size(dir: &Path, depth: u32) -> u64 {
+    if depth > 64 {
+        return 0;
+    }
+    let Ok(read) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in read.flatten() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            total += dir_size(&entry.path(), depth + 1);
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 /// Reads a file's raw bytes, for feeding into blob URLs (models, textures).
@@ -2408,6 +2528,8 @@ pub fn run() {
             save_scene,
             load_scene,
             list_dir,
+            list_dir_recursive,
+            dir_sizes,
             read_binary_file,
             read_binary_files,
             read_binary_file_head,

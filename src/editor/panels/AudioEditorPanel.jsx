@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AudioWaveform, Copy, Clipboard, Layers, Loader2, Package, Play, Plus, Redo2, Repeat,
-  Save, Scissors, Shuffle, Square, Trash2, Undo2, Volume2, VolumeX, ZoomIn, ZoomOut,
-} from "lucide-react";
+  AudioLines, AudioWaveform, ChevronDown, Copy, Clipboard, Crop, CopyPlus, FlipHorizontal,
+  Layers, Loader2, Maximize2, Package, Play, Plus, Power, Redo2, Repeat,
+  Save, Scissors, Shuffle, Square, Trash2, Undo2, Volume2, VolumeX, Wand2, ZoomIn, ZoomOut,
+} from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { AUDIO_EXTENSIONS, listProjectEntries, withoutSidecars, extOf } from "../assetLoader.js";
@@ -592,15 +593,14 @@ export function AudioEditorPanel({ api } = {}) {
     return (
       <div className="audio-editor">
         <div className="aud-gate">
-          <AudioWaveform size={28} />
-          <h3>Audio Editor</h3>
-          <p>
-            Edit sounds without leaving the engine: layer takes on separate tracks, cut and fade,
-            and mix down to the file your scene already references. Enable the Audio Editor module
-            to get started.
-          </p>
-          <button className="toolbar-btn wide" onClick={() => setModuleEnabled("audio-editor", true)}>
-            Enable Audio Editor module
+          <AudioWaveform
+            size={28}
+            className="empty-glyph"
+            title="Layer takes on separate tracks, cut and fade, and mix down to the file your scene already references"
+          />
+          <button className="toolbar-btn wide" title="Enable the Audio Editor module" onClick={() => setModuleEnabled("audio-editor", true)}>
+            <Power size={14} />
+            Enable Audio Editor
           </button>
         </div>
       </div>
@@ -608,20 +608,20 @@ export function AudioEditorPanel({ api } = {}) {
   }
 
   if (!document_) {
+    const hint = !rootPath
+      ? "Open a project first"
+      : files.length === 0
+        ? "No audio files in this project yet — import some from the Audio Library panel"
+        : "Open a sound to edit";
     return (
       <div className="audio-editor">
         <div className="aud-empty">
-          <AudioWaveform size={26} />
-          <h3>Open a sound to edit</h3>
-          {!rootPath ? (
-            <p>Open a project first.</p>
-          ) : files.length === 0 ? (
-            <p>No audio files in this project yet. Import some from the Audio Library panel.</p>
-          ) : (
+          <AudioWaveform size={28} className="empty-glyph" title={hint} />
+          {rootPath && files.length > 0 && (
             <ul className="aud-filelist">
               {files.map((f) => (
                 <li key={f.path}>
-                  <button onClick={() => open(f.path)} disabled={busy}>
+                  <button onClick={() => open(f.path)} disabled={busy} title={f.name}>
                     <AudioWaveform size={12} /> {f.name}
                   </button>
                 </li>
@@ -657,21 +657,24 @@ export function AudioEditorPanel({ api } = {}) {
         <button className="aud-btn" onClick={doCopy} title="Copy (Ctrl+C)"><Copy size={13} /></button>
         <button className="aud-btn" onClick={doPaste} title="Paste (Ctrl+V)"><Clipboard size={13} /></button>
         <button className="aud-btn" onClick={doDelete} title="Delete selection (Del)"><Trash2 size={13} /></button>
-        <button className="aud-btn text" onClick={doSilence} title="Replace the selection with silence">Silence</button>
-        <button className="aud-btn text" onClick={doTrim} title="Keep only the selection">Trim</button>
-        <button className="aud-btn text" onClick={doDuplicate} title="Insert a copy after the selection">Dup</button>
-        <button className="aud-btn text" onClick={doReverse} title="Reverse the selection">Reverse</button>
-        <button className="aud-btn text" onClick={doTrimSilence} title="Remove leading and trailing silence">Trim silence</button>
+        <button className="aud-btn" onClick={doSilence} title="Silence — replace the selection with silence"><VolumeX size={13} /></button>
+        <button className="aud-btn" onClick={doTrim} title="Trim — keep only the selection"><Crop size={13} /></button>
+        <button className="aud-btn" onClick={doDuplicate} title="Duplicate — insert a copy after the selection"><CopyPlus size={13} /></button>
+        <button className="aud-btn" onClick={doReverse} title="Reverse the selection"><FlipHorizontal size={13} /></button>
+        <button className="aud-btn text" onClick={doTrimSilence} title="Remove leading and trailing silence">
+          <AudioLines size={13} /> Trim silence
+        </button>
 
         <span className="aud-sep" />
 
         <div className="aud-menu-wrap">
           <button
-            className={`aud-btn text${effectMenuOpen ? " active" : ""}`}
+            className={`aud-btn${effectMenuOpen ? " active" : ""}`}
             onClick={() => setEffectMenuOpen((v) => !v)}
-            title="Processing"
+            title="Effects"
           >
-            Effects ▾
+            <Wand2 size={13} />
+            <ChevronDown size={11} />
           </button>
           {effectMenuOpen && (
             <>
@@ -732,24 +735,25 @@ export function AudioEditorPanel({ api } = {}) {
 
         <button className="aud-btn" onClick={() => zoom(0.5)} title="Zoom in"><ZoomIn size={13} /></button>
         <button className="aud-btn" onClick={() => zoom(2)} title="Zoom out"><ZoomOut size={13} /></button>
-        <button className="aud-btn text" onClick={zoomToSelection} title="Fit the selection, or the whole sound">Fit</button>
+        <button className="aud-btn" onClick={zoomToSelection} title="Fit the selection, or the whole sound"><Maximize2 size={13} /></button>
 
         <span className="aud-spacer" />
 
         <div className="aud-menu-wrap">
           <button
-            className={`aud-btn text${exportOpen ? " active" : ""}`}
+            className={`aud-btn${exportOpen ? " active" : ""}`}
             onClick={() => setExportOpen((v) => !v)}
-            title="Write this out in another format — with what it costs on disk"
+            title="Export — write this out in another format, with what it costs on disk"
           >
-            <Package size={12} /> Export ▾
+            <Package size={12} />
+            <ChevronDown size={11} />
           </button>
           {exportOpen && (
             <>
               <div className="aud-menu-scrim" onClick={() => setExportOpen(false)} />
               <div className="aud-menu right">
                 <div className="aud-menu-group">
-                  <div className="aud-menu-label">Ogg / Opus</div>
+                  <div className="aud-menu-label" title="Web builds should ship Ogg — it is 15-20× smaller than WAV">Ogg / Opus</div>
                   {!opusEncodingAvailable() ? (
                     <div className="aud-menu-note">This browser has no Opus encoder.</div>
                   ) : (
@@ -779,17 +783,19 @@ export function AudioEditorPanel({ api } = {}) {
                     </button>
                   ))}
                 </div>
-                {/* Audio is usually the largest thing in a web build and
-                    nothing else in the editor tells anyone that. */}
-                <div className="aud-menu-note">Web builds should ship Ogg — it is 15-20× smaller than WAV.</div>
               </div>
             </>
           )}
         </div>
 
-        <button className="aud-btn primary" onClick={() => save()} disabled={busy} title="Save (Ctrl+S)">
+        <button
+          className="aud-btn primary"
+          onClick={() => save()}
+          disabled={busy}
+          title={`${canWriteInPlace(path) ? "Save" : "Save as WAV"} (Ctrl+S)${dirty ? " — unsaved changes" : ""}`}
+        >
           {busy ? <Loader2 size={13} className="aud-spin" /> : <Save size={13} />}
-          {canWriteInPlace(path) ? "Save" : "Save as WAV"}
+          Save
           {dirty ? " •" : ""}
         </button>
       </div>
@@ -847,9 +853,7 @@ export function AudioEditorPanel({ api } = {}) {
               <option key={f.path} value={f.path}>{f.name}</option>
             ))}
           </select>
-          <span className="aud-hint">
-            <Layers size={11} /> Tracks layer like an impact: thud, crack, tail.
-          </span>
+          <Layers size={11} className="aud-hint" title="Tracks layer like an impact: thud, crack, tail" />
         </div>
       </div>
 
@@ -1011,7 +1015,7 @@ function TrackRow({
         </label>
         <div className={`aud-peak${trackPeak > 1 ? " over" : ""}`} title="Peak level">
           {trackPeak > 0 ? `${(20 * Math.log10(trackPeak)).toFixed(1)} dB` : "—∞"}
-          {trackPeak > 1 ? " OVER" : ""}
+          {trackPeak > 1 ? " over" : ""}
         </div>
       </div>
 

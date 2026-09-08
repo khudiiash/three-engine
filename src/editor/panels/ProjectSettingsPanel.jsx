@@ -1,10 +1,14 @@
 import { useEffect, useState } from "react";
-import { Save, X, RotateCcw, Crosshair, FolderOpen } from "lucide-react";
+import { Save, X, RotateCcw, Crosshair, FolderOpen } from "../icons/index.jsx";
+import { AssetField } from "../fields/AssetField.jsx";
 import { Row, Toggle, Note, Section } from "./settingsUi.jsx";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { getProjectSettings, saveProjectSettings } from "../projectSettings.js";
+import { applyAccent, DEFAULT_ACCENT } from "../accent.js";
+import { NumberField } from "../fields/NumberField.jsx";
 import { currentScenePath } from "../sceneIO.js";
 import { KEY_BINDING_ACTIONS, describeBinding, keyTokenFromEvent } from "../keybindings.js";
+import { AMBIENT_GLOW_DEFAULTS, setAmbientGlowLook } from "../ambientGlowLook.js";
 import {
   isViewportFreezeEnabled,
   onViewportFreezeChanged,
@@ -48,6 +52,8 @@ async function pathExists(absPath) {
 }
 
 function Num({ value, onChange, min, max, step = 0.1 }) {
+  // A bounded number is the shared slider field (drag by position, click to type).
+  if (Number.isFinite(min) && Number.isFinite(max) && max > min) return <NumberField value={value} min={min} max={max} step={step} onCommit={onChange} />;
   return (
     <input
       className="number-field"
@@ -197,10 +203,6 @@ function CollisionMatrix({ layers, matrix, onChange }) {
 
   return (
     <>
-      <Note>
-        A collider sits on one layer; the matrix decides which layers touch. Raycasts and
-        overlaps take their own layer list and ignore it.
-      </Note>
       <div className="settings-layer-names">
         {names.map((name, index) => (
           <label key={index}>
@@ -216,7 +218,10 @@ function CollisionMatrix({ layers, matrix, onChange }) {
           </label>
         ))}
       </div>
-      <div className="collision-matrix">
+      <div
+        className="collision-matrix"
+        title="A collider sits on one layer; the matrix decides which layers touch. Raycasts and overlaps take their own layer list and ignore it."
+      >
         {names.map((rowName, i) => (
           <div className="collision-matrix-row" key={i}>
             <span className="collision-matrix-label" title={rowName}>
@@ -367,21 +372,12 @@ export function ProjectSettingsPanel() {
         </Row>
         <Row
           label="Main scene"
-          wide
           hint="Opens on editor boot and boots the build. Empty = last-edited scene."
         >
-          <input
-            className={`text-field${mainMissing ? " missing-ref" : ""}`}
-            type="text"
-            value={mainDraft}
-            placeholder="scenes/main.scene"
-            onChange={(e) => {
-              setMainDraft(e.target.value);
-              setMainDirty(normalizeMainPath(e.target.value) !== normalizeMainPath(mainScene));
-            }}
-            onBlur={() => {
-              if (mainDirty && !mainMissing) setMain(normalizeMainPath(mainDraft));
-            }}
+          <AssetField
+            descriptor={{ exts: ["scene"], emptyLabel: "Last edited scene" }}
+            value={mainValue && rootPath ? `${rootPath}/${mainValue}` : ""}
+            onCommit={(abs) => setMain(abs ? normalizeMainPath(projectRelative(rootPath, abs)) : "")}
           />
           <button
             className="toolbar-btn icon-only"
@@ -390,14 +386,6 @@ export function ProjectSettingsPanel() {
             onClick={useCurrentAsMain}
           >
             <Crosshair size={13} />
-          </button>
-          <button
-            className="toolbar-btn icon-only"
-            title="Clear"
-            disabled={!mainScene && !mainDraft}
-            onClick={() => setMain("")}
-          >
-            <X size={13} />
           </button>
         </Row>
         {mainMissing ? (
@@ -428,7 +416,7 @@ export function ProjectSettingsPanel() {
         </Row>
       </Section>
 
-      <Section id="project.hotreload" title="Hot Reload">
+      <Section id="project.hotreload" title="Hot reload">
         <Row
           label="Watch project files"
           hint="Re-read files changed outside the editor — an agent's file tools, your IDE, a paint program, a git checkout. Off means those changes appear only after a manual refresh or a restart."
@@ -464,6 +452,28 @@ export function ProjectSettingsPanel() {
       </Section>
 
       <Section id="project.editor" title="Editor">
+        <Row label="Accent" hint="The editor's highlight colour: selection, focus, the active tool. Applies immediately; Save keeps it.">
+          <input
+            type="color"
+            className="color-field"
+            value={editor.accent || DEFAULT_ACCENT}
+            onChange={(e) => {
+              applyAccent(e.target.value);
+              patch("editor", { accent: e.target.value });
+            }}
+          />
+          <button
+            className="toolbar-btn icon-only"
+            title="Default accent"
+            disabled={(editor.accent || DEFAULT_ACCENT).toLowerCase() === DEFAULT_ACCENT}
+            onClick={() => {
+              applyAccent(DEFAULT_ACCENT);
+              patch("editor", { accent: DEFAULT_ACCENT });
+            }}
+          >
+            <RotateCcw size={12} />
+          </button>
+        </Row>
         <Row label="Autosave" hint="Seconds between automatic scene saves. 0 = off.">
           <Num
             value={editor.autosaveSeconds}
@@ -542,6 +552,46 @@ export function ProjectSettingsPanel() {
         >
           <Toggle checked={freezeUnfocused} onChange={setViewportFreezeEnabled} />
         </Row>
+        {/* The glow's switch is `editor.layers.ambient` — the SAME value the
+            viewport's Visibility menu writes, so the two surfaces can never
+            disagree about whether the light is on. Its two numbers apply the
+            moment they change (like the accent above) because a light you
+            cannot watch move is a light you cannot tune; Save is what keeps
+            them. */}
+        <Row
+          label="Ambient glow"
+          hint="Spill the viewport's own light under the panels around it. Also in the viewport's Visibility menu — it is one setting."
+        >
+          <Toggle
+            checked={editor.layers?.ambient !== false}
+            onChange={(v) => patch("editor", { layers: { ...(editor.layers ?? {}), ambient: v } })}
+          />
+        </Row>
+        <Row label="Spread" sub disabled={editor.layers?.ambient === false} hint="How far the light reaches past the viewport's edges, in pixels.">
+          <Num
+            value={editor.ambientGlowSpread ?? AMBIENT_GLOW_DEFAULTS.spread}
+            min={0}
+            max={400}
+            step={5}
+            onChange={(v) => {
+              setAmbientGlowLook({ spread: v });
+              patch("editor", { ambientGlowSpread: v });
+            }}
+          />
+          <span className="settings-unit">px</span>
+        </Row>
+        <Row label="Intensity" sub disabled={editor.layers?.ambient === false} hint="How visible the light is, from 0 to 1.">
+          <Num
+            value={editor.ambientGlowIntensity ?? AMBIENT_GLOW_DEFAULTS.intensity}
+            min={0}
+            max={1}
+            step={0.05}
+            onChange={(v) => {
+              setAmbientGlowLook({ intensity: v });
+              patch("editor", { ambientGlowIntensity: v });
+            }}
+          />
+        </Row>
       </Section>
 
       <Section id="project.screenshot" title="Screenshot">
@@ -581,7 +631,14 @@ export function ProjectSettingsPanel() {
             <X size={13} />
           </button>
         </Row>
-        <Row label="File name prefix" hint="Files are named <prefix>-<date>_<time>.png.">
+        <Row
+          label="File name prefix"
+          hint={
+            "Files are named <prefix>-<date>_<time>.png. Captured with the “Screenshot viewport” " +
+            "binding under Keybindings — Shift+Alt+S by default (Option on macOS) — the frame " +
+            "exactly as shown, path copied to the clipboard."
+          }
+        >
           <input
             className="text-field"
             type="text"
@@ -590,11 +647,6 @@ export function ProjectSettingsPanel() {
             onChange={(e) => patch("screenshot", { prefix: e.target.value })}
           />
         </Row>
-        <Note>
-          Captured with the “Screenshot viewport” binding under Keybindings — Shift+Alt+S by default
-          (Alt is the Option key on macOS). The shot is the frame exactly as displayed — debug views
-          and overlays included — and the saved file's path is copied to the clipboard.
-        </Note>
       </Section>
 
       <Section id="project.keybindings" title="Keybindings" defaultOpen={false}>
@@ -620,11 +672,6 @@ export function ProjectSettingsPanel() {
           onChange={(next) => patch("physics", next)}
         />
       </Section>
-
-      <Note footer>
-        Stored in project.json. Scene look — background, fog, tone mapping — lives in Scene
-        Settings.
-      </Note>
     </div>
   );
 }

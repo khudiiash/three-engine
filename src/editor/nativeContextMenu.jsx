@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Clipboard, ClipboardPaste, LayoutTemplate, Redo2, Scissors, TextCursorInput, Undo2 } from "lucide-react";
+import { Clipboard, ClipboardPaste, LayoutTemplate, Redo2, Scissors, TextCursorInput, Undo2 } from "./icons/index.jsx";
 import { ContextMenu, isTextEditTarget } from "./ContextMenu.jsx";
 import { commandBus, useHistoryStore } from "./commands/CommandBus.js";
 import { resetLayout } from "./EditorShell.jsx";

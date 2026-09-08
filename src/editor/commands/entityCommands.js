@@ -159,45 +159,47 @@ export class SetEntityPersistentCommand {
 }
 
 /**
- * Toggles the "enabled in editor" flag on a single entity. Visible in the
- * editor (i.e. when `!engine.playing`) when true. The engine applies this
- * to `entity.object3D.visible` on every frame so changing it doesn't
- * require an explicit redraw.
+ * Hides or shows a single entity in the editor viewport — the viewing aid,
+ * not the enabled flag: its components keep working, and play mode shows it.
  */
-export class SetEntityEnabledInEditorCommand {
+export class SetEntityVisibleInEditorCommand {
   constructor(entityId, value) {
     this.entityId = entityId;
     this.value = !!value;
-    this.oldValue = engine.getEntity(entityId)?.enabledInEditor !== false;
+    this.oldValue = engine.getEntity(entityId)?.visibleInEditor !== false;
     this.label = this.value ? "Show in Editor" : "Hide in Editor";
   }
 
   do() {
-    engine.getEntity(this.entityId)?.setEnabledInEditor(this.value);
+    engine.getEntity(this.entityId)?.setVisibleInEditor(this.value);
   }
 
   undo() {
-    engine.getEntity(this.entityId)?.setEnabledInEditor(this.oldValue);
+    engine.getEntity(this.entityId)?.setVisibleInEditor(this.oldValue);
   }
 }
 
-/** Mirrors SetEntityEnabledInEditorCommand for the in-game (play) mode. */
-export class SetEntityEnabledInGameCommand {
+/** Enables or disables a single entity: one flag, both modes (the Hierarchy's eye). */
+export class SetEntityEnabledCommand {
   constructor(entityId, value) {
     this.entityId = entityId;
     this.value = !!value;
-    this.oldValue = engine.getEntity(entityId)?.enabledInGame !== false;
-    this.label = this.value ? "Show in Game" : "Hide in Game";
+    this.oldValue = engine.getEntity(entityId)?.enabled !== false;
+    this.label = this.value ? "Enable" : "Disable";
   }
 
   do() {
-    engine.getEntity(this.entityId)?.setEnabledInGame(this.value);
+    engine.getEntity(this.entityId)?.setEnabled(this.value);
   }
 
   undo() {
-    engine.getEntity(this.entityId)?.setEnabledInGame(this.oldValue);
+    engine.getEntity(this.entityId)?.setEnabled(this.oldValue);
   }
 }
+
+/** @deprecated The old per-mode commands: the editor one is the viewing aid, the game one is `enabled`. */
+export const SetEntityEnabledInEditorCommand = SetEntityVisibleInEditorCommand;
+export const SetEntityEnabledInGameCommand = SetEntityEnabledCommand;
 
 /** True if `candidateId` is `entityId` itself or one of its descendants. */
 export function isDescendantOf(candidateId, entityId) {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Sparkles, Zap, Save, Camera, FilePlus2 } from "lucide-react";
+import { Plus, Sparkles, Zap, Save, Camera, FilePlus2 } from "../icons/index.jsx";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -330,8 +330,8 @@ function SaveAsPopover({ defaultName, folder, onClose, onCreate }) {
         <div className="postprocess-hint" title={folder}>
           in {folder ? basename(folder) : "the project"}
         </div>
-        <button className="toolbar-btn" disabled={!trimmed} onClick={submit}>
-          Create
+        <button className="toolbar-btn" disabled={!trimmed} onClick={submit} title="Create">
+          <Plus size={13} /> Create
         </button>
       </div>
     </>
@@ -360,9 +360,27 @@ function useCamerasWithPost() {
     refresh();
     const off = engine.on?.("hierarchy-changed", refresh);
     const off2 = engine.on?.("modules-changed", refresh);
+    // ⚠ hierarchy-changed stopped firing for prop edits (the structural-prop
+    // gate, Component.setProp) — and "Show in Editor" is not structural. This
+    // dropdown owns that checkbox's state, so without the precise signals the
+    // checkbox never re-rendered checked (the prop HAD applied; the UI just
+    // refused to believe it) and a freshly added Post Process component —
+    // which emits only "component-added" — never appeared at all.
+    const off3 = engine.on?.("component-changed", (e) => {
+      if (e?.componentType === "postprocess") refresh();
+    });
+    const off4 = engine.on?.("component-added", (e) => {
+      if (e?.componentType === "postprocess" || e?.componentType === "camera") refresh();
+    });
+    const off5 = engine.on?.("component-removed", (e) => {
+      if (e?.componentType === "postprocess" || e?.componentType === "camera") refresh();
+    });
     return () => {
       off?.();
       off2?.();
+      off3?.();
+      off4?.();
+      off5?.();
     };
   }, [refresh]);
   return items;
@@ -602,14 +620,11 @@ function PostprocessEditor({ entityId, docPath, onOpenDoc }) {
   if (!entityId && !docPath) {
     return (
       <div className="shader-graph-panel postprocess-empty">
-        <div className="empty-state">
-          <Sparkles size={32} />
-          <h3>Pick a camera or a graph</h3>
-          <p>
-            Add a <code>Post Process</code> component to any camera in the scene and select that
-            camera above, or open a <code>.post</code> graph from the Graph slot. New graphs come
-            from Assets → right-click → New Post Process Graph.
-          </p>
+        <div
+          className="empty-state"
+          title="Add a Post Process component to a camera, or open a .post graph from the Graph slot"
+        >
+          <Sparkles className="empty-glyph" size={28} />
         </div>
       </div>
     );
@@ -636,22 +651,26 @@ function PostprocessEditor({ entityId, docPath, onOpenDoc }) {
           <Zap size={14} />
         </button>
         <button
-          className={`toolbar-btn${dirty ? "" : " disabled"}`}
+          className={`toolbar-btn icon-only${dirty ? "" : " disabled"}`}
           disabled={!dirty}
           onClick={apply}
-          title={dirty ? (docPath ? `Write ${basename(docPath)}` : "Apply to the camera") : "No pending changes"}
+          title={
+            dirty
+              ? docPath
+                ? `${saveLabel} — write ${basename(docPath)}`
+                : `${saveLabel} to the camera`
+              : "No pending changes — saved"
+          }
         >
           <Save size={14} />
-          {dirty ? saveLabel : "Saved"}
         </button>
         <div className="dropdown-wrap">
           <button
-            className="toolbar-btn"
+            className="toolbar-btn icon-only"
             onClick={() => setSaveAsOpen((v) => !v)}
-            title="Fork this graph into a new .post file"
+            title="Save As — fork this graph into a new .post file"
           >
             <FilePlus2 size={14} />
-            Save As
           </button>
           {saveAsOpen && (
             <SaveAsPopover
@@ -770,17 +789,24 @@ export function PostprocessPanel() {
       <div className="postprocess-panel">
         <div className="postprocess-header">
           <div className="dropdown-wrap">
-            <button className="toolbar-btn" onClick={() => setPending((v) => !v)}>
-              <Camera size={14} label="Pick a camera" />
-              {activeCamera?.name ?? "Camera"}
+            <button
+              className="toolbar-btn icon-only"
+              onClick={() => setPending((v) => !v)}
+              title={`Camera: ${activeCamera?.name ?? "none selected"}`}
+            >
+              <Camera size={14} />
             </button>
             {pending && (
               <>
                 <div className="dropdown-overlay" onClick={() => setPending(false)} />
                 <div className="dropdown-menu">
                   {cameras.length === 0 && (
-                    <div className="dropdown-item" style={{ opacity: 0.6, pointerEvents: "none" }}>
-                      No cameras with a Post Process component
+                    <div
+                      className="dropdown-item"
+                      style={{ opacity: 0.6, pointerEvents: "none" }}
+                      title="No cameras with a Post Process component"
+                    >
+                      <Camera size={12} />
                     </div>
                   )}
                   {cameras.map(({ entityId, name }) => (

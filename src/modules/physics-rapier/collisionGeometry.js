@@ -128,6 +128,46 @@ export function collectCollisionMeshParts(root, options = {}) {
   return collectSourceMeshes(root, options).flatMap(splitCollisionMesh);
 }
 
+/**
+ * Local-space triangles of a single BufferGeometry — the Custom collider's
+ * source, an authored `.geom` asset rather than rendered meshes. Returns null
+ * when there is no usable position data, an index is out of range, or any
+ * vertex is non-finite (the same survivable-failure rule the rendered path
+ * follows: skip the shape, name the cause).
+ */
+export function collisionMeshFromGeometry(geometry) {
+  const position = geometry?.attributes?.position;
+  if (!position?.count) return null;
+  const vertices = new Float32Array(position.count * 3);
+  for (let i = 0; i < position.count; i++) {
+    const x = position.getX(i), y = position.getY(i), z = position.getZ(i);
+    if (![x, y, z].every(Number.isFinite)) return null;
+    vertices[i * 3] = x;
+    vertices[i * 3 + 1] = y;
+    vertices[i * 3 + 2] = z;
+  }
+  const index = geometry.index;
+  const indices = new Uint32Array(index?.count ?? position.count);
+  if (index) {
+    for (let i = 0; i < index.count; i++) {
+      const vertex = index.getX(i);
+      if (!(vertex >= 0 && vertex < position.count)) return null;
+      indices[i] = vertex;
+    }
+  } else {
+    for (let i = 0; i < position.count; i++) indices[i] = i;
+  }
+  return indices.length >= 3 ? { vertices, indices } : null;
+}
+
+/** Collision islands of one BufferGeometry — the same per-island split the
+ *  rendered-mesh path gets, so a disconnected custom mesh still cooks one
+ *  hull per island instead of one wrongly-bridging hull over them all. */
+export function collisionMeshPartsFromGeometry(geometry) {
+  const mesh = collisionMeshFromGeometry(geometry);
+  return mesh ? splitCollisionMesh(mesh) : [];
+}
+
 /** A bind-pose hull is not valid collision for geometry whose positions can
  * change independently of its entity transform. */
 export function isDeformingCollisionMesh(object) {

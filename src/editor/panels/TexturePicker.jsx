@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Image as ImageIcon, Search, X } from "lucide-react";
+import { Image as ImageIcon, Search, X } from "../icons/index.jsx";
 import { listProjectAssets, TEXTURE_EXTENSIONS, toBlobUrl } from "../assetLoader.js";
 import { useProjectStore, basename } from "../store/projectStore.js";
 

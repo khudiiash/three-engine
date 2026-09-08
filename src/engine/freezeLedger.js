@@ -1,0 +1,791 @@
+/**
+ * THE FREEZE LEDGER — every main-thread block, with an owner.
+ *
+ * ⭐ WHY THIS EXISTS (docs/ZERO_FREEZE_PLAN.md §3 R5). Until this file, the
+ * editor recorded nothing about its own freezes. Every one the user reported
+ * — a 10-120 s boot, a 10 s click, a param change that hangs — was
+ * reconstructed days later from console archaeology, and several of those
+ * reconstructions were wrong (see the ledgers: "the reflect HOLD held a trace
+ * that never ran", "the lit marker lied by 22 s"). A freeze the instrument
+ * cannot name is a freeze nobody can fix, and a mean cannot see one:
+ * `profile.cpuFrame` reports a healthy 14 ms for a drag with a 300 ms hitch
+ * every second.
+ *
+ * WHAT IT IS. A `PerformanceObserver('longtask')` — the browser's own report
+ * of "the main thread was blocked for N ms" — joined to a ring of ACTIVITY
+ * SPANS the engine records as it works. The observer fires after the task, so
+ * attribution is an overlap query against spans that are already closed:
+ * nothing needs to guess, and nothing on the hot path allocates.
+ *
+ * SELF TIME, NOT TOTAL. Spans nest (`gi:rebuild` contains `gi:staticBvh`
+ * contains `gpu:shaderModule`), so a naive overlap sum reports 300 % of the
+ * task. Each span subtracts its direct children's total from its own, exactly
+ * as a sampling profiler's self time works, and attribution reads `selfMs`.
+ * A block therefore reads as ONE name plus the frames above it, which is what
+ * "who froze the editor" means.
+ *
+ * COST WHEN NOTHING IS FREEZING. `begin`/`end` are two `performance.now()`
+ * calls and a push/pop on a preallocated stack; a span shorter than
+ * `MIN_SPAN_MS` is dropped without touching the ring. There is no allocation
+ * per span and no string work until a report is read. The observer itself is
+ * a browser-side thing that only calls back when the thread actually blocked.
+ *
+ * ⚠ THE ONE FAILURE MODE, same as StatsSystem's phase marks: an UNMARKED
+ * block does not read as zero, it reads as `(unattributed)`. That is
+ * deliberate — an honest hole beats a wrong name — but it means adding a
+ * heavy new stage without a mark makes the ledger quietly less useful. Mark
+ * the stage in the same commit that adds it.
+ */
+
+/** Spans shorter than this never reach the ring: a freeze is not built of them. */
+const MIN_SPAN_MS = 0.4;
+
+/** Ring capacity. ~4 s of a busy boot at 500 spans/s. */
+const SPAN_RING = 4096;
+
+/** Long tasks kept for `profile.freezes`, newest last. */
+/** How many individual node-build causes to keep for per-block attribution. */
+const BUILD_CAUSE_RING = 2000;
+const TASK_RING = 200;
+
+/** A task at or over this is worth a console line. */
+const LOG_MS = 150;
+
+/** At most this many console lines per window, so a bad boot stays readable. */
+const LOG_BUDGET = 12;
+const LOG_WINDOW_MS = 10_000;
+
+const now = () => performance.now();
+
+class FreezeLedger {
+  constructor() {
+    /** Master switch. Off in a shipped game unless something turns it on. */
+    this.enabled = true;
+    /** Console lines for blocks over LOG_MS. */
+    this.logging = true;
+
+    // Span ring, struct-of-arrays so a span costs no object.
+    this._names = new Array(SPAN_RING).fill(null);
+    this._starts = new Float64Array(SPAN_RING);
+    this._ends = new Float64Array(SPAN_RING);
+    this._selves = new Float64Array(SPAN_RING);
+    this._head = 0;
+    this._filled = 0;
+
+    // Open-span stack. `_stackChild[i]` accumulates the TOTAL ms of spans
+    // closed inside frame i, which is what makes `selfMs` exclusive.
+    this._stackName = [];
+    this._stackStart = [];
+    this._stackChild = [];
+
+    /** Long tasks, each already attributed. */
+    this.tasks = [];
+    /** Totals since boot, so a session has a headline without a capture. */
+    this.totals = { tasks: 0, ms: 0, worstMs: 0, over100: 0, over500: 0 };
+
+    // Sync GPU-object creation counted per task window. These are the calls
+    // that block without appearing in any JS profile (the driver parses WGSL
+    // on the calling thread), so they are counted as well as spanned.
+    this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0 };
+
+    this._logCount = 0;
+    this._logWindow = 0;
+    this._observer = null;
+    /** Boot timeline; see `bootStage`. */
+    this.boot = { stages: [], t0: now(), openName: null, openAt: 0 };
+  }
+
+  // ---------------------------------------------------------------- spans
+
+  /**
+   * Open an activity span. Returns a token to pass to `end`; a falsy token
+   * means the ledger was off and `end` is a no-op, so call sites never branch.
+   *
+   *     const t = freeze.begin("gi:staticBvh");
+   *     try { ...  } finally { freeze.end(t); }
+   */
+  begin(name) {
+    if (!this.enabled) return 0;
+    const depth = this._stackName.length;
+    this._stackName.push(name);
+    this._stackStart.push(now());
+    this._stackChild.push(0);
+    // Token encodes the depth so a mismatched end cannot corrupt the stack.
+    return depth + 1;
+  }
+
+  /** Close the span opened by `token`, and every span left open inside it. */
+  end(token) {
+    if (!token || !this.enabled) return;
+    const depth = token - 1;
+    // An early return or a throw between begin and end leaves inner spans
+    // open. Closing them here (rather than asserting) keeps the ledger honest
+    // through exactly the code paths that fail.
+    while (this._stackName.length > depth) this.#pop();
+  }
+
+  #pop() {
+    const t = now();
+    const name = this._stackName.pop();
+    const start = this._stackStart.pop();
+    const childMs = this._stackChild.pop();
+    const total = t - start;
+    const parent = this._stackChild.length - 1;
+    if (parent >= 0) this._stackChild[parent] += total;
+    if (total < MIN_SPAN_MS) return;
+    const i = this._head;
+    this._names[i] = name;
+    this._starts[i] = start;
+    this._ends[i] = t;
+    this._selves[i] = Math.max(0, total - childMs);
+    this._head = (i + 1) % SPAN_RING;
+    if (this._filled < SPAN_RING) this._filled++;
+  }
+
+  /** `begin`/`end` around a synchronous call, with the return value passed through. */
+  run(name, fn) {
+    const t = this.begin(name);
+    try {
+      return fn();
+    } finally {
+      this.end(t);
+    }
+  }
+
+  /** Same, for an awaited call. Only the synchronous head is attributed. */
+  async runAsync(name, fn) {
+    const t = this.begin(name);
+    try {
+      return await fn();
+    } finally {
+      this.end(t);
+    }
+  }
+
+  /**
+   * Record a span that already happened (a measurement taken elsewhere).
+   * Used for work timed by another instrument — the compile wave's per-object
+   * timings, a worker round trip — so one report covers both.
+   */
+  note(name, startMs, endMs = now()) {
+    if (!this.enabled || endMs - startMs < MIN_SPAN_MS) return;
+    const i = this._head;
+    this._names[i] = name;
+    this._starts[i] = startMs;
+    this._ends[i] = endMs;
+    this._selves[i] = endMs - startMs;
+    this._head = (i + 1) % SPAN_RING;
+    if (this._filled < SPAN_RING) this._filled++;
+  }
+
+  // ------------------------------------------------------------ attribution
+
+  /**
+   * Owners of the window [from, to), by self time, largest first.
+   * `(unattributed)` is the remainder — real time in code nothing marks.
+   */
+  attribute(from, to, limit = 4) {
+    const byName = new Map();
+    let attributed = 0;
+    for (let k = 0; k < this._filled; k++) {
+      const i = (this._head - 1 - k + SPAN_RING * 2) % SPAN_RING;
+      const end = this._ends[i];
+      if (end < from) {
+        // The ring is chronological going backwards; once a span ends before
+        // the window there is nothing older that can overlap it.
+        break;
+      }
+      const start = this._starts[i];
+      if (start >= to) continue;
+      // Self time is not a span on the timeline (children were subtracted), so
+      // scale it by the fraction of the span that lies inside the window.
+      const total = end - start;
+      const inside = Math.min(end, to) - Math.max(start, from);
+      if (inside <= 0 || total <= 0) continue;
+      const ms = this._selves[i] * (inside / total);
+      if (ms < 0.05) continue;
+      byName.set(this._names[i], (byName.get(this._names[i]) ?? 0) + ms);
+      attributed += ms;
+    }
+    const owners = [...byName.entries()]
+      .map(([name, ms]) => ({ name, ms: +ms.toFixed(1) }))
+      .sort((a, b) => b.ms - a.ms)
+      .slice(0, limit);
+    const rest = to - from - attributed;
+    if (rest > 1 && rest > (to - from) * 0.15) {
+      owners.push({ name: "(unattributed)", ms: +rest.toFixed(1) });
+      owners.sort((a, b) => b.ms - a.ms);
+    }
+    return owners;
+  }
+
+  /**
+   * Record one node-graph build's cause at the time it happened, so a BLOCK
+   * can name the reason it froze rather than leaving the reader to correlate
+   * it against session-wide totals.
+   *
+   * The distinction matters because the two readings disagree: session totals
+   * on the user's Pool scene put `material key: side` on top, but that is 40
+   * builds spread over the whole boot, while ONE 724 ms block is what the
+   * user actually feels. Without this, "the biggest cause" and "the cause of
+   * the freeze" are silently assumed to be the same thing.
+   */
+  noteBuildCause(at, cause, ms) {
+    const ring = (this.buildCauseLog ??= []);
+    ring.push({ at, cause, ms });
+    if (ring.length > BUILD_CAUSE_RING) ring.splice(0, ring.length - BUILD_CAUSE_RING);
+  }
+
+  /** The build causes that fired inside one window, largest first. */
+  #causesWithin(from, to) {
+    const ring = this.buildCauseLog;
+    if (!ring?.length) return null;
+    const byCause = new Map();
+    for (const entry of ring) {
+      if (entry.at < from || entry.at > to) continue;
+      const row = byCause.get(entry.cause) ?? { name: entry.cause, count: 0, ms: 0 };
+      row.count++;
+      row.ms += entry.ms;
+      byCause.set(entry.cause, row);
+    }
+    if (!byCause.size) return null;
+    return [...byCause.values()]
+      .map((row) => ({ ...row, ms: +row.ms.toFixed(0) }))
+      .sort((a, b) => b.ms - a.ms)
+      .slice(0, 4);
+  }
+
+  /** Called by the observer for one long task. */
+  recordTask(start, duration) {
+    const owners = this.attribute(start, start + duration);
+    const causes = this.#causesWithin(start, start + duration);
+    const gpu = this.gpu.renderPipelines || this.gpu.computePipelines || this.gpu.shaderModules
+      ? { ...this.gpu }
+      : null;
+    this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0 };
+    const task = {
+      at: +start.toFixed(0),
+      ms: +duration.toFixed(0),
+      sinceBootMs: +(start - this.boot.t0).toFixed(0),
+      owners,
+      // Why the material graphs inside THIS block were rebuilt. Absent when
+      // the block contained no node build at all.
+      causes,
+      gpu,
+    };
+    this.tasks.push(task);
+    if (this.tasks.length > TASK_RING) this.tasks.splice(0, this.tasks.length - TASK_RING);
+    this.totals.tasks++;
+    this.totals.ms += duration;
+    if (duration > this.totals.worstMs) this.totals.worstMs = duration;
+    if (duration >= 100) this.totals.over100++;
+    if (duration >= 500) this.totals.over500++;
+    if (this.logging && duration >= LOG_MS) this.#log(task);
+    return task;
+  }
+
+  #log(task) {
+    const t = now();
+    if (t - this._logWindow > LOG_WINDOW_MS) { this._logWindow = t; this._logCount = 0; }
+    this._logCount++;
+    if (this._logCount === LOG_BUDGET + 1) {
+      console.warn(`[freeze] …more blocks this window; read profile.freezes for the rest`);
+      return;
+    }
+    if (this._logCount > LOG_BUDGET) return;
+    const who = task.owners.map((o) => `${o.name} ${o.ms}`).join(", ") || "unattributed";
+    const gpu = task.gpu
+      ? ` [sync gpu: ${task.gpu.renderPipelines}r/${task.gpu.computePipelines}c/${task.gpu.shaderModules}m` +
+        `${task.gpu.bytes ? `, ${(task.gpu.bytes / 1024).toFixed(0)}kB WGSL` : ""}]`
+      : "";
+    const why = task.causes?.length
+      ? ` [rebuilt: ${task.causes.map((c) => `${c.name} x${c.count}`).join(", ")}]`
+      : "";
+    console.warn(`[freeze] ${task.ms} ms — ${who}${gpu}${why}`);
+  }
+
+  /** The report `profile.freezes` returns. */
+  read({ limit = 20, sinceMs = 0 } = {}) {
+    const from = this.boot.t0 + sinceMs;
+    const tasks = this.tasks.filter((t) => t.at >= from);
+    const byOwner = new Map();
+    for (const task of tasks) {
+      for (const owner of task.owners) {
+        const row = byOwner.get(owner.name) ?? { name: owner.name, ms: 0, blocks: 0 };
+        row.ms += owner.ms;
+        row.blocks++;
+        byOwner.set(owner.name, row);
+      }
+    }
+    return {
+      observing: !!this._observer,
+      totals: {
+        ...this.totals,
+        ms: +this.totals.ms.toFixed(0),
+        worstMs: +this.totals.worstMs.toFixed(0),
+      },
+      worst: tasks.slice().sort((a, b) => b.ms - a.ms).slice(0, limit),
+      recent: tasks.slice(-limit),
+      byOwner: [...byOwner.values()]
+        .map((r) => ({ ...r, ms: +r.ms.toFixed(0) }))
+        .sort((a, b) => b.ms - a.ms)
+        .slice(0, limit),
+      // Every TSL node-graph build this session. This is three's
+      // `nodeBuilder.build()` — the graph walk and WGSL codegen — and it runs
+      // SYNCHRONOUSLY inside whatever frame first needs the program.
+      nodeBuilds: [...(this.nodeBuilds?.values() ?? [])]
+        .map((r) => ({ ...r, ms: +r.ms.toFixed(0), worstMs: +r.worstMs.toFixed(0), meanMs: +(r.ms / r.count).toFixed(1) }))
+        .sort((a, b) => b.ms - a.ms)
+        .slice(0, limit),
+      // WHY those builds happened. `first compile` is the unavoidable one —
+      // every material is built once. Anything else is a scene-wide input to
+      // three's dynamic cache key MOVING, which invalidates every material at
+      // once: `fog` is `scene.fogNode` (the water medium), `lights` is the
+      // light set changing, `context` is a new render target or pass.
+      nodeBuildCauses: [...(this.nodeBuildCauses?.values() ?? [])]
+        .map((r) => ({
+          name: r.name,
+          count: r.count,
+          ms: +r.ms.toFixed(0),
+          // The names, not just how many: a cause is only actionable once you
+          // know WHICH material is paying it. `side` on a glass material is a
+          // look decision the author can make; `side` on a name they do not
+          // recognise is a bug hunt.
+          materials: [...r.materials].slice(0, 6).join(", ") + (r.materials.size > 6 ? `, +${r.materials.size - 6}` : ""),
+        }))
+        .sort((a, b) => b.ms - a.ms)
+        .slice(0, limit),
+      // Which pipelines were built SYNCHRONOUSLY this session, by name. A
+      // count says a frame blocked; this says which module to fix.
+      syncPipelines: [...(this.syncPipelines?.values() ?? [])]
+        .map((r) => ({ ...r, ms: +r.ms.toFixed(1) }))
+        .sort((a, b) => b.ms - a.ms)
+        .slice(0, limit),
+    };
+  }
+
+  /**
+   * Empty the ledger so the next read measures ONE action.
+   *
+   * ⚠ The counters go too. They did not at first, and that is a trap with the
+   * shape this project keeps meeting: a before/after A/B would have cleared the
+   * blocks, left `nodeBuilds` and `syncPipelines` carrying the whole session,
+   * and read the "after" arm as no better — with the numbers looking perfectly
+   * plausible. Everything a report shows is cleared together or none of it is.
+   */
+  clear() {
+    this.tasks.length = 0;
+    this.totals = { tasks: 0, ms: 0, worstMs: 0, over100: 0, over500: 0 };
+    this.nodeBuilds?.clear();
+    this.nodeBuildCauses?.clear();
+    this.buildCauseLog = [];
+    this.syncPipelines?.clear();
+    this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0 };
+  }
+
+  // ------------------------------------------------------------- boot table
+
+  /**
+   * Close the open boot stage and open `name`. `null` closes without opening.
+   * The boot is the one timeline where a stage's WALL time (not its self time)
+   * is the number that matters, because stages overlap with GPU work on
+   * purpose — so this is a separate, tiny record rather than a span.
+   */
+  bootStage(name, detail = null) {
+    const t = now();
+    if (this.boot.openName) {
+      const stage = { name: this.boot.openName, ms: +(t - this.boot.openAt).toFixed(0), at: +(this.boot.openAt - this.boot.t0).toFixed(0) };
+      if (this.boot.openDetail) stage.detail = this.boot.openDetail;
+      this.boot.stages.push(stage);
+    }
+    this.boot.openName = name;
+    this.boot.openAt = t;
+    this.boot.openDetail = detail;
+  }
+
+  /** A stage that measured itself elsewhere (GI's own logs, an awaited load). */
+  bootMark(name, ms, detail = null) {
+    const stage = { name, ms: +ms.toFixed(0), at: +(now() - this.boot.t0 - ms).toFixed(0) };
+    if (detail) stage.detail = detail;
+    this.boot.stages.push(stage);
+  }
+
+  readBoot() {
+    const stages = this.boot.stages.slice();
+    if (this.boot.openName) {
+      stages.push({ name: this.boot.openName, ms: +(now() - this.boot.openAt).toFixed(0), at: +(this.boot.openAt - this.boot.t0).toFixed(0), open: true });
+    }
+    return {
+      sinceLoadMs: +(now() - this.boot.t0).toFixed(0),
+      stages,
+      blocked: {
+        tasks: this.totals.tasks,
+        ms: +this.totals.ms.toFixed(0),
+        worstMs: +this.totals.worstMs.toFixed(0),
+      },
+    };
+  }
+
+  /** One printable table, logged at "Editor ready" and at first light. */
+  logBoot(label) {
+    const boot = this.readBoot();
+    const rows = boot.stages
+      .filter((s) => s.ms >= 5)
+      .map((s) => `    ${String(s.ms).padStart(6)} ms  ${s.name}${s.detail ? `  (${s.detail})` : ""}`)
+      .join("\n");
+    console.log(
+      `[boot] ${label} at ${boot.sinceLoadMs} ms — main thread blocked ${boot.blocked.ms} ms ` +
+      `in ${boot.blocked.tasks} long task(s), worst ${boot.blocked.worstMs} ms\n${rows}`,
+    );
+  }
+}
+
+/**
+ * The one ledger. A module singleton rather than an engine field because the
+ * things that freeze the editor are not all inside the engine — the scene
+ * parse, the React mirror and the command bus are editor-side, and a boot
+ * table that could not see them would describe half a boot.
+ */
+export const freeze = new FreezeLedger();
+
+/**
+ * Start observing. Idempotent, safe in any host (a missing PerformanceObserver
+ * or an unsupported `longtask` type leaves the spans working and the tasks
+ * empty, which still powers the boot table).
+ */
+export function installFreezeObserver() {
+  if (freeze._observer || typeof PerformanceObserver === "undefined") return false;
+  try {
+    const observer = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) freeze.recordTask(entry.startTime, entry.duration);
+    });
+    observer.observe({ entryTypes: ["longtask"] });
+    freeze._observer = observer;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Span three's per-material NODE GRAPH BUILD — the other half of "a material
+ * compiles for an enormous time", and the half no existing instrument sees.
+ *
+ * `Nodes.getForRender(renderObject)` misses its cache the first time a program
+ * is needed and runs `nodeBuilder.build()`: the TSL graph walk and the WGSL
+ * codegen, measured at ~80-110 ms per GI-injected lit variant. It runs
+ * SYNCHRONOUSLY inside `renderer.render`, so it lands in the freeze ledger as
+ * `frame:renderEncode` with no further detail — indistinguishable from the
+ * driver compile that follows it, which has a completely different fix. This
+ * splits them.
+ *
+ * The span carries the material's name, so the answer to "which material
+ * froze the editor" is a name in the console line.
+ */
+export function installNodeBuildLedger(renderer) {
+  const nodes = renderer?._nodes;
+  if (!nodes || typeof nodes.getForRender !== "function" || nodes.__freezeLedgerInstalled) return false;
+  nodes.__freezeLedgerInstalled = true;
+  // Per-material totals, so a report can say "31 builds of MeshPhysicalNodeMaterial,
+  // 14 ms each" rather than "438 ms somewhere in three". The COUNT is the part
+  // that decides which fix applies: many cheap builds is a variant-count
+  // problem, few expensive ones is a graph-size problem, and they have nothing
+  // in common.
+  const builds = (freeze.nodeBuilds ??= new Map());
+  const causes = (freeze.nodeBuildCauses ??= new Map());
+  const original = nodes.getForRender.bind(nodes);
+
+  /**
+   * WHY a build happened, which the count alone cannot say.
+   *
+   * three keys its node-builder cache on `RenderObject.getCacheKey()`, and half
+   * of that is `getDynamicCacheKey()` — a key recomputed EVERY DRAW out of
+   * scene-wide state: the lights node, the environment node, `scene.fogNode`,
+   * the shadow-map mode, the renderer's context node. Every material in the
+   * scene shares those inputs, so one of them changing does not invalidate one
+   * program — it invalidates ALL of them, and the editor spends half a second
+   * rebuilding graphs for objects nobody touched.
+   *
+   * That is the difference between "59 builds" and a fix. Sampling the same
+   * inputs three does and reporting which one MOVED turns a wave into a name:
+   * `fog` is the water medium arming its underwater term, `lights` is a light
+   * being added or toggled, `context` is a new render target or pass.
+   */
+  const sampleKeyInputs = (renderObject) => {
+    const scene = renderObject?.scene;
+    const read = (fn) => { try { return fn(); } catch { return "?"; } };
+    return {
+      lights: read(() => renderObject?.lightsNode?.getCacheKey?.(true) ?? "-"),
+      fog: read(() => nodes.getFogNode?.(scene)?.getCacheKey?.() ?? "-"),
+      environment: read(() => nodes.getEnvironmentNode?.(scene)?.getCacheKey?.() ?? "-"),
+      shadowMap: read(() => `${renderer.shadowMap?.enabled}/${renderer.shadowMap?.type}`),
+      lighting: read(() => String(renderer.lighting?.enabled)),
+      context: read(() => `${renderer.contextNode?.id}/${renderer.contextNode?.version}`),
+    };
+  };
+  // The key inputs as they stood the last time THIS MATERIAL INSTANCE was
+  // built, keyed on `material.id` — three's per-instance counter.
+  //
+  // ⚠ NOT THE LABEL, and the first cut of this got it wrong in a way that
+  // read plausibly: a label is `material.name || material.type`, so all 28
+  // unnamed MeshPhysicalNodeMaterials in a scene share one. Keyed that way,
+  // 27 perfectly ordinary FIRST builds of 27 different materials reported as
+  // re-mints of one, and the section's largest row — the one a reader would
+  // go fix — was pure measurement error. A cause table that cannot tell "this
+  // material had never been built" from "this material was invalidated" is
+  // worse than no cause table, because it looks like an answer.
+  const lastInputsById = new Map();
+
+  /**
+   * The material's OWN key, field by field, the way three folds it.
+   *
+   * `RenderObject.getMaterialCacheKey()` walks every enumerable property of
+   * the material and hashes it, so a rebuild with no scene-wide input moving
+   * means one of those properties changed. A hash cannot say which; this can,
+   * and the answer is the difference between "materials rebuild, that is how
+   * it is" and a named thing to stop doing — a texture landing after the
+   * material was already drawn, a node slot wired a frame late, a flag toggled
+   * per frame. The filter and the number/texture formatting mirror three's
+   * exactly (r185 RenderObject.js), or the diff reports fields three ignores.
+   */
+  const SKIP_PROPERTY = /^(is[A-Z]|_)|^(visible|version|uuid|name|opacity|userData)$/;
+  const materialFields = (material, renderObject) => {
+    const fields = new Map();
+    if (!material) return fields;
+    const read = (key, fn) => { try { fields.set(key, String(fn())); } catch { fields.set(key, "?"); } };
+    // ⚠ THE REST OF three's KEY, not just the material's plain properties.
+    // `getMaterialCacheKey` also folds in the clipping context, the geometry
+    // key, skeleton size, instancing, the RENDER CONTEXT id and
+    // `receiveShadow` — and `customProgramCacheKey()`'s RETURN VALUE, which is
+    // where node identity and GI's roughness bucket enter.
+    //
+    // Without these the diff reported `material key: ?` — "something forked and
+    // I cannot say what" — which is the least useful answer an attribution can
+    // give. It came up on the exact case being chased (a mesh vanishing on
+    // select), so it is closed here rather than worked around.
+    read("customProgramCacheKey", () => material.customProgramCacheKey?.() ?? "");
+    if (renderObject) {
+      read("renderContext", () => renderObject.context?.id);
+      read("clippingContext", () => renderObject.clippingContextCacheKey);
+      read("geometry", () => renderObject.getGeometryCacheKey?.());
+      read("receiveShadow", () => renderObject.object?.receiveShadow);
+      read("bones", () => renderObject.object?.skeleton?.bones?.length ?? 0);
+      read("instanced", () => (renderObject.object?.isInstancedMesh ? renderObject.object.uuid : 0));
+    }
+    try {
+      for (const property in material) {
+        if (SKIP_PROPERTY.test(property)) continue;
+        const value = material[property];
+        // Read explicitly above by CALLING it; stringifying the function shows
+        // only the wrapper's source, which never changes even when GI's bucket
+        // flips the value it returns.
+        if (typeof value === "function") continue;
+        let valueKey;
+        if (value === null || value === undefined) valueKey = String(value);
+        else if (typeof value === "number") valueKey = property === "side" ? String(value) : (value !== 0 ? "1" : "0");
+        else if (typeof value === "object") valueKey = value.isTexture ? `tex:${value.mapping},${value.magFilter},${value.minFilter},${value.wrapS},${value.wrapT}` : "{}";
+        else valueKey = String(value);
+        fields.set(property, valueKey);
+      }
+    } catch { /* a getter that throws mid-rebuild is not worth losing the row over */ }
+    return fields;
+  };
+  const lastFieldsById = new Map();
+
+  // `nodeBuilderCache` is three's own map; a hit means no build happened, and
+  // spanning a hit would bury the misses under thousands of 0 ms rows.
+  nodes.getForRender = function (renderObject) {
+    if (!freeze.enabled) return original(renderObject);
+    const cache = this.nodeBuilderCache;
+    const hit = cache ? cache.has(renderObject.initialCacheKey) : false;
+    if (hit) return original(renderObject);
+    const material = renderObject?.material;
+    const label = material?.name || material?.type || "?";
+    const token = freeze.begin(`material:nodeBuild ${label}`);
+    const t0 = now();
+    try {
+      return original(renderObject);
+    } finally {
+      freeze.end(token);
+      const ms = now() - t0;
+      const row = builds.get(label) ?? { name: label, count: 0, ms: 0, worstMs: 0 };
+      row.count++;
+      row.ms += ms;
+      if (ms > row.worstMs) row.worstMs = ms;
+      builds.set(label, row);
+
+      const inputs = sampleKeyInputs(renderObject);
+      const id = material?.id ?? material?.uuid ?? label;
+      const before = lastInputsById.get(id);
+      lastInputsById.set(id, inputs);
+      const fields = materialFields(material, renderObject);
+      const beforeFields = lastFieldsById.get(id);
+      lastFieldsById.set(id, fields);
+      const changedFields = beforeFields
+        ? [...fields.keys()].filter((key) => fields.get(key) !== beforeFields.get(key))
+          .concat([...beforeFields.keys()].filter((key) => !fields.has(key)))
+          .sort()
+        : [];
+      // Every material must be built ONCE, and no amount of work removes that.
+      // A build of a material that was never built is `first compile`; a
+      // SECOND build of the same material is a re-mint, and the cause is
+      // whichever shared input moved since its last one. `material variant` is
+      // the honest answer when nothing shared moved — the material's own key
+      // forked (a node slot, a define, a new instance), which is legitimate
+      // and is nobody's bug.
+      let cause;
+      if (!before) {
+        cause = "first compile";
+      } else {
+        const moved = Object.keys(inputs).filter((field) => inputs[field] !== before[field]);
+        // This exact material was built before and no shared input moved, so
+        // its OWN key forked. Name the fields that moved: a material whose
+        // `map` went null → texture was DRAWN BEFORE IT WAS READY, and that
+        // first build was pure waste.
+        cause = moved.length ? moved.join("+") : `material key: ${changedFields.slice(0, 4).join(",") || "?"}`;
+      }
+      freeze.noteBuildCause(t0, cause, ms);
+      const causeRow = causes.get(cause) ?? { name: cause, count: 0, ms: 0, materials: new Set() };
+      causeRow.count++;
+      causeRow.ms += ms;
+      causeRow.materials.add(label);
+      causes.set(cause, causeRow);
+    }
+  };
+  return true;
+}
+
+/**
+ * Count and span the synchronous GPU-object creation a JS profile cannot see.
+ *
+ * ⭐ THE CLASS THIS EXISTS FOR: `createShaderModule` parses and validates a
+ * material's 180-250 kB of WGSL ON THE CALLING THREAD. It lands in the
+ * profiler as "(program)" with no stack, so three sessions of this project
+ * attributed those blocks to whatever JS happened to be on the stack. Here
+ * they are their own spans, and their count rides every long task's report.
+ */
+export function installGpuCallLedger(device) {
+  if (!device || device.__freezeLedgerInstalled) return false;
+  device.__freezeLedgerInstalled = true;
+
+  // module → WGSL length, so a pipeline can report the size of the shader it
+  // is compiling. The descriptor carries a GPUShaderModule, not the source.
+  const moduleBytes = new WeakMap();
+
+  /**
+   * Who compiled synchronously, and how big it was. A count alone says "41
+   * compute pipelines blocked a frame" and leaves you guessing which module
+   * owns them; this names them, which is the difference between a finding and
+   * a lead.
+   */
+  const offenders = new Map();
+  freeze.syncPipelines = offenders;
+
+  const describe = (descriptor, stage) => {
+    const label = descriptor?.label;
+    if (label) return String(label).slice(0, 80);
+    const entry = stage?.entryPoint;
+    const mod = stage?.module;
+    const bytes = mod ? moduleBytes.get(mod) : 0;
+    return `${entry ?? "?"}${bytes ? ` (${(bytes / 1024).toFixed(0)}kB)` : ""}`;
+  };
+
+  const wrap = (method, name, counter, meta) => {
+    const original = device[method];
+    if (typeof original !== "function") return;
+    device[method] = function (descriptor, ...rest) {
+      if (!freeze.enabled) return original.call(this, descriptor, ...rest);
+      const t0 = now();
+      const token = freeze.begin(name);
+      try {
+        return original.call(this, descriptor, ...rest);
+      } finally {
+        freeze.end(token);
+        const ms = now() - t0;
+        freeze.gpu[counter]++;
+        freeze.gpu.ms += ms;
+        const info = meta?.(descriptor);
+        if (info) {
+          freeze.gpu.bytes += info.bytes ?? 0;
+          const key = `${counter}:${info.name}`;
+          const row = offenders.get(key) ?? { kind: counter, name: info.name, count: 0, ms: 0, bytes: info.bytes ?? 0 };
+          row.count++;
+          row.ms += ms;
+          offenders.set(key, row);
+        }
+      }
+    };
+  };
+
+  wrap("createShaderModule", "gpu:shaderModule", "shaderModules", (d) => {
+    const bytes = d?.code?.length ?? 0;
+    return { name: null, bytes };
+  });
+  wrap("createRenderPipeline", "gpu:renderPipeline(sync)", "renderPipelines", (d) => ({
+    name: describe(d, d?.fragment ?? d?.vertex),
+    bytes: 0,
+  }));
+  wrap("createComputePipeline", "gpu:computePipeline(sync)", "computePipelines", (d) => ({
+    name: describe(d, d?.compute),
+    bytes: 0,
+  }));
+
+  // ⭐ THE **ASYNC** PIPELINE CALLS BLOCK TOO, AND THEY WERE NOT MEASURED.
+  //
+  // `createRenderPipelineAsync` returns a promise, which reads as "this does
+  // not block" — and that reading is why `(unattributed)` stayed the largest
+  // owner of every boot measured on 2026-09-07 (~1.1 s across ~11 blocks).
+  // The promise only covers the DRIVER's compile. Everything before it — WGSL
+  // parsing, reflection, layout validation — runs synchronously on the calling
+  // thread inside the call, and the blocks in question were creating pipelines
+  // over 380-980 kB of WGSL while the wrapped SYNC calls in them accounted for
+  // 1.5 ms.
+  //
+  // Only the call itself is spanned, never the promise: charging a block for
+  // the driver's own threads would be the opposite error, and this project has
+  // made it before (a boot probe that timestamped console lines at receipt
+  // time turned a 7 s boot into a reported 21.7 s).
+  const wrapAsync = (method, name, counter, meta) => {
+    const original = device[method];
+    if (typeof original !== "function") return;
+    device[method] = function (descriptor, ...rest) {
+      if (!freeze.enabled) return original.call(this, descriptor, ...rest);
+      const t0 = now();
+      const token = freeze.begin(name);
+      try {
+        return original.call(this, descriptor, ...rest);
+      } finally {
+        freeze.end(token);
+        const ms = now() - t0;
+        freeze.gpu[counter]++;
+        freeze.gpu.ms += ms;
+        const info = meta?.(descriptor);
+        if (info) {
+          const key = `${counter}:${info.name}`;
+          const row = offenders.get(key) ?? { kind: counter, name: info.name, count: 0, ms: 0, bytes: 0 };
+          row.count++;
+          row.ms += ms;
+          offenders.set(key, row);
+        }
+      }
+    };
+  };
+  wrapAsync("createRenderPipelineAsync", "gpu:renderPipeline(async call)", "renderPipelines", (d) => ({
+    name: `${describe(d, d?.fragment ?? d?.vertex)} [async]`,
+  }));
+  wrapAsync("createComputePipelineAsync", "gpu:computePipeline(async call)", "computePipelines", (d) => ({
+    name: `${describe(d, d?.compute)} [async]`,
+  }));
+
+  // Record every module's source length as it is created, so the pipeline
+  // wrappers above can size what they are compiling.
+  const rawShaderModule = device.createShaderModule;
+  const wrappedShaderModule = device.createShaderModule;
+  device.createShaderModule = function (descriptor, ...rest) {
+    const module = wrappedShaderModule.call(this, descriptor, ...rest);
+    if (module && descriptor?.code) moduleBytes.set(module, descriptor.code.length);
+    return module;
+  };
+  void rawShaderModule;
+  return true;
+}

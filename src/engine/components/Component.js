@@ -15,9 +15,97 @@ const RESERVED_PROP_KEYS = new Set([
   "type",
   "props",
   "enabled",
+  "editorEnabled",
   "viewOnly",
   "constructor",
 ]);
+
+/**
+ * ── WHICH PROPERTIES ARE "STRUCTURE" (2026-09-07, ZERO_FREEZE_PLAN §1.1) ────
+ *
+ * THE FAILURE: `setProp` emitted "hierarchy-changed" for EVERY property of
+ * EVERY component, and that event reaches ~20 listeners that each WALK THE
+ * SCENE — the React mirror, `merging.invalidate`, `shadowMerge`,
+ * `batching.invalidate`, `OcclusionSystem`, GI's rebake fingerprint,
+ * `PhysicsSystem.prewarmAutoColliders`, the selection outline, the
+ * selection-mask prewarm, the live-preview `exportGame()`. A boolean on a
+ * light and a re-parent of 5 000 entities therefore delivered the IDENTICAL
+ * signal; that is the user's "changing a parameter freezes the editor", and,
+ * once per `pointermove`, why a slider drag stalls the editor.
+ *
+ * THE RULE NOW: a property emits "hierarchy-changed" only when it is
+ * STRUCTURAL — when the change adds or removes something from the scene
+ * graph, or moves a mesh in or out of a set some system BAKES (shadowMerge's
+ * caster set, merging's groups, a decal's projection targets). Everything
+ * else emits only "component-changed", which carries entityId/componentType/
+ * key and which every system with a precise interest already subscribes to
+ * (merging and batching filter it by componentType, physics by key, GI
+ * re-queues its rebake check from it, the mirror re-reads one entity).
+ *
+ * Four ways to be structural, checked in this order:
+ *   1. the schema descriptor says so — `{ key: "path", …, structural: true }`;
+ *   2. the class lists it — `static structuralProps = ["path"]`;
+ *   3. the table below, for keys that predate the marker;
+ *   4. the component has NOT overridden `onPropChanged`, so the base
+ *      implementation rebuilds it by `onDetach(); onAttach()` on EVERY prop —
+ *      it literally replaces its objects in the scene graph, which is
+ *      structural by definition (Cloth, Pool, PlanarReflection, Joint, Bone,
+ *      ImpulseSource, LevelFloor today).
+ *
+ * ⚠ The table lives here rather than in each component's own schema because
+ * these keys' structural meaning is owned by the LISTENERS, not the component:
+ * `shadowMerge` subscribes to "hierarchy-changed" ALONE (no component-changed
+ * hook at all), so a `castShadow` or geometry swap that stopped emitting it
+ * would leave the shadow merge baking a caster set that no longer exists —
+ * a stale silhouette standing where the object used to be. A NEW property
+ * should declare `structural: true` in its own schema instead of growing this.
+ *
+ * `globalThis.__engineStructuralProps = false` restores the old behaviour
+ * (every prop structural) for a one-boot A/B.
+ */
+const STRUCTURAL_PROPS = new Map([
+  // Geometry/material swaps change what merging groups, what shadowMerge bakes
+  // into its proxies, what batching can instance and what a decal projects
+  // onto. `collision` is NOT here: PhysicsSystem has a component-changed hook
+  // keyed on exactly ["geometry","geometryAsset","collision"]. The gi* trio is
+  // not here either: GISystem re-queues its rebake check from
+  // "component-changed" with no key filter.
+  ["mesh", ["geometry", "geometryAsset", "material", "material2", "material3", "material4", "material5", "material6", "material7", "material8", "castShadow", "receiveShadow"]],
+  ["skinnedmesh", ["geometry", "material", "castShadow", "receiveShadow"]],
+  ["model", ["path", "castShadow", "receiveShadow"]],
+  ["objModel", ["path", "castShadow", "receiveShadow"]],
+  // Every one of these regenerates the swept tube — a different geometry in
+  // the graph, not a different value on the same one.
+  ["splineMesh", ["path", "profile", "width", "height", "radius", "sides", "density", "capEnds", "material", "castShadow", "receiveShadow"]],
+  // LightComponent.onPropChanged replaces the THREE.Light instance for these
+  // (see its own comment: three must not retain an AnalyticLightNode compiled
+  // against the old shadow node), so the object in the scene is a new one.
+  // `intensity`, `color`, the csm tuning and every shadow-camera number write
+  // in place and are NOT structural — the light-intensity edit this whole unit
+  // exists for.
+  ["light", ["kind", "castShadow", "shadowMode", "shadowMapType", "csm", "csmCascades", "csmFade"]],
+  // Instancing count/mode/source add and remove InstancedMesh objects.
+  ["instancer", ["mode", "count", "pathEntity"]],
+  // The impostor bakes a billboard from another entity and swaps it in.
+  ["impostor", ["source", "castShadow", "receiveShadow"]],
+]);
+
+/**
+ * The structural key set for a component class, computed once per class.
+ *
+ * Memoised because `setProp` runs on the pointermove path: a linear scan of
+ * LightComponent's 28-entry schema per scrub frame is the kind of cost this
+ * unit exists to delete. `hasOwnProperty` so a subclass never inherits its
+ * parent's set.
+ */
+function structuralKeysFor(cls) {
+  if (Object.prototype.hasOwnProperty.call(cls, "__structuralKeys")) return cls.__structuralKeys;
+  const set = new Set(STRUCTURAL_PROPS.get(cls.type) ?? []);
+  for (const key of cls.structuralProps ?? []) set.add(key);
+  for (const entry of cls.schema ?? []) if (entry?.structural === true && entry.key) set.add(entry.key);
+  Object.defineProperty(cls, "__structuralKeys", { value: set, configurable: true });
+  return set;
+}
 
 /**
  * Install get/set mirrors for every authored prop so scripts can write
@@ -71,6 +159,25 @@ function installPropAccessors(component) {
  *   static schema     — property descriptors used by the inspector:
  *                       [{ key, label, type: "number"|"color"|"select"|"text"|"boolean",
  *                          min?, max?, step?, options? }]
+ *
+ *                       A descriptor may also declare `module: "<moduleId>"`
+ *                       when the property only does something while an
+ *                       OPTIONAL module is enabled (MeshComponent's
+ *                       `collision` belongs to physics-rapier, its `gi*`
+ *                       selects to gi). The inspector hides such a row until
+ *                       that module is installed and groups the installed
+ *                       ones under the module's name. For a select whose
+ *                       OPTION list is what depends on a module (the light's
+ *                       "gi" shadow source), `optionModules` maps option
+ *                       value → module id and the module's absence removes
+ *                       just that choice.
+ *
+ *                       A descriptor may declare `structural: true` when
+ *                       changing that property adds or removes something from
+ *                       the scene graph (see STRUCTURAL_PROPS above). Default
+ *                       false: an ordinary value edit notifies only
+ *                       "component-changed", not the ~20 scene-walking
+ *                       listeners of "hierarchy-changed".
  * and may override onAttach/onDetach/onPropChanged.
  *
  * Constructed with just `props` — `new MeshComponent({ geometry: "sphere" })`
@@ -194,7 +301,19 @@ export class Component extends EventEmitter {
   get enabled() {
     if (this._enabledOverride === false) return false;
     if (this._enabledOverride === true) return true;
+    // Paused for editing: off while the editor is stopped, on in play mode.
+    if (this.props.editorEnabled === false && !this.entity?.engine?.playing) return false;
     return this.props.enabled !== false;
+  }
+
+  /**
+   * True for a component with no onDisable/onEnable of its own. Disabling
+   * such a component DETACHES it (onDetach; onAttach again when enabled), so
+   * "disabled" always means "does nothing" — a component that never opted in
+   * used to keep rendering and ticking with its eye switched off.
+   */
+  get stopsByDetaching() {
+    return this.onDisable === Component.prototype.onDisable && this.onEnable === Component.prototype.onEnable;
   }
 
   /**
@@ -227,8 +346,10 @@ export class Component extends EventEmitter {
   onPropChanged() {
     // A prop change on a component its entity has detached (the entity is
     // disabled) must not attach it: the props are stored, and the entity's
-    // reconcile attaches from them when it becomes active.
+    // reconcile attaches from them when it becomes active. Likewise one that
+    // is disabled and stops by detaching: it is built from its props on enable.
     if (this._attached === false) return;
+    if (!this._enabled && this.stopsByDetaching) return;
     this.onDetach();
     this.onAttach();
   }
@@ -247,9 +368,24 @@ export class Component extends EventEmitter {
     // No hooks on a detached component: there is no state to enable or
     // disable, and `onAttach` reads `this.enabled` when the entity comes back.
     if (this._attached === false) return true;
-    if (effective) this.onEnable();
+    if (this.stopsByDetaching) {
+      if (effective) this.onAttach();
+      else this.onDetach();
+    } else if (effective) this.onEnable();
     else this.onDisable();
     return true;
+  }
+
+  /**
+   * Persisted setter for "works while editing". Off, the component does
+   * nothing while the editor is stopped (the same stop as `enabled` false)
+   * and resumes the moment play starts. Writes `props.editorEnabled`.
+   */
+  setEditorEnabled(value) {
+    const next = value !== false;
+    if (next === (this.props.editorEnabled !== false)) return false;
+    this.props.editorEnabled = next;
+    return this.reconcileEnabled();
   }
 
   /**
@@ -280,12 +416,30 @@ export class Component extends EventEmitter {
     return this.reconcileEnabled();
   }
 
+  /**
+   * Whether changing `key` is a change to the SCENE'S STRUCTURE — see
+   * STRUCTURAL_PROPS at the top of this file for what that buys and what it
+   * costs to get it wrong. Public so the editor (and the tests) can ask the
+   * same question the emit path asks.
+   */
+  isStructuralProp(key) {
+    // THE HATCH: `globalThis.__engineStructuralProps = false` makes every prop
+    // structural again, i.e. restores the pre-2026-09-07 fan-out, so a
+    // regression can be A/B'd in one boot without a rebuild.
+    if (globalThis.__engineStructuralProps === false) return true;
+    if (structuralKeysFor(this.constructor).has(key)) return true;
+    // A component that has not overridden onPropChanged is rebuilt by
+    // `onDetach(); onAttach()` on every prop change — its objects leave and
+    // re-enter the scene graph, which no listener can hear any other way.
+    return this.onPropChanged === Component.prototype.onPropChanged;
+  }
+
   setProp(key, value) {
-    if (key === "enabled") {
-      // Routing through setEnabled so the onEnable/onDisable hooks fire
+    if (key === "enabled" || key === "editorEnabled") {
+      // Routing through the setters so the onEnable/onDisable hooks fire
       // and `_enabled` stays in sync. Skip the generic onPropChanged
       // (which would detach/reattach and tear down three.js state).
-      const changed = this.setEnabled(value);
+      const changed = key === "enabled" ? this.setEnabled(value) : this.setEditorEnabled(value);
       if (changed) {
         const engine = this.entity?.engine;
         engine?.emit?.("component-changed", {
@@ -293,6 +447,10 @@ export class Component extends EventEmitter {
           componentType: this.type,
           key,
         });
+        // ALWAYS STRUCTURAL: a disabled component detaches (Entity.
+        // reconcileActivity) — its mesh leaves the scene graph, its collider
+        // stops existing, its light is removed from the lighting graph. Every
+        // scene-walking listener has to re-read.
         engine?.emit?.("hierarchy-changed");
         this.emit("changed", key);
       }
@@ -319,15 +477,20 @@ export class Component extends EventEmitter {
     // Detached (the entity is disabled): store the prop, react on re-attach.
     // Gated here rather than in each subclass's onPropChanged, several of
     // which re-run `this.onAttach()` themselves.
-    if (this._attached !== false) this.onPropChanged(key, value);
+    // Nor on one disabled and stopped by detaching: nothing is built to react,
+    // and a subclass that rebuilds itself on a prop change must not wake it.
+    if (this._attached !== false && (this._enabled || !this.stopsByDetaching)) this.onPropChanged(key, value);
     // Two events, both for editor consumers:
-    //   - "component-changed" is a precise signal — the camera follow
-    //     section uses it to know exactly which entity/component changed
-    //     and skip noise from other entities.
-    //   - "hierarchy-changed" piggy-backs the existing sceneStore refresh
-    //     so the React mirror re-reads the entity's props and controlled
-    //     inputs (camera's follow checkboxes, show-preview toggle, …)
-    //     reflect the latest value instead of going stale.
+    //   - "component-changed" is the PRECISE signal and it fires for every
+    //     property: it carries entityId/componentType/key, the React mirror
+    //     re-reads exactly that one entity from it (sceneStore.refreshEntity),
+    //     and the camera-follow section, merging, batching, physics and GI all
+    //     filter it down to what they actually care about.
+    //   - "hierarchy-changed" is the SCENE-WIDE signal — ~20 listeners that
+    //     each walk the scene — and now fires only for a STRUCTURAL property
+    //     (see STRUCTURAL_PROPS at the top of this file). It used to fire for
+    //     every property of every component, which is the fan-out behind
+    //     "changing a parameter freezes the editor".
     // "changed" is the local, per-instance equivalent for scripts/other
     // components listening on THIS component specifically.
     const engine = this.entity?.engine;
@@ -336,7 +499,7 @@ export class Component extends EventEmitter {
       componentType: this.type,
       key,
     });
-    engine?.emit?.("hierarchy-changed");
+    if (this.isStructuralProp(key)) engine?.emit?.("hierarchy-changed");
     this.emit("changed", key);
   }
 

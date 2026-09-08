@@ -5,10 +5,42 @@ import { editorFrameRateFor, shouldSuspendViewport } from "./framePolicy.js";
 import { onAssetInvalidated } from "./assetLoader.js";
 import { useHistoryStore } from "./commands/CommandBus.js";
 import { useSelectionStore } from "./store/selectionStore.js";
+import { useGeometryEditStore } from "./store/geometryEditStore.js";
 import { isViewportFreezeEnabled, onViewportFreezeChanged } from "./viewportFreeze.js";
 
 // Re-exported so existing importers (and the smokes) keep working.
 export { editorFrameRateFor, shouldSuspendViewport };
+
+/**
+ * The engine events that mean "the viewport would draw something different".
+ *
+ * ⛔⛔ **"component-changed" IS THE MOST IMPORTANT ENTRY, AND IT WAS MISSING.**
+ * This list began as a single "hierarchy-changed" subscription, back when
+ * `setProp` emitted that for EVERY property — so one line woke the viewport for
+ * every edit in the editor. The structural-prop split (ZERO_FREEZE §1.1,
+ * `Component.isStructuralProp`) took that away deliberately and correctly: a
+ * light's intensity does not need ~20 scene walks. But it also took away the
+ * WAKE, and a suspended viewport then held the old picture until something
+ * structural happened to it.
+ *
+ * "most prop changes do not display immediately in the editor, only after
+ * restarting the editor" (user, 2026-09-08). Restarting was not fixing
+ * anything — it was just the next thing that woke the loop.
+ *
+ * ⚠ That was the SECOND consumer to lose the same signal (PostprocessPanel had
+ * already re-subscribed its own refresh), which is the sign it belongs in one
+ * named list rather than scattered `engine.on` calls: anything that rode
+ * "hierarchy-changed" to mean "something changed" now needs the precise event
+ * too. `wake` is one timestamp write and the deadline coalesces it, so a slider
+ * drag costs exactly what it did before.
+ */
+export const VIEWPORT_WAKE_EVENTS = Object.freeze([
+  "hierarchy-changed",
+  "component-changed",
+  "settings-changed",
+  "entity-spawned",
+  "renderer-rebuilt",
+]);
 
 const SAMPLE_MS = 250;
 const UI_PRIORITY_MS = 350;
@@ -269,6 +301,89 @@ export function installEditorFramePacing() {
     // orbit" report: the bursts follow the edits. Play mode is exempt as
     // always. The deferred work resumes the moment the gesture ends; a GI
     // rebuild finishing an orbit later is invisible, a stuttering orbit is not.
+    // ── THE WHOLE GEOMETRY SESSION, NOT JUST A DRAG IN IT (2026-09-07) ────
+    //
+    // Entering Edit Mode mounts `.scene-geometry-editor-overlay`, which is
+    // `inset: 0` over the viewport panel with an opaque background — the main
+    // canvas is COVERED for the entire session — and the geometry editor draws
+    // through its own `WebGPURenderer` and its own `requestAnimationFrame`
+    // loop, so it needs nothing from the engine's. Until now the engine kept
+    // ticking and rendering that hidden canvas at full rate for as long as the
+    // user stayed in Edit Mode: the water solver dispatching its FFT chain
+    // every frame, GI's g-buffer prepass rendering the whole scene again,
+    // batching/merging/impostors re-grouping, the selection outline compositing
+    // — all of it into a canvas nobody can see, competing for the one main
+    // thread the geometry editor is trying to draw and pick on. That is the
+    // user's report: "when entering geometry editing mode, all the components
+    // currently ticking in the editor viewport must be stopped: they must be
+    // causing freezes and lags in the geometry editor".
+    //
+    // ⚠ THE LOOP IS STOPPED, NOT THE RENDER. `engine.renderSuspended` is
+    // GI's flag (it owns it for the compile wave) and, worse, suspending the
+    // draw while still running preRender re-creates the ShadowFreeze hazard
+    // documented in Engine.#tick: `shadowFreeze.update()` must never run on a
+    // tick that does not draw, or a light's map latches off for the session.
+    // `host.stop()` has no half-frames and cannot hit it.
+    //
+    // ⚠ AND IT OVERRIDES THE PIN. A GI rebuild queued by the previous edit
+    // would otherwise hold the loop UNCAPPED for seconds — which is exactly
+    // the thread the user is trying to orbit and select with. Resume is
+    // immediate on exit (the store subscription below calls `apply`), which
+    // matters because the virtual-geometry re-cluster a geometry save queues
+    // is deferred to the engine tick.
+    // TWO facts, not one — see geometryEditStore's header. `entityId` means the
+    // viewport is COVERED by the overlay (Tab / the Inspector button), so
+    // nothing the engine draws can be seen and the loop can stop outright.
+    // `sessions` means an editor is open by ANY path, including the docked
+    // panel that sets no `entityId` and sits beside a possibly-visible
+    // viewport — there the simulation still has no business running, but the
+    // viewport may still need to draw, so it is capped rather than stopped.
+    const geometryState = useGeometryEditStore.getState();
+    const geometryOpen = !engine.playing && geometryState.sessions > 0;
+    const geometrySession = !engine.playing
+      && (!!geometryState.entityId || (geometryOpen && !viewportVisible()));
+    if (geometryOpen && !geometrySession) {
+      // Editor open beside a live viewport: stop the world, keep the picture.
+      if (!engine.simulationSuspended) {
+        engine.suspendSimulation("geometry-edit");
+        console.log(
+          "[editor] geometry editor open: simulation, GI and the rebuild systems are held "
+            + "(the viewport is still visible, so it keeps drawing at the catch-up rate)",
+        );
+      }
+      if (suspended) {
+        suspended = false;
+        host.start();
+      }
+      if (applied !== DIRTY_FPS) {
+        applied = DIRTY_FPS;
+        engine.setFrameRateLimit(DIRTY_FPS);
+      }
+      return;
+    }
+    if (geometrySession) {
+      if (!engine.simulationSuspended) {
+        engine.suspendSimulation("geometry-edit");
+        // Said out loud, because "did the suspension actually engage?" is the
+        // first question when someone reports the geometry editor still
+        // lagging, and there is no other way to tell from the outside: a
+        // stopped loop and a busy one look identical in a screenshot.
+        console.log(
+          "[editor] geometry edit mode: engine loop STOPPED (simulation, GI, rebuild systems and the main "
+            + "viewport render are all held until you leave Edit Mode)",
+        );
+      }
+      if (!suspended && host.loopActive) {
+        suspended = true;
+        host.stop();
+      }
+      return;
+    }
+    if (engine.simulationSuspended) {
+      engine.resumeSimulation("geometry-edit");
+      console.log("[editor] geometry edit mode ended: engine loop resumed");
+    }
+
     const gesture = engine.playing ? null : activeGesture();
     if (gesture === "geometry") {
       if (!viewportVisible()) {
@@ -380,10 +495,7 @@ export function installEditorFramePacing() {
   onViewportFreezeChanged(apply);
 
   // Everything that changes what the viewport would draw.
-  engine.on("hierarchy-changed", wake);
-  engine.on("settings-changed", wake);
-  engine.on("entity-spawned", wake);
-  engine.on("renderer-rebuilt", wake);
+  for (const event of VIEWPORT_WAKE_EVENTS) engine.on(event, wake);
   // A texture saved in the Texture Editor, a material recompiled, a geometry
   // rewritten — all land here.
   onAssetInvalidated(wake);
@@ -394,6 +506,15 @@ export function installEditorFramePacing() {
   useHistoryStore.subscribe(wake);
   // Selection drives the outline and the gizmo, which are drawn, not DOM.
   useSelectionStore.subscribe(wake);
+  // Entering and LEAVING Edit Mode must both take effect now rather than at
+  // the next 250 ms sample: on the way in because the session's first frames
+  // are the ones that feel worst, and on the way out because the geometry
+  // save queues work (virtual-geometry re-clustering, a GI rebake check) that
+  // is deferred to the engine tick and must not wait for a sampler.
+  useGeometryEditStore.subscribe(() => {
+    wake();
+    apply();
+  });
 
   setInterval(apply, SAMPLE_MS);
 }

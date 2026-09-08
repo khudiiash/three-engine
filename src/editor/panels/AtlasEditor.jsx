@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { accentAlpha, currentAccent } from "../accent.js";
 import {
   Brush,
   Crosshair,
@@ -18,7 +19,7 @@ import {
   Wand2,
   ZoomIn,
   ZoomOut,
-} from "lucide-react";
+} from "../icons/index.jsx";
 import { basename } from "../store/projectStore.js";
 import { pushToast } from "../toasts.js";
 import { ContextMenu } from "../ContextMenu.jsx";
@@ -446,10 +447,10 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
       const [rx, ry, rw, rh] = region.rect;
       const isSelected = region.name === selected;
       ctx.lineWidth = 1;
-      ctx.strokeStyle = isSelected ? "#0a84ff" : "rgba(255,255,255,0.42)";
+      ctx.strokeStyle = isSelected ? currentAccent() : "rgba(255,255,255,0.42)";
       ctx.strokeRect(x + rx * zoom + 0.5, y + ry * zoom + 0.5, rw * zoom - 1, rh * zoom - 1);
       if (isSelected) {
-        ctx.fillStyle = "rgba(10,132,255,0.12)";
+        ctx.fillStyle = accentAlpha(0.12);
         ctx.fillRect(x + rx * zoom, y + ry * zoom, rw * zoom, rh * zoom);
 
         // Nine-slice guides, drawn only for the selected region: four of these
@@ -482,7 +483,7 @@ function AtlasCanvas({ def, image, selected, onSelect, onCreate, onUpdateRegion 
         ctx.stroke();
 
         // Corner handles.
-        ctx.fillStyle = "#0a84ff";
+        ctx.fillStyle = currentAccent();
         for (const [hx, hy] of [
           [rx, ry],
           [rx + rw, ry],

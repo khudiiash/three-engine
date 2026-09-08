@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Film } from "lucide-react";
+import { Film } from "../icons/index.jsx";
 import { useSceneStore } from "../store/sceneStore.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";

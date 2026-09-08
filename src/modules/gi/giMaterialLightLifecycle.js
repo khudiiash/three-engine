@@ -66,20 +66,37 @@ export function captureGiMaterialLightShape(light) {
   return { refs, flags, nested: nestedRefs(light) };
 }
 
-/** True only when an existing material graph can keep using this light. */
-export function giMaterialLightShapeMatches(snapshot, light) {
-  if (!snapshot || !light) return false;
+/**
+ * WHY a light cannot be reused — the field that moved, or null when it can.
+ *
+ * ⭐ THIS ANSWER IS WORTH MORE THAN THE BOOLEAN (2026-09-07). A `false` here
+ * costs the whole material set: the light is replaced with a fresh id, the
+ * node-builder cache is purged, and three re-runs `nodeBuilder.build()` for
+ * every material on its next draw — which the freeze ledger prices at
+ * **150-210 ms EACH** (`material:nodeBuild MeshPhysicalNodeMaterial 209 ms`,
+ * user's Pool scene). On a 90-material scene that is the difference between a
+ * GI property edit costing a second and costing twenty. The boolean says a
+ * re-warm happened; only the field name says whether it had to.
+ */
+export function giMaterialLightShapeDiff(snapshot, light) {
+  if (!snapshot) return "no previous light";
+  if (!light) return "no new light";
   for (const key of REF_FIELDS) {
-    if (snapshot.refs[key] !== (light[key] ?? null)) return false;
+    if (snapshot.refs[key] !== (light[key] ?? null)) return `ref:${key}`;
   }
   for (const key of FLAG_FIELDS) {
-    if (snapshot.flags[key] !== (light[key] ?? null)) return false;
+    if (snapshot.flags[key] !== (light[key] ?? null)) return `flag:${key}`;
   }
   const next = nestedRefs(light);
   for (const key of Object.keys(snapshot.nested)) {
-    if (snapshot.nested[key] !== next[key]) return false;
+    if (snapshot.nested[key] !== next[key]) return `nested:${key}`;
   }
-  return true;
+  return null;
+}
+
+/** True only when an existing material graph can keep using this light. */
+export function giMaterialLightShapeMatches(snapshot, light) {
+  return giMaterialLightShapeDiff(snapshot, light) === null;
 }
 
 /**

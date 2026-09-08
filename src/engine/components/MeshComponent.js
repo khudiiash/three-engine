@@ -123,14 +123,18 @@ export class MeshComponent extends Component {
     { key: "material8", label: "Material 8", type: "asset", exts: ["mat"], hidden: true },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
-    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"] },
-    { key: "giMobility", label: "GI Mobility", type: "select", options: ["auto", "static", "dynamic"] },
+    // `module` on a descriptor: this row belongs to an optional module and the
+    // inspector only shows it (grouped under the module's name) while that
+    // module is enabled. `collision` is read by the physics module's auto
+    // colliders; the gi* trio is read by src/modules/gi/dynamicObjects.js.
+    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"], module: "physics-rapier" },
+    { key: "giMobility", label: "GI Mobility", type: "select", options: ["auto", "static", "dynamic"], module: "gi" },
     // Only meaningful for movers — a static mesh is traced exactly by the
     // world shadow BVH no matter what this says.
-    { key: "giTrace", label: "GI Trace", type: "select", options: ["auto", "bvh", "obb", "voxel"], showIf: (props) => props.giMobility !== "static" },
+    { key: "giTrace", label: "GI Trace", type: "select", options: ["auto", "bvh", "obb", "voxel"], showIf: (props) => props.giMobility !== "static", module: "gi" },
     // Same visibility rule as giTrace: a static mesh is voxelized and needs no
     // proxy, so the control would be dead for it.
-    { key: "giProxy", label: "GI Proxy Shape", type: "select", options: ["auto", "sphere", "capsule", "none"], showIf: (props) => props.giMobility !== "static" },
+    { key: "giProxy", label: "GI Proxy Shape", type: "select", options: ["auto", "sphere", "capsule", "none"], showIf: (props) => props.giMobility !== "static", module: "gi" },
     // `hidden` keeps this out of the inspector, but it does NOT cross the MCP
     // bridge: `component.types` projects key/label/type/options only, so an
     // assistant reading the schema sees THREE GI selects with nothing to rank

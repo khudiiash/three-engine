@@ -2,6 +2,7 @@ import ReactDOM from "react-dom/client";
 import { Suspense, lazy } from "react";
 import "dockview-react/dist/styles/dockview.css";
 import "./editor/theme.css";
+import "./editor/theme-v3.css";
 import { installConsoleCapture } from "./editor/store/consoleStore.js";
 import { ProjectHub } from "./editor/ProjectHub.jsx";
 import { useProjectStore, basename } from "./editor/store/projectStore.js";

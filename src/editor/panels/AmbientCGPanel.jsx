@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Download, Globe, Loader2, Search } from "lucide-react";
+import { Download, Globe, Loader2, Power, Search } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import {
@@ -121,14 +121,9 @@ export function AmbientCGPanel() {
     return (
       <div className="acg-panel">
         <div className="acg-gate">
-          <Globe size={28} />
-          <h3>AmbientCG</h3>
-          <p>
-            Browse thousands of free CC0 PBR materials, HDRIs and 3D models and import them into the
-            project with one click. Enable the AmbientCG module to get started.
-          </p>
+          <Globe size={28} className="empty-glyph" />
           <button className="toolbar-btn wide" onClick={() => setModuleEnabled("ambientcg", true)}>
-            Enable AmbientCG module
+            <Power size={13} /> Enable AmbientCG module
           </button>
         </div>
       </div>
@@ -176,7 +171,7 @@ export function AmbientCGPanel() {
             <div className="acg-status">Couldn't reach AmbientCG: {error}</div>
           ) : items === null ? (
             <div className="acg-status">
-              <Loader2 size={14} className="acg-spin" /> Loading catalog…
+              <Loader2 size={14} className="acg-spin" />
             </div>
           ) : filtered.length === 0 ? (
             <div className="acg-status">No assets match.</div>
@@ -310,7 +305,7 @@ function AssetDetail({ asset, dataType, hasProject, onClose }) {
       <h3 className="acg-detail-name">{asset.name}</h3>
       <div className="acg-detail-meta">
         {asset.category && <span>{asset.category}</span>}
-        <span>{(asset.downloadCount ?? 0).toLocaleString()} downloads · CC0</span>
+        <span><span className="cnt" title="downloads">{(asset.downloadCount ?? 0).toLocaleString()}</span> · CC0</span>
       </div>
       {dataType === "Material" && asset.maps?.length > 0 && (
         <div className="acg-detail-cats">
@@ -336,7 +331,7 @@ function AssetDetail({ asset, dataType, hasProject, onClose }) {
 
       {files === null && !error ? (
         <div className="acg-status">
-          <Loader2 size={14} className="acg-spin" /> Fetching file list…
+          <Loader2 size={14} className="acg-spin" />
         </div>
       ) : (
         <>

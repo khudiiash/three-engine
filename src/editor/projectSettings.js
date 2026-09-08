@@ -5,6 +5,8 @@ import { ensureEngine } from "./engineInstance.js";
 // editor's settings module without dragging the physics module in with it.
 import { DEFAULT_PHYSICS_LAYERS } from "../modules/physics-rapier/layers.js";
 import { BUILD_DEFAULTS } from "./build/buildSettings.js";
+import { applyAccent, DEFAULT_ACCENT } from "./accent.js";
+import { AMBIENT_GLOW_DEFAULTS, setAmbientGlowLook } from "./ambientGlowLook.js";
 
 /**
  * Project-wide settings, stored under `settings` in project.json. Scene-look
@@ -14,6 +16,10 @@ import { BUILD_DEFAULTS } from "./build/buildSettings.js";
 export const PROJECT_SETTINGS_DEFAULTS = {
   editor: {
     autosaveSeconds: 10, // 0 = disabled
+    // The editor's accent colour (selection, focus, the active tool). Applied
+    // as CSS custom properties by accent.js; per project because a project is
+    // a place, and two open at once are easier to tell apart by colour.
+    accent: DEFAULT_ACCENT,
     snapTranslate: 0.5,
     snapRotateDeg: 15,
     snapScale: 0.1,
@@ -24,6 +30,16 @@ export const PROJECT_SETTINGS_DEFAULTS = {
     // visit picks up the user's preferred view (e.g. "hide colliders +
     // grid for a clean scene review").
     layers: { gizmos: true, colliders: true, grid: true, stats: true, debugDraw: true, uiOverlay: false, virtualGeometry: false },
+    // The same toggles for Play mode, which keeps its own profile so a debug
+    // view switched on while playing never touches the Edit-mode view. All off
+    // by default: Play is the game as the player sees it, until asked otherwise.
+    playLayers: { gizmos: false, cursor3D: false, colliders: false, grid: false, stats: false, debugDraw: false, uiOverlay: false, virtualGeometry: false, ambient: false },
+    // The ambient glow — the viewport's light spilling under the panels
+    // around it (AmbientGlow.jsx). Whether it exists at all is
+    // `layers.ambient` above, shared with the viewport's Visibility menu so
+    // there is one switch and not two; these are its shape and its strength.
+    ambientGlowSpread: 50, // CSS px the light reaches past the viewport
+    ambientGlowIntensity: 0.55, // 0..1, the layer's opacity
     // User-rebindable visibility hotkeys (H, Shift+H, E, Shift+E by
     // default). Each entry maps an action id → chord string; the
     // dispatcher in keybindings.js reads this on every keydown so
@@ -133,6 +149,15 @@ export function onProjectSettingsApplied(fn) {
 
 /** Pushes settings onto the running engine/editor (call at boot too). */
 export async function applyProjectSettings(settings = getProjectSettings()) {
+  // Before the engine: the accent is chrome, and chrome must not wait on a
+  // renderer that may take seconds (or fail) to come up.
+  applyAccent(settings.editor.accent);
+  // Chrome too, and for the same reason: the glow is CSS over the window, so
+  // it must not wait on a renderer that may take seconds to come up.
+  setAmbientGlowLook({
+    spread: settings.editor.ambientGlowSpread ?? AMBIENT_GLOW_DEFAULTS.spread,
+    intensity: settings.editor.ambientGlowIntensity ?? AMBIENT_GLOW_DEFAULTS.intensity,
+  });
   const engine = await ensureEngine();
   engine.config.scriptHotReload = settings.scripts.hotReload !== false;
   engine.config.scriptReloadIntervalMs = settings.scripts.reloadIntervalMs ?? 750;

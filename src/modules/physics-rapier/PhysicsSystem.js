@@ -5,6 +5,7 @@ import {
   collectCollisionMesh,
   collectCollisionMeshParts,
   collisionGeometryBounds,
+  collisionMeshPartsFromGeometry,
   hasOwnedDeformingCollisionGeometry,
   hasOwnedStaticCollisionGeometry,
   mergeCollisionMeshes,
@@ -84,12 +85,42 @@ export function bodyDensitySI(value) {
   if (!(density > 0)) return 0;
   return density > 30 ? density : density * DENSITY_TO_SI;
 }
-function applyColliderMass(rb, colliders, weights) {
+/**
+ * Give a dynamic body its mass, either from a density or from an authored
+ * figure split across its colliders by `weights` (their volumes).
+ *
+ * ⚠ TRIANGLE MESHES ARE FINE HERE, and it is worth writing down why, because
+ * the opposite is widely repeated: Rapier DOES derive a trimesh's mass
+ * properties from the volume its triangles enclose. Measured 2026-09-07
+ * against the shipped `@dimforge/rapier3d-compat`: a closed unit-cube trimesh
+ * at density 500 weighs 500.0 with the same inertia tensor as the equivalent
+ * cuboid, inconsistent winding resolves to the same figure, and an open mesh
+ * (the cube minus its lid) integrates to a sensible 0.83 of it. So density
+ * mode needs no special case.
+ *
+ * The one shape that does break is a mesh enclosing NO volume — a single flat
+ * sheet, a cut plane. Rapier resolves that to mass 0, and a dynamic body with
+ * mass 0 has an inverse mass of 0, which means it never moves again: it looks
+ * like the body silently stopped being dynamic. `degenerateLabel` turns that
+ * into a nominal mass and one warning naming the entity.
+ *
+ * @param {string} [degenerateLabel] Entity name; pass it only for colliders
+ *   whose `weights` are real volumes, which is every shape built here.
+ */
+function applyColliderMass(rb, colliders, weights, degenerateLabel = null) {
   if (rb?.props.bodyType !== "dynamic") return;
   if (rb.props.massMode === "density") {
     const density = bodyDensitySI(rb.props.density);
     if (!(density > 0)) return;
     for (const collider of colliders) collider.setDensity(density);
+    if (degenerateLabel && weights?.length && !weights.some((weight) => weight > 1e-9)) {
+      console.warn(
+        `Collider on "${degenerateLabel}": the collision mesh encloses no volume, so its density resolves to ` +
+          `zero mass and the body would never move. Using ${DEGENERATE_MASS} kg — give the shape thickness, ` +
+          `or set the Rigidbody's mass mode to Mass.`,
+      );
+      for (const collider of colliders) collider.setMass(DEGENERATE_MASS / colliders.length);
+    }
     return;
   }
   if (!(rb.props.mass > 0)) return;
@@ -98,6 +129,55 @@ function applyColliderMass(rb, colliders, weights) {
     colliders[i].setMass(rb.props.mass * (total > 0 ? weights[i] / total : 1 / colliders.length));
   }
 }
+
+/**
+ * ⚠ A CONVEX HULL OF CONCAVE ARCHITECTURE IS A SOLID BLOCK, and Convex is the
+ * default shape an auto-generated collider gets.
+ *
+ * The case that earned this (2026-09-07): the user's Sponza floor is one mesh
+ * holding the ground AND the gallery 3.3 m above it — 7 vertices at y = 0 and
+ * 16 at y = 3.32. Its convex hull is **713 m³ against the mesh's 162 m³**, a
+ * solid brick filling the whole atrium from the floor to the balcony. Every
+ * curtain in the room was inside it, and the cloth simulation tore itself
+ * apart being pushed out of a collider it lived in. Nothing said so: the
+ * collider "worked", the character stood on it, and the volume it actually
+ * occupied was invisible.
+ *
+ * The ratio is the signal, not the size. A genuinely convex mesh hulls to
+ * itself (ratio 1); a floor with a raised gallery, an archway, a horseshoe, a
+ * bowl — anything with a concavity a body can occupy — hulls to several times
+ * its own volume, and everything in that space is now inside a solid.
+ *
+ * Diagnostic only. Convex is often exactly right (a crate, a rock, a barrel),
+ * and the author may want it here too — so this names the shape, the numbers
+ * and the alternative, once per entity, and changes nothing.
+ */
+const HULL_SWALLOW_RATIO = 3;
+
+function warnIfHullSwallowsMesh(pending, colliders) {
+  try {
+    if (!pending) return;
+    const { name, entityId, meshVolume } = pending;
+    let hullVolume = 0;
+    for (const collider of colliders) hullVolume += collider.volume?.() ?? 0;
+    if (globalThis.__physicsHullDebug) console.log(`[hull] ${name}: mesh ${meshVolume.toFixed(2)} hull ${hullVolume.toFixed(2)}`);
+    if (!(meshVolume > 0) || !(hullVolume > meshVolume * HULL_SWALLOW_RATIO)) return;
+    const seen = (PhysicsSystem._hullSwallowWarned ??= new Set());
+    if (seen.has(entityId)) return;
+    seen.add(entityId);
+    console.warn(
+      `Collider on "${name}": CONVEX collision fills ${hullVolume.toFixed(0)} m³ where the mesh itself is ` +
+        `${meshVolume.toFixed(0)} m³ — ${(hullVolume / meshVolume).toFixed(0)}x larger. A convex hull cannot have a ` +
+        `concavity, so everything in that space is now INSIDE a solid: cloth tears, bodies are pushed out, and ` +
+        `characters stand on air. Use Concave collision for level geometry with openings, arches or a raised floor.`,
+    );
+  } catch {
+    // A diagnostic must never be the reason a collider fails to build.
+  }
+}
+
+/** The stand-in mass for a dynamic body whose collision mesh has no volume. */
+const DEGENERATE_MASS = 1;
 
 export class PhysicsSystem {
   constructor(engine, RAPIER) {
@@ -310,9 +390,38 @@ export class PhysicsSystem {
     });
   }
 
+  /**
+   * ── THE BOOT STORM THIS FLUSH USED TO BE (2026-09-07) ────────────────────
+   *
+   * `[engine] hierarchy-changed storm: 30 flushes within a second` on the
+   * user's own project traced here: every pass that touched ANY entity emitted
+   * a scene-wide "hierarchy-changed", and that event runs ~20 listeners that
+   * each walk the scene (ZERO_FREEZE_PLAN §2.4). Two things were wrong.
+   *
+   * 1. The pass emitted per flush, and each `addComponent`/`removeComponent`
+   *    inside it emits its own component events which re-queue entities — so
+   *    a scene load produced a chain of flushes, each with its own fan-out.
+   *    `batchHierarchy` holds the coalesced event until the whole pass is
+   *    done: one event for the pass, whatever it touched.
+   *
+   * 2. AN AUTO COLLIDER THAT STARTS DISABLED CHANGES NOTHING ANY LISTENER CAN
+   *    SEE. It attaches nothing to the scene graph, cooks no shape and builds
+   *    no Rapier body until someone enables it (see the 2026-09-02 note
+   *    below); `enabled` flipping later emits "hierarchy-changed" on its own.
+   *    Announcing it scene-wide was 30 full fan-outs to report an inert row in
+   *    the inspector — and the Inspector hears about it through
+   *    "component-added" anyway.
+   *
+   * `globalThis.__physicsColliderFlushQuiet = false` restores the old
+   * "any change emits" behaviour for a one-boot A/B.
+   */
   #flushDefaultColliders() {
     this.defaultColliderFlushPending = false;
     if (this.disposed) return;
+    this.engine.batchHierarchy(() => this.#flushDefaultCollidersPass());
+  }
+
+  #flushDefaultCollidersPass() {
     const queued = [...this.defaultColliderQueue];
     this.defaultColliderQueue.clear();
     let changed = false;
@@ -333,13 +442,16 @@ export class PhysicsSystem {
         // or skin detection may remove only an untouched automatic component.
         if (collider?.props?.autoGenerated && !collider.props.autoCustomized) {
           if (this.#autoColliderStorm(entity, "remove", { hasSource, sourcePending, deformingOnly, mode: this.#autoCollisionMode(entity) })) continue;
+          const wasEnabled = collider.enabled !== false;
           this.defaultColliderRemovalGuard.add(entity);
           try {
             entity.removeComponent("collider");
           } finally {
             this.defaultColliderRemovalGuard.delete(entity);
           }
-          changed = true;
+          // Same rule as the add below: taking away a collider that was never
+          // enabled removes nothing from the scene.
+          if (wasEnabled || globalThis.__physicsColliderFlushQuiet === false) changed = true;
         }
         continue;
       }
@@ -359,12 +471,15 @@ export class PhysicsSystem {
       // Settings → Physics → "Auto colliders start enabled" restores the old
       // behaviour project-wide (`engine.config.physicsAutoColliders`).
       if (this.#autoColliderStorm(entity, "add", { hasSource, sourcePending, deformingOnly, mode: requested })) continue;
+      const startsEnabled = this.#autoCollidersStartEnabled();
       entity.addComponent("collider", {
         shape: requested === "concave" ? "concave" : "convex",
         autoGenerated: true,
-        enabled: this.#autoCollidersStartEnabled(),
+        enabled: startsEnabled,
       });
-      changed = true;
+      // A DISABLED auto collider is not news: no scene-graph object, no cooked
+      // shape, no body. Only an ENABLED one changes what the scene contains.
+      if (startsEnabled || globalThis.__physicsColliderFlushQuiet === false) changed = true;
       this.invalidateAutoCollider(entity);
     }
     if (changed) this.engine.emit("hierarchy-changed");
@@ -522,10 +637,14 @@ export class PhysicsSystem {
   }
 
   #needsCollisionGeometry(entity) {
-    if (!this.#hasCollisionGeometrySource(entity) || entity.getComponent?.("charactercontroller")) return false;
     const collider = entity.getComponent?.("collider");
+    if (entity.getComponent?.("charactercontroller")) return false;
     if (collider && !collider.enabled) return false;
     const shape = collider?.props?.shape;
+    // A Custom collider's source is its authored asset, not rendered meshes —
+    // it does not need (and may not have) a Mesh/Model on the entity.
+    if (shape === "custom") return !!collider.props.geometryAsset;
+    if (!this.#hasCollisionGeometrySource(entity)) return false;
     return !shape || shape === "convex" || shape === "concave" || shape === "mesh";
   }
 
@@ -540,6 +659,8 @@ export class PhysicsSystem {
       this.autoCollisionGeometry.set(entity, null);
       return null;
     }
+    const collider = entity.getComponent?.("collider");
+    if (collider?.props?.shape === "custom") return this.#cookCustomGeometry(entity, collider);
     const mesh = entity.getComponent?.("mesh");
     const model = entity.getComponent?.("model");
     if (mesh?.assetLoadsPending || model?.assetLoadsPending) {
@@ -567,6 +688,40 @@ export class PhysicsSystem {
       concave,
       // Kept as a compatibility/fallback view for callers that require one
       // envelope. Runtime and preview prefer the separate island hulls.
+      convex: convexParts.length === 1 ? convexParts[0] : this.#cookConvexMesh(triangles.vertices),
+    };
+    this.autoCollisionGeometry.set(entity, cooked);
+    this.engine.emit("physics-collider-cooked", entity);
+    return cooked;
+  }
+
+  /**
+   * Cooks a Custom collider from its authored `.geom` asset. The component
+   * owns the load (ColliderComponent.geometry, the shared refcounted
+   * instance); until it arrives there is nothing to cook, and a geometry
+   * whose recorded path no longer matches the picker is treated the same way
+   * — a mid-swap cook must never build the OLD asset's shape.
+   */
+  #cookCustomGeometry(entity, collider) {
+    const geometry = collider.geometry;
+    if (!geometry || geometry.userData?.assetPath !== collider.props.geometryAsset) {
+      this.autoCollisionGeometry.set(entity, null);
+      return null;
+    }
+    const parts = collisionMeshPartsFromGeometry(geometry);
+    const triangles = mergeCollisionMeshes(parts);
+    if (!triangles) {
+      this.autoCollisionGeometry.set(entity, null);
+      return null;
+    }
+    const convexParts = parts
+      .map((part) => this.#cookConvexMesh(part.vertices))
+      .filter(Boolean);
+    const concave = mergeCollisionMeshes(parts.map((part) => simplifyCollisionMesh(part)));
+    const cooked = {
+      ...triangles,
+      convexParts,
+      concave,
       convex: convexParts.length === 1 ? convexParts[0] : this.#cookConvexMesh(triangles.vertices),
     };
     this.autoCollisionGeometry.set(entity, cooked);
@@ -919,6 +1074,10 @@ export class PhysicsSystem {
     } catch (error) {
       for (const collider of colliders) this.world.removeCollider(collider, true);
       throw new Error(`Failed to create collider for "${entity.name}": ${error?.message ?? error}`, { cause: error });
+    }
+    if (this._pendingHullCheck) {
+      warnIfHullSwallowsMesh(this._pendingHullCheck, colliders);
+      this._pendingHullCheck = null;
     }
     if (col) {
       col.colliders = colliders;
@@ -1307,7 +1466,15 @@ export class PhysicsSystem {
 
     const rb = bodyEntity.getComponent?.("rigidbody");
     if (entity === bodyEntity) {
-      applyColliderMass(rb, shapes.map(({ desc }) => desc), shapes.map(({ part }) => collisionMeshVolume(part)));
+      // The label arms the zero-volume guard here too: a convex hull cannot be
+      // built from coplanar points, but a very THIN one can still round to no
+      // volume, and a dynamic body at mass 0 silently stops moving.
+      applyColliderMass(
+        rb,
+        shapes.map(({ desc }) => desc),
+        shapes.map(({ part }) => collisionMeshVolume(part)),
+        entity.name,
+      );
     }
 
     _pos.set(0, 0, 0);
@@ -1343,13 +1510,62 @@ export class PhysicsSystem {
       : null;
     const fitSize = autoFit && fitBounds ? fitBounds.getSize(new THREE.Vector3()) : null;
     const bodyType = bodyEntity.getComponent?.("rigidbody")?.props?.bodyType ?? "fixed";
-    const dynamicTriangleMesh = bodyType === "dynamic" && (shape === "concave" || shape === "mesh");
-    const runtimeShape = dynamicTriangleMesh ? "convex" : shape;
-    if (dynamicTriangleMesh) {
+    // ── A DYNAMIC BODY KEEPS THE SHAPE IT WAS AUTHORED WITH (2026-09-07) ────
+    //
+    // `concave`, `mesh` and `custom` used to be silently downgraded to a
+    // single convex hull on any dynamic body — which turns a boat hull into a
+    // solid block, and a Custom collider is chosen precisely BECAUSE the
+    // desired shape is not something a hull can express ("custom collision …
+    // must be supported", 2026-09-07).
+    //
+    // The downgrade rested on a belief that is simply not true of the Rapier
+    // build we ship: that a trimesh has no mass properties. Measured against
+    // `@dimforge/rapier3d-compat` on 2026-09-07 — a closed unit-cube trimesh
+    // on a dynamic body at density 500 weighs 500.0 with a cuboid's inertia
+    // tensor, and it rests correctly on cuboid, convex-hull and trimesh
+    // ground. See `applyColliderMass` for the full table.
+    //
+    // ⚠ THE REAL LIMITATION, which no shape substitution can hide, is that a
+    // triangle mesh is a SURFACE with no interior. Two things follow, and both
+    // were reproduced rather than assumed:
+    //   · a small fast body crosses it in one step (a 0.05 m ball at 200 m/s
+    //     went straight through; the same ball with CCD on stopped dead);
+    //   · a body small enough to end up entirely INSIDE it generates no
+    //     contact at all and falls out.
+    // Those belong to the shape the author chose, so they are stated once,
+    // with the remedy, instead of being "fixed" by quietly using a different
+    // shape than the one on screen.
+    //
+    // `__physicsDynamicTrimesh = false` restores the old convex downgrade.
+    const triangleShape = shape === "concave" || shape === "mesh" || shape === "custom";
+    const dynamicTriangleMesh = bodyType === "dynamic" && triangleShape;
+    const downgradeDynamic = dynamicTriangleMesh && globalThis.__physicsDynamicTrimesh === false;
+    const runtimeShape = downgradeDynamic ? "convex" : shape;
+    if (downgradeDynamic) {
       console.warn(
-        `Collider on "${entity.name}": ${shape} collision is unsupported on dynamic bodies; using convex collision.`,
+        `Collider on "${entity.name}": ${shape} collision downgraded to convex on a dynamic body ` +
+          `(__physicsDynamicTrimesh = false).`,
+      );
+    } else if (dynamicTriangleMesh && !PhysicsSystem._dynamicTrimeshNoted) {
+      PhysicsSystem._dynamicTrimeshNoted = true;
+      console.log(
+        `Collider on "${entity.name}": ${shape} collision on a dynamic body uses the exact triangles, and its ` +
+          `mass comes from the volume they enclose. Note a triangle mesh has no interior: a small fast body can ` +
+          `cross it in one step (enable CCD on its Rigidbody), and one small enough to fit inside it falls out.`,
       );
     }
+
+    // ⚠ A TRIANGLE MESH IS NOT SOLID TO A POINT QUERY UNLESS IT IS `ORIENTED`.
+    // Measured 2026-09-07: `collider.containsPoint` on a trimesh built without
+    // the flag returns FALSE FOR EVERY POINT, inside or out — the flag is what
+    // makes parry compute the vertex/edge pseudo-normals a containment test
+    // needs. Buoyancy (`waterPhysics.js`) samples exactly that call to find how
+    // much of a hull is under water, so a boat with a Custom collider would
+    // float on nothing and sink without this. It is not free — the pseudo-normal
+    // pass costs about 60 % on top of the build (11.4 → 18.5 ms for 28.8k
+    // triangles) — so it is spent only where a point query can reach: buoyancy
+    // skips every non-dynamic body, and so does this.
+    const triFlags = dynamicTriangleMesh ? RAPIER.TriMeshFlags?.ORIENTED : undefined;
 
     let desc = null;
     let descs = null;
@@ -1380,11 +1596,22 @@ export class PhysicsSystem {
       desc = RAPIER.ColliderDesc.capsule(halfHeight, r);
     } else if (runtimeShape === "convex") {
       const cooked = this.#getAutoGeometry(entity);
+      if (shape === "custom" && !cooked) {
+        // Never fall back to rendered meshes here: the whole point of a
+        // Custom collider is a shape the render geometry does not have.
+        console.warn(`Collider on "${entity.name}": custom geometry is missing or still loading`);
+        return null;
+      }
+      // The SOURCE triangles the hulls stand in for, whichever path supplied
+      // them — the hull-volume check below needs the thing being approximated,
+      // and on a cold attach `cooked` is still null while the cook runs.
+      const rendered = cooked ? null : collectCollisionMesh(entity.object3D, { includeSkinned: false });
+      const convexSource = cooked?.concave ?? cooked ?? rendered;
       const hulls = cooked?.convexParts?.length
         ? cooked.convexParts.map((part) => scaleCollisionMesh(part, _scale))
         : cooked?.convex
           ? [scaleCollisionMesh(cooked.convex, _scale)]
-          : [collectCollisionMesh(entity.object3D, { includeSkinned: false })].filter(Boolean);
+          : [rendered].filter(Boolean);
       const shapes = hulls
         .map((hull) => ({
           hull,
@@ -1393,6 +1620,15 @@ export class PhysicsSystem {
         .filter(({ desc }) => !!desc);
       descs = shapes.map(({ desc }) => desc);
       massWeights = shapes.map(({ hull }) => collisionMeshVolume(hull));
+      // ⛔ MEASURED AFTER CREATION, NOT HERE. `massWeights` is the volume of
+      // the SOURCE triangles, not of the hull Rapier builds from them — for
+      // distributing mass across disconnected parts that is a fine proxy, and
+      // for this check it is exactly the wrong number (it reported a ratio of
+      // 1.00 on a mesh whose hull is four times its size). Rapier hands back
+      // the real hull volume from `collider.volume()`, so the comparison waits
+      // until the colliders exist.
+      this._pendingHullCheck = { entityId: entity.id, name: entity.name,
+        meshVolume: collisionMeshVolume(scaleCollisionMesh(convexSource, _scale)) };
       if (!descs.length) {
         console.warn(`Collider on "${entity.name}": convex shape found no geometry`);
         return null;
@@ -1406,7 +1642,24 @@ export class PhysicsSystem {
         console.warn(`Collider on "${entity.name}": ${shape} shape found no geometry`);
         return null;
       }
-      desc = RAPIER.ColliderDesc.trimesh(tri.vertices, tri.indices);
+      desc = RAPIER.ColliderDesc.trimesh(tri.vertices, tri.indices, triFlags);
+      massWeights = [collisionMeshVolume(tri)];
+    } else if (runtimeShape === "custom") {
+      // Authored geometry at exact triangles — the user picked this asset for
+      // its shape, so it is never simplified the way Concave is, and (since
+      // 2026-09-07) never swapped for a convex hull on a dynamic body either.
+      const cooked = this.#getAutoGeometry(entity);
+      if (!cooked) {
+        console.warn(`Collider on "${entity.name}": custom geometry is missing or still loading`);
+        return null;
+      }
+      const tri = scaleCollisionMesh(cooked, _scale);
+      if (!tri || !tri.vertices.every(Number.isFinite)) {
+        console.warn(`Collider on "${entity.name}": custom geometry has no valid triangles`);
+        return null;
+      }
+      desc = RAPIER.ColliderDesc.trimesh(tri.vertices, tri.indices, triFlags);
+      massWeights = [collisionMeshVolume(tri)];
     } else if (runtimeShape === "heightfield") {
       const terrain = entity.getComponent("terrain");
       if (!terrain?.heightsArray) {
@@ -1434,7 +1687,7 @@ export class PhysicsSystem {
 
     // A dynamic body's mass comes from its Rigidbody, not shape density.
     const rb = bodyEntity.getComponent("rigidbody");
-    if (entity === bodyEntity) applyColliderMass(rb, built, massWeights);
+    if (entity === bodyEntity) applyColliderMass(rb, built, massWeights, entity.name);
 
     // Collider pose relative to its body (child colliders + local offset).
     // Geometry-derived shapes already carry mesh offsets in their vertices;

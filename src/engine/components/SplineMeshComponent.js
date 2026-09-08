@@ -55,7 +55,8 @@ export class SplineMeshComponent extends Component {
     { key: "material", label: "Material", type: "asset", exts: ["mat"], emptyLabel: "Default" },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
-    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"] },
+    // Read by the physics module's auto colliders, like Mesh/Model's.
+    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"], module: "physics-rapier" },
   ];
 
   onAttach() {

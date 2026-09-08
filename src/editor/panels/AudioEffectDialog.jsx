@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2 } from "lucide-react";
+import { Loader2 } from "../icons/index.jsx";
 import { EFFECTS, defaultParams } from "../audio/effects.js";
 
 /**

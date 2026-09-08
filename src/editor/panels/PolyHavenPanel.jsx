@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Download, Globe, Loader2, Search } from "lucide-react";
+import { Download, Globe, Loader2, Power, Search } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import {
@@ -109,14 +109,9 @@ export function PolyHavenPanel() {
     return (
       <div className="ph-panel">
         <div className="ph-gate">
-          <Globe size={28} />
-          <h3>Poly Haven</h3>
-          <p>
-            Browse thousands of free CC0 PBR materials, models and HDRIs and import them into the
-            project with one click. Enable the Poly Haven module to get started.
-          </p>
+          <Globe size={28} className="empty-glyph" />
           <button className="toolbar-btn wide" onClick={() => setModuleEnabled("polyhaven", true)}>
-            Enable Poly Haven module
+            <Power size={13} /> Enable Poly Haven module
           </button>
         </div>
       </div>
@@ -167,7 +162,7 @@ export function PolyHavenPanel() {
             <div className="ph-status">Couldn't reach Poly Haven: {error}</div>
           ) : items === null ? (
             <div className="ph-status">
-              <Loader2 size={14} className="ph-spin" /> Loading catalog…
+              <Loader2 size={14} className="ph-spin" />
             </div>
           ) : filtered.length === 0 ? (
             <div className="ph-status">No assets match.</div>
@@ -301,7 +296,7 @@ function AssetDetail({ asset, type, hasProject, onClose }) {
       <h3 className="ph-detail-name">{asset.name}</h3>
       <div className="ph-detail-meta">
         {asset.authors && <span>by {Object.keys(asset.authors).join(", ")}</span>}
-        <span>{(asset.download_count ?? 0).toLocaleString()} downloads · CC0</span>
+        <span><span className="cnt" title="downloads">{(asset.download_count ?? 0).toLocaleString()}</span> · CC0</span>
       </div>
       {asset.categories?.length > 0 && (
         <div className="ph-detail-cats">
@@ -315,7 +310,7 @@ function AssetDetail({ asset, type, hasProject, onClose }) {
 
       {files === null && !error ? (
         <div className="ph-status">
-          <Loader2 size={14} className="ph-spin" /> Fetching file list…
+          <Loader2 size={14} className="ph-spin" />
         </div>
       ) : (
         <>

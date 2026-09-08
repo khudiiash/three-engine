@@ -37,6 +37,7 @@
  */
 
 import { vmSingleton } from "../singleton.js";
+import { currentAccent } from "../accent.js";
 import ENGINE_DTS from "../../engine/script-types/engine.d.ts?raw";
 import EDITOR_DTS from "../../engine/script-types/editor.d.ts?raw";
 
@@ -78,6 +79,7 @@ async function installWorkers() {
  * against `--bg-1`, the panel background these editors always sit on.
  */
 function defineTheme(monaco) {
+  const accent = currentAccent().slice(1);
   monaco.editor.defineTheme("engine-dark", {
     base: "vs-dark",
     inherit: true,
@@ -100,9 +102,9 @@ function defineTheme(monaco) {
       "editor.foreground": "#ececee",
       "editorLineNumber.foreground": "#4a4d56",
       "editorLineNumber.activeForeground": "#9ea1a9",
-      "editorCursor.foreground": "#0a84ff",
-      "editor.selectionBackground": "#0a84ff40",
-      "editor.inactiveSelectionBackground": "#0a84ff20",
+      "editorCursor.foreground": `#${accent}`,
+      "editor.selectionBackground": `#${accent}40`,
+      "editor.inactiveSelectionBackground": `#${accent}20`,
       "editor.lineHighlightBackground": "#ffffff08",
       "editorIndentGuide.background1": "#ffffff10",
       "editorIndentGuide.activeBackground1": "#ffffff28",
@@ -110,15 +112,15 @@ function defineTheme(monaco) {
       "editorWidget.border": "#ffffff21",
       "editorSuggestWidget.background": "#1c1d22",
       "editorSuggestWidget.border": "#ffffff21",
-      "editorSuggestWidget.selectedBackground": "#0a84ff2a",
+      "editorSuggestWidget.selectedBackground": `#${accent}2a`,
       "editorHoverWidget.background": "#1c1d22",
       "editorHoverWidget.border": "#ffffff21",
       "editorGutter.background": "#151619",
       "scrollbarSlider.background": "#ffffff14",
       "scrollbarSlider.hoverBackground": "#ffffff22",
       "scrollbarSlider.activeBackground": "#ffffff33",
-      "editorBracketMatch.background": "#0a84ff22",
-      "editorBracketMatch.border": "#0a84ff66",
+      "editorBracketMatch.background": `#${accent}22`,
+      "editorBracketMatch.border": `#${accent}66`,
       "editorError.foreground": "#ff5d55",
       "editorWarning.foreground": "#e2a33c",
       "minimap.background": "#151619",

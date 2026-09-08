@@ -14,7 +14,7 @@
         "devtools": true,
         "browserExtensionsEnabled": true,
         "dataDirectory": "webgpu-inspector-dev",
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required --enable-unsafe-webgpu --force-high-performance-gpu --force_high_performance_gpu"
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required --enable-unsafe-webgpu --force-high-performance-gpu --force_high_performance_gpu --gpu-program-cache-size-kb=262144 --gpu-disk-cache-size-mb=1024"
       }
     ]
   }

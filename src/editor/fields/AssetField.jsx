@@ -1,123 +1,64 @@
-import { isBuiltinMaterial, WATER_MATERIAL_PATH } from "../../engine/builtinMaterials.js";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronDown, Search } from "lucide-react";
-import { useProjectStore } from "../store/projectStore.js";
-import { listProjectAssets, toBlobUrl, extOf, TEXTURE_EXTENSIONS, MATERIAL_EXTENSIONS } from "../assetLoader.js";
-import { MATERIAL_DEFAULTS } from "../../engine/materialAsset.js";
+import { isBuiltinMaterial } from "../../engine/builtinMaterials.js";
+import { useCallback, useRef, useState } from "react";
+import { ChevronDown } from "../icons/index.jsx";
 import { useAssetDrop } from "../assetDrag.js";
 import { revealAssetInPanel } from "../assetReveal.js";
-import { PopoverMenu } from "./PopoverMenu.jsx";
+import { AssetPeek } from "../components/AssetThumb.jsx";
+import { thumbKind } from "../assetThumbs.js";
 import { ContextMenu, useContextMenu } from "../ContextMenu.jsx";
 import { openAssetPath } from "../openAsset.js";
 import { openPanel } from "../EditorShell.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
+import { AssetBrowser, AssetPicture } from "./AssetBrowser.jsx";
 
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 
-// Plain white on a swatch is the classic "I haven't set a color yet" signal —
-// a freshly-created .mat file is white by default and looks identical to a mesh
-// that has no material assigned at all. Flag it so the user can tell the
-// difference at a glance.
-const isUnsetColor = (color) => !color || color.toLowerCase() === "#ffffff" || color.toLowerCase() === "white";
-
-function relativeToRoot(path) {
-  const root = useProjectStore.getState().rootPath;
-  if (!root) return path;
-  const norm = (p) => p.replaceAll("\\", "/");
-  const r = norm(root);
-  const p = norm(path);
-  return p.toLowerCase().startsWith(`${r.toLowerCase()}/`) ? p.slice(r.length + 1) : path;
-}
-
-/** Inline swatch/texture preview for .mat values and options. Reads the live
- *  shared material first so the swatch reflects the actual rendered color,
- *  not a stale top-level `def.color` from disk. */
-function MaterialOptionThumb({ path }) {
-  const [def, setDef] = useState(null);
-  const [mapUrl, setMapUrl] = useState(null);
-  const [liveColor, setLiveColor] = useState(null);
-  useEffect(() => {
-    let live = true;
-    (async () => {
-      try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        const value = { ...MATERIAL_DEFAULTS, ...JSON.parse(await invoke("read_text_file", { path })) };
-        if (!live) return;
-        setDef(value);
-        setMapUrl(value.map ? await toBlobUrl(value.map).catch(() => null) : null);
-      } catch {
-        if (live) setDef((prev) => prev ?? { ...MATERIAL_DEFAULTS, color: "#888" });
-      }
-    })();
-    let unsub = () => {};
-    import("../../engine/materialAsset.js").then(({ getMaterialColorPreview, loadMaterialAsset, subscribeMaterial }) => {
-      if (!live) return;
-      // Make sure the cache has an entry — the swatch may mount before any
-      // mesh has loaded this .mat, and the live-color walk needs an entry.
-      loadMaterialAsset(path).then(() => {
-        if (!live) return;
-        const refresh = () => {
-          if (live) setLiveColor(getMaterialColorPreview(path));
-        };
-        refresh();
-        unsub = subscribeMaterial(path, refresh);
-      });
-    });
-    return () => {
-      live = false;
-      unsub();
-    };
-  }, [path]);
-  const color = liveColor ?? def?.color;
-  const unset = isUnsetColor(color);
-  return (
-    <div
-      className={`asset-option-thumb mat-thumb${unset ? " mat-thumb--unset" : ""}`}
-      style={{ background: color ?? "#888" }}
-      title={unset ? "Default color — open in the Shader Graph panel to set a real color" : undefined}
-    >
-      {mapUrl && <img className="mat-thumb-map" src={mapUrl} alt="" draggable={false} />}
-    </div>
-  );
-}
-/** Small inline preview for texture options/values in asset pickers. */
-function TextureOptionThumb({ path }) {
-  const [url, setUrl] = useState(null);
-  useEffect(() => {
-    let live = true;
-    if (TEXTURE_EXTENSIONS.includes(extOf(path))) {
-      toBlobUrl(path).then((u) => live && setUrl(u)).catch(() => {});
-    } else {
-      setUrl(null);
-    }
-    return () => (live = false);
-  }, [path]);
-  if (!url) return null;
-  return <img className="asset-option-thumb" src={url} alt="" draggable={false} />;
-}
-
-function OptionThumb({ path }) {
-  return MATERIAL_EXTENSIONS.includes(extOf(path))
-    ? <MaterialOptionThumb path={path} />
-    : <TextureOptionThumb path={path} />;
-}
 /**
- * Asset reference input: drop target + picker listing project files of the
- * right type (descriptor.exts). Value is the asset's absolute path; commit ""
- * to clear.
+ * The kinds you choose by looking at them. A field for one of these is a
+ * CARD — the preview is most of it, the name and the caret sit under it —
+ * and its picker is a grid of previews. Everything else (a script, a sound)
+ * is a row: glyph, name, caret.
  */
-export function AssetField({ descriptor, value, onCommit }) {
+const CARD_EXTS = new Set([
+  "geom",
+  "mat",
+  "hdr",
+  "exr",
+  "png",
+  "jpg",
+  "jpeg",
+  "webp",
+  "scene",
+  "cubemap",
+  "glb",
+  "gltf",
+  "fbx",
+  "prefab",
+]);
+const isCardExt = (ext) => CARD_EXTS.has(String(ext).toLowerCase());
+
+/**
+ * Asset reference input: a drop target for a tile dragged out of the Assets
+ * panel, and a click opens the browser (`AssetBrowser`) over every project
+ * file of the right type (`descriptor.exts`). Never a text box. The value is
+ * the asset's absolute path; commit "" to clear.
+ *
+ * `descriptor.compact` (or `thumbSize="compact"`) keeps a row for a kind that
+ * would otherwise get a card — a dense list of slots, say.
+ */
+export function AssetField({ descriptor, value, onCommit, thumbSize = "small" }) {
   const [open, setOpen] = useState(false);
-  const [options, setOptions] = useState(null);
-  const [query, setQuery] = useState("");
+  // The hover peek on a row: which asset, and the rect it floats beside.
+  const [peek, setPeek] = useState(null);
   const triggerRef = useRef(null);
 
   const exts = descriptor.exts ?? [];
   const emptyLabel = descriptor.emptyLabel ?? "None";
-  const showThumb = value && [...TEXTURE_EXTENSIONS, ...MATERIAL_EXTENSIONS].includes(extOf(value));
+  const hasThumb = !!value && !!thumbKind(value);
+  const card = !descriptor.compact && thumbSize !== "compact" && (exts.some(isCardExt) || hasThumb);
 
   const dropRef = useAssetDrop({ accepts: exts, onDrop: onCommit });
-  // One element is both the drop target and the popover's anchor.
+  // One element is both the drop target and the browser's anchor.
   const setTriggerRef = useCallback(
     (el) => {
       triggerRef.current = el;
@@ -126,29 +67,28 @@ export function AssetField({ descriptor, value, onCommit }) {
     [dropRef],
   );
 
-  const browse = async () => {
+  const browse = () => {
     // Clicking a filled slot also points the Assets panel at the file, so
     // "which material is this?" is answered without leaving the inspector.
     if (value && !isBuiltinMaterial(value)) revealAssetInPanel(value).catch(() => {});
+    setPeek(null);
     setOpen(true);
-    setOptions(null);
-    setQuery("");
-    const root = useProjectStore.getState().rootPath;
-    setOptions([...(exts.includes("mat") ? [WATER_MATERIAL_PATH] : []), ...await listProjectAssets(root, exts)]);
+  };
+  const onKey = (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      browse();
+    }
   };
 
-  // Left-click has to stay the picker (that's what the field is for), so
-  // everything that acts on the asset ALREADY in the slot lives here. Without
-  // it there is no way to say "show me this file" without also opening a
-  // dropdown over the thing you wanted to look at.
+  // Left-click is the picker; everything that acts on the asset ALREADY in
+  // the slot lives in the context menu.
   const { menu, open: openMenu, close: closeMenu } = useContextMenu();
   const menuItems = value
     ? [
         {
           label: "Show in Assets Panel",
           action: async () => {
-            // Unlike the click-reveal, an explicit request opens the panel if
-            // it's closed — the user asked for it by name.
             openPanel("assets");
             // Let Dockview mount/activate the panel before it is asked to
             // browse; revealing into a panel that doesn't exist yet is a no-op.
@@ -168,91 +108,74 @@ export function AssetField({ descriptor, value, onCommit }) {
         { label: "Clear", danger: true, action: () => onCommit("") },
       ]
     : [{ label: "Browse…", action: browse }];
+  const visibleMenu = isBuiltinMaterial(value)
+    ? menuItems.filter((item) => !["Show in Assets Panel", "Select Asset"].includes(item.label))
+    : menuItems;
 
-  // A project with forty materials makes an unfiltered picker a scroll hunt.
-  // Matching on the full path (not just the filename) means the folder a user
-  // organised by is also a way to find things: typing "props" narrows to
-  // everything under Props/.
-  const needle = query.trim().toLowerCase();
-  const matches = needle
-    ? (options ?? []).filter((path) => path.toLowerCase().includes(needle))
-    : options;
+  const name = value ? (isBuiltinMaterial(value) ? "Water" : fileName(value)) : emptyLabel;
+  const title = value || `${emptyLabel} — drop an asset here or pick one`;
 
   return (
-    <div className="dropdown-wrap asset-field-wrap">
-      <div
-        className={`asset-field ${value ? "" : "empty"}`}
-        title={value || `${emptyLabel} — drop an asset here or browse`}
-        ref={setTriggerRef}
-        onClick={browse}
-        onContextMenu={openMenu}
-      >
-        {showThumb && <OptionThumb path={value} />}
-        <span className="asset-field-name">{value ? (isBuiltinMaterial(value) ? "Water" : fileName(value)) : emptyLabel}</span>
-        <span className="asset-field-caret">
-          <ChevronDown size={12} />
-        </span>
-      </div>
-      {open && (
-        <PopoverMenu
-          anchorRef={triggerRef}
-          className="asset-options component-menu"
-          minWidth={250}
-          layer={descriptor.layer}
-          onClose={() => setOpen(false)}
+    <div className={`dropdown-wrap asset-field-wrap${card ? " card" : ""}`}>
+      {card ? (
+        <div
+          ref={setTriggerRef}
+          className={`asset-card${value ? "" : " empty"} kind-${(value && thumbKind(value)) || "none"}`}
+          role="button"
+          tabIndex={0}
+          title={title}
+          onClick={browse}
+          onKeyDown={onKey}
+          onContextMenu={openMenu}
         >
-          <div className="component-menu-search">
-            <Search size={12} />
-            <input
-              autoFocus
-              type="text"
-              placeholder="Search assets…"
-              value={query}
-              spellCheck={false}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                e.stopPropagation();
-                if (e.key === "Escape") setOpen(false);
-                else if (e.key === "Enter" && matches?.length) {
-                  setOpen(false);
-                  onCommit(matches[0]);
-                }
-              }}
-            />
+          <div className="asset-card-preview">
+            {value ? <AssetPicture path={value} glyphSize={32} /> : <span className="asset-card-none">{emptyLabel}</span>}
           </div>
-          <div className="component-menu-list">
-            <button
-              className="dropdown-item"
-              onClick={() => {
-                setOpen(false);
-                onCommit("");
-              }}
-            >
-              {emptyLabel}
-            </button>
-            {options === null && <div className="dropdown-item">Loading…</div>}
-            {matches?.map((path) => (
-              <button
-                key={path}
-                className="dropdown-item asset-option"
-                title={path}
-                onClick={() => {
-                  setOpen(false);
-                  onCommit(path);
-                }}
-              >
-                <OptionThumb path={path} />
-                <span className="asset-option-name">{(isBuiltinMaterial(path) ? "Water (built-in)" : fileName(path))}</span>
-                <span className="asset-option-path">{relativeToRoot(path)}</span>
-              </button>
-            ))}
-            {matches?.length === 0 && (
-              <div className="dropdown-item">{needle ? "No matches" : "No assets found"}</div>
-            )}
+          <div className="asset-card-foot">
+            <span className="asset-card-name">{name}</span>
+            <ChevronDown size={12} className="asset-card-caret" aria-hidden="true" />
           </div>
-        </PopoverMenu>
+        </div>
+      ) : (
+        <div
+          ref={setTriggerRef}
+          className={`asset-field${value ? "" : " empty"}`}
+          role="button"
+          tabIndex={0}
+          title={title}
+          onClick={browse}
+          onKeyDown={onKey}
+          onContextMenu={openMenu}
+          onPointerEnter={hasThumb ? (e) => setPeek({ path: value, rect: e.currentTarget.getBoundingClientRect() }) : undefined}
+          onPointerLeave={() => setPeek(null)}
+        >
+          {value && (
+            <span className="asset-field-thumb">
+              <AssetPicture path={value} glyphSize={13} />
+            </span>
+          )}
+          <span className="asset-field-name">{name}</span>
+          <span className="asset-field-caret" aria-hidden="true">
+            <ChevronDown size={12} />
+          </span>
+        </div>
       )}
-      {menu && <ContextMenu x={menu.x} y={menu.y} items={isBuiltinMaterial(value) ? menuItems.filter(item => !["Show in Assets Panel", "Select Asset"].includes(item.label)) : menuItems} onClose={closeMenu} />}
+      {open && (
+        <AssetBrowser
+          anchorRef={triggerRef}
+          exts={exts}
+          value={value}
+          emptyLabel={emptyLabel}
+          layer={descriptor.layer}
+          onPick={(path) => {
+            setOpen(false);
+            onCommit(path);
+          }}
+          onClose={() => setOpen(false)}
+        />
+      )}
+      {peek && <AssetPeek path={peek.path} rect={peek.rect} />}
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={visibleMenu} onClose={closeMenu} />}
     </div>
   );
 }

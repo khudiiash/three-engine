@@ -1,5 +1,12 @@
-import { useEffect, useState } from "react";
-import { GitBranch } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Bot, Box, ChevronDown, CloudCheck, CloudUpload, GitBranch, Hammer, Pause, Play, RotateCcw, Search, Settings, Square, StepForward } from "./icons/index.jsx";
+import { listProjectAssets } from "./assetLoader.js";
+import { PopoverMenu } from "./fields/PopoverMenu.jsx";
+import { PANEL_ICONS } from "./panelCatalog.js";
+import { usePlayStore } from "./store/playStore.js";
+import { toggle as togglePlay, togglePaused, stepFrame } from "./playMode.js";
+import { BrowserPreviewLauncher } from "./components/BrowserPreviewLauncher.jsx";
+import { WindowControls } from "./WindowControls.jsx";
 import { commandBus, useHistoryStore } from "./commands/CommandBus.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useSceneStore } from "./store/sceneStore.js";
@@ -12,7 +19,7 @@ import {
   deleteSelection,
 } from "./clipboard.js";
 import { groupSelection } from "./group.js";
-import { newScene, openScene, saveScene } from "./sceneIO.js";
+import { newScene, openScene, openScenePath, saveScene } from "./sceneIO.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { openPanel, resetLayout } from "./EditorShell.jsx";
 import { describeBinding, getBinding, visibilityActions } from "./keybindings.js";
@@ -91,7 +98,8 @@ function McpIndicator() {
       onClick={() => openPanel("mcp")}
     >
       <span className="mcp-dot" />
-      MCP{status === "connected" && callCount > 0 ? ` ${callCount}` : ""}
+      <Bot size={12} className="mcp-chip-icon" aria-hidden="true" />
+      {status === "connected" && callCount > 0 ? <span className="mcp-chip-count">{callCount}</span> : null}
     </button>
   );
 }
@@ -125,6 +133,138 @@ function GitIndicator() {
   );
 }
 
+/**
+ * A menu item's label with its glyph when it has one. The Window menu shows the
+ * same glyphs the tab strip and the launcher use, so a panel is the same
+ * picture in all three places.
+ */
+function MenuItemLabel({ item }) {
+  const Icon = item.icon ?? (item.panel ? PANEL_ICONS[item.panel] : null);
+  return (
+    <span className="menu-item-label">
+      {Icon ? <Icon size={13} className="menu-item-icon" aria-hidden="true" /> : null}
+      {item.label}
+    </span>
+  );
+}
+
+/**
+ * Play / Pause / Step, Build and Preview, and the scene's name — centred in
+ * the bar, together, because they are application verbs: running the game
+ * means the same thing whether you are in the viewport or mid-word in the
+ * code editor (EditorChrome.jsx makes the same argument for the keyboard).
+ * The viewport toolbar used to hold Play, which contradicted that.
+ *
+ * While the game runs the Play button turns amber and the bar grows a 1 px
+ * amber line (`.menu-bar.live`), so "live" is visible from every panel.
+ */
+/**
+ * The scene, and every other scene in the project one click away. Lists the
+ * project's .scene files when opened; picking one opens it (the current scene
+ * autosaves on its interval, and Ctrl+S is one key away).
+ */
+function SceneSwitcher({ sceneName, dirty }) {
+  const rootPath = useProjectStore((s) => s.rootPath);
+  const [open, setOpen] = useState(false);
+  const [scenes, setScenes] = useState(null);
+  const anchorRef = useRef(null);
+  useEffect(() => {
+    if (!open || !rootPath) return undefined;
+    let live = true;
+    setScenes(null);
+    listProjectAssets(rootPath, ["scene"], 6)
+      .then((found) => live && setScenes(found))
+      .catch(() => live && setScenes([]));
+    return () => {
+      live = false;
+    };
+  }, [open, rootPath]);
+  const fileName = (path) => String(path ?? "").split(/[\\/]/).pop().replace(/\.scene$/i, "");
+  return (
+    <div className="dropdown-wrap">
+      <button
+        ref={anchorRef}
+        type="button"
+        className="scene-chip"
+        title={dirty ? `${sceneName} — unsaved changes. Click to switch scene.` : `${sceneName || "No scene"}. Click to switch scene.`}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <Box size={13} />
+        {sceneName || "No scene"}
+        <span className={`scene-dot${dirty ? " dirty" : ""}`} aria-hidden="true" />
+        <ChevronDown size={12} className="scene-caret" />
+      </button>
+      {open && (
+        <PopoverMenu anchorRef={anchorRef} className="scene-menu" minWidth={240} onClose={() => setOpen(false)}>
+          {scenes === null && <div className="dropdown-item">Loading…</div>}
+          {scenes?.map((path) => (
+            <button
+              key={path}
+              className={`dropdown-item${fileName(path) === sceneName ? " checked" : ""}`}
+              title={path}
+              onClick={() => {
+                setOpen(false);
+                if (fileName(path) !== sceneName) openScenePath(path);
+              }}
+            >
+              <span className="menu-item-label">
+                <Box size={13} className="menu-item-icon" aria-hidden="true" />
+                {fileName(path)}
+              </span>
+            </button>
+          ))}
+          {scenes?.length === 0 && <div className="dropdown-item">No scenes in this project</div>}
+          <div className="menu-separator" />
+          <button className="dropdown-item" onClick={() => { setOpen(false); newScene(); }}>
+            <span className="menu-item-label">New scene</span>
+          </button>
+          <button className="dropdown-item" onClick={() => { setOpen(false); openScene(); }}>
+            <span className="menu-item-label">Open scene…</span>
+          </button>
+        </PopoverMenu>
+      )}
+    </div>
+  );
+}
+
+function Transport({ sceneName, dirty }) {
+  const playing = usePlayStore((s) => s.playing);
+  const paused = usePlayStore((s) => s.paused);
+  return (
+    <div className="transport" role="group" aria-label="Play, build and preview">
+      <button
+        className={`transport-btn play${playing ? " live" : ""}`}
+        title={playing ? "Stop (Ctrl+P)" : "Play (Ctrl+P)"}
+        onClick={() => togglePlay()}
+      >
+        {playing ? <Square size={13} /> : <Play size={13} />}
+      </button>
+      <button
+        className={`transport-btn${paused ? " active" : ""}`}
+        disabled={!playing}
+        title={paused ? "Resume (Ctrl+Shift+P)" : "Pause (Ctrl+Shift+P)"}
+        onClick={() => togglePaused()}
+      >
+        <Pause size={13} />
+      </button>
+      <button className="transport-btn" disabled={!playing} title="Step one frame (Ctrl+.)" onClick={() => stepFrame()}>
+        <StepForward size={13} />
+      </button>
+      <span className="transport-sep" />
+      <button
+        className="transport-btn"
+        title="Build game (Ctrl+B)"
+        onClick={() => import("./exportGame.js").then((m) => m.exportGameWithToasts())}
+      >
+        <Hammer size={13} />
+      </button>
+      <BrowserPreviewLauncher />
+      <span className="transport-sep" />
+      <SceneSwitcher sceneName={sceneName} dirty={dirty} />
+    </div>
+  );
+}
+
 export function MenuBar() {
   const [openMenu, setOpenMenu] = useState(null);
   const [scriptItems, setScriptItems] = useState([]);
@@ -141,6 +281,7 @@ export function MenuBar() {
   const selection = useSelectionStore((s) => s.ids);
   const sceneName = useSceneStore((s) => s.sceneName);
   const dirty = useSceneStore((s) => s.dirty);
+  const playing = usePlayStore((s) => s.playing);
 
   const sceneRoot = useProjectStore((s) => s.rootPath);
   const menus = {
@@ -168,7 +309,7 @@ export function MenuBar() {
       { separator: true },
       // The panel is where a build is *configured*; this is the one-click path
       // for someone who has already configured it (or is happy with defaults).
-      { label: "Build Settings…", action: () => openPanel("build") },
+      { label: "Build Settings…", panel: "build", action: () => openPanel("build") },
       { label: "Build Game…", shortcut: "Ctrl+B", action: () => import("./exportGame.js").then((m) => m.exportGameWithToasts()) },
     ],
     Edit: [
@@ -228,45 +369,45 @@ export function MenuBar() {
       },
     ],
     Window: [
-      { label: "Viewport", action: () => openPanel("viewport") },
-      { label: "Game", action: () => openPanel("game") },
-      { label: "Hierarchy", action: () => openPanel("hierarchy") },
-      { label: "Inspector", action: () => openPanel("inspector") },
-      { label: "Assets", action: () => openPanel("assets") },
-      { label: "Console", action: () => openPanel("console") },
+      { label: "Viewport", panel: "viewport", action: () => openPanel("viewport") },
+      { label: "Game", panel: "game", action: () => openPanel("game") },
+      { label: "Hierarchy", panel: "hierarchy", action: () => openPanel("hierarchy") },
+      { label: "Inspector", panel: "inspector", action: () => openPanel("inspector") },
+      { label: "Assets", panel: "assets", action: () => openPanel("assets") },
+      { label: "Console", panel: "console", action: () => openPanel("console") },
       { separator: true },
-      { label: "Shader Graph", action: () => openPanel("shaderGraph") },
-      { label: "Particles", action: () => openPanel("particles") },
-      { label: "VFX", action: () => openPanel("vfx") },
-      { label: "Animator", action: () => openPanel("animator") },
-      { label: "Timeline", action: () => openPanel("timeline") },
-      { label: "Post Process", action: () => openPanel("postprocess") },
+      { label: "Shader Graph", panel: "shaderGraph", action: () => openPanel("shaderGraph") },
+      { label: "Particles", panel: "particles", action: () => openPanel("particles") },
+      { label: "VFX", panel: "vfx", action: () => openPanel("vfx") },
+      { label: "Animator", panel: "animator", action: () => openPanel("animator") },
+      { label: "Timeline", panel: "timeline", action: () => openPanel("timeline") },
+      { label: "Post Process", panel: "postprocess", action: () => openPanel("postprocess") },
       { separator: true },
-      { label: "Scene Settings", action: () => openPanel("sceneSettings") },
-      { label: "Project Settings", action: () => openPanel("projectSettings") },
-      { label: "Build Settings", action: () => openPanel("build") },
-      { label: "Modules", action: () => openPanel("modules") },
-      { label: "Input", action: () => openPanel("input") },
-      { label: "Events", action: () => openPanel("events") },
-      { label: "Event Graph", action: () => openPanel("eventGraph") },
-      { label: "Texture Editor", action: () => openPanel("textureEditor") },
-      { label: "Code", action: () => openPanel("code") },
-      { label: "Fonts", action: () => openPanel("fontLibrary") },
-      { label: "Poly Haven", action: () => openPanel("polyhaven") },
-      { label: "AmbientCG", action: () => openPanel("ambientcg") },
-      { label: "Sketchfab", action: () => openPanel("sketchfab") },
-      { label: "Poly Pizza", action: () => openPanel("polypizza") },
-      { label: "KayKit", action: () => openPanel("kaykit") },
-      { label: "Fab", action: () => openPanel("fab") },
-      { label: "itch.io", action: () => openPanel("itchio") },
-      { label: "Audio Library", action: () => openPanel("audioLibrary") },
-      { label: "Audio Editor", action: () => openPanel("audioEditor") },
-      { label: "Source Control", action: () => openPanel("git") },
-      { label: "Terminal", action: () => openPanel("terminal") },
-      { label: "Assistant (MCP)", action: () => openPanel("mcp") },
-      { label: "AI", action: () => openPanel("ai") },
+      { label: "Scene Settings", panel: "sceneSettings", action: () => openPanel("sceneSettings") },
+      { label: "Project Settings", panel: "projectSettings", action: () => openPanel("projectSettings") },
+      { label: "Build Settings", panel: "build", action: () => openPanel("build") },
+      { label: "Modules", panel: "modules", action: () => openPanel("modules") },
+      { label: "Input", panel: "input", action: () => openPanel("input") },
+      { label: "Events", panel: "events", action: () => openPanel("events") },
+      { label: "Event Graph", panel: "eventGraph", action: () => openPanel("eventGraph") },
+      { label: "Texture Editor", panel: "textureEditor", action: () => openPanel("textureEditor") },
+      { label: "Code", panel: "code", action: () => openPanel("code") },
+      { label: "Fonts", panel: "fontLibrary", action: () => openPanel("fontLibrary") },
+      { label: "Poly Haven", panel: "polyhaven", action: () => openPanel("polyhaven") },
+      { label: "AmbientCG", panel: "ambientcg", action: () => openPanel("ambientcg") },
+      { label: "Sketchfab", panel: "sketchfab", action: () => openPanel("sketchfab") },
+      { label: "Poly Pizza", panel: "polypizza", action: () => openPanel("polypizza") },
+      { label: "KayKit", panel: "kaykit", action: () => openPanel("kaykit") },
+      { label: "Fab", panel: "fab", action: () => openPanel("fab") },
+      { label: "itch.io", panel: "itchio", action: () => openPanel("itchio") },
+      { label: "Audio Library", panel: "audioLibrary", action: () => openPanel("audioLibrary") },
+      { label: "Audio Editor", panel: "audioEditor", action: () => openPanel("audioEditor") },
+      { label: "Source Control", panel: "git", action: () => openPanel("git") },
+      { label: "Terminal", panel: "terminal", action: () => openPanel("terminal") },
+      { label: "Assistant (MCP)", panel: "mcp", action: () => openPanel("mcp") },
+      { label: "AI", panel: "ai", action: () => openPanel("ai") },
       { separator: true },
-      { label: "Reset Layout", action: () => resetLayout() },
+      { label: "Reset Layout", icon: RotateCcw, action: () => resetLayout() },
     ],
     Visibility: [
       {
@@ -332,7 +473,11 @@ export function MenuBar() {
   };
 
   return (
-    <div className="menu-bar">
+    // The bar is the window's title bar on Windows (no native decorations):
+    // its empty surface drags the window and double-click maximises it.
+    <div className={`menu-bar${playing ? " live" : ""}`} data-tauri-drag-region>
+      <img className="app-mark" src="/app-icon.png" alt="" draggable={false} data-tauri-drag-region />
+      <span className="wordmark" data-tauri-drag-region>THREE ENGINE</span>
       {Object.entries(withScriptMenus(menus, scriptItems)).map(([name, items]) => (
         <div key={name} className="menu-wrap">
           <button
@@ -357,7 +502,7 @@ export function MenuBar() {
                     disabled={item.disabled}
                     onClick={() => runItem(item)}
                   >
-                    <span>{item.label}</span>
+                    <MenuItemLabel item={item} />
                     {item.shortcut && <span className="menu-shortcut">{item.shortcut}</span>}
                   </button>
                 ),
@@ -367,14 +512,29 @@ export function MenuBar() {
         </div>
       ))}
       {openMenu && <div className="dropdown-overlay" onClick={() => setOpenMenu(null)} />}
+      <Transport sceneName={sceneName} dirty={dirty} />
       <div className="menu-spacer" />
+      <span className={`save-state${dirty ? " dirty" : ""}`} title={dirty ? "The scene has changes not yet on disk (Ctrl+S, or autosave)" : "Everything is saved"}>
+        {dirty ? <CloudUpload size={13} /> : <CloudCheck size={13} />}
+        <span className="save-state-text">{dirty ? "Unsaved changes" : "All changes saved"}</span>
+      </span>
+      <button
+        type="button"
+        className="global-search"
+        title="Search entities, assets, panels and settings (Ctrl+F)"
+        onClick={() => window.dispatchEvent(new CustomEvent("editor-quick-search"))}
+      >
+        <Search size={12} />
+        <span className="global-search-text">Search assets, entities, settings</span>
+        <kbd>Ctrl F</kbd>
+      </button>
       <GitIndicator />
       <McpIndicator />
       <ProcessingIndicator />
-      <div className="menu-title">
-        {sceneName}
-        {dirty ? " •" : ""} — Three Engine
-      </div>
+      <button type="button" className="bar-gear" title="Project settings" onClick={() => openPanel("projectSettings")}>
+        <Settings size={14} />
+      </button>
+      <WindowControls />
     </div>
   );
 }

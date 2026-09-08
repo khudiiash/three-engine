@@ -1,6 +1,7 @@
 // @ts-check
 import * as THREE from "three/webgpu";
 import { authoredCastShadow } from "./merging.js";
+import { freeze } from "./freezeLedger.js";
 
 /**
  * Automatic static batching.
@@ -42,6 +43,36 @@ const MIN_GROUP_SIZE = 4;
 const EXCLUSIVE_COMPONENTS = ["skinnedmesh", "terrain", "geometryModifiers"];
 
 /**
+ * ── A SETTLE, LIKE MERGING'S (2026-09-07, ZERO_FREEZE_PLAN §1.5) ────────────
+ *
+ * THE FAILURE: `invalidate()` set a flag with NO settle and NO throttle, so
+ * the very next frame after ANY "hierarchy-changed" did a full regroup — a
+ * walk of every entity, a key per mesh, an InstancedMesh rebuilt per group —
+ * and batching is ON by default. A scene load, a prefab expansion or an edit
+ * storm is a burst of those events, and each one bought its own regroup on the
+ * frame the user was waiting for something else to finish.
+ *
+ * `merging.js` has carried the same gates for exactly this reason (see
+ * MIN_REBUILD_INTERVAL_MS there); this is that shape, with the same escape —
+ * a scene that never stops changing still regroups after MAX_DEFER_MS so
+ * batching cannot be starved forever by a stream of invalidations.
+ *
+ * ⚠ ONE INVALIDATION IS NOT A STORM, AND IT MUST NOT WAIT. Merging's plain
+ * trailing settle would be a LOOK regression here: a batch's inputs include
+ * VISIBILITY, and dropping a member takes a regroup, so clicking an entity's
+ * eye icon would leave it drawing through its batch for the whole settle — a
+ * ghost of the thing the user just hid, for 400 ms, every time. So the settle
+ * applies only once a BURST is underway (more than one invalidation since the
+ * last regroup), which is exactly the case the audit measured and exactly the
+ * case a single deliberate edit is not.
+ *
+ * `globalThis.__engineBatchingSettle = false` regroups on the next frame again
+ * (the pre-2026-09-07 behaviour) for a one-boot A/B.
+ */
+const SETTLE_MS = 400;
+const MAX_DEFER_MS = 2000;
+
+/**
  * True when `entity` and every ancestor are both enabled for the current mode
  * and visible.
  *
@@ -68,6 +99,10 @@ export class BatchSystem {
     this.enabled = false;
     this.batches = []; // { key, mesh, members: [Mesh], cache: Float32Array }
     this._dirty = true;
+    // 0 = "dirty since construction / since being switched on", which
+    // #readyToRebuild treats as "build now" — the first grouping never waits.
+    this._dirtiedAt = 0;
+    this._dirtySince = 0;
     this._unsubscribe = [];
   }
 
@@ -78,6 +113,8 @@ export class BatchSystem {
     this.enabled = next;
     if (next) {
       this._dirty = true;
+      this._dirtiedAt = 0;
+      this._dirtySince = 0;
       const invalidate = () => this.invalidate();
       this._unsubscribe = [
         this.engine.on("hierarchy-changed", invalidate),
@@ -95,9 +132,12 @@ export class BatchSystem {
     }
   }
 
-  /** Marks the grouping stale; the next `sync()` rebuilds it. */
+  /** Marks the grouping stale; `sync()` rebuilds it once the burst settles. */
   invalidate() {
     this._dirty = true;
+    this._dirtiedAt = performance.now();
+    if (!this._dirtySince) this._dirtySince = this._dirtiedAt;
+    this._invalidations = (this._invalidations ?? 0) + 1;
   }
 
   /**
@@ -113,11 +153,31 @@ export class BatchSystem {
     // refreshes those later in the frame — so bring the graph up to date here
     // or every batch renders one frame behind its entities.
     this.engine.scene.updateMatrixWorld();
-    if (this._dirty) {
+    if (this._dirty && this.#readyToRebuild()) {
       this._dirty = false;
-      this.#rebuild();
+      this._dirtySince = 0;
+      this._invalidations = 0;
+      freeze.run("batching:rebuild", () => this.#rebuild());
     }
     for (const batch of this.batches) this.#syncMatrices(batch);
+  }
+
+  /**
+   * Whether the invalidation burst has settled. See SETTLE_MS.
+   *
+   * The FIRST grouping is exempt: `_dirty` starts true with no `_dirtiedAt`,
+   * and making the scene's opening batch wait 400 ms would show the user the
+   * unbatched draw count for a quarter of a second on every boot.
+   */
+  #readyToRebuild() {
+    if (globalThis.__engineBatchingSettle === false) return true;
+    if (!this._dirtiedAt) return true;
+    // A single deliberate change (an eye toggle, one material swap) is shown
+    // immediately — see the ghost note on SETTLE_MS.
+    if ((this._invalidations ?? 0) <= 1) return true;
+    const now = performance.now();
+    if (now - this._dirtySince >= MAX_DEFER_MS) return true;
+    return now - this._dirtiedAt >= SETTLE_MS;
   }
 
   /* ---------------------------------------------------------------------- */

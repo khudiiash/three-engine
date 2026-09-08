@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Download, ExternalLink, Loader2, Search, Swords } from "lucide-react";
+import { Download, ExternalLink, Loader2, Power, Search, Swords } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { PACKS, downloadModel, fetchPackItems, openModelPage, packImageUrl } from "../kaykit.js";
@@ -59,15 +59,9 @@ export function KayKitPanel() {
     return (
       <div className="ph-panel">
         <div className="ph-gate">
-          <Swords size={28} />
-          <h3>KayKit</h3>
-          <p>
-            Browse KayKit's free CC0 low-poly packs — rigged, animated characters (Adventurers,
-            Skeletons) plus dungeon, city and space prop sets — and import per file, no account
-            needed. Enable the KayKit module to get started.
-          </p>
+          <Swords size={28} className="empty-glyph" />
           <button className="toolbar-btn wide" onClick={() => setModuleEnabled("kaykit", true)}>
-            Enable KayKit module
+            <Power size={13} /> Enable KayKit module
           </button>
         </div>
       </div>
@@ -105,7 +99,7 @@ export function KayKitPanel() {
           {error && !items ? (
             <div className="ph-status">Couldn't reach GitHub: {error}</div>
           ) : items === null ? (
-            <div className="ph-status"><Loader2 size={14} className="ph-spin" /> Loading pack…</div>
+            <div className="ph-status"><Loader2 size={14} className="ph-spin" /></div>
           ) : filtered.length === 0 ? (
             <div className="ph-status">No models in this pack match.</div>
           ) : (

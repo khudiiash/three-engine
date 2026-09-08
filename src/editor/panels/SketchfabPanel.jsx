@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Download, ExternalLink, Globe, KeyRound, Loader2, Search } from "lucide-react";
+import { Download, ExternalLink, Globe, KeyRound, Loader2, Power, Search } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { downloadModel, getSavedToken, openModelPage, searchModels } from "../sketchfab.js";
@@ -89,14 +89,9 @@ export function SketchfabPanel() {
     return (
       <div className="ph-panel">
         <div className="ph-gate">
-          <Globe size={28} />
-          <h3>Sketchfab</h3>
-          <p>
-            Browse downloadable Creative Commons models from Sketchfab and import GLTF assets with
-            creator attribution. Enable the Sketchfab module to get started.
-          </p>
+          <Globe size={28} className="empty-glyph" />
           <button className="toolbar-btn wide" onClick={() => setModuleEnabled("sketchfab", true)}>
-            Enable Sketchfab module
+            <Power size={13} /> Enable Sketchfab module
           </button>
         </div>
       </div>
@@ -115,7 +110,9 @@ export function SketchfabPanel() {
             onChange={(event) => setQuery(event.target.value)}
           />
         </div>
-        <button className="toolbar-btn" type="submit">Search</button>
+        <button className="toolbar-btn icon-only" type="submit" title="Search">
+          <Search size={13} />
+        </button>
         <select className="ph-category" value={category} onChange={(event) => setCategory(event.target.value)}>
           <option value="">All loaded categories</option>
           {categories.map((value) => <option key={value} value={value}>{value}</option>)}
@@ -123,9 +120,8 @@ export function SketchfabPanel() {
       </form>
 
       {!token && (
-        <div className="sf-authbar">
+        <div className="sf-authbar" title="Downloads require your personal Sketchfab token — connect it in the Modules panel">
           <KeyRound size={13} />
-          <span>Downloads require your personal Sketchfab token — connect it in the Modules panel</span>
           <button className="toolbar-btn" onClick={() => openModulesPanel()}>Open Modules</button>
         </div>
       )}
@@ -135,7 +131,7 @@ export function SketchfabPanel() {
           {error && !items ? (
             <div className="ph-status">Couldn't reach Sketchfab: {error}</div>
           ) : items === null ? (
-            <div className="ph-status"><Loader2 size={14} className="ph-spin" /> Loading catalog…</div>
+            <div className="ph-status"><Loader2 size={14} className="ph-spin" /></div>
           ) : filtered.length === 0 ? (
             <div className="ph-status">No downloadable models match.</div>
           ) : (
@@ -216,8 +212,8 @@ function ModelDetail({ model, hasProject, hasToken, onClose }) {
       <div className="ph-detail-meta">
         <span>by {model.author}</span>
         <span>{model.license}</span>
-        <span>{model.views.toLocaleString()} views · {model.likes.toLocaleString()} likes</span>
-        {model.faces > 0 && <span>{model.faces.toLocaleString()} faces</span>}
+        <span><span className="cnt" title="views">{model.views.toLocaleString()}</span> · <span className="cnt" title="likes">{model.likes.toLocaleString()}</span></span>
+        {model.faces > 0 && <span className="cnt" title="faces">{model.faces.toLocaleString()}</span>}
       </div>
       {model.categories.length > 0 && (
         <div className="ph-detail-cats">

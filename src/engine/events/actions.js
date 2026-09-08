@@ -152,11 +152,8 @@ export const ACTION_KINDS = {
         component.setProp("enabled", mode === "toggle" ? !component.enabled : mode === "enable");
         return;
       }
-      // `enabledInGame`, not `enabledInEditor`: an entity has a flag per mode
-      // and bindings only ever run while playing, so the editor flag is not the
-      // one being asked about. (There is no plain `entity.enabled`.)
-      const next = mode === "toggle" ? !target.enabledInGame : mode === "enable";
-      target.setEnabledInGame(next);
+      const next = mode === "toggle" ? !target.enabled : mode === "enable";
+      target.setEnabled(next);
     },
   },
 

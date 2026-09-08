@@ -885,6 +885,23 @@ export class MergeSystem {
       // a rebuild the cache has made cheap would trade a real artifact for
       // nothing. Both are self-limiting anyway — a mover is marked unstable and
       // never merged again, an edit lands once.
+      //
+      // ── ⛔ REFUTED 2026-09-07 (ZERO_FREEZE_PLAN §1.5 audit) ───────────────
+      // The audit read this bypass as "a gizmo drag re-merges every frame" and
+      // asked for `_urgent` to skip only the settle. It does not: the ONLY
+      // runtime setter of `_urgent` is `#watchForMotion`, and the same pass
+      // adds the mover to `this._unstable`, which `#collectGroups` skips
+      // FOREVER (line ~1116). So a drag costs exactly ONE re-merge — the first
+      // frame the motion is seen — and the mover is never a member again. The
+      // other two setters are the constructor and `setEnabled(true)`, both of
+      // which mean "first build, do not wait".
+      // Throttling it anyway was measured to cost five green checks in
+      // `scripts/run-merging-test.mjs` (eviction, teardown, world split,
+      // re-enable, cache reuse) and a 250 ms window of a proxy drawn where the
+      // user has already dragged the mesh away from. Left as an opt-in:
+      // `globalThis.__engineMergeUrgentThrottle = true` applies the interval to
+      // urgent rebuilds, for whoever finds a case this reasoning misses.
+      if (throttled && globalThis.__engineMergeUrgentThrottle === true) return;
       if (throttled && !this._urgent) return;
       this._urgent = false;
       this._lastRebuildAt = now;

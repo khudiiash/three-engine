@@ -31,7 +31,47 @@ export function projectClothMeshContact({ field, skip, point, old, velocity, rad
           If(length.greaterThan(.000001), () => {
             const normal = rawNormal.div(length);
             const d0 = dot(old.sub(a), normal), d1 = dot(end.sub(a), normal);
-            const side = d0.greaterThanEqual(0).select(1, -1);
+            // ⛔⛔ A TWO-SIDED CONTACT IS BISTABLE, AND THE WRONG STATE IS
+            // STABLE.
+            //
+            // The side used to come from `d0` alone — where the particle WAS.
+            // That is right for a floor you can legitimately be under, and
+            // catastrophic for a wall a curtain is pressed against: once a
+            // particle ends up behind the wall, its `old` is behind too, so
+            // the contact dutifully pushes it BACK behind, every substep,
+            // forever. Its neighbours stay in front and the spring between
+            // them spans the wall for good. Every curtain that breaks in
+            // Sponza is one the wind presses into a wall; the ones hanging
+            // free are clean, and a held particle measures 3.63x rest length
+            // with no path back (see `relaxHeld` in the topology tests).
+            //
+            // ⛔⛔ AND THE OBVIOUS FIX IS REFUTED, MEASURED, ON THE LIVE
+            // SCENE. Taking the side from the triangle's WINDING instead —
+            // "a cloth belongs on the side a scene collider's normal points" —
+            // assumes a cooked collider is wound consistently. Sponza's are
+            // not. Shipped as the default for one reload and every island got
+            // worse, the previously PRISTINE one worst of all:
+            //
+            //     island 2   mean strain 0.014 -> 0.174   worst 0.30 -> 17.25
+            //     island 0   mean strain 0.077 -> 0.171   worst 7.24 -> 21.98
+            //
+            // A wrongly wound triangle pushes cloth INTO the wall, and there
+            // are enough of them in a decimated collider to wreck every piece.
+            // So the approach side stays the default; `__clothOneSidedContact`
+            // opts into the winding for geometry known to be clean.
+            //
+            // ⚠ "Prefer the front unless BOTH ends are behind" was tried first
+            // and is not even a candidate: a stuck particle has both ends
+            // behind, which is the entire condition.
+            //
+            // ▶ The bistability is REAL and still unfixed — see the plan doc.
+            // Whatever replaces this needs a CPU model of the contact to test
+            // against, the way `relaxPass` models the constraint solve. Two
+            // speculative solver changes in a row shipped and had to be
+            // reverted; that is the lesson, not the hypotheses.
+            const side = globalThis.__clothOneSidedContact === true
+              ? float(1)
+              : d0.greaterThanEqual(0).select(1, -1);
             const facing = normal.mul(side);
             const from = d0.mul(side), to = d1.mul(side);
             const denominator = from.sub(to);

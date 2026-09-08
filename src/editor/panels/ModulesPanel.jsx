@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Boxes, ChevronDown, KeyRound, Search, Sliders, Tag } from "lucide-react";
+import { Boxes, ChevronDown, ExternalLink, KeyRound, Loader2, LogIn, Plug, Search, Sliders, Tag, Unlink } from "../icons/index.jsx";
 import {
   useModulesStore,
   listModuleDefinitions,
@@ -162,13 +162,11 @@ export function ModulesPanel() {
 
   const selected = defs.find((d) => d.id === selectedId) ?? null;
   const disabledReason = playing ? "Stop play mode to change modules" : null;
-  const intro = (
+  const intro = !hasProject ? (
     <div className="modules-intro">
-      Engine modules extend the runtime with new components and systems.
-      Enabled modules are saved with the project and ship with exported games.
-      {!hasProject && <em> No project open — choices won't persist.</em>}
+      <em>No project open — choices won't persist.</em>
     </div>
-  );
+  ) : null;
 
   const toggleCategory = (cat) => {
     setCollapsed((prev) =>
@@ -180,11 +178,18 @@ export function ModulesPanel() {
     <div className="modules-panel">
       {intro}
       {defs.length === 0 ? (
-        <div className="modules-intro">No modules registered.</div>
+        <div className="modules-detail-empty">
+          <Boxes size={28} className="empty-glyph" />
+        </div>
       ) : (
         <div className="modules-body">
           {/* Left rail: pick a module to inspect on the right. */}
-          <div className="modules-list" role="listbox" aria-label="Engine modules">
+          <div
+            className="modules-list"
+            role="listbox"
+            aria-label="Engine modules"
+            title="Engine modules extend the runtime with new components and systems. Enabled modules are saved with the project and ship with exported games."
+          >
             <div className="modules-search">
               <Search size={13} />
               <input
@@ -197,7 +202,9 @@ export function ModulesPanel() {
             </div>
 
             {grouped.length === 0 ? (
-              <div className="modules-empty">No modules match "{query}".</div>
+              <div className="modules-empty" title={`No modules match "${query}"`}>
+                <Search size={28} className="empty-glyph" />
+              </div>
             ) : (
               grouped.map(({ category, items }) => {
                 const isCollapsed = collapsed.includes(category);
@@ -273,7 +280,9 @@ export function ModulesPanel() {
                 onToggle={(on) => toggle(selected.id, on)}
               />
             ) : (
-              <div className="modules-detail-empty">Select a module to see its details.</div>
+              <div className="modules-detail-empty" title="Select a module to see its details">
+                <Boxes size={28} className="empty-glyph" />
+              </div>
             )}
           </div>
         </div>
@@ -395,7 +404,9 @@ function ModuleCredential({ provider }) {
       {token ? (
         <div className="modules-credential-row">
           <span className="asset-hint">Saved locally{name ? ` — ${name}` : ""}</span>
-          <button className="toolbar-btn" onClick={disconnect}>Disconnect</button>
+          <button className="toolbar-btn icon-only" title="Disconnect" onClick={disconnect}>
+            <Unlink size={13} />
+          </button>
         </div>
       ) : (
         <form className="modules-credential-row" onSubmit={connect}>
@@ -407,11 +418,17 @@ function ModuleCredential({ provider }) {
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
           />
-          <button className="toolbar-btn" disabled={busy || !draft.trim()}>
+          <button className="toolbar-btn" disabled={busy || !draft.trim()} title="Connect">
+            {busy ? <Loader2 size={13} className="spin" /> : <LogIn size={13} />}
             {busy ? "Checking…" : "Connect"}
           </button>
-          <button type="button" className="sf-link-btn" onClick={() => provider.openHelp(mod)}>
-            {provider.helpLabel}
+          <button
+            type="button"
+            className="toolbar-btn icon-only"
+            title={provider.helpLabel}
+            onClick={() => provider.openHelp(mod)}
+          >
+            <ExternalLink size={13} />
           </button>
         </form>
       )}
@@ -456,7 +473,14 @@ function ModuleSettings({ def }) {
 
   return (
     <section className="modules-detail-section">
-      <div className="modules-detail-section-label">
+      <div
+        className="modules-detail-section-label"
+        title={
+          hasProject
+            ? "Defaults apply to newly imported assets and this project's runtime."
+            : "Open a project for these defaults to persist."
+        }
+      >
         <Sliders size={11} />
         <span>Default settings</span>
       </div>
@@ -484,11 +508,6 @@ function ModuleSettings({ def }) {
           )}
         </div>
       ))}
-      <div className="asset-hint">
-        {hasProject
-          ? "Defaults apply to newly imported assets and this project's runtime."
-          : "Open a project for these defaults to persist."}
-      </div>
     </section>
   );
 }
@@ -594,7 +613,12 @@ function ModuleDetail({ def, on, busy, disabledReason, onToggle }) {
       )}
 
       <section className="modules-detail-section">
-        <div className="modules-detail-section-label">Runtime</div>
+        <div
+          className="modules-detail-section-label"
+          title="Enabled choices persist in project.json and ride into exported games."
+        >
+          Runtime
+        </div>
         <dl className="modules-detail-grid">
           <dt>Module ID</dt>
           <dd>
@@ -609,10 +633,6 @@ function ModuleDetail({ def, on, busy, disabledReason, onToggle }) {
           </dd>
         </dl>
       </section>
-
-      <p className="modules-detail-note">
-        Enabled choices persist in <code>project.json</code> and ride into exported games.
-      </p>
     </div>
   );
 }

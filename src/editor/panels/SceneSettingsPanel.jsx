@@ -1,5 +1,6 @@
 // @ts-check
 import { useEffect, useState } from "react";
+import { Import, MousePointer2, Pencil } from "../icons/index.jsx";
 import { engine, ensureEngine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetSceneSettingsCommand } from "../commands/settingsCommands.js";
@@ -7,6 +8,9 @@ import { useSceneStore } from "../store/sceneStore.js";
 import { MSAA_SAMPLES, SHADOW_TYPES, SCENE_SETTINGS_DEFAULTS } from "../../engine/sceneSettings.js";
 import { ENVIRONMENT_EXTENSIONS, CUBEMAP_EXTENSIONS } from "../assetLoader.js";
 import { AssetField } from "../fields/AssetField.jsx";
+import { NumberField } from "../fields/NumberField.jsx";
+import { EquirectPreview } from "../components/AssetThumb.jsx";
+import { isEquirectPath } from "../../engine/environmentAsset.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { openPanel } from "../EditorShell.jsx";
 import { Row, Toggle, Note, Section } from "./settingsUi.jsx";
@@ -28,6 +32,12 @@ const SHADOW_TYPE_OPTIONS = Object.keys(SHADOW_TYPES).map((k) => [k, k.replace("
  *           max?: number, step?: number }} props
  */
 function NumberInput({ value, onCommit, min, max, step = 0.1 }) {
+  // A bounded number is the shared slider field (drag by position, click to type).
+  if (Number.isFinite(min) && Number.isFinite(max) && max > min) return <NumberField value={value} min={min} max={max} step={step} onCommit={onCommit} />;
+  return <PlainNumberInput value={value} onCommit={onCommit} min={min} max={max} step={step} />;
+}
+
+function PlainNumberInput({ value, onCommit, min, max, step = 0.1 }) {
   const [text, setText] = useState(String(value));
   useEffect(() => setText(String(Math.round(value * 1000) / 1000)), [value]);
   const commit = () => {
@@ -132,11 +142,9 @@ function LegacyEnvironmentNote({ entity }) {
   };
   return (
     <>
-      {/* Short on purpose — this panel's prose budget is one line per note,
-          and the polish smoke enforces it. The explanation is the tooltip. */}
-      <Note>
-        The sky comes from the <strong>{entity.name}</strong> entity, not this slot.
-      </Note>
+      {/* The explanation lives in the tooltip — this panel's prose budget is
+          one glyph per note, and the polish smoke enforces it. */}
+      <Note danger>{`The sky comes from the ${entity.name} entity, not this slot.`}</Note>
       <button
         className="toolbar-btn wide"
         title={
@@ -146,16 +154,18 @@ function LegacyEnvironmentNote({ entity }) {
         }
         onClick={move}
       >
-        Move HDRI into Scene Settings
+        <Import size={13} />
+        Move into Scene Settings
       </button>
       <button
-        className="toolbar-btn wide"
+        className="toolbar-btn icon-only"
+        title={`Select ${entity.name}`}
         onClick={() => {
           useSelectionStore.getState().select([entity.id]);
           openPanel("inspector");
         }}
       >
-        Select {entity.name}
+        <MousePointer2 size={13} />
       </button>
     </>
   );
@@ -322,13 +332,14 @@ export function SceneSettingsPanel() {
             </Row>
             {isCubemap(env.cubemap) && (
               <button
-                className="toolbar-btn wide"
+                className="toolbar-btn icon-only"
+                title="Edit cube map faces"
                 onClick={() => {
                   useSelectionStore.getState().selectAsset(env.cubemap);
                   openPanel("inspector");
                 }}
               >
-                Edit Cube Map Faces
+                <Pencil size={13} />
               </button>
             )}
           </>
@@ -521,11 +532,10 @@ export function SceneSettingsPanel() {
             onChange={(v) => commitPerf({ occlusionCulling: v }, "Toggle occlusion culling")}
           />
         </Row>
-        <Note>Applied live. Tune against the GPU ms readout — 16.7 ms = 60 fps.</Note>
       </Section>
 
       <Section id="scene.renderer" title="Renderer" defaultOpen={false}>
-        <Note>Changing these rebuilds the renderer.</Note>
+        <Note danger>Changing these rebuilds the renderer.</Note>
         <Row label="Antialias">
           <Toggle
             checked={renderer.antialias !== false}
@@ -554,8 +564,6 @@ export function SceneSettingsPanel() {
           />
         </Row>
       </Section>
-
-      <Note footer>Saved with the scene. Project-wide settings live in Project Settings.</Note>
     </div>
   );
 }

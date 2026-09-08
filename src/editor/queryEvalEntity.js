@@ -71,6 +71,7 @@ export function resolveEntityPath(candidate, path) {
   if (head === "tag" || head === "tags") return { found: true, value: candidate.tags ?? [] };
   if (head === "enabled") return { found: true, value: candidate.enabled };
   if (head === "enabledingame") return { found: true, value: candidate.enabledInGame };
+  if (head === "visibleineditor") return { found: true, value: candidate.visibleInEditor };
   if (head === "childcount") {
     return { found: true, value: candidate.childIds ? candidate.childIds.length : 0 };
   }
@@ -120,7 +121,8 @@ function compareFilter(candidate, filter, contextType) {
   // `collider=true` / `sound=false` — a bare component path compared against
   // a boolean means existence, not object identity.
   if (filter.path.length === 1 && typeof filter.value === "boolean" && filter.path[0] !== "name" &&
-      filter.path[0] !== "tag" && filter.path[0] !== "enabled" && filter.path[0] !== "enabledingame") {
+      filter.path[0] !== "tag" && filter.path[0] !== "enabled" && filter.path[0] !== "enabledingame" &&
+      filter.path[0] !== "visibleineditor") {
     const exists = candidate.components?.[filter.path[0]] !== undefined;
     return compareOp(filter.op, exists, filter.value);
   }

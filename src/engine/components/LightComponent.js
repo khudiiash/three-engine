@@ -114,7 +114,11 @@ export class LightComponent extends Component {
     { key: "angle", label: "Angle°", type: "number", min: 1, max: 90, step: 1, showIf: (p) => p.kind === "spot" },
     { key: "penumbra", label: "Penumbra", type: "number", min: 0, max: 1, step: 0.05, showIf: (p) => p.kind === "spot" },
     { key: "castShadow", label: "Cast Shadow", type: "boolean", showIf: (p) => p.kind !== "ambient" },
-    { key: "shadowMode", label: "Shadow Source", type: "select", options: ["map", "gi"], showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+    // `optionModules` gates ONE option behind an optional module: "gi" is
+    // traced by the GI module, so without it the dropdown offers only "map"
+    // (a scene saved in gi mode shows "gi (missing)" rather than silently
+    // rewriting the prop).
+    { key: "shadowMode", label: "Shadow Source", type: "select", options: ["map", "gi"], optionModules: { gi: "gi" }, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
     // Angular size shapes the GI penumbra in BOTH modes (gi traces it directly;
     // map mode still feeds it to the GI bounce), so it is never gated on mode.
     // Up to 90° (Blender sun parity): beyond ~20° the softness comes from the

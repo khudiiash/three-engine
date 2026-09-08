@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Search, Download, Check, AlertTriangle, RefreshCw, Type } from "lucide-react";
+import { Search, Download, Check, AlertTriangle, Loader2, RefreshCw, Type } from "../icons/index.jsx";
 import {
   fetchFontCatalog,
   catalogCategories,
@@ -59,14 +59,18 @@ function FontRow({ entry, sample, size, installed, onImport, busy }) {
   }, [entry.family]);
 
   return (
-    <div className="font-row" ref={ref}>
+    <div className="font-row" ref={ref} title={entry.designers[0] || undefined}>
       <div className="font-row-head">
         <span className="font-row-name">{entry.family}</span>
         <span className="font-row-meta">
           {entry.category}
-          {entry.variants.length > 1 ? ` · ${entry.variants.length} styles` : ""}
+          {entry.variants.length > 1 && (
+            <>
+              {" · "}
+              <span className="cnt" title="styles">{entry.variants.length}</span>
+            </>
+          )}
           {entry.variable ? " · variable" : ""}
-          {entry.designers[0] ? ` · ${entry.designers[0]}` : ""}
         </span>
         {!entry.openSource && (
           <span className="font-row-warn" title="Not open source — check Google's licence terms before shipping it">
@@ -74,13 +78,12 @@ function FontRow({ entry, sample, size, installed, onImport, busy }) {
           </span>
         )}
         <button
-          className="toolbar-btn"
+          className="toolbar-btn icon-only"
           disabled={busy}
           onClick={() => onImport(entry)}
-          title={`Download ${entry.family} into the project`}
+          title={busy ? "Importing…" : installed ? `Re-import ${entry.family}` : `Import ${entry.family} into the project`}
         >
-          {installed ? <Check size={13} /> : <Download size={13} />}
-          {busy ? "Importing…" : installed ? "Re-import" : "Import"}
+          {busy ? <Loader2 size={13} className="ph-spin" /> : installed ? <Check size={13} /> : <Download size={13} />}
         </button>
       </div>
       <div
@@ -240,7 +243,7 @@ export function FontLibraryPanel({ api }) {
         </div>
       )}
       {!rootPath && <div className="asset-hint">Open a project to import fonts into it.</div>}
-      {!catalog && !error && <div className="asset-hint">Loading the Google Fonts catalog…</div>}
+      {!catalog && !error && <div className="asset-hint"><Loader2 size={14} className="ph-spin" /></div>}
 
       {picking && (
         <div className="font-variant-picker">

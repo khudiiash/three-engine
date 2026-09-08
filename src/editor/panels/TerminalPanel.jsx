@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { RotateCcw, Trash2, TerminalSquare } from "lucide-react";
+import { RotateCcw, Trash2, TerminalSquare } from "../icons/index.jsx";
 import "@xterm/xterm/css/xterm.css";
 import { useProjectStore } from "../store/projectStore.js";
 import { vmSingleton } from "../singleton.js";
@@ -276,7 +276,11 @@ export function TerminalPanel() {
           );
         })}
         <div className="menu-spacer" />
-        <span className={`terminal-status ${status}`}>{status}</span>
+        <span
+          className={`terminal-status ${status}`}
+          title={status}
+          style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "currentColor" }}
+        />
         <button className="toolbar-btn" title="Restart the session" onClick={() => start(program, { force: true })}>
           <RotateCcw size={12} />
         </button>

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { Trash2 } from "../icons/index.jsx";
 import { useConsoleStore } from "../store/consoleStore.js";
 
 export function ConsolePanel() {
@@ -14,7 +15,9 @@ export function ConsolePanel() {
   return (
     <div className="console-panel">
       <div className="panel-toolbar">
-        <button className="toolbar-btn" onClick={clear}>Clear</button>
+        <button className="toolbar-btn icon-only" title="Clear the console" onClick={clear}>
+          <Trash2 size={13} />
+        </button>
       </div>
       <div className="console-list" ref={listRef}>
         {entries.map((entry) => (

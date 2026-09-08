@@ -159,12 +159,21 @@ check("a disabled entity is dropped from its batch and stays hidden", () => {
   const batch = proxies()[0];
   assert.equal(batch.count, 9, `expected 9 instances, got ${batch.count}`);
   assert.equal(crates[0].enabledInEditor, false);
-  // The entity subtree is what hides it (the engine loop mirrors the flag onto
-  // object3D.visible each frame). What matters is that the batch stopped
-  // drawing it — a batch proxy lives at the scene root and would otherwise keep
-  // rendering an instance for a disabled entity.
-  const stillBatched = crates[0].getComponent("mesh").mesh.userData.batchedInto;
-  assert.equal(stillBatched, null, "a disabled entity is still claimed by a batch");
+  // What matters is that the batch stopped drawing it — a batch proxy lives at
+  // the scene root and would otherwise keep rendering an instance for a
+  // disabled entity. That is the count above.
+  //
+  // ⚠ THIS USED TO READ `component.mesh.userData.batchedInto` AND THREW ON
+  // NULL. Since 17d4b44 ("a disabled entity detaches its components, not just
+  // its Object3D") disabling an entity runs `Entity.reconcileActivity`, which
+  // calls `MeshComponent.onDetach` — and that removes the mesh from the entity
+  // and NULLS it (MeshComponent.js). So there is no longer a mesh object to
+  // carry a batch claim, which is a stronger guarantee than the claim being
+  // cleared, not a weaker one: nothing in the scene can draw it at all.
+  const component = crates[0].getComponent("mesh");
+  assert.equal(component._attached, false, "a disabled entity must detach its mesh component");
+  assert.equal(component.mesh, null, "a detached mesh component owns no mesh to be claimed");
+  assert.equal(crates[0].object3D.children.length, 0, "and nothing is left in the entity to draw");
 });
 
 check("a disabled COMPONENT stays hidden after leaving its batch", () => {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, ArrowUp, ArrowDown, ChevronRight, ChevronDown, Zap, FilePlus, Share2 } from "lucide-react";
+import { Plus, Trash2, ArrowUp, ArrowDown, ChevronRight, ChevronDown, Zap, FilePlus, Share2 } from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { methodsForEntity } from "../scriptIntrospect.js";

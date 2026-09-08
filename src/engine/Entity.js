@@ -79,8 +79,11 @@ export class Entity extends EventEmitter {
     // Inherits to descendants: a parent disabled in the current mode disables
     // its whole subtree, whatever the children's own flags say — see
     // `activeInHierarchy` / `reconcileActivity`. Serialised with the entity.
-    this.enabledInEditor = true;
-    this.enabledInGame = true;
+    this.enabled = true;
+    // The editor's viewing aid: hidden in the viewport while authoring (the
+    // per-frame visibility walk in Engine reads it), still enabled, and shown
+    // again in play mode. See setVisibleInEditor.
+    this.visibleInEditor = true;
     // Whether this entity's components are attached right now — the flags
     // above resolved through the ancestors for the current mode. Written only
     // by `reconcileActivity`; read by `addComponent` so a component added to
@@ -359,18 +362,50 @@ export class Entity extends EventEmitter {
   }
 
   /**
-   * Sets the "enabled in editor" flag. The actual `object3D.visible` is
-   * recomputed by the engine each frame (parent wins unless this entity
-   * has an explicit override), so we don't need to walk descendants
-   * here — they pick up the new state automatically. Emits
-   * "hierarchy-changed" so the React mirror (and the inspector) refresh.
+   * Enables or disables the entity — ONE flag, both modes. Disabled, its
+   * components and its whole subtree's are detached (see reconcileActivity):
+   * nothing draws, ticks or collides. Emits "hierarchy-changed" so the React
+   * mirror (and the inspector) refresh.
    */
-  setEnabledInEditor(value) {
-    const next = !!value;
-    if (next === this.enabledInEditor) return;
-    this.enabledInEditor = next;
+  setEnabled(value) {
+    const next = value !== false;
+    if (next === this.enabled) return;
+    this.enabled = next;
     this.reconcileActivity();
     this.engine.emit("hierarchy-changed");
+  }
+
+  /**
+   * The editor's viewing aid: hides the entity (and, through three's
+   * traversal, its subtree) in the viewport while authoring. It stays
+   * ENABLED — its components keep working — and play mode shows it again.
+   * The per-frame visibility walk in Engine applies it.
+   */
+  setVisibleInEditor(value) {
+    const next = value !== false;
+    if (next === this.visibleInEditor) return;
+    this.visibleInEditor = next;
+    this.engine.emit("hierarchy-changed");
+  }
+
+  /** @deprecated One flag now: `setEnabled`. */
+  setEnabledInEditor(value) {
+    this.setVisibleInEditor(value);
+  }
+
+  /** The old per-mode names read and write the new flags: `enabledInGame`
+   *  is `enabled`, `enabledInEditor` is the viewing aid. */
+  get enabledInGame() {
+    return this.enabled;
+  }
+  set enabledInGame(value) {
+    this.enabled = value !== false;
+  }
+  get enabledInEditor() {
+    return this.visibleInEditor;
+  }
+  set enabledInEditor(value) {
+    this.visibleInEditor = value !== false;
   }
 
   /**
@@ -385,13 +420,9 @@ export class Entity extends EventEmitter {
     this.engine.emit("hierarchy-changed");
   }
 
-  /** Sets the "enabled in game" flag (mirrors setEnabledInEditor). */
+  /** @deprecated One flag now: `setEnabled`. */
   setEnabledInGame(value) {
-    const next = !!value;
-    if (next === this.enabledInGame) return;
-    this.enabledInGame = next;
-    this.reconcileActivity();
-    this.engine.emit("hierarchy-changed");
+    this.setEnabled(value);
   }
 
   /**
@@ -401,9 +432,8 @@ export class Entity extends EventEmitter {
    * mid-frame, before the walk in Engine.#tick has run.
    */
   get activeInHierarchy() {
-    const mode = this.engine?.playing ? "enabledInGame" : "enabledInEditor";
     for (let entity = this; entity; entity = entity.parent) {
-      if (entity[mode] === false) return false;
+      if (entity.enabled === false) return false;
     }
     return true;
   }
@@ -420,8 +450,7 @@ export class Entity extends EventEmitter {
    * reconcile keeps current.
    */
   reconcileActivity(parentActive = this.parent ? this.parent._componentsActive !== false : true) {
-    const mode = this.engine?.playing ? "enabledInGame" : "enabledInEditor";
-    const active = parentActive && this[mode] !== false;
+    const active = parentActive && this.enabled !== false;
     if (active !== this._componentsActive) {
       this._componentsActive = active;
       for (const component of this.components.values()) {
@@ -442,13 +471,28 @@ export class Entity extends EventEmitter {
   #attachComponent(component) {
     if (component._attached === true) return;
     component._attached = true;
-    component.onAttach();
+    component._enabled = component.enabled;
+    // A component that stops by detaching (no onDisable of its own) and is
+    // disabled is not built at all; `reconcileEnabled` builds it when it is
+    // enabled. One with its own hooks is built and reads `this.enabled`.
+    if (component._enabled || !component.stopsByDetaching) {
+      // Callbacks the component registers while attaching are charged to it
+      // in the profiler's breakdown (Engine.`_registrant`).
+      const engine = this.engine;
+      const previous = engine ? engine._registrant : null;
+      if (engine) engine._registrant = component;
+      try {
+        component.onAttach();
+      } finally {
+        if (engine) engine._registrant = previous;
+      }
+    }
   }
 
   #detachComponent(component) {
     if (component._attached !== true) return;
     component._attached = false;
-    component.onDetach();
+    if (component._enabled || !component.stopsByDetaching) component.onDetach();
   }
 
   removeComponent(typeOrCtor) {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Images, Layers3 } from "lucide-react";
+import { Images, Layers3 } from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";

@@ -1,4 +1,4 @@
-import { AlertTriangle, AlertCircle, Info, X } from "lucide-react";
+import { AlertTriangle, AlertCircle, Info, X } from "./icons/index.jsx";
 import { useToastStore, dismissToast } from "./toasts.js";
 
 const ICONS = { error: AlertTriangle, warn: AlertCircle, info: Info };

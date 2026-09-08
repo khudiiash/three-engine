@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Hammer, Play, FolderOpen, RefreshCw, AlertTriangle, UploadCloud, Loader2, CheckCircle2, Circle, Copy, Check, ExternalLink } from "lucide-react";
+import { Hammer, Play, FolderOpen, RefreshCw, AlertTriangle, UploadCloud, Loader2, CheckCircle2, Circle, Copy, Check, ExternalLink, FileX2 } from "../icons/index.jsx";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { getProjectSettings, saveProjectSettings } from "../projectSettings.js";
 import {
@@ -18,17 +18,10 @@ import { exportGame, formatBytes } from "../exportGame.js";
 
 function Row({ label, children, hint }) {
   return (
-    <>
-      <div className="field-row">
-        <span className="field-label">{label}</span>
-        {children}
-      </div>
-      {hint ? (
-        <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
-          {hint}
-        </div>
-      ) : null}
-    </>
+    <div className="field-row" title={hint || undefined}>
+      <span className="field-label">{label}</span>
+      {children}
+    </div>
   );
 }
 
@@ -159,7 +152,7 @@ export function BuildPanel() {
   return (
     <div className="inspector-panel scene-settings-panel">
       <div className="panel-toolbar">
-        <span className="asset-path" title={rootPath}>
+        <span className="asset-path" title={`${rootPath} — build settings are stored in project.json under settings.build`}>
           {projectName ?? basename(rootPath)}
         </span>
         <button className="toolbar-btn" disabled={!!busy} onClick={() => runBuild(false)}>
@@ -262,7 +255,11 @@ export function BuildPanel() {
           </div>
         </Row>
         <div className="build-scene-list">
-          {scenes.length === 0 ? <div className="asset-hint">No .scene files found.</div> : null}
+          {scenes.length === 0 ? (
+            <div className="asset-hint" title="No .scene files found.">
+              <FileX2 size={28} className="empty-glyph" />
+            </div>
+          ) : null}
           {scenes.map((rel) => {
             const isStart = normalizeRelPath(rel).toLowerCase() === normalizeRelPath(plan.startScene).toLowerCase();
             return (
@@ -434,10 +431,6 @@ export function BuildPanel() {
       ) : null}
 
       {report ? <BuildReport report={report} /> : null}
-
-      <div className="asset-hint" style={{ padding: "4px 10px" }}>
-        Stored in project.json under <code>settings.build</code>.
-      </div>
     </div>
   );
 }
@@ -551,9 +544,15 @@ function BuildReport({ report }) {
     <div className="inspector-section">
       <div className="section-header">Last build</div>
       <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
-        {report.sceneCount} scene(s), {report.assetCount} file(s)
-        {report.preloadCount ? `, ${report.preloadCount} preloaded` : ""}
-        {report.savedBytes ? `, ${formatBytes(report.savedBytes)} saved by compression` : ""}
+        <span className="cnt" title="scenes shipped">{report.sceneCount}</span>{" "}
+        <span className="cnt" title="files shipped">{report.assetCount}</span>
+        {report.preloadCount ? (
+          <>
+            {" "}
+            <span className="cnt" title="preloaded">{report.preloadCount}</span>
+          </>
+        ) : null}
+        {report.savedBytes ? `  ·  ${formatBytes(report.savedBytes)} saved by compression` : ""}
       </div>
       <div className="asset-hint" style={{ padding: "0 2px 6px", wordBreak: "break-all" }}>
         {report.zipPath ?? report.outDir}
@@ -564,19 +563,18 @@ function BuildReport({ report }) {
         </div>
       ))}
       <div style={{ display: "flex", gap: 4, padding: "4px 2px" }}>
-        <button className="toolbar-btn" onClick={() => runPreview(report.contentDir)}>
+        <button className="toolbar-btn icon-only" title="Run" onClick={() => runPreview(report.contentDir)}>
           <Play size={12} />
-          Run
         </button>
         <button
-          className="toolbar-btn"
+          className="toolbar-btn icon-only"
+          title="Show in folder"
           onClick={async () => {
             const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
             revealItemInDir(report.zipPath ?? report.outDir);
           }}
         >
           <FolderOpen size={12} />
-          Show
         </button>
       </div>
     </div>

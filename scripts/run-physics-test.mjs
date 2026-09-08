@@ -831,7 +831,15 @@ await check("an explicit convex collider fills a concave mesh's hole", async () 
   assert.equal(w.physics.raycast([0, 0, 2], [0, 0, -1], 4)?.entity?.name, entity.name);
 });
 
-await check("dynamic Concave and Mesh requests use convex runtime collision", async () => {
+await check("dynamic Concave and Mesh keep their own triangles, hole and all", async () => {
+  // ⛔ THIS TEST USED TO ASSERT THE OPPOSITE. Until 2026-09-07 a dynamic body
+  // silently swapped any triangle shape for a convex hull, and this check
+  // proved it by firing a ray through the torus's hole and demanding a hit.
+  // That is the bug, not the contract: a hull filled the hole, and a Custom
+  // collider on a boat became a solid block ("custom collision … must be
+  // supported"). The premise behind the downgrade — that Rapier gives a
+  // trimesh no mass — is false in the build we ship, which is the other half
+  // of what this pins.
   const authoredShapes = [[-1, "Dynamic Concave", "concave"], [1, "Dynamic Mesh", "mesh"]];
   const w = await world({
     build: (engine) => {
@@ -844,16 +852,158 @@ await check("dynamic Concave and Mesh requests use convex runtime collision", as
 
   for (const [x, name, shape] of authoredShapes) {
     const entity = [...w.engine.entities.values()].find((candidate) => candidate.name === name);
-    assert.equal(entity.getComponent("collider").props.shape, shape, "the runtime fallback must not rewrite authored data");
+    assert.equal(entity.getComponent("collider").props.shape, shape, "the authored shape is what runs");
     assert.equal(
-      w.physics.raycast([x, 0, 2], [0, 0, -1], 4)?.entity?.name,
+      w.physics.raycast([x, 0, 2], [0, 0, -1], 4),
+      null,
+      `${shape} on a dynamic body must keep the torus hole open — a convex hull is what fills it`,
+    );
+    assert.equal(
+      w.physics.raycast([x + 0.4, 0, 2], [0, 0, -1], 4)?.entity?.name,
       name,
-      `${shape} must use a solid convex fallback on a dynamic body`,
+      `${shape} on a dynamic body must still collide on the ring itself`,
     );
     assert.ok(
       Math.abs(entity.getComponent("collider").collider.mass() - 4) < 1e-3,
-      `${shape} fallback should preserve the Rigidbody mass`,
+      `${shape} must carry the Rigidbody's authored mass`,
     );
+  }
+});
+
+await check("a dynamic triangle mesh weighs its enclosed volume in density mode", async () => {
+  // The claim the old downgrade was built on. Measured against the shipped
+  // rapier3d-compat: a closed trimesh reports a real volume and density mode
+  // resolves to density x volume, exactly as a primitive does. If a future
+  // Rapier ever regresses to zero-mass trimeshes, this is the check that says
+  // so — a dynamic body at mass 0 has inverse mass 0 and never moves again.
+  const w = await world({
+    build: (engine) => {
+      const entity = meshWithCollider(engine, "Floating hull", [0, 0, 0], { shape: "mesh" });
+      entity.addComponent("rigidbody", { bodyType: "dynamic", gravityScale: 0, massMode: "density", density: 500 });
+    },
+  });
+  const collider = [...w.engine.entities.values()]
+    .find((candidate) => candidate.name === "Floating hull")
+    .getComponent("collider").collider;
+
+  const volume = collider.volume();
+  assert.ok(volume > 0, `a closed trimesh must report a volume, got ${volume}`);
+  assert.ok(
+    Math.abs(collider.mass() - volume * 500) < volume * 500 * 0.01,
+    `density mode must weigh the enclosed volume: mass ${collider.mass()} vs volume ${volume} x 500`,
+  );
+});
+
+await check("a dynamic triangle mesh answers point containment, which is what floats it", async () => {
+  // Buoyancy (`waterPhysics.js`) measures how much of a hull is under water by
+  // asking `collider.containsPoint` for a grid of sample points. A trimesh
+  // built WITHOUT `TriMeshFlags.ORIENTED` answers false for every point in the
+  // universe, so the boat would report zero displaced volume and sink with no
+  // error anywhere. The flag is only spent on dynamic bodies, so a static
+  // level mesh is asserted to stay on the cheap build.
+  const w = await world({
+    build: (engine) => {
+      const dynamic = meshWithCollider(engine, "Floater", [0, 0, 0], { shape: "mesh" }, "box");
+      dynamic.addComponent("rigidbody", { bodyType: "dynamic", gravityScale: 0, massMode: "density", density: 500 });
+      meshWithCollider(engine, "Level mesh", [8, 0, 0], { shape: "mesh" }, "box");
+    },
+  });
+  const colliderOf = (name) => [...w.engine.entities.values()]
+    .find((candidate) => candidate.name === name).getComponent("collider").collider;
+
+  const floater = colliderOf("Floater");
+  const centre = floater.translation();
+  assert.equal(floater.containsPoint(centre), true, "a point at the hull's centre is inside it");
+  assert.equal(
+    floater.containsPoint({ x: centre.x + 50, y: centre.y, z: centre.z }),
+    false,
+    "and a point far outside is not — a flag that answers true everywhere would be just as useless",
+  );
+  const level = colliderOf("Level mesh");
+  assert.equal(
+    level.containsPoint(level.translation()),
+    false,
+    "a STATIC trimesh skips the pseudo-normal build (~60 % of its build time) because nothing queries it",
+  );
+});
+
+await check("a Custom collider on a dynamic body is the authored shape, not a hull of it", async () => {
+  // The report, verbatim: `Collider on "Fishing Boat": custom collision is
+  // unsupported on dynamic bodies; using convex collision.` A boat is the
+  // worst possible case for that substitution — the hull's whole job is to be
+  // concave — and Custom is the shape a user reaches for precisely when the
+  // render mesh is not the collision they want. So this drives the exact
+  // combination the message named: an authored .geom asset, on a dynamic body.
+  await collisionSimplifierReady;
+  const engine = makeEngine();
+  await applyEngineModules(engine, ["physics-rapier"]);
+  await engine.modules.get("physics-rapier")?.ready;
+
+  const entity = engine.createEntity({ name: "Fishing Boat" });
+  // A render mesh that must not be what collides, at a size that would be
+  // unmistakable if it leaked in.
+  const renderMesh = new THREE.Mesh(new THREE.BoxGeometry(50, 50, 50));
+  renderMesh.userData.entityId = entity.id;
+  entity.object3D.add(renderMesh);
+  entity.addComponent("collider", { shape: "custom", geometryAsset: "hull.geom" });
+  entity.addComponent("rigidbody", { bodyType: "dynamic", gravityScale: 0, mass: 4 });
+  const collider = entity.getComponent("collider");
+  // The loaded shared instance, handed over the way acquireGeometryAsset does.
+  const asset = new THREE.TorusGeometry(0.4, 0.1, 12, 24);
+  asset.userData.assetPath = "hull.geom";
+  collider.geometry = asset;
+
+  engine.physics.invalidateAutoCollider(entity);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  engine.setPlaying(true);
+
+  assert.ok(collider.collider, "the custom collider built on a dynamic body at all");
+  assert.equal(collider.props.shape, "custom", "and it is still authored as Custom");
+  assert.equal(
+    engine.physics.raycast([0, 0, 2], [0, 0, -1], 4),
+    null,
+    "the hole through the authored shape stays open — a convex hull is what fills it",
+  );
+  assert.equal(
+    engine.physics.raycast([0.4, 0, 2], [0, 0, -1], 4)?.entity?.name,
+    "Fishing Boat",
+    "and the authored surface itself still collides",
+  );
+  assert.ok(
+    Math.abs(collider.collider.mass() - 4) < 1e-3,
+    `the Rigidbody's mass survives the trimesh, got ${collider.collider.mass()}`,
+  );
+  assert.equal(collider.collider.containsPoint({ x: 50, y: 0, z: 0 }), false, "a far point is outside the hull");
+  // Without this the case could pass on a collider that is merely SMALL. The
+  // authored torus has 12 x 24 x 2 triangles and every one of them runs; the
+  // render box would be 12.
+  assert.equal(
+    nativeTriangleCount(entity),
+    576,
+    "every triangle of the authored asset is the collision shape, and the render box is not in it",
+  );
+});
+
+await check("the dynamic-trimesh hatch restores the old convex downgrade", async () => {
+  globalThis.__physicsDynamicTrimesh = false;
+  try {
+    const w = await world({
+      build: (engine) => {
+        // `concave`, not `custom`: Custom needs an authored .geom asset, and
+        // the hatch is about the body type, not about where the mesh came from.
+        const entity = meshWithCollider(engine, "Downgraded", [0, 0, 0], { shape: "concave" });
+        entity.addComponent("rigidbody", { bodyType: "dynamic", gravityScale: 0, mass: 4 });
+      },
+    });
+    const entity = [...w.engine.entities.values()].find((candidate) => candidate.name === "Downgraded");
+    assert.equal(entity.getComponent("collider").props.shape, "concave", "the hatch must not rewrite authored data");
+    assert.equal(
+      w.physics.raycast([0, 0, 2], [0, 0, -1], 4)?.entity?.name,
+      "Downgraded",
+      "with the hatch set, the hull fills the torus hole again",
+    );
+  } finally {
+    delete globalThis.__physicsDynamicTrimesh;
   }
 });
 
@@ -1458,6 +1608,44 @@ await check("the project setting restores generated colliders that start enabled
   engine.setPlaying(true);
   assert.equal(engine.physics.world.colliders.len(), 1, "and builds its native shape");
 });
+
+await check("a convex hull far larger than its mesh is called out", async () => {
+  // ⚠ A CONVEX HULL OF CONCAVE ARCHITECTURE IS A SOLID BLOCK, and Convex is
+  // what an auto-generated collider defaults to. The user's Sponza floor is one
+  // mesh holding the ground AND the gallery 3.3 m above it; its hull measured
+  // 713 m3 against the mesh's 162 m3 — a brick filling the whole atrium. Every
+  // curtain was inside it, and a cloth being pushed out of a collider it lives
+  // in tears itself apart. The collider "worked" the entire time.
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.join(" ")); };
+  try {
+    await world({
+      build: (engine) => {
+        // ⚠ ONE CONNECTED mesh, which is the whole point: the convex path
+        // builds one hull PER CONNECTED ISLAND, so three separate boxes make
+        // three tight hulls and nothing is swallowed. A concavity only becomes
+        // a solid when it belongs to a single piece — a floor with a raised
+        // gallery, an arch, this U.
+        const entity = engine.createEntity({ name: "Archway" });
+        const shape = new THREE.Shape();
+        shape.moveTo(-5, 0); shape.lineTo(5, 0); shape.lineTo(5, 5); shape.lineTo(4, 5);
+        shape.lineTo(4, 0.2); shape.lineTo(-4, 0.2); shape.lineTo(-4, 5); shape.lineTo(-5, 5);
+        shape.closePath();
+        const mesh = new THREE.Mesh(new THREE.ExtrudeGeometry(shape, { depth: 1, bevelEnabled: false }));
+        mesh.userData.entityId = entity.id;
+        entity.object3D.add(mesh);
+        entity.addComponent("collider", { shape: "convex" });
+      },
+    });
+  } finally {
+    console.warn = realWarn;
+  }
+  const hit = warnings.find((line) => /CONVEX collision fills/.test(line));
+  assert.ok(hit, `expected a hull-volume warning, got: ${warnings.join(" | ") || "(none)"}`);
+  assert.match(hit, /Use Concave collision/, "the warning must say what to do instead");
+});
+
 
 console.log(failures ? `\n${failures} failing` : "\nall physics checks passed");
 process.exit(failures ? 1 : 0);

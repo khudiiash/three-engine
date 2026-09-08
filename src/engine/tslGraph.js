@@ -2,6 +2,7 @@ import { vmState } from "./vmState.js";
 import * as THREE from "three/webgpu";
 import * as TSL from "three/tsl";
 import { loadTextureAsset } from "./textureAsset.js";
+import { freeze } from "./freezeLedger.js";
 
 /**
  * TSL-first shader graph. Every node maps ~1:1 to a `three/tsl` export; the
@@ -846,6 +847,20 @@ export function matchStockPbr(graph) {
  * tiling, which is impossible if every graph hard-codes the mesh's raw UV.
  */
 export async function compileShaderGraph(graph, { taps, uvNode = null } = {}) {
+  // Spanned for the freeze ledger: this is the per-material TSL node build,
+  // and a material that misses `matchStockPbr` gets one of these ALL TO
+  // ITSELF (fresh uniform/texture nodes per material ⇒ its own program ⇒ its
+  // own driver compile). When a boot blocks in "(unattributed)" during scene
+  // load, this is the first suspect.
+  const __graphSpan = freeze.begin(`material:compileGraph ${graph?.name ?? ""}`.trim());
+  try {
+    return await compileShaderGraphInner(graph, { taps, uvNode });
+  } finally {
+    freeze.end(__graphSpan);
+  }
+}
+
+async function compileShaderGraphInner(graph, { taps, uvNode = null } = {}) {
   if (!graph?.nodes?.length) return null;
   const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
   const edges = graph.edges ?? [];

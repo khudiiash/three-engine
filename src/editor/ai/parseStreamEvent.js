@@ -31,6 +31,36 @@ function truncate(text, max) {
 }
 
 /**
+ * Argument keys worth showing, best first. One short value identifies a call
+ * ("entity.get fYKenR1LuZ") without turning the transcript into a JSON dump.
+ */
+const HINT_KEYS = ["id", "entityId", "path", "name", "query", "command", "type"];
+
+/**
+ * One tool call, as a person would read it: `entity.get fYKenR1LuZ`.
+ *
+ * The raw form — the full MCP tool name plus `JSON.stringify(input)` — is what
+ * made the panel unreadable in practice. A single `ToolSearch` call printed a
+ * 300-character query, `entity_list` printed its whole result, and the
+ * transcript became a wall of escaped JSON with the actual answer lost in it.
+ * The call's IDENTITY is what a person watching wants ("it's reading the
+ * entity"); the arguments are debugging detail, so at most one short hint
+ * survives.
+ */
+export function summarizeCall(name, input) {
+  const label = String(name ?? "tool")
+    .replace(/^mcp__[^_]+(?:-[^_]+)*__/, "")
+    .replaceAll("_", ".");
+  if (!input || typeof input !== "object") return label;
+  for (const key of HINT_KEYS) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim()) return `${label} ${truncate(value.trim(), 48)}`;
+    if (typeof value === "number") return `${label} ${value}`;
+  }
+  return label;
+}
+
+/**
  * Event types confirmed (2026-08-04, CLI v2.1.221) to open every `-p
  * --output-format stream-json` run: a `system`/`init` event carrying the full
  * tool list, model, mcp server statuses etc., and a `rate_limit_event`.
@@ -73,7 +103,16 @@ export function parseStreamEvent(event) {
   if (IGNORED_EVENT_TYPES.has(event.type)) return { lines, result, meta };
 
   if (event.type === "system") {
-    if (event.subtype === "init" && event.model) meta = { model: event.model };
+    // `init` opens every run. Beyond the model it carries the run's
+    // `session_id` — load-bearing now that the AI panel is a CONVERSATION
+    // rather than a one-shot: the next message resumes this session instead
+    // of starting a fresh, amnesiac one (see providers/claudeCli.js).
+    if (event.subtype === "init") {
+      const found = {};
+      if (event.model) found.model = event.model;
+      if (event.session_id) found.sessionId = event.session_id;
+      if (Object.keys(found).length) meta = found;
+    }
     return { lines, result, meta };
   }
 
@@ -82,8 +121,7 @@ export function parseStreamEvent(event) {
       if (block.type === "text" && block.text) {
         lines.push({ kind: "text", text: block.text });
       } else if (block.type === "tool_use") {
-        const input = block.input && Object.keys(block.input).length ? ` ${JSON.stringify(block.input)}` : "";
-        lines.push({ kind: "tool_call", text: `→ ${block.name}${input}` });
+        lines.push({ kind: "tool_call", text: summarizeCall(block.name, block.input) });
       }
     }
     return { lines, result, meta };
@@ -91,13 +129,15 @@ export function parseStreamEvent(event) {
 
   if (event.type === "user" && Array.isArray(event.message?.content)) {
     for (const block of event.message.content) {
-      if (block.type === "tool_result") {
-        // Deliberately terse: the CALL above already says what it's doing,
-        // and a user watching this panel needs "it worked" more than the raw
-        // payload — a full mesh/scene dump here is exactly the "ton of text
-        // we don't need to see" this replaced.
+      // Successful results are DROPPED, not truncated. The call line above
+      // already says what happened, and a result is the single noisiest thing
+      // a transcript can carry: one `entity_list` is 120 kB of JSON, and even
+      // clipped to a preview it reads as escaped garbage stacked between the
+      // question and the answer. Only a FAILURE earns a line, because that is
+      // the one case where the call line alone is not the whole story.
+      if (block.type === "tool_result" && block.is_error) {
         const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
-        lines.push({ kind: "tool_result", text: truncate(text, 120) });
+        lines.push({ kind: "tool_result", text: truncate(text, 160) });
       }
     }
     return { lines, result, meta };
@@ -110,6 +150,10 @@ export function parseStreamEvent(event) {
       costUsd: typeof event.total_cost_usd === "number" ? event.total_cost_usd : null,
       turns: typeof event.num_turns === "number" ? event.num_turns : null,
       tokens: formatTokens(event.usage),
+      // Repeated here as well as on `init` because a resumed turn's id is
+      // the one that matters for the turn AFTER it, and a run that somehow
+      // missed its init event would otherwise lose the thread.
+      ...(event.session_id ? { sessionId: event.session_id } : {}),
     };
     return { lines, result, meta };
   }

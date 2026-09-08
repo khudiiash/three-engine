@@ -15,6 +15,14 @@ export const useConsoleStore = vmSingleton("consoleStore", () => create((set) =>
   // the user opens it) or when they hit Clear. The tab renderer reads this to
   // draw the red-dot indicator.
   unreadErrors: 0,
+  // Has this session logged an error / a warning at all, since the last Clear?
+  // Two counters rather than a scan of `entries`, because the dock's signal
+  // dots (ConsoleSignals) re-read this on every push and the ring holds 500.
+  // They count what was logged, so a message that has since scrolled out of
+  // the ring still keeps its dot lit — the fault happened, and Clear is how
+  // the user says they are done with it.
+  errorCount: 0,
+  warnCount: 0,
 
   push(level, message) {
     set((state) => {
@@ -34,6 +42,8 @@ export const useConsoleStore = vmSingleton("consoleStore", () => create((set) =>
         return {
           entries,
           unreadErrors: level === "error" ? state.unreadErrors + 1 : state.unreadErrors,
+          errorCount: level === "error" ? state.errorCount + 1 : state.errorCount,
+          warnCount: level === "warn" ? state.warnCount + 1 : state.warnCount,
         };
       }
       const entries = [...state.entries, { id: ids.next++, level, message, time: new Date() }];
@@ -41,12 +51,14 @@ export const useConsoleStore = vmSingleton("consoleStore", () => create((set) =>
       return {
         entries,
         unreadErrors: level === "error" ? state.unreadErrors + 1 : state.unreadErrors,
+        errorCount: level === "error" ? state.errorCount + 1 : state.errorCount,
+        warnCount: level === "warn" ? state.warnCount + 1 : state.warnCount,
       };
     });
   },
 
   clear() {
-    set({ entries: [], unreadErrors: 0 });
+    set({ entries: [], unreadErrors: 0, errorCount: 0, warnCount: 0 });
   },
 
   /** Called by the editor shell when the Console tab becomes the active tab. */

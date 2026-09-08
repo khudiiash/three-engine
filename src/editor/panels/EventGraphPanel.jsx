@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus } from "lucide-react";
+import { Plus, Zap } from "../icons/index.jsx";
 import { GraphEditor } from "../nodegraph/GraphEditor.jsx";
 import { eventGraphRegistry } from "../eventGraphRegistry.js";
 import { engine } from "../engineInstance.js";
@@ -122,7 +122,11 @@ export function EventGraphPanel() {
   );
 
   if (!entity) {
-    return <div className="inspector-panel empty">Select an entity to edit its event graph.</div>;
+    return (
+      <div className="inspector-panel empty" title="Select an entity to edit its event graph">
+        <Zap className="empty-glyph" size={28} />
+      </div>
+    );
   }
 
   if (!component) {
@@ -130,13 +134,12 @@ export function EventGraphPanel() {
     // no direction, so a paragraph beside a button becomes two squeezed
     // columns rather than a stack.
     return (
-      <div className="events-graph-empty">
-        <p>
-          “{entity.name}” has no <strong>Events</strong> component yet.
-        </p>
+      <div className="events-graph-empty" title={`"${entity.name}" has no Events component yet`}>
+        <Zap className="empty-glyph" size={28} />
         <button
           className="toolbar-btn"
           onClick={() => commandBus.execute(new AddComponentCommand(selectedId, "events"))}
+          title="Add Events component"
         >
           <Plus size={13} /> Add Events
         </button>
@@ -152,7 +155,6 @@ export function EventGraphPanel() {
       initialGraph={initialGraph}
       onChange={onChange}
       nodeClasses={nodeClasses}
-      hint="Pink wires run the flow, coloured wires carry values · right-click the canvas to add nodes · a value left unwired uses the node's own field · Ctrl+Z undoes"
     />
   );
 }

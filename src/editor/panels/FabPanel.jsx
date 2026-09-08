@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Boxes, Download, ExternalLink, Loader2, Search } from "lucide-react";
+import { Boxes, Download, ExternalLink, Loader2, Power, Search } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import {
@@ -110,16 +110,9 @@ export function FabPanel() {
     return (
       <div className="ph-panel">
         <div className="ph-gate">
-          <Boxes size={28} />
-          <h3>Fab</h3>
-          <p>
-            Browse Fab — Epic's marketplace, where the Unreal Marketplace, the Sketchfab store and
-            Quixel Megascans all ended up — and import its free Creative Commons assets. Most ship
-            glTF alongside the Unreal build, and one listing is often a whole pack. No account
-            needed.
-          </p>
+          <Boxes size={28} className="empty-glyph" />
           <button className="toolbar-btn wide" onClick={() => setModuleEnabled("fab", true)}>
-            Enable Fab module
+            <Power size={13} /> Enable Fab module
           </button>
         </div>
       </div>
@@ -138,7 +131,9 @@ export function FabPanel() {
             onChange={(event) => setQuery(event.target.value)}
           />
         </div>
-        <button className="toolbar-btn" type="submit">Search</button>
+        <button className="toolbar-btn icon-only" type="submit" title="Search">
+          <Search size={13} />
+        </button>
         <select
           className="ph-category"
           value={filters.listingType}
@@ -174,7 +169,7 @@ export function FabPanel() {
           {error && !items ? (
             <div className="ph-status">Couldn't reach Fab: {error}</div>
           ) : items === null ? (
-            <div className="ph-status"><Loader2 size={14} className="ph-spin" /> Loading catalog…</div>
+            <div className="ph-status"><Loader2 size={14} className="ph-spin" /></div>
           ) : items.length === 0 ? (
             <div className="ph-status">No listings match those filters.</div>
           ) : (
@@ -326,7 +321,7 @@ function ListingDetail({ listing, hasProject, onClose }) {
         <span>by {model.author}</span>
         <span>{model.license}</span>
         {model.category && <span>{model.category}</span>}
-        {model.reviews > 0 && <span>{model.rating.toFixed(1)} ★ · {model.reviews.toLocaleString()} reviews</span>}
+        {model.reviews > 0 && <span>{model.rating.toFixed(1)} ★ · <span className="cnt" title="reviews">{model.reviews.toLocaleString()}</span></span>}
         {model.formats.length > 0 && <span>Formats: {model.formats.join(", ")}</span>}
       </div>
       {model.tags.length > 0 && (

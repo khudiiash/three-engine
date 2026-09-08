@@ -1,4 +1,5 @@
 import { vmSingleton } from "./singleton.js";
+import { freeze } from "../engine/freezeLedger.js";
 
 const MIME_BY_EXT = {
   glb: "model/gltf-binary",
@@ -82,28 +83,84 @@ function isEngineTypesPath(path) {
  *  inside the editor-scaffolded `engine-types/` directory — those are never
  *  runtime scripts. */
 export async function listProjectAssets(rootPath, exts, depth = 4) {
-  const { invoke } = await import("@tauri-apps/api/core");
   const out = [];
-  async function walk(path, d) {
-    if (d < 0) return;
-    let entries;
-    try {
-      entries = await invoke("list_dir", { path });
-    } catch {
-      return;
+  const wanted = exts.map((ext) => String(ext).toLowerCase());
+  await walkProject(rootPath, depth, wanted, (entry) => {
+    if (entry.is_dir) return;
+    if (wanted.includes(entry.ext) && !isDeclarationFile(entry.name)) out.push(entry.path);
+  });
+  // Lexicographic, so the listing is the same on every boot regardless of the
+  // order the concurrent walk happened to finish in. Sorting by full path also
+  // keeps a directory's files together, which is what the depth-first walk
+  // used to give callers for free.
+  return out.sort();
+}
+
+/**
+ * ⭐ THE WHOLE TREE IN ONE NATIVE CALL, WITH A WALK AS THE FALLBACK.
+ *
+ * ⛔ AND THE REFUTATION THAT GOT US HERE, so nobody spends the afternoon on it
+ * twice: this walk was `for (const e of entries) { ... await walk(e.path) }` —
+ * one `list_dir` round trip at a time, depth first — and the obvious read was
+ * that it had the same fault the prefab READS had (serial IPC, fixed the same
+ * day, 2 217 -> 85 ms). It does not. Making the walk breadth-first with 16
+ * concurrent `list_dir` calls moved the measured stage from **2 418 ms to
+ * 2 453 ms**: nothing. Tauri's IPC does not parallelise, so 575 directories
+ * cost 575 serialized round trips however they are issued, and the filesystem
+ * itself is not the problem at all — the same tree walks in 43 ms from Python.
+ *
+ * So the walk moved into Rust (`list_dir_recursive`), where the whole tree is
+ * one round trip. The JS walk stays as the fallback, and not out of caution:
+ * the frontend hot-reloads in milliseconds while a Rust change takes minutes
+ * to rebuild, so for that window the running binary genuinely has no such
+ * command. Callers must not break in it.
+ *
+ * @param {string} rootPath
+ * @param {number} depth How many levels below the root to descend.
+ * @param {?Array<string>} exts Lowercase file extensions to keep, or null for
+ *   every file. Directories always come back — the asset catalog needs them.
+ * @param {(entry: object) => void} visit Called once per entry, in no
+ *   guaranteed order; callers that care sort afterwards.
+ */
+async function walkProject(rootPath, depth, exts, visit) {
+  if (!rootPath) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  try {
+    const entries = await invoke("list_dir_recursive", { path: rootPath, depth, exts });
+    for (const entry of entries) {
+      if (isEngineTypesPath(entry.path)) continue;
+      visit(entry);
     }
-    for (const e of entries) {
-      if (e.is_dir) {
-        // Skip the editor-scaffolded declarations directory entirely.
-        if (isEngineTypesPath(e.path)) continue;
-        await walk(e.path, d - 1);
-      } else if (exts.includes(e.ext) && !isDeclarationFile(e.name) && !isEngineTypesPath(e.path)) {
-        out.push(e.path);
-      }
-    }
+    return;
+  } catch {
+    // Older binary: fall through to the per-directory walk below.
   }
-  if (rootPath) await walk(rootPath, depth);
-  return out;
+  const LIST_CONCURRENCY = 16;
+  let level = [rootPath];
+  for (let d = depth; d >= 0 && level.length; d--) {
+    const next = [];
+    let cursor = 0;
+    const worker = async () => {
+      for (let i = cursor++; i < level.length; i = cursor++) {
+        let entries;
+        try {
+          entries = await invoke("list_dir", { path: level[i] });
+        } catch {
+          continue;
+        }
+        for (const entry of entries) {
+          // The editor-scaffolded declarations directory holds no project
+          // assets, and is skipped whole rather than filtered per file.
+          if (isEngineTypesPath(entry.path)) continue;
+          if (entry.is_dir) next.push(entry.path);
+          else if (exts && !exts.includes(entry.ext)) continue;
+          visit(entry);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(LIST_CONCURRENCY, level.length) }, worker));
+    level = next;
+  }
 }
 
 /**
@@ -118,24 +175,11 @@ export async function listProjectAssets(rootPath, exts, depth = 4) {
  * which holds no project assets.
  */
 export async function listProjectEntries(rootPath, depth = 8) {
-  const { invoke } = await import("@tauri-apps/api/core");
   const out = [];
-  async function walk(path, d) {
-    if (d < 0) return;
-    let entries;
-    try {
-      entries = await invoke("list_dir", { path });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (isEngineTypesPath(entry.path)) continue;
-      out.push(entry);
-      if (entry.is_dir) await walk(entry.path, d - 1);
-    }
-  }
-  if (rootPath) await walk(rootPath, depth);
-  return out;
+  await walkProject(rootPath, depth, null, (entry) => out.push(entry));
+  // Same reason as listProjectAssets: a stable order across boots, and a
+  // directory's entries still land together.
+  return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
 /** Drops generated sidecars from a listing — they're managed via their asset
@@ -484,7 +528,10 @@ export async function preloadAssetBinaries(paths) {
   const { invoke } = await import("@tauri-apps/api/core");
   if (bulkReadSupported) {
     try {
-      adoptBinaryPackage(pending, await invoke("read_binary_files", { paths: pending }));
+      // The bulk read is IPC (off-thread); ADOPTING it is a main-thread copy
+      // of every byte, and it was one of the boot's unattributed blocks.
+      const packed = await invoke("read_binary_files", { paths: pending });
+      freeze.run(`assets:adopt ${pending.length} files`, () => adoptBinaryPackage(pending, packed));
       return pending.filter((path) => binaryAssetCache.has(path)).length;
     } catch (error) {
       const message = String(error?.message ?? error);

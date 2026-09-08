@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Box, Circle, CircleDot, Crosshair, Eye, Layers, Magnet, Move, Rotate3d, Scale3d, Scissors, Shapes, Square, Triangle, Undo2, Redo2, X } from "lucide-react";
+import { Box, Circle, CircleDot, Crosshair, Eye, Layers, Magnet, Move, Rotate3d, Scale3d, Scissors, Shapes, Square, Triangle, Undo2, Redo2, X } from "../icons/index.jsx";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { engine } from "../engineInstance.js";
@@ -71,6 +71,8 @@ import {
   updateSideUVs,
 } from "../mesh/ops/extrude.js";
 import { bevelEdges, knifeCut, loopCut, offsetEdgeLoop, subdivideFaces } from "../mesh/ops/topology.js";
+import { freeze, installGpuCallLedger, installNodeBuildLedger } from "../../engine/freezeLedger.js";
+import { useGeometryEditStore } from "../store/geometryEditStore.js";
 import {
   bridgeEdgeLoops,
   bridgeFaces,
@@ -2511,9 +2513,15 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     const host = hostRef.current;
     if (!host || !component?.mesh) return undefined;
     let disposed = false;
+    // Announce the session however this panel was opened — Tab, the Inspector
+    // button, or the docked panel. The pacer keys its suspension on this;
+    // keying on `entityId` alone missed the docked path entirely.
+    useGeometryEditStore.getState().openSession();
     let renderer;
     let frame = 0;
     let resizeObserver;
+    /** Removes the activity listeners that drive the idle throttle. */
+    let idleListeners = null;
 
     const canvas = document.createElement("canvas");
     canvas.className = "geometry-editor-canvas";
@@ -2564,6 +2572,16 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     scene.add(context);
     engine.scene.updateMatrixWorld(true);
     entity.object3D.updateWorldMatrix(true, false);
+    // ── ONE MATERIAL FOR THE WHOLE CONTEXT, NOT ONE PER MESH ──────────────
+    // Every clone used to get its own `new THREE.MeshStandardMaterial` with
+    // identical settings. On a scene with ~85 visible meshes that is 85
+    // material instances, 85 render objects with their own bind groups, and 85
+    // chances for this renderer's cache to miss — for a translucent grey the
+    // user cannot tell apart. They are identical by construction, so they
+    // share one instance, disposed once with the session.
+    const contextMaterial = new THREE.MeshStandardMaterial({
+      color: 0x687078, roughness: 0.9, metalness: 0, transparent: true, opacity: 0.38, depthWrite: false,
+    });
     engine.scene.traverse((source) => {
       if (source.isLight && !hasEditorOnlyAncestor(source)) {
         const clone = source.clone();
@@ -2573,9 +2591,12 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         return;
       }
       if (!source.isMesh || source === component.mesh || !source.visible || hasEditorOnlyAncestor(source)) return;
-      const material = new THREE.MeshStandardMaterial({ color: 0x687078, roughness: 0.9, metalness: 0, transparent: true, opacity: 0.38, depthWrite: true });
-      const clone = new THREE.Mesh(source.geometry, material);
+      const clone = new THREE.Mesh(source.geometry, contextMaterial);
       clone.userData.sharedGeometry = true;
+      // The teardown's traverse disposes each object's material; one shared
+      // instance across 85 clones would be disposed 85 times. This is the
+      // existing convention for exactly that — it is disposed once below.
+      clone.userData.sharedMaterial = true;
       clone.matrixAutoUpdate = false;
       clone.matrix.copy(source.matrixWorld);
       context.add(clone);
@@ -2645,7 +2666,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     for (const object of [basePoints, edgeOverlay, vertexOverlay, activeOverlay]) object.frustumCulled = false;
 
     const session = {
-      mesh, meshObject, wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, activeOverlay, context,
+      mesh, meshObject, wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, activeOverlay, context, contextMaterial,
       modifierPreviewObject, modifierCageMaterial, modifierWireframeMaterial,
       scene, editMaterials, realMaterials, wireframeMaterial, editorLights, sceneLights, shading,
       // Every material ever borrowed from the entity — the dispose sweep must
@@ -3092,6 +3113,15 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
       await renderer.init();
       if (disposed) return;
+      // ── THIS IS A SECOND RENDERER, AND IT WAS INVISIBLE (2026-09-07) ──────
+      // Edit Mode draws through its own `WebGPURenderer` on its own canvas,
+      // with its own device and therefore its own pipeline cache: every
+      // material in the context clone compiles AGAIN here. None of that showed
+      // up in the freeze ledger, because the ledger's wrappers were installed
+      // on `engine.renderer`'s device only — so "the geometry editor lags" had
+      // no owner at all. It has one now.
+      installGpuCallLedger(renderer.backend?.device);
+      installNodeBuildLedger(renderer);
       const resize = () => {
         const { width, height } = host.getBoundingClientRect();
         if (!width || !height) return;
@@ -3101,13 +3131,55 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       resizeObserver = new ResizeObserver(resize);
       resizeObserver.observe(host);
       resize();
+      // ── IDLE DOES NOT NEED SIXTY FRAMES A SECOND (2026-09-07) ────────────
+      // This loop rendered unconditionally at the display's rate for as long
+      // as Edit Mode was open, and the scene it renders is not small: a clone
+      // of every visible mesh in the level (translucent, so depth-sorted) plus
+      // the edited mesh and its overlays, through a SECOND WebGPU renderer
+      // with MSAA on. Holding that at 60+ fps while the user is reading their
+      // mesh, or typing a value, or doing nothing, is the background load
+      // every interaction then has to fight for the main thread.
+      //
+      // While anything is HAPPENING it still runs at full rate — that is the
+      // half that has to feel immediate. `ACTIVE_MS` after the last camera
+      // move, pointer, wheel or key, it drops to `IDLE_INTERVAL_MS`. The idle
+      // rate is a HEARTBEAT rather than a stop, deliberately: a missed change
+      // signal then shows up a fifth of a second late instead of never, which
+      // is the failure mode an on-demand renderer has and a throttled one
+      // does not. `__geomEditorIdleThrottle = false` restores full rate.
+      const ACTIVE_MS = 400;
+      const IDLE_INTERVAL_MS = 200;
+      let lastActivity = performance.now();
+      let lastIdleDraw = 0;
+      const markActive = () => { lastActivity = performance.now(); };
+      controls.addEventListener("change", markActive);
+      for (const type of ["pointerdown", "pointermove", "pointerup", "wheel", "keydown"]) {
+        window.addEventListener(type, markActive, { passive: true, capture: true });
+      }
+      session.markEditorActive = markActive;
+      idleListeners = () => {
+        controls.removeEventListener("change", markActive);
+        for (const type of ["pointerdown", "pointermove", "pointerup", "wheel", "keydown"]) {
+          window.removeEventListener(type, markActive, { capture: true });
+        }
+      };
+
       const render = () => {
         if (disposed) return;
         const rect = host.getBoundingClientRect();
-        if (canvas.isConnected && rect.width >= 1 && rect.height >= 1) {
-          controls.update();
-          refreshCursor3D();
-          renderer.render(scene, session.camera);
+        const now = performance.now();
+        const active = globalThis.__geomEditorIdleThrottle === false || now - lastActivity < ACTIVE_MS;
+        const dueIdle = now - lastIdleDraw >= IDLE_INTERVAL_MS;
+        if (canvas.isConnected && rect.width >= 1 && rect.height >= 1 && (active || dueIdle)) {
+          if (!active) lastIdleDraw = now;
+          const span = freeze.begin("geomEditor:render");
+          try {
+            controls.update();
+            refreshCursor3D();
+            renderer.render(scene, session.camera);
+          } finally {
+            freeze.end(span);
+          }
         }
         frame = requestAnimationFrame(render);
       };
@@ -3116,6 +3188,8 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
 
     return () => {
       disposed = true;
+      useGeometryEditStore.getState().closeSession();
+      idleListeners?.();
       if (globalThis.__geometrySession === session) delete globalThis.__geometrySession;
       cancelAnimationFrame(frame);
       cancelAnimationFrame(session.macroFrame);
@@ -3144,6 +3218,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         for (const material of materials) if (!borrowed.has(material)) material?.dispose?.();
       });
       for (const material of [...editMaterials, wireframeMaterial]) material.dispose();
+      session.contextMaterial?.dispose?.();
       session.paintTexture?.dispose?.();
       session.paintMaterial?.dispose?.();
       renderer?.dispose();
@@ -3156,7 +3231,13 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   /* Render                                                                  */
   /* ---------------------------------------------------------------------- */
 
-  if (!component) return <div className="geometry-editor-empty">Select an entity with a Mesh component.</div>;
+  if (!component) {
+    return (
+      <div className="geometry-editor-empty" title="Select an entity with a Mesh component">
+        <Box size={28} className="empty-glyph" />
+      </div>
+    );
+  }
   const session = sessionRef.current;
   const count = session ? selectionCount(session.mesh, mode) : 0;
   const run = (event, action) => {

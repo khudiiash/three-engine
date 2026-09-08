@@ -5,6 +5,8 @@ import { instanceNodeOf } from "./prefab/sync.js";
 import { SCENE_SETTINGS_DEFAULTS } from "./sceneSettings.js";
 import { waitForTextureAssets } from "./textureAsset.js";
 import { migrateLegacySurfaceModules } from "./vfx/legacyModules.js";
+import { freeze } from "./freezeLedger.js";
+import { sliceLoop } from "./scheduling.js";
 
 export const SCENE_VERSION = 1;
 
@@ -26,10 +28,10 @@ export function serializeEntity(entity) {
     ...(entity.tags?.length ? { tags: [...entity.tags] } : {}),
     // Same reasoning: only the rare entity that survives a scene load says so.
     ...(entity.persistent ? { persistent: true } : {}),
-    // Newer scenes may include entities without these flags — defaults are
-    // booleans, but we still defensively normalise on read.
-    enabledInEditor: entity.enabledInEditor !== false,
-    enabledInGame: entity.enabledInGame !== false,
+    // One enabled flag (both modes) and the editor's viewing aid. Older
+    // scenes carried `enabledInEditor` / `enabledInGame`; the reader maps them.
+    enabled: entity.enabled !== false,
+    visibleInEditor: entity.visibleInEditor !== false,
     components: [...entity.components.values()].map((c) => c.toJSON()),
     children: entity.children.map(serializeEntity),
   };
@@ -62,10 +64,11 @@ export function instantiateEntity(engine, data, parent) {
   if (data.viewOnly) entity.setViewOnly(true);
   if (data.tags?.length) entity.setTags(data.tags);
   if (data.persistent) entity.setPersistent(true);
-  // Per-mode enabled flags. Older scenes omit them — default to true so
-  // existing scenes keep their current behaviour.
-  if (data.enabledInEditor === false) entity.setEnabledInEditor(false);
-  if (data.enabledInGame === false) entity.setEnabledInGame(false);
+  // `enabled` (both modes) and `visibleInEditor`. Older scenes carried a
+  // flag per mode: their game flag is the enabled flag now, and their
+  // editor flag the viewing aid. Absent means true.
+  if ((data.enabled ?? data.enabledInGame) === false) entity.setEnabled(false);
+  if ((data.visibleInEditor ?? data.enabledInEditor) === false) entity.setVisibleInEditor(false);
   for (const { type, props } of data.components ?? []) {
     entity.addComponent(type, props);
   }
@@ -201,8 +204,8 @@ function applyEntityData(entity, data) {
   entity.setViewOnly(!!data.viewOnly);
   entity.setTags(data.tags ?? []);
   entity.setPersistent(!!data.persistent);
-  entity.setEnabledInEditor(data.enabledInEditor !== false);
-  entity.setEnabledInGame(data.enabledInGame !== false);
+  entity.setEnabled((data.enabled ?? data.enabledInGame) !== false);
+  entity.setVisibleInEditor((data.visibleInEditor ?? data.enabledInEditor) !== false);
 }
 
 /** Cheap structural compare — prop values are always JSON-serializable. */
@@ -288,16 +291,62 @@ export async function deserializeScene(engine, json) {
       // that allowed components to attach to the temporary renderer between the
       // two async initializations. Renderer-owned objects (notably post-process
       // pipelines) then retained a disposed backend and rendered black on Play.
-      engine.clear({ resetSettings: false });
+      // ── EVERY PHASE OF THE STAGE MARKS ITS OWN WALL TIME ────────────────
+      //
+      // `scene: deserialize` measured 1.9 s on the user's project while its
+      // one marked sub-step, entity instantiation, measured 111 ms. The other
+      // 1.8 s had no name, and an unnamed stage is an unfixable one. The
+      // freeze SPANS below only surface when a phase happens to land inside a
+      // long task, which an await-heavy phase never does — so wall time is
+      // marked separately. This is the same instrument that found the prefab
+      // search (2 453 ms to locate 22 files) two units ago; it is worth
+      // spending a `performance.now()` per phase to never guess again.
+      const tClear = performance.now();
+      freeze.run("scene:clear", () => engine.clear({ resetSettings: false }));
+      freeze.bootMark("scene: clear previous", performance.now() - tClear);
       engine.sceneName = json.name ?? "Untitled";
-      await engine.applySettings(json.settings ?? structuredClone(SCENE_SETTINGS_DEFAULTS));
+      // `fromSceneLoad`: this scene's authored renderer block arrives because
+      // the user OPENED it, not because they changed a setting — so it must not
+      // destroy the GPU device on the way in. See Engine.applySettings.
+      const tSettings = performance.now();
+      await freeze.runAsync("scene:applySettings", () =>
+        engine.applySettings(json.settings ?? structuredClone(SCENE_SETTINGS_DEFAULTS), { fromSceneLoad: true }));
+      freeze.bootMark("scene: apply settings", performance.now() - tSettings);
       // Prefabs must be in the registry before any instance node is expanded.
+      const tEmbedded = performance.now();
+      let embedded = 0;
       for (const def of json.prefabs ?? []) {
-        if (def?.guid) prefabRegistry.register(def, def.path ?? null);
+        if (def?.guid) { prefabRegistry.register(def, def.path ?? null); embedded++; }
       }
+      if (embedded) freeze.bootMark("scene: embedded prefabs", performance.now() - tEmbedded, `${embedded} defs`);
 
-      for (const entityData of json.entities ?? []) {
+      // ── TIME-SLICED INSTANTIATION (zero-freeze plan unit 4.3) ──────────
+      // This loop used to run to completion with no yield: on a 3 000-entity
+      // scene that is one multi-second main-thread block with the whole
+      // editor dead inside it. Slicing it hands the thread back every ~8 ms,
+      // so panels, menus and the console stay alive while the scene builds.
+      // The whole loop is still inside `batchHierarchy` with
+      // `scene.visible = false`, so nothing observes a half-built tree — a
+      // slice boundary is only a chance for the HOST to run, not for the
+      // engine to publish.
+      //
+      // ⚠ Never make this a per-item yield. See scheduling.js's header: the
+      // budget is what keeps the yield count bounded by time rather than by
+      // entity count.
+      const entities = json.entities ?? [];
+      const instantiateStart = performance.now();
+      const yields = await sliceLoop(entities, (entityData) => {
         instantiateEntity(engine, entityData, null);
+      });
+      freeze.note("scene:instantiate", instantiateStart);
+      if (entities.length) {
+        // `bootMark`, not `bootStage`: this is a sub-stage inside the open
+        // "scene: deserialize" stage and must not close it.
+        freeze.bootMark(
+          "scene: instantiate entities",
+          performance.now() - instantiateStart,
+          `${entities.length} roots, ${yields} yields`,
+        );
       }
 
       // Packed bytes make these resolve without further native IPC, but the
@@ -311,9 +360,18 @@ export async function deserializeScene(engine, json) {
           }
         }
       }
-      await Promise.allSettled(pending);
-      await waitForTextureAssets();
+      // The awaits themselves are cheap; what lands on the main thread inside
+      // them is the geometry/material adoption each component does when its
+      // bytes arrive, which is why both are spanned rather than assumed idle.
+      const tMeshes = performance.now();
+      await freeze.runAsync("scene:awaitMeshAssets", () => Promise.allSettled(pending));
+      freeze.bootMark("scene: await mesh assets", performance.now() - tMeshes, `${pending.length} components`);
+      const tTextures = performance.now();
+      await freeze.runAsync("scene:awaitTextures", () => waitForTextureAssets());
+      freeze.bootMark("scene: await textures", performance.now() - tTextures);
+      const tPublish = performance.now();
       engine.emit("hierarchy-changed");
+      freeze.bootMark("scene: publish hierarchy", performance.now() - tPublish);
     } finally {
       engine.scene.visible = wasVisible;
     }

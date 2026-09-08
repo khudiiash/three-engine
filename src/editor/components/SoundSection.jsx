@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, Play, Square, ChevronDown, ChevronRight } from "lucide-react";
+import { NumberField } from "../fields/NumberField.jsx";
+import { Plus, Trash2, Play, Square, ChevronDown, ChevronRight } from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";
@@ -213,6 +214,14 @@ function PropRow({ label, children }) {
 }
 
 function NumberInput({ value, min, max, step, onCommit, allowNull, placeholder }) {
+  // A bounded number is the shared slider field; a nullable one keeps the text box.
+  if (!allowNull && Number.isFinite(min) && Number.isFinite(max) && max > min) {
+    return <NumberField value={value ?? min} min={min} max={max} step={step ?? 0.1} onCommit={onCommit} />;
+  }
+  return <PlainNumberInput value={value} min={min} max={max} step={step} onCommit={onCommit} allowNull={allowNull} placeholder={placeholder} />;
+}
+
+function PlainNumberInput({ value, min, max, step, onCommit, allowNull, placeholder }) {
   // Local text so empty (null) values don't get coerced to 0.
   const [text, setText] = useState(value === undefined || value === null ? "" : String(value));
   useEffect(() => {

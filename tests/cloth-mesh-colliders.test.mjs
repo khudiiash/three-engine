@@ -145,3 +145,92 @@ test('global shell ids remain separate across opposite-winding islands and colli
   for(const shell of shells.values()){assert.equal(shell.owners.size,1);assert.equal(shell.signs.size,1);assert.equal(shell.count,12);}
   assert.deepEqual([...shells.values()].map(s=>[...s.signs][0]).sort(),[-1,1,1]);
 });
+
+/**
+ * ⛔⛔ A COLLIDER NOTHING CAN TOUCH MUST COST NOTHING.
+ *
+ * Every mesh/concave collider in the scene was collected, transformed and
+ * packed into one BVH regardless of where it stood, so a collider on the far
+ * side of the level was paid for by every cloth — and the bill is a product,
+ * because the shared field was ALSO refreshed once per cloth per frame rather
+ * than once per frame.
+ *
+ * "adding more colliders to the scene automatically make cloth a lot more
+ * expensive, even if the colliders do not interact with the cloth" (user,
+ * 2026-09-08).
+ */
+
+/** A field with one cloth user standing at `centre` with the given reach. */
+function withCloth(centre, radius, colliderAt) {
+  const engine = { entities: new Map(), playing: false, renderer: { info: { frame: 1 } } };
+  const entity = new Entity(engine, { id: 'wall', name: 'Wall' });
+  engine.entities.set(entity.id, entity);
+  const collider = new ColliderComponent({ shape: 'concave' });
+  entity.components.set('collider', collider); collider.entity = entity;
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1));
+  mesh.position.fromArray(colliderAt);
+  mesh.userData.entityId = entity.id;
+  entity.object3D.add(mesh);
+  entity.object3D.updateMatrixWorld(true);
+
+  // The cloth, as `addUser` receives it: a component with a simulation mesh
+  // whose geometry carries the culling sphere `updateBounds` maintains.
+  const clothMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1));
+  clothMesh.position.fromArray(centre);
+  clothMesh.updateMatrixWorld(true);
+  clothMesh.geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), radius);
+
+  const field = new ClothMeshColliderField(engine);
+  field.addUser({ simulation: { mesh: clothMesh } });
+  return field;
+}
+
+test("⭐⭐ a collider far from every cloth is not packed at all", () => {
+  const near = withCloth([0, 0, 0], 2, [1, 0, 0]);
+  near.refresh();
+  assert.ok(near.triangleCount > 0, "a collider inside the cloth's reach must still be packed");
+
+  const far = withCloth([0, 0, 0], 2, [500, 0, 0]);
+  far.refresh();
+  assert.equal(far.triangleCount, 0, "a collider 500 m away must contribute nothing");
+});
+
+test("⛔ the cull is conservative — it keeps anything it cannot measure", () => {
+  // No bounding sphere yet (the cloth has not run a frame), so reach is
+  // unknown and everything must be kept. Dropping a collider here would make
+  // a cloth fall through the world on its first frame.
+  const engine = { entities: new Map(), playing: false, renderer: { info: { frame: 1 } } };
+  const entity = new Entity(engine, { id: 'wall', name: 'Wall' });
+  engine.entities.set(entity.id, entity);
+  const collider = new ColliderComponent({ shape: 'concave' });
+  entity.components.set('collider', collider); collider.entity = entity;
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1));
+  mesh.position.set(500, 0, 0);
+  mesh.userData.entityId = entity.id;
+  entity.object3D.add(mesh);
+  entity.object3D.updateMatrixWorld(true);
+
+  const field = new ClothMeshColliderField(engine);
+  const clothMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1));
+  clothMesh.geometry.boundingSphere = null;
+  field.addUser({ simulation: { mesh: clothMesh } });
+  field.refresh();
+  assert.ok(field.triangleCount > 0, "unmeasurable reach must keep every collider");
+});
+
+test("⭐ the shared field scans once per FRAME, not once per cloth", () => {
+  // Ten cloths asking in the same frame must produce one scan. This was the
+  // other factor of the product: cloths x colliders, every frame.
+  const field = withCloth([0, 0, 0], 2, [1, 0, 0]);
+  let scans = 0;
+  const engine = field.engine;
+  const realValues = engine.entities.values.bind(engine.entities);
+  engine.entities.values = () => { scans++; return realValues(); };
+
+  for (let i = 0; i < 10; i++) field.refresh();
+  assert.equal(scans, 1, `ten cloths in one frame must scan once, scanned ${scans}`);
+
+  engine.renderer.info.frame = 2;
+  for (let i = 0; i < 10; i++) field.refresh();
+  assert.equal(scans, 2, "and once more on the next frame");
+});

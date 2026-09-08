@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, Check, Eye, EyeOff, Eraser } from "lucide-react";
+import { NumberField } from "../fields/NumberField.jsx";
+import { Plus, Trash2, Check, Eye, EyeOff, Eraser } from "../icons/index.jsx";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";
 import { SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
@@ -34,6 +35,12 @@ const TOOL_HINTS = {
 };
 
 function NumberInput({ value, min, max, step = 0.1, onCommit }) {
+  // A bounded number is the shared slider field (drag by position, click to type).
+  if (Number.isFinite(min) && Number.isFinite(max) && max > min) return <NumberField value={value} min={min} max={max} step={step} onCommit={onCommit} />;
+  return <PlainNumberInput value={value} min={min} max={max} step={step} onCommit={onCommit} />;
+}
+
+function PlainNumberInput({ value, min, max, step = 0.1, onCommit }) {
   const [text, setText] = useState(String(value));
   useEffect(() => setText(String(value)), [value]);
   const commit = () => {

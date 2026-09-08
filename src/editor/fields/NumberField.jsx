@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { commandBus } from "../commands/CommandBus.js";
 
 /**
  * The inspector's number input. Two interaction modes on one control:
@@ -37,6 +38,60 @@ export function formatNumber(v) {
 const DRAG_SLOP = 3;
 
 /**
+ * ── A BOUNDED NUMBER IS A SLIDER (2026-09-08) ─────────────────────────────
+ * A field that knows both its minimum and its maximum draws its value as a
+ * fill from the left (see `.number-field.slider`), and a drag sets the value
+ * by POSITION — where the pointer is along the field is where the value lands,
+ * the way a slider works — instead of by delta. Shift keeps the delta mode at
+ * a tenth of the range per field-width, for the last decimal. Click still
+ * types. The value is quantised to the field's step when the step is a whole
+ * number (a count stays a count), and otherwise to a fine grid so the slider
+ * feels continuous while the figure stays readable.
+ */
+const isBounded = (min, max) => Number.isFinite(min) && Number.isFinite(max) && max > min;
+
+function quantize(value, step, min, max) {
+  if (step >= 1) return Math.round(value / step) * step;
+  return tidy(value, Math.min(step, (max - min) / 500));
+}
+
+/**
+ * ── A SCRUB IS A PREVIEW; THE COMMIT HAPPENS ON RELEASE ────────────────────
+ * (2026-09-07, ZERO_FREEZE_PLAN §1.3)
+ *
+ * THE FAILURE: this field called `onCommit` on EVERY `pointermove`. Each call
+ * built a full undoable command, pushed it, and ran the whole edit fan-out —
+ * the scene mirror, merging, shadowMerge, batching, GI's rebake check — in its
+ * own macrotask, so none of it coalesced. A one-second scrub of a light's
+ * intensity left ~100 entries in the undo stack (Ctrl+Z became useless) and
+ * spent the frame budget on listeners instead of on drawing the change.
+ *
+ * Now: the drag opens a command-bus transaction, writes AT MOST ONCE PER
+ * ANIMATION FRAME while it runs (a 1000 Hz mouse delivers several moves per
+ * frame; the extra ones cannot be seen and are dropped), and closes the
+ * transaction on release — ONE undo entry, whose undo restores the value the
+ * drag started from. The viewport still updates live because the previewed
+ * commands really do run; only the history push and the scene-wide refresh
+ * wait for the release.
+ *
+ * `globalThis.__editorDragPreview = false` restores commit-per-pointermove
+ * for a one-boot A/B.
+ */
+const previewEnabled = () => globalThis.__editorDragPreview !== false;
+
+function openPreview(d) {
+  if (d.preview || !previewEnabled()) return;
+  d.preview = true;
+  commandBus.beginPreview();
+}
+
+function closePreview(d) {
+  if (!d.preview) return;
+  d.preview = false;
+  commandBus.endPreview();
+}
+
+/**
  * @param {{ value: number, onCommit: (value: number) => void, min?: number,
  *           max?: number, step?: number, mixed?: boolean, className?: string,
  *           title?: string }} props
@@ -60,6 +115,8 @@ export function NumberField({
   const inputRef = useRef(null);
   const drag = useRef(null);
   const text = draft !== null ? draft : mixed ? "" : formatNumber(value);
+  const bounded = isBounded(min, max);
+  const fillPct = bounded ? Math.max(0, Math.min(100, ((Number(value) || 0) - min) / (max - min) * 100)) : 0;
 
   const commitText = () => {
     const parsed = parseFloat(text);
@@ -78,6 +135,13 @@ export function NumberField({
       value: Number(value) || 0,
       moved: 0,
       active: false,
+      // The rAF handle of a queued preview write, and the modifier scale that
+      // write should tidy against. 0 = nothing queued.
+      frame: 0,
+      scale: 1,
+      preview: false,
+      // For the slider: the field's box, so a pointer position maps to a value.
+      rect: bounded ? e.currentTarget.getBoundingClientRect() : null,
     };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
@@ -90,14 +154,35 @@ export function NumberField({
       if (d.moved < DRAG_SLOP) return;
       d.active = true;
       setScrubbing(true);
+      openPreview(d);
       // The browser focused us on mousedown and may have started a text
       // selection. Drop both so the drag reads as a scrub, not a highlight.
       e.currentTarget.blur();
       window.getSelection?.()?.removeAllRanges?.();
     }
     const scale = e.shiftKey ? 0.1 : e.altKey ? 10 : 1;
-    d.value += e.movementX * step * scale;
-    onCommit(tidy(clamp(d.value, min, max), step * scale));
+    if (bounded && d.rect?.width > 0) {
+      // Slider: absolute by position; Shift = fine, by delta.
+      if (e.shiftKey) d.value += (e.movementX / d.rect.width) * (max - min) * 0.1;
+      else d.value = min + ((e.clientX - d.rect.left) / d.rect.width) * (max - min);
+    } else {
+      d.value += e.movementX * step * scale;
+    }
+    d.scale = scale;
+    const settle = (v, s) => (bounded ? quantize(clamp(v, min, max), step, min, max) : tidy(clamp(v, min, max), s));
+    if (!previewEnabled()) {
+      onCommit(settle(d.value, step * scale));
+      return;
+    }
+    // ONE WRITE PER FRAME. The accumulator above already holds every delta, so
+    // a dropped intermediate write loses nothing but the work of applying a
+    // value that would have been overwritten before it was ever drawn.
+    if (d.frame) return;
+    d.frame = requestAnimationFrame(() => {
+      d.frame = 0;
+      if (drag.current !== d) return; // the drag ended before the frame ran
+      onCommit(settle(d.value, step * d.scale));
+    });
   };
 
   const endDrag = (e) => {
@@ -105,16 +190,23 @@ export function NumberField({
     if (!d) return;
     drag.current = null;
     setScrubbing(false);
+    if (d.frame) cancelAnimationFrame(d.frame);
+    d.frame = 0;
     e.currentTarget.releasePointerCapture?.(d.pointerId);
     // A press that never crossed the slop threshold is a plain click; the
     // browser already gave the input focus, so typing just works.
-    if (d.active) onCommit(tidy(clamp(d.value, min, max), step));
+    if (d.active) onCommit(bounded ? quantize(clamp(d.value, min, max), step, min, max) : tidy(clamp(d.value, min, max), step));
+    // ⚠ AFTER the final write, never before: the transaction has to contain
+    // the value the user released on, or the one undo entry redoes to the
+    // second-to-last frame of the drag.
+    closePreview(d);
   };
 
   return (
     <input
       ref={inputRef}
-      className={`number-field${scrubbing ? " scrubbing" : ""}${className ? ` ${className}` : ""}`}
+      className={`number-field${bounded ? " slider" : ""}${scrubbing ? " scrubbing" : ""}${className ? ` ${className}` : ""}`}
+      style={bounded ? { "--fill-pct": `${fillPct}%` } : undefined}
       type="text"
       inputMode="decimal"
       title={title}
@@ -125,6 +217,16 @@ export function NumberField({
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
       onLostPointerCapture={() => {
+        // The last exit. `endDrag` normally got there first (it releases the
+        // capture itself), but a capture torn away by the browser must not
+        // strand an open transaction — the next command anywhere in the editor
+        // would be swallowed into this drag's single undo entry.
+        const d = drag.current;
+        if (d) {
+          if (d.frame) cancelAnimationFrame(d.frame);
+          d.frame = 0;
+          closePreview(d);
+        }
         drag.current = null;
         setScrubbing(false);
       }}

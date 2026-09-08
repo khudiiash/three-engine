@@ -45,6 +45,7 @@ globalThis.cancelAnimationFrame ??= (id) => clearTimeout(id);
 
 const { Engine, registerBuiltInComponents } = await import("../src/engine/index.js");
 const { rendererConstructorOptions } = await import("../src/engine/sceneSettings.js");
+const { refuseWebGLFallback } = await import("../src/engine/Engine.js");
 
 registerBuiltInComponents();
 
@@ -137,6 +138,64 @@ await check("three flips in one tick coalesce to the FINAL state's single answer
     engine.__disposeCount, 1,
     `the net change is one antialias flip — expected one teardown, saw ${engine.__disposeCount}`,
   );
+});
+
+await check("⭐⭐ OPENING A SCENE never destroys the device, however its renderer block differs", async () => {
+  // The renderer block is authored PER SCENE, so before this every scene switch
+  // whose antialias differed from the running renderer's tore the device down —
+  // and a destroyed device means GI rebuilds from nothing and every material
+  // compiles again (~40 s). The user opened a scene; they did not change a
+  // setting. `fromSceneLoad` is what tells the two apart.
+  const engine = makeEngine({ antialias: false, samples: 2 });
+  await engine.applySettings({ renderer: { antialias: true, samples: 4 } }, { fromSceneLoad: true });
+  await settle();
+  assert.equal(
+    engine.__disposeCount, 0,
+    `a scene load must not destroy the device, saw ${engine.__disposeCount} teardown(s)`,
+  );
+  // …and the value is still adopted, so saving the scene keeps what it said and
+  // the next launch builds the renderer it asked for.
+  assert.equal(engine.settings.renderer.antialias, true, "the scene's authored value must still be applied");
+});
+
+await check("⭐ the opt-out restores the old scene-switch rebuild", async () => {
+  globalThis.__engineSceneSwitchRebuildsRenderer = true;
+  try {
+    const engine = makeEngine({ antialias: false, samples: 2 });
+    await engine.applySettings({ renderer: { antialias: true, samples: 4 } }, { fromSceneLoad: true });
+    await settle();
+    assert.equal(engine.__disposeCount, 1, "the hatch must bring the rebuild back for an A/B");
+  } finally {
+    delete globalThis.__engineSceneSwitchRebuildsRenderer;
+  }
+});
+
+await check("⛔ a rebuild on a WebGPU canvas REFUSES three's WebGL fallback", () => {
+  // THE FAILURE THIS PREVENTS, observed live on 2026-09-07: the GPU ran out of
+  // memory (`ID3D12Device::CreateDescriptorHeap failed with E_OUTOFMEMORY`),
+  // three caught that inside `init()` and retried with `new WebGLBackend(...)`,
+  // and a canvas that has already handed out a WebGPU context returns null for
+  // `getContext('webgl2')` — so all four rebuild attempts reported "Cannot read
+  // properties of null (reading 'getSupportedExtensions')" and the real cause
+  // never reached the operator. three installs the hook inside the
+  // WebGPURenderer constructor, overwriting anything the caller passes, so it
+  // has to be cleared on the instance afterwards or not at all.
+  const webgpuCanvas = { _getFallback: () => ({ isWebGLBackend: true }) };
+  refuseWebGLFallback(webgpuCanvas, true);
+  assert.equal(
+    webgpuCanvas._getFallback, null,
+    "with the hook armed, init() reports a WebGL error for what is really a WebGPU one",
+  );
+
+  // A build that asked for WebGL keeps its fallback — there the WebGL backend
+  // is the intent, not a trap.
+  const fallback = () => ({ isWebGLBackend: true });
+  const webglCanvas = { _getFallback: fallback };
+  refuseWebGLFallback(webglCanvas, false);
+  assert.equal(webglCanvas._getFallback, fallback);
+
+  // And it must not throw on a rebuild attempt that produced no renderer.
+  refuseWebGLFallback(null, true);
 });
 
 console.log(failures ? `\n${failures} failing` : "\nall ok");

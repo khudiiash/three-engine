@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Check, Plus, RotateCcw, Sparkles, Zap, Save, FilePlus2 } from "lucide-react";
+import { Check, Plus, RotateCcw, Sparkles, Zap, Save, FilePlus2 } from "../icons/index.jsx";
 import { ReactFlowProvider } from "@xyflow/react";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
@@ -243,17 +243,21 @@ function ParticleGraphEditor({ entityId, kind, committedGraph, document, docPath
       >
         <Zap size={14} />
       </button>
-      <button className="toolbar-btn" disabled={!dirty || autosave} onClick={apply}>
-        <Check size={13} />
-        {docPath ? "Save" : "Apply"}{dirty ? " •" : ""}
+      <button
+        className="toolbar-btn icon-only"
+        disabled={!dirty || autosave}
+        onClick={apply}
+        title={autosave ? "Autosave is on" : dirty ? (docPath ? "Save" : "Apply") : "No changes to save"}
+      >
+        <Check size={13} />{dirty ? " •" : ""}
       </button>
       <div className="dropdown-wrap">
-        <button className="toolbar-btn" disabled={!folder} onClick={() => setSaveAsOpen((value) => !value)}><FilePlus2 size={13} />Save As</button>
+        <button className="toolbar-btn icon-only" disabled={!folder} onClick={() => setSaveAsOpen((value) => !value)} title="Save As — fork into a new .vfx file"><FilePlus2 size={13} /></button>
         {saveAsOpen && <><div className="dropdown-overlay" onClick={() => setSaveAsOpen(false)} /><div className="dropdown-menu save-as-menu">
           <div className="node-palette-group">Save particle graph as</div>
           <input autoFocus aria-label="VFX asset filename" className="text-field" value={fileName} onChange={(event) => setFileName(event.target.value)} onKeyDown={(event) => { event.stopPropagation(); if (event.key === "Enter") saveAs(); if (event.key === "Escape") setSaveAsOpen(false); }} />
           <div title={folder}>in {basename(folder ?? "")}</div>
-          <button className="toolbar-btn" disabled={saving || !fileName.trim()} onClick={saveAs}><Save size={13} />{saving ? "Saving..." : "Create"}</button>
+          <button className="toolbar-btn" disabled={saving || !fileName.trim()} onClick={saveAs} title={saving ? "Saving…" : "Create"}><Save size={13} />{saving ? "Saving..." : "Create"}</button>
         </div></>}
       </div>
     </>
@@ -269,7 +273,6 @@ function ParticleGraphEditor({ entityId, kind, committedGraph, document, docPath
       initialGraph={initialGraph}
       onChange={onChange}
       toolbar={toolbar}
-      hint={kind === "particles" ? "Wire emitters and forces into the Particle System node · right-click to add nodes · double-click a wire to delete it · Ctrl+Z undoes" : "Connect Grid to Solver, then Solver and Material to Surface Output · right-click to add values and math · Apply commits changes"}
     />
     </div>
   );
@@ -334,7 +337,7 @@ export function ParticlesPanel() {
     {error && <div className="vfx-error" role="alert">{error}</div>}
     {graph ? <ReactFlowProvider key={docPath || `${entity.id}:${kind}`}><ParticleGraphEditor entityId={entity?.id} kind={activeKind} committedGraph={graph} document={document} docPath={docPath} onOpenDoc={openDoc} /></ReactFlowProvider>
       : docPath ? <div className="vfx-empty">{error ? "Unable to open particle graph." : "Loading particle graph..."}</div>
-      : !entity ? <div className="vfx-empty"><Sparkles size={24} /><strong>Particles</strong><p>Select an entity with particles or open a particle graph asset.</p></div>
-      : <div className="vfx-empty"><Sparkles size={24} /><strong>Build a particle effect</strong><p>Create on "{entity.name}", then edit its graph.</p><button className="toolbar-btn" disabled={adding} onClick={add}><Plus size={13} />{adding ? "Adding..." : "Add Particles"}</button></div>}
+      : !entity ? <div className="vfx-empty" title="Select an entity with particles or open a particle graph asset"><Sparkles className="empty-glyph" size={28} /></div>
+      : <div className="vfx-empty" title={`Build a particle effect on "${entity.name}"`}><Sparkles className="empty-glyph" size={28} /><button className="toolbar-btn" disabled={adding} onClick={add} title={`Add particles to "${entity.name}"`}><Plus size={13} />{adding ? "Adding..." : "Add Particles"}</button></div>}
   </div>;
 }

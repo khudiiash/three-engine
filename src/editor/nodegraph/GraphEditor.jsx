@@ -15,7 +15,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import "./nodegraph.css";
-import { Plus, Undo2, Redo2, Map as MapIcon, Grid3x3, StickyNote, Maximize2 } from "lucide-react";
+import { Plus, Undo2, Redo2, Map as MapIcon, Grid3x3, StickyNote, Maximize2 } from "../icons/index.jsx";
 import { setGraphHovered } from "./graphContext.js";
 import { ownsKeyboard, activeKeyScopeElement } from "../keyScope.js";
 import { sharedNodeTypes } from "./GraphNode.jsx";
@@ -23,7 +23,7 @@ import { NodePalette, noteRecent } from "./palette.jsx";
 import { createGraphHistory } from "./history.js";
 import { ContextMenu } from "../ContextMenu.jsx";
 import { copySelection, pasteClipboard, duplicateSelection } from "./clipboard.js";
-import { makeConnectionValidator, wouldCycle } from "./socketTypes.js";
+import { makeConnectionValidator, wouldCycle, socketColor } from "./socketTypes.js";
 import {
   graphToFlow,
   flowToGraph,
@@ -64,6 +64,24 @@ function makeNodeId(type) {
 }
 
 const isHelper = (type) => type === FRAME_TYPE || type === REROUTE_TYPE;
+
+/**
+ * A wire carries the colour of the socket it leaves, so a scalar, a vector
+ * and a colour read apart at a glance (the way the prototype draws them).
+ * Computed per render — a graph has tens of edges, not thousands.
+ */
+function colourEdges(edges, nodes, registry) {
+  if (!edges?.length) return edges;
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  return edges.map((edge) => {
+    if (edge.style?.stroke) return edge;
+    const node = byId.get(edge.source);
+    const def = node?.data?.nodeType ? registry?.describe?.(node.data.nodeType) : null;
+    const out = def?.outputs?.find((o) => (typeof o === "string" ? o : o.key) === (edge.sourceHandle ?? "out")) ?? def?.outputs?.[0];
+    const type = typeof out === "string" ? "any" : out?.type;
+    return { ...edge, style: { ...(edge.style ?? {}), stroke: socketColor(type ?? "any") } };
+  });
+}
 
 export const GraphEditor = forwardRef(function GraphEditor(
   {
@@ -747,6 +765,7 @@ export const GraphEditor = forwardRef(function GraphEditor(
       }),
     [nodes, edges, registry, handlePropsChange, registerThumb, canPreview, nodeErrors, nodeClasses],
   );
+  const styledEdges = useMemo(() => colourEdges(edges, nodesWithHandlers, registry), [edges, nodesWithHandlers, registry]);
 
   const toggleMinimap = () => {
     setShowMinimap((v) => {
@@ -834,7 +853,7 @@ export const GraphEditor = forwardRef(function GraphEditor(
       >
         <ReactFlow
           nodes={nodesWithHandlers}
-          edges={edges}
+          edges={styledEdges}
           nodeTypes={sharedNodeTypes}
           onNodesChange={guardedNodesChange}
           onEdgesChange={guardedEdgesChange}

@@ -10,7 +10,7 @@ import {
   Clock,
   FileBox,
   X,
-} from "lucide-react";
+} from "./icons/index.jsx";
 import { useProjectStore, basename } from "./store/projectStore.js";
 
 function LogoMark() {

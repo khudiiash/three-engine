@@ -1,0 +1,3780 @@
+/* ============================================================================
+   Theme v3 — "Aurora": the design system the user prototyped (2026-09-08).
+
+   Loaded AFTER theme.css and wins by order. The material: a deep green-black
+   ground, panels one step lighter, every group and every field carrying a
+   1 px teal-grey border, 4 px radii, one GREEN accent for the active tab, the
+   selection, checkboxes, sliders and Play. Panel names are text tabs with a
+   green underline. Labels are dim green-grey; values are near-white. Status is
+   a coloured word (green loaded / blue active / orange streaming / red error).
+
+   Kept from the earlier pass: the launcher, the transport in the bar, the
+   entity header, hover-only actions, no explainer text, the preview system.
+   ========================================================================== */
+
+/* ---------- 0 · tokens ---------- */
+:root {
+  --bg-0: #111;
+  --bg-1: #111;
+  --bg-2: #111;
+  --bg-3: #111;
+  --inset: #111;
+  --fill-1: #111; 
+  --fill-2: #111;
+  --border: #111;
+  --border-strong: #111;
+  --text: #e6eeeb;
+  --text-dim: #8b9a97;
+  --text-faint: #5e6c69;
+  --accent: #fff;
+  --accent-soft: #fff;
+  --accent-ring: #fff;
+  --on-accent: #0b1512;
+  --info: #4c8dff;
+  --live: #e8a33b;
+  --warn: #e8a33b;
+  --danger: #ff5c5c;
+  --ok: #fff;
+  --menu-bg: #111;
+  --shadow-menu: 0 12px 32px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.4);
+  --shadow-card: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --r-1: 4px;
+  --r-input: 4px;
+  --r-card: 6px;
+  --r-menu: 6px;
+}
+html,
+body,
+#root {
+  background: var(--bg-0);
+}
+body {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- controls: inset fields, bordered buttons, green marks ---------- */
+.number-field,
+.text-field,
+.select-field,
+.asset-field,
+.hierarchy-search,
+.assets-search,
+.search,
+.component-menu-search,
+.panel-launcher-search {
+  background-color: var(--inset);
+  border: 1px solid var(--border);
+}
+.number-field:hover,
+.text-field:hover,
+.select-field:hover,
+.asset-field:hover {
+  background-color: var(--inset);
+  border-color: var(--border-strong);
+}
+.number-field:focus,
+.text-field:focus,
+.select-field:focus,
+.assets-search:focus-within,
+.hierarchy-search:focus-within {
+  background-color: var(--inset);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.select-field {
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'><path d='M1 1l3 3 3-3' fill='none' stroke='%238b9a97' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+}
+.toolbar-btn {
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.toolbar-btn:hover:not(:disabled) {
+  background: var(--bg-3);
+  border-color: var(--border-strong);
+}
+.toolbar-btn.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.toolbar-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.toolbar-btn.primary:hover:not(:disabled) {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+.toolbar-btn.subtle {
+  border-style: dashed;
+}
+.icon-btn:hover {
+  color: var(--text);
+  background: var(--fill-2);
+}
+.icon-btn.danger:hover,
+.toolbar-btn.danger:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+/* Every checkbox is the prototype's green square with a dark check. The old
+   sheet drew a sliding knob in ::after; that pseudo-element is switched off
+   here and re-used for the check mark. */
+input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  flex: none;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  background: var(--inset);
+  cursor: pointer;
+  position: relative;
+  transition: background-color 0.12s var(--ease), border-color 0.12s var(--ease);
+}
+input[type="checkbox"]::after {
+  content: none;
+  display: none;
+  transform: none;
+}
+input[type="checkbox"]:hover {
+  border-color: var(--accent);
+}
+input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+input[type="checkbox"]:checked::after {
+  content: "";
+  display: block;
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--on-accent);
+  border-width: 0 2px 2px 0;
+  border-radius: 0;
+  background: transparent;
+  transform: rotate(45deg);
+}
+input[type="checkbox"]:indeterminate {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+input[type="checkbox"]:indeterminate::after {
+  content: "";
+  display: block;
+  position: absolute;
+  left: 3px;
+  top: 5px;
+  width: 6px;
+  height: 2px;
+  border: 0;
+  background: var(--accent);
+  transform: none;
+}
+input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 1px;
+}
+.field-row.inline input[type="checkbox"],
+.visibility-toggle input[type="checkbox"],
+.settings-control input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: var(--inset);
+}
+.field-row.inline input[type="checkbox"]:checked {
+  background: var(--accent);
+}
+.field-row.inline input[type="checkbox"]::after {
+  width: 4px;
+  height: 8px;
+  top: 1px;
+  left: 4px;
+}
+.field-row.inline input[type="checkbox"]:checked::after {
+  transform: rotate(45deg);
+}
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 14px;
+  background: transparent;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border-strong);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 11px;
+  height: 11px;
+  margin-top: -4px;
+  border-radius: 50%;
+  border: 2px solid var(--bg-1);
+  background: var(--accent);
+}
+
+/* ---------- 1 · dock: ONE SPACE — panels edge to edge, one seam ---------- */
+/* No padding and a 1 px Dockview gap: the ground shows through between
+   panels as a single dark crease, in place of two 1 px borders, a 6 px
+   gutter and eight rounded corners per pair. The dock now reads as one
+   surface that happens to be divided — which is also the surface you drag
+   to resize, so the crease is where the pointer already goes. */
+.dock-container {
+  padding: 0;
+  background: var(--bg-0);
+}
+.dock-container .dv-dockview {
+  --dv-group-view-background-color: var(--bg-1);
+  --dv-tabs-and-actions-container-background-color: var(--bg-1);
+  --dv-tabs-and-actions-container-height: 34px;
+  --dv-activegroup-visiblepanel-tab-background-color: transparent;
+  --dv-inactivegroup-visiblepanel-tab-background-color: transparent;
+  --dv-activegroup-visiblepanel-tab-color: var(--accent);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--text);
+  --dv-activegroup-hiddenpanel-tab-color: var(--text-dim);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--text-dim);
+  --dv-separator-border: transparent;
+  --dv-drag-over-background-color: var(--accent-soft);
+  --dv-drag-over-border-color: var(--accent);
+}
+.dock-container .dv-groupview {
+  border: 0;
+  border-radius: 0;
+  overflow: hidden;
+  background: var(--bg-1);
+}
+/* The strip is the panel: same ground, no rule under it. The active tab's
+   accent underline is the only mark the boundary needs. */
+.dock-container .dv-tabs-and-actions-container {
+  padding: 0 4px 0 0;
+  border-bottom: 0;
+}
+.dock-container .dv-tabs-container {
+  align-items: stretch;
+  gap: 0;
+}
+.dock-container .dv-tab {
+  height: 33px;
+  min-height: 33px;
+  max-height: 33px;
+  padding: 0;
+  border-radius: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+  transition: color 0.12s var(--ease), background-color 0.12s var(--ease), box-shadow 0.12s var(--ease);
+}
+.dock-container .dv-tab:hover {
+  color: var(--text);
+  background: var(--fill-1);
+}
+.dock-container .dv-tab.dv-active-tab {
+  color: var(--accent);
+  font-weight: 600;
+  background: var(--bg-1);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.panel-tab {
+  display: flex;
+  align-items: center;
+  height: 33px;
+  padding: 0 10px;
+}
+.panel-tab-content {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+.panel-tab-icon {
+  flex: none;
+}
+/* The active tab is glyph + name; an inactive tab is its glyph, and its name
+   floats under it on hover (.tab-tip, a portal) so hovering never changes
+   the strip's width. Eight panels in one strip stay eight glyphs wide; a
+   long name on a narrow group's active tab ends in an ellipsis. */
+.panel-tab-label {
+  display: none;
+  max-width: 120px;
+  margin-left: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.dv-tab.dv-active-tab .panel-tab-label {
+  display: block;
+  margin-left: 7px;
+}
+.panel-tab-close {
+  display: none;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 6px;
+  padding: 0;
+  opacity: 0;
+  border-radius: 3px;
+  color: var(--text-dim);
+  transition: opacity 0.12s var(--ease);
+}
+.dv-tab.dv-active-tab .panel-tab-close {
+  display: inline-grid;
+}
+.dv-tab.dv-active-tab:hover .panel-tab-close {
+  opacity: 1;
+}
+.tab-tip {
+  position: fixed;
+  z-index: 1200;
+  transform: translate(-50%, 0);
+  padding: 3px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-1);
+  background: var(--bg-3);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: var(--shadow-menu);
+}
+.panel-tab-close:hover {
+  background: var(--fill-2);
+  color: var(--text);
+}
+.panel-tab-badge {
+  display: inline-block;
+  min-width: 15px;
+  height: 15px;
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+  text-align: center;
+}
+.dock-container .dv-right-actions-container {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+/* The console's signal dots, left of a tab strip's `+`: red = the console
+   holds errors, yellow = warnings. Sized so the strip's height never moves. */
+.dock-signals {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  margin: 0 2px 0 0;
+  padding: 0 5px;
+  border: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  cursor: pointer;
+}
+.dock-signals:hover {
+  background: var(--fill-2);
+}
+.dock-signal {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.dock-signal.error {
+  background: var(--danger);
+}
+.dock-signal.warn {
+  background: var(--warn);
+}
+.panel-launcher-button {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin: 0 2px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease), color 0.12s var(--ease);
+}
+.panel-launcher-button:hover,
+.panel-launcher-button.open {
+  background: var(--fill-2);
+  color: var(--text);
+}
+.panel-launcher {
+  position: fixed;
+  z-index: 400;
+  padding: 10px 12px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-menu);
+  box-shadow: var(--shadow-menu);
+  animation: menu-in 0.14s var(--ease);
+}
+.panel-launcher-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: var(--r-1);
+  color: var(--text-dim);
+}
+.panel-launcher-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: none;
+  color: var(--text);
+  font-size: 12px;
+}
+.panel-launcher-search input::placeholder {
+  color: var(--text-dim);
+}
+.panel-launcher-family {
+  margin-top: 8px;
+}
+.panel-launcher-family-title {
+  margin: 0 0 2px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.panel-launcher-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 1px;
+}
+.panel-launcher-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 2px 5px;
+  border: 1px solid transparent;
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--text);
+  font-size: 10.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.panel-launcher-item svg {
+  color: var(--text-dim);
+}
+.panel-launcher-item:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.panel-launcher-item:hover svg {
+  color: var(--accent);
+}
+.panel-launcher-item:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: -2px;
+}
+.panel-loading {
+  background: var(--bg-1);
+}
+
+/* ---------- 2 · the bar: wordmark, menus, scene, transport, status, search ---------- */
+.menu-bar {
+  height: 40px;
+  padding: 0 8px 0 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-0);
+  transition: box-shadow 0.2s var(--ease);
+}
+.menu-bar.live {
+  box-shadow: inset 0 -2px 0 var(--live);
+}
+.app-mark {
+  width: 16px;
+  height: 16px;
+  margin: 0 6px 0 2px;
+  flex: none;
+  opacity: 0.95;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+.wordmark {
+  margin-right: 14px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  white-space: nowrap;
+}
+.menu-btn {
+  color: var(--text-dim);
+}
+.transport {
+  position: absolute;
+  left: 50%;
+  top: 6px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.scene-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 27px;
+  padding: 0 8px 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.scene-chip:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-3);
+}
+.scene-chip svg {
+  color: var(--text-dim);
+}
+.scene-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: transparent;
+  transition: background-color 0.12s var(--ease);
+}
+.scene-dot.dirty {
+  background: var(--live);
+}
+.scene-menu {
+  min-width: 240px;
+}
+.transport-btn,
+.transport .toolbar-btn {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  min-width: 28px;
+  height: 27px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--bg-2);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease), color 0.12s var(--ease), border-color 0.12s var(--ease);
+}
+.transport-btn:hover:not(:disabled),
+.transport .toolbar-btn:hover:not(:disabled) {
+  background: var(--bg-3);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.transport-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.transport-btn.active,
+.transport .toolbar-btn.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.transport-btn.play {
+  width: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 0 9px;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.transport-btn.play:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  filter: brightness(1.08);
+}
+.transport-btn.play.live {
+  background: var(--live);
+  border-color: var(--live);
+  color: var(--on-accent);
+}
+.transport-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--border-strong);
+}
+.save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 27px;
+  padding: 0 8px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.save-state svg {
+  color: var(--accent);
+}
+.save-state.dirty svg {
+  color: var(--live);
+}
+.global-search {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: 230px;
+  height: 27px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--inset);
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: text;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.global-search:hover {
+  border-color: var(--border-strong);
+}
+.global-search kbd {
+  margin-left: auto;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-faint);
+  font-family: inherit;
+  font-size: 10px;
+}
+.bar-gear {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  border: 0;
+  border-radius: var(--r-input);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.bar-gear:hover {
+  background: var(--fill-2);
+  color: var(--text);
+}
+.git-chip,
+.mcp-chip {
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  border-radius: var(--r-input);
+}
+.mcp-chip-count {
+  font-variant-numeric: tabular-nums;
+}
+.window-controls {
+  display: flex;
+  align-self: stretch;
+  margin: 0 -8px 0 6px;
+}
+.window-controls button {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: default;
+  transition: background-color 0.12s var(--ease), color 0.12s var(--ease);
+}
+.window-controls button:hover {
+  background: var(--fill-2);
+  color: var(--text);
+}
+.window-controls button.close:hover {
+  background: #c42b1c;
+  color: #fff;
+}
+.menu-item-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+.menu-item-icon {
+  flex: none;
+  color: var(--text-dim);
+}
+.dropdown-item:hover:not(:disabled) .menu-item-icon {
+  color: inherit;
+}
+.dropdown-menu {
+  background: var(--menu-bg);
+  border: 1px solid var(--border-strong);
+}
+.dropdown-item:hover:not(:disabled) {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.dropdown-item.checked {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ---------- 3 · viewport: pills over the picture ---------- */
+.viewport-hud-cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: rgba(10, 14, 16, 0.82);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-card);
+}
+.viewport-toolbar .viewport-hud-cluster .toolbar-btn {
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text);
+}
+.viewport-toolbar .viewport-hud-cluster .toolbar-btn:hover:not(:disabled) {
+  background: var(--fill-2);
+}
+.viewport-toolbar .viewport-hud-cluster .toolbar-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.viewport-toolbar .toolbar-btn {
+  background: rgba(10, 14, 16, 0.82);
+  border: 1px solid var(--border-strong);
+}
+.stats-overlay,
+.stats-overlay-section,
+.stats-overlay-label {
+  letter-spacing: normal;
+  text-transform: none;
+}
+.stats-overlay {
+  background: rgba(10, 14, 16, 0.86);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-card);
+}
+.stats-overlay-section {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* ---------- 4 · hierarchy: green selection, visible toggles ---------- */
+.scene-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text);
+}
+.hierarchy-row {
+  height: 24px;
+  border-radius: var(--r-1);
+}
+.hierarchy-row:hover {
+  background: var(--fill-1);
+}
+.hierarchy-row.selected {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.hierarchy-row.selected .entity-name {
+  color: var(--accent);
+}
+.hierarchy-vis-icons .hierarchy-vis-icon {
+  opacity: 0.55;
+  transition: opacity 0.12s var(--ease);
+}
+.hierarchy-row:hover .hierarchy-vis-icon,
+.hierarchy-row.selected .hierarchy-vis-icon,
+.hierarchy-vis-icons .hierarchy-vis-icon.off,
+.hierarchy-vis-icons:focus-within .hierarchy-vis-icon {
+  opacity: 1;
+}
+.hierarchy-search-match.tier-0,
+.hierarchy-search-match.tier-1 {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ---------- 5 · inspector: the entity header, sections, rows ---------- */
+.inspector-section.entity-header {
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.entity-header-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.entity-header-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.entity-name-field {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.entity-kind {
+  padding-left: 1px;
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.entity-toggle {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--bg-2);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease), color 0.12s var(--ease), border-color 0.12s var(--ease);
+}
+.entity-toggle:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.entity-toggle.on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.entity-toggle.mixed {
+  border-style: dashed;
+}
+.inspector-section {
+  border-bottom: 1px solid var(--border);
+}
+.section-header {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text);
+}
+.section-header .section-title svg {
+  flex: none;
+}
+.section-actions {
+  opacity: 0;
+  transition: opacity 0.12s var(--ease);
+}
+.inspector-section:hover .section-actions,
+.section-actions:focus-within {
+  opacity: 1;
+}
+.field-label {
+  color: var(--text-dim);
+}
+.field-row .field-mod,
+.field-row .lock-btn.field-mod {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin: 0 -2px 0 -6px;
+  padding: 0;
+  border-radius: 4px;
+  color: var(--text-dim);
+}
+.field-row .lock-btn.field-mod:hover {
+  color: var(--text);
+  background: var(--fill-2);
+}
+.field-row .lock-btn.field-mod.active-toggle {
+  color: var(--accent);
+}
+.script-slot .script-slot-actions {
+  opacity: 0;
+  transition: opacity 0.12s var(--ease);
+}
+.script-slot:hover .script-slot-actions,
+.script-slot .script-slot-actions:focus-within {
+  opacity: 1;
+}
+.inspector-subheader,
+.module-fields-toggle,
+.advanced-fields-toggle {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+}
+.prefab-section {
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+}
+.prefab-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 6px 0 12px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.prefab-section-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--accent);
+}
+.prefab-variant-tag {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--fill-2);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 16px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.prefab-overrides-count {
+  flex: none;
+  min-width: 18px;
+  height: 16px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 16px;
+  cursor: pointer;
+}
+.prefab-overrides-count.open {
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.prefab-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  margin-left: auto;
+}
+.prefab-section-actions .icon-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--text);
+}
+.prefab-section-actions .icon-btn:hover:not(:disabled) {
+  background: rgba(79, 214, 143, 0.2);
+  color: var(--text);
+}
+.prefab-section-actions .icon-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.prefab-overrides {
+  padding: 4px 12px 8px;
+}
+.asset-info-label,
+.asset-info-row {
+  color: var(--text-dim);
+}
+
+/* ---------- 6 · assets: one chrome row, bordered tiles ---------- */
+.assets-panel .panel-toolbar {
+  flex-wrap: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+.assets-panel .asset-path {
+  flex: 0 1 auto;
+  max-width: 220px;
+}
+.assets-toolbar-gap {
+  flex: 1 1 8px;
+  min-width: 8px;
+}
+.assets-panel .panel-toolbar .assets-search {
+  flex: 0 1 320px;
+  min-width: 140px;
+}
+.assets-sidebar {
+  background: var(--bg-1);
+  border-right: 1px solid var(--border);
+}
+.asset-tile.selected {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.folder-row.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.panel-toolbar {
+  background: var(--bg-1);
+}
+
+/* ---------- 7 · words: explainers hidden, status as colour ---------- */
+.settings-note:not(.danger) {
+  display: none;
+}
+.settings-note.danger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--warn);
+  font-size: 12px;
+  cursor: default;
+}
+.settings-note.danger .settings-note-body {
+  color: var(--text-dim);
+}
+.empty-glyph {
+  color: var(--text-faint);
+}
+.cnt {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 16px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.console-entry.error .console-message {
+  color: var(--danger);
+}
+.console-entry.warn .console-message {
+  color: var(--warn);
+}
+.console-time {
+  color: var(--text-faint);
+}
+.modules-body {
+  flex-direction: column;
+}
+.modules-list {
+  width: auto;
+  flex: 0 1 auto;
+  max-height: 55%;
+  border-right: 0;
+  border-bottom: 1px solid var(--border);
+}
+.modules-detail {
+  flex: 1 1 auto;
+  padding: 10px 12px 14px;
+}
+.modules-detail-body {
+  gap: 10px;
+  max-width: none;
+}
+.modules-detail-desc {
+  display: none;
+}
+.modules-detail-title h3 {
+  font-size: 13px;
+}
+.ai-provider-disclosure,
+.ai-provider-capability {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 2px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--warn);
+  cursor: default;
+}
+.ai-provider-capability {
+  color: var(--text-dim);
+}
+.mcp-action.icon-only {
+  width: 28px;
+  min-width: 28px;
+  padding: 0;
+  justify-content: center;
+}
+.asset-hint:not(.warn):not(.error) {
+  display: none;
+}
+.asset-hint.error {
+  color: var(--danger);
+}
+.asset-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+.asset-actions .asset-action {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--bg-2);
+  color: var(--text);
+  text-align: center;
+}
+.asset-actions .asset-action:hover:not(:disabled) {
+  background: var(--bg-3);
+}
+.asset-actions .asset-action.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.asset-actions .asset-action.danger {
+  color: var(--danger);
+}
+.asset-actions .asset-action.danger:hover:not(:disabled) {
+  background: rgba(255, 92, 92, 0.16);
+}
+.material-graph-counts {
+  display: flex;
+  gap: 4px;
+}
+.panel-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 100%;
+  padding: 24px;
+  background: var(--bg-1);
+  color: var(--danger);
+  text-align: center;
+}
+.panel-error-message {
+  max-width: 420px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  user-select: text;
+}
+
+/* ---------- 8 · previews ---------- */
+.asset-thumb-fallback {
+  display: inline-block;
+  flex: none;
+  border-radius: 4px;
+  background: var(--fill-2);
+}
+.asset-option .asset-option-thumb {
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  object-fit: contain;
+  background: var(--bg-0);
+}
+.asset-option {
+  min-height: 46px;
+  gap: 10px;
+}
+.asset-field.large {
+  height: 52px;
+  padding: 3px 8px 3px 3px;
+}
+.asset-field.large .asset-option-thumb {
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  object-fit: contain;
+  background: var(--bg-0);
+}
+.asset-field.large .asset-field-name {
+  font-size: 12.5px;
+}
+.field-row:has(> .asset-field-wrap > .asset-field.large) {
+  align-items: center;
+}
+.asset-peek {
+  position: fixed;
+  z-index: 1200;
+  padding: 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-menu);
+  box-shadow: var(--shadow-menu);
+  pointer-events: none;
+  animation: menu-in 0.12s var(--ease);
+}
+.asset-peek img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: contain;
+  border-radius: 4px;
+  background:
+    repeating-conic-gradient(rgba(255, 255, 255, 0.06) 0% 25%, transparent 0% 50%)
+    0 0 / 16px 16px,
+    var(--bg-0);
+}
+.asset-peek.wide img {
+  aspect-ratio: 2 / 1;
+}
+.asset-peek-name {
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mat-thumb-render {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.asset-thumb.mat-thumb:has(> .mat-thumb-render) {
+  background: transparent !important;
+  border-color: transparent;
+}
+.asset-preview {
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+}
+.asset-preview.material-preview,
+.asset-preview.equirect-preview {
+  min-height: 120px;
+  background:
+    radial-gradient(120% 100% at 50% 0%, rgba(255, 255, 255, 0.05), transparent 70%),
+    var(--bg-0);
+}
+.asset-preview.material-preview img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  max-height: 320px;
+  object-fit: contain;
+}
+.asset-preview.equirect-preview img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 2 / 1;
+  object-fit: cover;
+}
+.asset-preview-pending {
+  height: 160px;
+}
+.settings-body > .asset-preview.equirect-preview {
+  margin: 4px 0 8px;
+}
+.texture-preview img {
+  max-height: 320px;
+}
+.model-preview-stage {
+  aspect-ratio: 16 / 10;
+  border: 1px solid var(--border);
+}
+.geom-preview img,
+.asset-preview.geom-preview img {
+  display: block;
+  width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+}
+.picker-grid {
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+}
+.picker-tile img,
+.picker-thumb {
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+/* Row toggles are quiet marks, not accents; a prefab is shown by its glyph,
+   not by colouring the name. */
+.hierarchy-vis-icons .hierarchy-vis-icon.on {
+  color: var(--text-dim);
+}
+.hierarchy-vis-icons .hierarchy-vis-icon.on:hover {
+  color: var(--text);
+}
+.entity-name.prefab-root,
+.entity-name.prefab-child {
+  color: var(--text);
+}
+.hierarchy-row.selected .entity-name.prefab-root,
+.hierarchy-row.selected .entity-name.prefab-child {
+  color: var(--accent);
+}
+
+/* Outranks every panel-scoped checkbox rule left in theme.css: one mark everywhere. */
+.editor-root input[type="checkbox"],
+.editor-root .settings-control input[type="checkbox"],
+.editor-root .settings-row input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  background: var(--inset);
+  position: relative;
+}
+.editor-root input[type="checkbox"]::after {
+  content: none;
+  display: none;
+}
+.editor-root input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.editor-root input[type="checkbox"]:checked::after {
+  content: "";
+  display: block;
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--on-accent);
+  border-width: 0 2px 2px 0;
+  border-radius: 0;
+  background: transparent;
+  transform: rotate(45deg);
+}
+
+/* ---------- 9 · bounded numbers are sliders ----------
+   A number with both a minimum and a maximum carries its value as a fill
+   from the left, the figure at the right edge, and a hairline at the fill's
+   end. Drag anywhere on it to set the value by position (Shift = fine, by
+   delta); click to type. One control, no separate slider row. */
+.number-field.slider,
+.number-field.slider.scrubbing {
+  --fill-pct: 0%;
+  background-color: var(--inset);
+  background-image:
+    linear-gradient(90deg, transparent calc(var(--fill-pct) - 2px), var(--accent) calc(var(--fill-pct) - 2px), var(--accent) var(--fill-pct), transparent var(--fill-pct)),
+    linear-gradient(90deg, rgba(140, 190, 175, 0.22) var(--fill-pct), transparent var(--fill-pct));
+  background-repeat: no-repeat;
+  text-align: left;
+  padding-left: 8px;
+  cursor: ew-resize;
+}
+.number-field.slider:hover {
+  background-color: var(--inset);
+  border-color: var(--border-strong);
+}
+.number-field.slider.scrubbing {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.number-field.slider:focus {
+  background-image: none;
+  text-align: left;
+  cursor: text;
+}
+
+/* The bar gives up words before it overlaps: first the save-state sentence,
+   then the search field's placeholder, so the centre cluster always has room. */
+.global-search-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (max-width: 1640px) {
+  .save-state-text {
+    display: none;
+  }
+  .global-search {
+    width: 170px;
+  }
+}
+@media (max-width: 1440px) {
+  .global-search {
+    width: 30px;
+    padding: 0;
+    justify-content: center;
+  }
+  .global-search-text,
+  .global-search kbd {
+    display: none;
+  }
+}
+
+/* ---------- alignment pass (09-08) ---------- */
+/* The flag buttons line up with the name field, not with the name + kind block. */
+.entity-header-row {
+  align-items: flex-start;
+}
+/* A row modifier lives INSIDE the label column (the label is short; the lock
+   sits at its right end), so the fields keep the same left edge on every row. */
+.field-row .field-mod,
+.field-row .lock-btn.field-mod {
+  width: 22px;
+  height: 22px;
+  margin: 0 4px 0 -26px;
+}
+/* Hierarchy rows in the prototype's voice: quiet monochrome glyphs, the name
+   as the only bright thing, the accent reserved for the selected row. */
+.hierarchy-row .entity-icon {
+  color: var(--text-dim);
+}
+.hierarchy-row.selected .entity-icon,
+.hierarchy-row.selected .row-disclosure {
+  color: var(--accent);
+}
+.hierarchy-row .row-disclosure {
+  color: var(--text-faint);
+}
+.hierarchy-row .entity-name {
+  color: var(--text);
+}
+.hierarchy-row.inactive .entity-name {
+  color: var(--text-faint);
+}
+.hierarchy-vis-icon {
+  width: 18px;
+  height: 18px;
+  color: var(--text-dim);
+}
+.hierarchy-vis-icon.off {
+  color: var(--text-faint);
+  opacity: 1;
+}
+.prefab-badge {
+  color: var(--text-dim);
+}
+/* The bar's right cluster: one gap between every item. */
+.menu-bar {
+  gap: 4px;
+}
+.save-state {
+  padding: 0 4px;
+}
+
+/* ---------- 10 · assets: thumbnail-first tiles, like the prototype's content browser ----------
+   A tile is a bordered square holding the preview (or the type glyph), with
+   the name under it; selection is the green outline. Large is the default. */
+.asset-grid.view-large {
+  gap: 6px 8px;
+  padding: 10px;
+}
+.asset-grid.view-large .asset-tile {
+  width: 112px;
+  padding: 7px 7px 6px;
+  border-radius: var(--r-card);
+}
+.asset-grid.view-large .asset-tile:hover {
+  background: var(--fill-1);
+}
+.asset-grid.view-large .asset-thumb,
+.asset-grid.view-large .asset-icon {
+  width: 96px;
+  height: 96px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-2);
+  box-shadow: none;
+  object-fit: cover;
+}
+.asset-grid.view-large .asset-thumb.geom-thumb,
+.asset-grid.view-large .mat-thumb {
+  object-fit: contain;
+}
+.asset-grid.view-large .mat-thumb {
+  border-radius: 4px;
+  border-color: var(--border);
+}
+.asset-grid.view-large .asset-icon svg {
+  width: 40px;
+  height: 40px;
+  color: var(--text-dim);
+}
+.asset-grid.view-large .dir-icon svg {
+  color: var(--text-dim);
+}
+.asset-grid.view-large .asset-name {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text);
+}
+.asset-grid.view-large .asset-tile.selected {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.asset-grid.view-large .asset-tile.selected .asset-thumb,
+.asset-grid.view-large .asset-tile.selected .asset-icon {
+  border-color: var(--accent);
+}
+.asset-grid.view-medium .asset-thumb,
+.asset-grid.view-medium .asset-icon {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-2);
+  box-shadow: none;
+}
+
+/* A panel bar's path label gives way to the verbs: in a 320 px column the
+   Build bar's project name was one letter wide. */
+.panel-toolbar .asset-path {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.panel-toolbar:has(> .toolbar-btn:not(.icon-only)) .asset-path {
+  display: none;
+}
+
+/* The launcher sits in a wrapper dockview-react gives inline height:100% and
+   display:block, so the 24px button hung from the strip's top. The wrapper
+   centres it; the overflow chip (⌄ N) takes the same footprint. */
+.dock-container .dv-right-actions-container > .dv-react-part {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.dock-container .dv-tabs-overflow-dropdown-root {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+.dock-container .dv-tabs-overflow-dropdown-default {
+  height: 24px;
+  margin: 0 2px;
+  padding: 0 5px;
+  gap: 2px;
+  border-radius: var(--r-1);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.dock-container .dv-tabs-overflow-dropdown-default > span {
+  padding-left: 0;
+}
+.dock-container .dv-tabs-overflow-dropdown-default:hover {
+  background: var(--fill-2);
+  color: var(--text);
+}
+
+/* The overflow list (⌄ N) is the folded tabs as a vertical menu, so every row
+   carries its name the way a menu row does; the strip's underline stays in
+   the strip. */
+.dock-container .dv-tabs-overflow-container {
+  min-width: 168px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-menu);
+  background: var(--bg-2);
+  box-shadow: var(--shadow-menu);
+}
+.dock-container .dv-tabs-overflow-container .dv-tab {
+  height: 28px;
+  min-height: 28px;
+  max-height: 28px;
+  border-bottom: 0;
+  border-radius: var(--r-1);
+  background: transparent;
+  box-shadow: none;
+  font-weight: 500;
+}
+.dock-container .dv-tabs-overflow-container .dv-tab:hover {
+  background: var(--fill-1);
+  color: var(--text);
+}
+.dock-container .dv-tabs-overflow-container .dv-tab.dv-active-tab {
+  background: var(--accent-soft);
+  box-shadow: none;
+}
+.dock-container .dv-tabs-overflow-container .panel-tab {
+  height: 28px;
+  padding: 0 8px;
+}
+.dock-container .dv-tabs-overflow-container .panel-tab-label {
+  display: block;
+  max-width: 220px;
+  margin-left: 8px;
+}
+.dock-container .dv-tabs-overflow-container .panel-tab-close {
+  display: none;
+}
+
+/* Dockview styles its default tab's action slot (padding 4px, display flex,
+   content margin 4px) at a specificity above a bare class, so an inactive
+   glyph tab was carrying an invisible close button's width. */
+.dock-container .dv-tab .dv-default-tab .panel-tab-content {
+  flex-grow: 0;
+  margin-right: 0;
+}
+.dock-container .dv-tab .dv-default-tab .panel-tab-close {
+  display: none;
+  padding: 0;
+}
+.dock-container .dv-tab.dv-active-tab .dv-default-tab .panel-tab-close {
+  display: inline-grid;
+}
+.dock-container .dv-tab .dv-default-tab .panel-tab-close:hover {
+  border-radius: 3px;
+  background: var(--fill-2);
+}
+
+/* List header cells sort the list: the sorted column reads in full text with
+   its direction glyph, the others dim until hovered. */
+.asset-row.header .asset-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  user-select: none;
+  border-radius: 3px;
+}
+.asset-row.header .asset-sort:hover,
+.asset-row.header .asset-sort.sorted {
+  color: var(--text);
+}
+.asset-row.header .asset-sort:focus-visible {
+  outline: 1px solid var(--accent-ring);
+  outline-offset: 1px;
+}
+
+/* ---------- settings panels in a narrow column ---------- */
+/* The label column yields before the fields do: a 140 px label column in a
+   260 px panel left 86 px for a field with two buttons beside it, and the
+   labels were cut anyway. Now it is a share of the row, between 72 and 140. */
+.settings-row {
+  grid-template-columns: clamp(72px, 36%, 140px) minmax(0, 1fr);
+  column-gap: 8px;
+}
+.settings-row.wide {
+  grid-template-columns: clamp(56px, 24%, 84px) minmax(0, 1fr);
+}
+/* A button with nothing to do is flat, not a dimmed box. */
+.toolbar-btn:disabled {
+  opacity: 1;
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text-faint);
+}
+.toolbar-btn.primary:disabled {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text-faint);
+  font-weight: 500;
+}
+/* The collision matrix is a grid of small squares, tighter than a form row. */
+.editor-root .collision-matrix-cell input[type="checkbox"] {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+.collision-matrix-cell {
+  flex-basis: 18px;
+  height: 18px;
+}
+.collision-matrix-vlabel {
+  flex-basis: 18px;
+}
+.dock-container .dv-tabs-container {
+  overflow: hidden;
+}
+
+/* Below ~300 px a settings row stacks: the label above its field, so nothing
+   is cut and the field gets the whole width. A row whose control is a lone
+   checkbox keeps the box right after its label. */
+.settings-body {
+  container-type: inline-size;
+}
+@container (max-width: 200px) {
+  .settings-row,
+  .settings-row.wide {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 0;
+    padding: 2px 0 7px;
+  }
+  .settings-row:has(> .settings-control > input[type="checkbox"]:first-child) {
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 8px;
+    padding-bottom: 2px;
+  }
+}
+
+/* ---------- asset cards, the asset browser, entity fields ---------- */
+/* A field for something you choose by its look is a card: the preview is
+   most of it, the name and the caret sit under it. */
+.asset-field-wrap.card {
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+.asset-card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--inset);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.12s var(--ease);
+}
+.asset-card:hover,
+.asset-card:focus-visible {
+  border-color: var(--border-strong);
+  outline: none;
+}
+.asset-card.asset-drop-hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-ring);
+}
+.asset-card-preview {
+  position: relative;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 4 / 3;
+  max-height: 180px;
+  background: var(--bg-0);
+  color: var(--text-faint);
+  overflow: hidden;
+}
+.asset-card-preview .asset-picture-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.asset-card-none {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.asset-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 6px 0 8px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text);
+}
+.asset-card.empty .asset-card-foot {
+  color: var(--text-dim);
+}
+.asset-card-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.asset-card-caret {
+  flex: none;
+  color: var(--text-dim);
+}
+/* The row form keeps an 18 px picture before the name. */
+.asset-field-thumb {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  overflow: hidden;
+  color: var(--text-dim);
+}
+.asset-field-thumb .asset-picture-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.field-row:has(> .asset-field-wrap.card) {
+  align-items: flex-start;
+}
+.field-row:has(> .asset-field-wrap.card) > .field-label {
+  padding-top: 6px;
+}
+
+/* The browser: a grid of previews, search at the top, none first. */
+.asset-browser {
+  width: min(392px, calc(100vw - 24px));
+  padding: 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-menu);
+  box-shadow: var(--shadow-menu);
+}
+.asset-browser-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  margin-bottom: 8px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background-color: var(--inset);
+  color: var(--text-dim);
+}
+.asset-browser-search:focus-within {
+  border-color: var(--accent);
+}
+.asset-browser-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+.asset-browser-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 6px;
+  max-height: min(60vh, 520px);
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.asset-browser-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--inset);
+  color: var(--text);
+  overflow: hidden;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.12s var(--ease), background-color 0.12s var(--ease);
+}
+.asset-browser-tile:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-3);
+}
+.asset-browser-tile.current {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.asset-browser-preview {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
+  background: var(--bg-0);
+  color: var(--text-faint);
+  overflow: hidden;
+}
+.asset-browser-preview .asset-picture-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.asset-browser-tile.none .asset-browser-preview {
+  color: var(--text-dim);
+}
+.asset-browser-name {
+  display: block;
+  padding: 5px 7px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.asset-browser-note {
+  padding: 8px 4px 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* An entity reference: glyph, name, caret; a Hierarchy row drops on it. */
+.entity-field-wrap {
+  flex: 1;
+  min-width: 0;
+}
+.entity-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 6px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background-color: var(--inset);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.entity-field:hover,
+.entity-field:focus-visible {
+  border-color: var(--border-strong);
+  outline: none;
+}
+.entity-field.empty {
+  color: var(--text-dim);
+}
+.entity-field.missing {
+  color: var(--warn);
+}
+.entity-field-glyph {
+  flex: none;
+  color: var(--text-dim);
+}
+.entity-field.missing .entity-field-glyph {
+  color: var(--warn);
+}
+.entity-field-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.entity-field.entity-drop-hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-ring);
+  background-color: var(--accent-soft);
+}
+.entity-browser-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.entity-browser-glyph {
+  flex: none;
+  color: var(--text-dim);
+}
+.entity-browser-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.entity-browser-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--text-faint);
+  text-align: right;
+}
+
+/* A panorama's card is the 2:1 strip, not a letterboxed 4:3. */
+.asset-card.kind-equirect .asset-card-preview {
+  aspect-ratio: 2 / 1;
+  max-height: none;
+}
+/* Every number reads from the LEFT, slider or not (user: never to the right). */
+.number-field,
+input.number-field,
+.number-field input,
+.settings-control input[type="number"],
+.field-row input[type="number"] {
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+}
+/* A component paused for editing (or disabled) shows it without a hover. */
+.section-actions .icon-btn.paused {
+  color: var(--warn);
+}
+.section-actions:has(.icon-btn.paused) {
+  opacity: 1;
+}
+/* Previews sit inside a margin; a panorama runs edge to edge. */
+.asset-card-preview {
+  padding: 6%;
+  box-sizing: border-box;
+}
+.asset-card.kind-equirect .asset-card-preview {
+  padding: 0;
+}
+.asset-browser-preview {
+  padding: 8%;
+  box-sizing: border-box;
+}
+
+/* ---------- hierarchy, to the prototype ---------- */
+/* The top is one search field across the panel with the add glyph at its
+   end; deleting is the Delete key and the row's menu. */
+.hierarchy-toolbar {
+  gap: 6px;
+  padding: 6px 8px;
+}
+.hierarchy-toolbar .hierarchy-search {
+  order: 0;
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+}
+.hierarchy-toolbar .hierarchy-add {
+  order: 1;
+  flex: none;
+}
+.hierarchy-add-btn {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--bg-2);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.hierarchy-add-btn:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+/* The scene is the tree's root row: a glyph, its name, the dirty mark. */
+.scene-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  margin: 0 4px;
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+.scene-label-glyph {
+  flex: none;
+  color: var(--text-dim);
+}
+/* Rows: dim names and glyphs, the eye always there and faint; the selected
+   row is the green tint with the green outline, its name white, its eye green. */
+.hierarchy-row {
+  height: 24px;
+  margin: 0 4px;
+  border-radius: var(--r-1);
+  font-size: 12px;
+}
+.hierarchy-row .entity-name {
+  color: var(--text-dim);
+}
+.hierarchy-row:hover .entity-name {
+  color: var(--text);
+}
+.hierarchy-row.selected .entity-name,
+.hierarchy-row.selected .entity-icon,
+.hierarchy-row.selected .row-disclosure {
+  color: var(--text);
+}
+.hierarchy-row.selected .entity-name.prefab-root,
+.hierarchy-row.selected .entity-name.prefab-child {
+  color: var(--text);
+}
+.hierarchy-vis-icons .hierarchy-vis-icon,
+.hierarchy-vis-icons .hierarchy-vis-icon.on {
+  opacity: 1;
+  color: var(--text-faint);
+}
+.hierarchy-row:hover .hierarchy-vis-icon.on {
+  color: var(--text-dim);
+}
+.hierarchy-row.selected .hierarchy-vis-icon.on {
+  color: var(--accent);
+}
+.hierarchy-vis-icons .hierarchy-vis-icon.off {
+  color: var(--warn);
+}
+.hierarchy-vis-icons {
+  padding-right: 4px;
+}
+
+/* The scene row reads left to right like every other row. */
+.scene-label {
+  justify-content: flex-start;
+}
+.scene-label-name {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  text-align: left;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* ---------- hierarchy: the tree's guide lines, prefabs by colour ---------- */
+/* One vertical hairline per ancestor, at that ancestor's chevron, so an
+   open group's children hang from it the way the prototype draws them. */
+.hierarchy-row {
+  position: relative;
+}
+.hierarchy-row::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 15px;
+  width: calc(var(--depth, 0) * 14px);
+  background-image: repeating-linear-gradient(90deg, rgba(140, 190, 175, 0.18) 0 1px, transparent 1px 14px);
+  pointer-events: none;
+}
+.hierarchy-row.selected .entity-name,
+.hierarchy-row.selected .entity-icon,
+.hierarchy-row.selected .row-disclosure {
+  color: var(--accent);
+}
+/* A prefab's rows read in a cool blue; the only mark is the override dot. */
+.entity-name.prefab-root,
+.entity-name.prefab-child {
+  color: #a4bbdc;
+}
+.hierarchy-row:hover .entity-name.prefab-root,
+.hierarchy-row:hover .entity-name.prefab-child {
+  color: #c6d6ee;
+}
+.hierarchy-row.selected .entity-name.prefab-root,
+.hierarchy-row.selected .entity-name.prefab-child {
+  color: var(--accent);
+}
+.prefab-mark {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-left: 2px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.prefab-mark:hover {
+  background: var(--fill-2);
+}
+.prefab-mark .prefab-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #6f9be0;
+}
+.prefab-mark.missing .prefab-dot {
+  background: var(--danger);
+}
+
+/* ---------- the performance monitor ---------- */
+.stats-overlay.perf-hud {
+  width: auto;
+  padding: 0;
+  gap: 0;
+  background: rgba(15, 22, 24, 0.92);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-menu);
+  font-size: 11px;
+  overflow: hidden;
+}
+.stats-overlay.perf-hud.size-fps {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.stats-overlay.perf-hud.size-medium {
+  width: 232px;
+}
+.stats-overlay.perf-hud.size-full {
+  width: 440px;
+  max-height: calc(100% - 20px);
+  overflow-y: auto;
+}
+.perf {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.perf-panel {
+  height: 100%;
+  overflow-y: auto;
+  padding: 8px;
+}
+.perf-panel .perf-full {
+  max-width: 720px;
+}
+/* fps: the pill */
+.perf-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: rgba(15, 22, 24, 0.92);
+  color: var(--text);
+  cursor: pointer;
+}
+.perf-pill-value {
+  font-size: 13px;
+  font-weight: 600;
+}
+.perf-pill-unit {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.perf.tone-good .perf-pill-value,
+.perf.tone-good .perf-big,
+.perf.tone-good .perf-tile-value.big { color: var(--accent); }
+.perf.tone-warm .perf-pill-value,
+.perf.tone-warm .perf-big,
+.perf.tone-warm .perf-tile-value.big { color: var(--warn); }
+.perf.tone-hot .perf-pill-value,
+.perf.tone-hot .perf-big,
+.perf.tone-hot .perf-tile-value.big { color: var(--danger); }
+/* medium */
+.perf-medium {
+  padding: 8px 10px 8px;
+}
+.perf-medium-head {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  margin-bottom: 4px;
+}
+.perf-big {
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+}
+.perf-big-unit {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.perf-medium-ms {
+  margin-left: auto;
+  color: var(--text-dim);
+}
+.perf-sizes {
+  display: inline-flex;
+  gap: 2px;
+  margin-left: 6px;
+  align-self: center;
+}
+.perf-medium-head .perf-sizes {
+  margin-left: 6px;
+}
+.perf-size-btn {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.perf-size-btn:hover { color: var(--text); background: var(--fill-2); }
+.perf-size-btn.on { color: var(--accent); }
+.perf-chart {
+  display: block;
+  width: 100%;
+  border-radius: 4px;
+  background: var(--bg-0);
+}
+.perf-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding: 6px 0;
+  color: var(--text-dim);
+}
+.perf-legend.small {
+  padding: 5px 0 0;
+  gap: 4px 10px;
+  font-size: 10.5px;
+}
+.perf-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.perf-legend i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.perf-legend b {
+  font-weight: 600;
+  color: var(--text);
+}
+.perf-legend-note {
+  color: var(--text-faint);
+}
+/* full */
+.perf-full {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px 12px;
+}
+.perf-head {
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.perf-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.perf-head .perf-sizes {
+  margin-left: auto;
+}
+.perf-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.perf-tabs {
+  display: inline-flex;
+  gap: 4px;
+}
+.perf-tab {
+  height: 24px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--bg-2);
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+.perf-tab:hover { color: var(--text); border-color: var(--border-strong); }
+.perf-tab.on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.perf-toolbar-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.perf-window {
+  height: 24px;
+  min-width: 64px;
+  font-size: 11px;
+}
+.perf-pause {
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--bg-2);
+  color: var(--text-dim);
+}
+.perf-pause.on { color: var(--accent); border-color: var(--accent); }
+.perf-tiles {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1fr 1fr 1.2fr;
+  gap: 1px;
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--border);
+  overflow: hidden;
+}
+.perf-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px 10px;
+  background: var(--bg-2);
+}
+.perf-tile-label {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.perf-tile-value {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.perf-tile-value.big {
+  font-size: 18px;
+}
+.perf-tile-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.perf-bar,
+.perf-stack {
+  display: flex;
+  height: 5px;
+  margin-top: 4px;
+  border-radius: 3px;
+  background: var(--fill-2);
+  overflow: hidden;
+}
+.perf-bar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.perf.tone-warm .perf-bar i { background: var(--warn); }
+.perf.tone-hot .perf-bar i { background: var(--danger); }
+.perf-stack i {
+  display: block;
+  height: 100%;
+}
+.perf-section-title {
+  margin: 14px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.perf-memory {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--border);
+  overflow: hidden;
+}
+.perf-mem-col {
+  min-width: 0;
+  padding: 8px 10px;
+  background: var(--bg-2);
+}
+.perf-mem-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.perf-mem-total {
+  font-weight: 600;
+}
+.perf-mem-pct {
+  margin-left: auto;
+  color: var(--text-dim);
+}
+.perf-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.perf-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 20px;
+  color: var(--text-dim);
+}
+.perf-list li i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.perf-list li b {
+  margin-left: auto;
+  font-weight: 600;
+  color: var(--text);
+}
+.perf-list li.warm b { color: var(--warn); }
+@container (max-width: 420px) {
+  .perf-tiles { grid-template-columns: 1fr 1fr; }
+  .perf-memory { grid-template-columns: 1fr; }
+}
+.perf-panel, .stats-overlay.perf-hud.size-full {
+  container-type: inline-size;
+}
+
+.perf-bar.heap i {
+  background: #4c8dff;
+}
+
+/* ---------- shader graph, to the prototype ---------- */
+/* A node is a dark card with a header band in its category's colour; the
+   band carries the name, so the category dot is gone. */
+.shader-node {
+  background: var(--bg-1);
+  border: 1px solid color-mix(in srgb, var(--cat, var(--accent)) 38%, var(--border-strong));
+  border-radius: 6px;
+  min-width: 150px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.4);
+}
+.shader-node.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 8px 22px rgba(0, 0, 0, 0.4);
+}
+.shader-node-header {
+  gap: 6px;
+  padding: 6px 10px;
+  background: color-mix(in srgb, var(--cat, var(--accent)) 30%, var(--bg-2));
+  border-bottom: 1px solid color-mix(in srgb, var(--cat, var(--accent)) 40%, transparent);
+  border-radius: 5px 5px 0 0;
+}
+.shader-node:not(:has(.shader-node-body)) .shader-node-header {
+  border-radius: 5px;
+}
+.shader-node-dot {
+  display: none;
+}
+.shader-node-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #fff;
+}
+.graph-node-collapse,
+.node-thumb-toggle {
+  color: rgba(255, 255, 255, 0.7);
+}
+.shader-node-body {
+  padding: 6px 0 8px;
+}
+.shader-node-row {
+  min-height: 22px;
+  padding: 0 10px;
+}
+.shader-port-label {
+  color: var(--text);
+}
+.shader-node-row.out-row .shader-port-label {
+  color: var(--text-dim);
+}
+.shader-node-row[data-wired] .shader-port-label {
+  color: var(--text);
+}
+/* Ports: filled dots in the socket's colour, sitting on the card's edge. */
+.react-flow__handle.shader-handle {
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--bg-1);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--cat, var(--accent)) 40%, transparent);
+}
+.react-flow__handle.shader-handle.react-flow__handle-left { left: -5px; }
+.react-flow__handle.shader-handle.react-flow__handle-right { right: -5px; }
+.react-flow__handle.shader-handle:hover,
+.react-flow__handle.shader-handle.connectionindicator:hover {
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+/* Wires: smooth, 2 px, in the source socket's colour (GraphEditor sets it). */
+.shader-graph-canvas .react-flow__edge-path {
+  stroke: #6f7f7c;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+.shader-graph-canvas .react-flow__edge.selected .react-flow__edge-path,
+.shader-graph-canvas .react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--accent) !important;
+  stroke-width: 2.5;
+}
+.shader-graph-canvas .react-flow__connection-path {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+.shader-graph-canvas .react-flow__background {
+  color: rgba(140, 190, 175, 0.16);
+}
+.shader-graph-canvas {
+  background: var(--bg-0);
+}
+/* Category bands: the prototype's teal for textures, green for values and
+   maths, red for the surface/output, violet for vectors and attributes. */
+.cat-texture { --cat: #2fb8ae; }
+.cat-value { --cat: #4fd68f; }
+.cat-math { --cat: #4fd68f; }
+.cat-vector { --cat: #a78bfa; }
+.cat-coords { --cat: #a78bfa; }
+.cat-attribute { --cat: #a78bfa; }
+.cat-color { --cat: #e0a84a; }
+.cat-noise { --cat: #ee74bd; }
+.cat-osc { --cat: #ee74bd; }
+.cat-utility { --cat: #8b9a97; }
+.cat-advanced { --cat: #8b9a97; }
+.cat-shader { --cat: #e05a5a; }
+.cat-bsdf { --cat: #e05a5a; }
+.cat-output { --cat: #e05a5a; }
+.cat-volume { --cat: #5fd35f; }
+
+/* ---------- MCP panel: the provider is one row ---------- */
+.mcp-provider-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.mcp-provider-row .ai-provider-wrap {
+  flex: 1;
+  min-width: 0;
+}
+.mcp-provider-row .ai-provider-trigger {
+  width: 100%;
+}
+.mcp-provider-row .ai-provider-fields {
+  flex-basis: 100%;
+}
+.mcp-flag {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--bg-2);
+  color: var(--text-dim);
+  cursor: help;
+}
+.mcp-flag.warn {
+  color: var(--warn);
+}
+.mcp-provider-row .mcp-action.icon-only {
+  flex: none;
+  width: 28px;
+  height: 28px;
+}
+.ai-provider-disclosure,
+.ai-provider-capability {
+  display: none;
+}
+.mcp-port-row .number-field {
+  flex: none;
+  width: 88px;
+}
+
+/* Monitor: one control height, no ghost panel behind the fps pill, tiles that wrap. */
+.stats-overlay.perf-hud.size-fps { backdrop-filter: none; -webkit-backdrop-filter: none; border-radius: 12px; }
+.perf-tab, .perf-window, .perf-pause { height: 26px; box-sizing: border-box; }
+.perf-toolbar { margin-bottom: 4px; }
+.perf-legend { padding: 6px 2px 8px; }
+.perf-head { margin-bottom: 10px; }
+.perf-tiles { margin-top: 12px; }
+.perf-tile { padding: 9px 12px; }
+.perf-tile-label { line-height: 1.2; }
+.perf-section-title { margin: 16px 0 8px; }
+.perf-mem-col { padding: 9px 12px; }
+@container (max-width: 560px) {
+  .perf-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .perf-tile.primary { grid-column: 1 / -1; flex-direction: row; align-items: baseline; gap: 10px; }
+}
+@container (max-width: 380px) {
+  .perf-memory { grid-template-columns: 1fr; }
+}
+
+/* The fps pill stands as tall as the gizmo cluster it shares the line with. */
+.stats-overlay.perf-hud.size-fps { top: 10px; right: 10px; }
+.perf-pill { height: 34px; padding: 0 13px; border-radius: 17px; gap: 5px; }
+.perf-pill-value { font-size: 14px; }
+.perf-pill-unit { font-size: 10.5px; }
+/* A graph node keeps its asset field to a row; the node preview is the picture. */
+.shader-node .asset-field-wrap { min-width: 0; }
+.shader-node .asset-field { height: 22px; max-width: 150px; }
+
+/* The pill text is one 34 px line: baseline-aligned spans that fill the height sit centred. */
+.perf-pill { align-items: baseline; line-height: 34px; }
+.perf-pill-value, .perf-pill-unit { line-height: inherit; display: inline-block; }
+
+/* A node's picture: the texture itself, the size of the shader preview. */
+.node-output-group .node-thumb.inline.picture {
+  display: grid;
+  place-items: center;
+  width: 112px;
+  height: 112px;
+  margin: 2px 0 2px 8px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-0);
+  color: var(--text-faint);
+  overflow: hidden;
+}
+.node-output-group .node-thumb.inline.picture .asset-picture-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ---------- the breakdown: ranked rows with a share bar ---------- */
+.perf-groups { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 10px; }
+.perf-group { border: 1px solid var(--border); border-radius: var(--r-card); background: var(--bg-2); padding: 8px 10px 6px; }
+.perf-group-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.perf-group-title { font-size: 11.5px; font-weight: 600; color: var(--text); }
+.perf-group-sum { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+.perf-rows { margin: 0; padding: 0; list-style: none; }
+.perf-row { display: grid; grid-template-columns: minmax(0, 1fr) 64px 44px; align-items: center; gap: 8px; height: 22px; font-size: 11px; }
+.perf-row-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text); }
+.perf-row-name small { color: var(--text-faint); margin-left: 6px; }
+.perf-row-ms { text-align: left; color: var(--text); font-weight: 600; }
+.perf-row-pct { display: flex; align-items: center; gap: 4px; color: var(--text-dim); }
+.perf-row-bar { position: relative; height: 4px; flex: 1; border-radius: 2px; background: var(--fill-2); overflow: hidden; }
+.perf-row-bar i { position: absolute; inset: 0 auto 0 0; background: var(--accent); }
+.perf-row.kind-script .perf-row-bar i { background: #e8a33b; }
+.perf-row.kind-module .perf-row-bar i { background: #b06cff; }
+.perf-row.kind-engine .perf-row-bar i { background: #6f7f7c; }
+/* Empty slots. Every group renders a fixed number of rows so the profiler
+   never changes height while the ranking moves under it; the spare ones are
+   these — the same 22px, with nothing in them. */
+.perf-row.empty { pointer-events: none; }
+.perf-row.empty.note { display: flex; align-items: center; color: var(--text-faint); }
+.perf-note { padding: 6px 2px; font-size: 11px; color: var(--text-faint); }
+@container (min-width: 620px) { .perf-groups { grid-template-columns: 1fr 1fr; } }
+
+/* ---------- AI panel: a conversation, not a log ----------------------------
+   Three rows that never move: an anchor bar, a scrolling transcript, and a
+   composer pinned to the bottom. `.inspector-panel` owns `overflow-y: auto`
+   on ITSELF and is not a flex container, so the panel root has to opt back
+   out of that or the composer scrolls away with the transcript and the log's
+   own scrollbar never appears (the exact bug the old .ai-lines had). The
+   `min-height: 0` on the log is load-bearing for the same reason: a flex
+   child refuses to shrink below its content without it. */
+.inspector-panel.ai-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+  gap: 0;
+}
+
+.ai-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  min-height: 30px;
+}
+.ai-bar-btn {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.ai-bar-btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text);
+  background: var(--fill-1);
+}
+.ai-bar-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.ai-bar-select {
+  height: 22px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: var(--inset);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.ai-bar-select:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.ai-bar-sub {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Context chips: what the next message is about. `kind` is the quiet half —
+   you mostly need to know WHICH thing, and only occasionally what sort. */
+.ai-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 190px;
+  padding: 2px 3px 2px 6px;
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--r-1);
+  background: var(--accent-soft);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+.ai-chip-kind {
+  color: var(--text-faint);
+  text-transform: uppercase;
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+}
+.ai-chip-label {
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.ai-chip-x {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.ai-chip-x:hover {
+  background: var(--fill-2);
+  color: var(--text);
+}
+
+/* The chip row above the composer, where attachments are added and removed. */
+.ai-attach-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px 0;
+  background: var(--bg-1);
+}
+.ai-attach-btn {
+  display: inline-grid;
+  place-items: center;
+  height: 20px;
+  min-width: 20px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-1);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.ai-attach-btn:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+  background: var(--fill-1);
+}
+
+/* Drop feedback. `entity-drop-hover` is entityDrag.js's fixed class name;
+   `ai-drop-hover` is what this panel asks assetDrag.js to use. */
+.ai-panel.entity-drop-hover,
+.ai-panel.ai-drop-hover {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* Past chats. */
+.ai-history-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+}
+.ai-history-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ai-history-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.ai-history-count {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+.ai-history-del {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 4px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.ai-history-del:hover {
+  background: var(--fill-2);
+  color: var(--danger);
+}
+
+/* The chips recorded on a past question, inside its own bubble. */
+.ai-bubble-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-bottom: 5px;
+}
+
+.ai-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  user-select: text;
+}
+
+.ai-empty {
+  margin: auto;
+  max-width: 260px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.ai-empty svg {
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+.ai-empty p {
+  margin: 0 0 6px;
+}
+.ai-empty-sub {
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+/* Your own words sit right and boxed; the assistant's run full width and
+   unboxed. Two bubble styles would make a narrow docked panel feel like a
+   phone; asymmetry costs nothing and reads instantly. */
+.ai-msg.user {
+  display: flex;
+  justify-content: flex-end;
+}
+.ai-bubble {
+  max-width: 85%;
+  padding: 6px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-card);
+  background: var(--bg-2);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ai-answer {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ai-thinking {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.ai-note {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--live);
+}
+.ai-msg-meta {
+  margin-top: 5px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* The tool trail: progress while it runs, a folded footnote afterwards. */
+.ai-trail {
+  margin-bottom: 6px;
+  border-left: 1px solid var(--border);
+  padding-left: 8px;
+}
+.ai-trail-head {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.ai-trail.live .ai-trail-head {
+  color: var(--accent);
+}
+.ai-trail-caret {
+  transition: transform 0.12s ease;
+}
+.ai-trail.open .ai-trail-caret {
+  transform: rotate(90deg);
+}
+.ai-trail-body {
+  margin-top: 3px;
+  font-family: "Cascadia Mono", Consolas, "SF Mono", monospace;
+  font-size: 10.5px;
+}
+.ai-line {
+  padding: 1px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+.ai-line.tool_call {
+  color: var(--accent);
+}
+.ai-line.tool_result,
+.ai-line.raw {
+  color: var(--text-faint);
+}
+.ai-line.error {
+  color: var(--danger);
+  font-family: inherit;
+  font-size: 11.5px;
+}
+
+.ai-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-1);
+}
+.ai-input {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  background: var(--inset);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.ai-input:focus {
+  outline: none;
+  border-color: var(--accent-ring);
+}
+.ai-input::placeholder {
+  color: var(--text-faint);
+}
+.ai-send {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: var(--r-input);
+  background: var(--accent);
+  color: var(--on-accent);
+  cursor: pointer;
+}
+.ai-send:disabled {
+  background: var(--fill-2);
+  color: var(--text-faint);
+  cursor: default;
+}
+.ai-send.stop {
+  background: transparent;
+  border-color: var(--border-strong);
+  color: var(--danger);
+}
+
+/* =====================================================================
+ * FLAT — one space, and a line only where it means something
+ * (user, 2026-09-08: "too many borders and lines which i feel bloat the
+ * look ... remove all the borders where possible and eliminate the
+ * spacing between docks so it feels more like one space")
+ *
+ * THE RULE: a boundary is drawn by FILL, not by a line. The palette
+ * already carries three depths — a field is the dark inset, a button is
+ * the raised bg-2, a panel is bg-1, a rail is bg-0 — so every hairline
+ * that only repeated what the fill already said is gone.
+ *
+ * What still draws a line, and why:
+ *   · the 1 px seam between docks (it is also the resize handle)
+ *   · the accent underline on the active tab
+ *   · a control's border on HOVER or FOCUS — the one moment its exact
+ *     edge matters
+ *   · a floating surface's edge (menus, popovers, the viewport's own
+ *     overlays): they sit ON something else and have to end somewhere
+ *   · two structural dividers, at --hairline: between components in the
+ *     inspector, and under a list's column headers
+ *
+ * Borders are set TRANSPARENT rather than removed, so a control does not
+ * move by a pixel when its border comes back on hover.
+ * ===================================================================== */
+:root {
+  /* Half the old border's weight: for the few dividers that survive. */
+  --hairline: rgba(140, 190, 175, 0.07);
+}
+
+/* ---------- docked chrome: no rules at all ---------- */
+.menu-bar,
+.panel-toolbar,
+.assets-panel .panel-toolbar,
+.assets-filterbar,
+.inspector-section.entity-header,
+.prefab-section,
+.modules-list,
+.timeline-list,
+.timeline-list-head,
+.events-list,
+.font-row,
+.git-tabs,
+.code-tabs,
+.texture-mode-tabs,
+.tx-section,
+.events-section-header,
+.stats-overlay-section,
+.advanced-fields-toggle,
+.module-fields-toggle,
+.dropdown-section-label {
+  border-top-color: transparent;
+  border-bottom-color: transparent;
+}
+.panel-toolbar {
+  background: transparent;
+}
+/* A rail is recessed, not fenced off. */
+.assets-sidebar,
+.animator-sidebar {
+  border-right: 0;
+  background: var(--bg-0);
+}
+.modules-list {
+  border-bottom: 0;
+}
+
+/* ---------- the two dividers worth keeping ---------- */
+.inspector-section {
+  border-bottom: 1px solid var(--hairline);
+}
+.asset-row.header {
+  border-bottom: 1px solid var(--hairline);
+}
+
+/* ---------- controls: the edge appears when you reach for it ---------- */
+.number-field,
+.text-field,
+.select-field,
+.asset-field,
+.entity-field,
+.color-field,
+.hierarchy-search,
+.assets-search,
+.search,
+.component-menu-search,
+.panel-launcher-search,
+.asset-browser-search,
+.global-search,
+.scene-chip,
+.perf-window,
+.toolbar-btn,
+.icon-btn,
+.mcp-action,
+.perf-tab,
+.perf-pause,
+.perf-size-btn,
+.hierarchy-add-btn,
+.entity-toggle,
+.mcp-flag,
+.git-chip,
+.mcp-chip,
+.bar-gear,
+.asset-action,
+.global-search kbd {
+  border-color: transparent;
+}
+.hierarchy-search:hover,
+.assets-search:hover,
+.search:hover,
+.component-menu-search:hover,
+.panel-launcher-search:hover,
+.asset-browser-search:hover,
+.global-search:hover,
+.scene-chip:hover,
+.entity-field:hover,
+.perf-window:hover,
+.mcp-action:hover:not(:disabled),
+.perf-tab:hover,
+.perf-pause:hover,
+.hierarchy-add-btn:hover,
+.entity-toggle:hover,
+.mcp-flag:hover,
+.git-chip:hover,
+.mcp-chip:hover,
+.bar-gear:hover,
+.asset-action:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+.hierarchy-search:focus-within,
+.assets-search:focus-within,
+.search:focus-within,
+.component-menu-search:focus-within,
+.panel-launcher-search:focus-within,
+.asset-browser-search:focus-within {
+  border-color: var(--accent);
+}
+/* A disabled button keeps its flat, unfenced look. */
+.toolbar-btn:disabled,
+.toolbar-btn.primary:disabled {
+  border-color: transparent;
+}
+
+/* ---------- tiles and cards: the fill is the card ---------- */
+.asset-card,
+.asset-card-foot,
+.asset-browser-tile,
+.asset-browser-name,
+.asset-option-thumb,
+.asset-field.large .asset-option-thumb,
+.asset-option .asset-option-thumb,
+.asset-grid.view-large .asset-thumb,
+.asset-grid.view-large .asset-icon,
+.asset-grid.view-medium .asset-thumb,
+.asset-grid.view-medium .asset-icon,
+.asset-preview,
+.model-preview-stage,
+.node-output-group .node-thumb.inline.picture,
+.node-thumb canvas,
+.perf-group,
+.mcp-client,
+.mcp-hero {
+  border-color: transparent;
+}
+/* A tile's own fill has to hold it now: the grid's seams are creases in
+   the ground, the same trick the dock uses one level up. */
+.perf-tiles,
+.perf-memory {
+  border-color: transparent;
+  background: var(--bg-0);
+}
+
+/* ---------- what deliberately keeps an edge ----------
+   A surface that floats over another one ends somewhere, and that is the
+   line that says so. Left alone on purpose: .dropdown-menu, .context-menu,
+   .panel-launcher, .asset-browser, .asset-peek, .dv-tabs-overflow-container,
+   .stats-overlay / .perf-hud, .viewport-toolbar, and every checkbox — an
+   empty box with no outline is not a control. */
+
+/* Two cards were drawn ONLY by their border — with the line gone they had
+   nothing left. A card is its fill, so give them one. (The MCP client row
+   keeps its green edge when linked: that is a state, not chrome.) */
+.mcp-client {
+  background: var(--bg-2);
+}
+.asset-preview {
+  background: var(--bg-0);
+}
+
+/* =====================================================================
+ * ROWS WITH NOTHING TO LEAN ON
+ * (user, 2026-09-08: every surface token is #111 now and the borders are
+ * gone — "the panels with settings look a bit weird, can we fix it
+ * without adding borders?")
+ *
+ * A field used to be a box. On one flat tone it cannot be, so three other
+ * things do that work:
+ *
+ *   1. ONE VALUE COLUMN. Dim labels on the left, bright values all
+ *      starting at the same x down the whole panel. A column reads as a
+ *      column because it lines up, not because something encloses it.
+ *   2. PAIRS GROUP BY SPACING. A label sits close to its own value and
+ *      well clear of the next row. When the gap above a value equals the
+ *      gap below it — which is what the old stacked layout did — you
+ *      cannot tell which label owns it.
+ *   3. PRESENCE ON DEMAND. Hovering a row lifts a soft wash behind its
+ *      control, and focus deepens it. The field shows itself when you
+ *      reach for it instead of drawing a permanent outline. The wash is
+ *      white at low alpha, not a token, so it survives any palette the
+ *      tokens are set to.
+ *
+ * An unchecked checkbox is the one control that cannot wait for a hover:
+ * with border and fill both #111 it was invisible, so "Use for lighting"
+ * looked like a label with no control at all. It gets a fill of its own.
+ * ===================================================================== */
+
+/* 1 · the value column */
+.settings-row {
+  grid-template-columns: clamp(88px, 42%, 176px) minmax(0, 1fr);
+  column-gap: 12px;
+  align-items: center;
+}
+.settings-row.wide {
+  grid-template-columns: clamp(64px, 26%, 104px) minmax(0, 1fr);
+}
+.settings-label,
+.field-label {
+  color: var(--text-dim);
+}
+/* The value is the bright half of the pair — that contrast is the row. */
+.settings-control,
+.settings-control input,
+.settings-control select,
+.field-row .number-field,
+.field-row .text-field,
+.field-row .select-field {
+  color: var(--text);
+}
+
+/* 2 · a field fills its column, so every value starts at the same x */
+.settings-control > .number-field,
+.settings-control > .text-field,
+.settings-control > .select-field,
+.settings-control > .asset-field-wrap,
+.settings-control > .entity-field-wrap {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 3 · presence on demand */
+.settings-control > .number-field,
+.settings-control > .text-field,
+.settings-control > .select-field,
+.field-row .number-field,
+.field-row .text-field,
+.field-row .select-field,
+.vector-fields .number-field {
+  background-color: transparent;
+  border-radius: var(--r-input);
+  transition: background-color 0.1s var(--ease);
+}
+.settings-row:hover .settings-control > .number-field,
+.settings-row:hover .settings-control > .text-field,
+.settings-row:hover .settings-control > .select-field,
+.field-row:hover .number-field,
+.field-row:hover .text-field,
+.field-row:hover .select-field,
+.vector-fields .number-field:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+.settings-control > .number-field:focus,
+.settings-control > .text-field:focus,
+.settings-control > .select-field:focus,
+.field-row .number-field:focus,
+.field-row .text-field:focus,
+.field-row .select-field:focus,
+.vector-fields .number-field:focus {
+  background-color: rgba(255, 255, 255, 0.1);
+  outline: none;
+}
+/* A slider keeps its own fill: that IS the control, and it must not be
+   washed out by the hover tint sitting on top of it. */
+.settings-control > .number-field.slider,
+.field-row .number-field.slider {
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+/* 4 · an empty checkbox needs a body of its own */
+.editor-root input[type="checkbox"],
+.editor-root .settings-control input[type="checkbox"],
+.editor-root .settings-row input[type="checkbox"] {
+  background: rgba(255, 255, 255, 0.09);
+}
+.editor-root input[type="checkbox"]:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+.editor-root input[type="checkbox"]:checked,
+.editor-root input[type="checkbox"]:checked:hover,
+.editor-root .settings-control input[type="checkbox"]:checked,
+.editor-root .settings-row input[type="checkbox"]:checked {
+  background: var(--accent);
+}
+
+/* 5 · a section is a group because of the air around its name */
+.settings-section > .section-header,
+.inspector-section > .section-header {
+  padding-top: 10px;
+  padding-bottom: 4px;
+}
+
+/* Every editable field carries the SAME faint wash, bounded or not. Before
+   this, a slider had a track and a plain number had nothing, so "Near 10"
+   and "Far 80" sitting next to each other looked like two different kinds
+   of thing rather than one column of fields. 4% white is a whisper — it
+   never reads as a box, and it survives whatever the surface tokens are
+   set to. */
+.number-field,
+.text-field,
+.select-field,
+.settings-control > .number-field,
+.settings-control > .text-field,
+.settings-control > .select-field,
+.field-row .number-field,
+.field-row .text-field,
+.field-row .select-field,
+.vector-fields .number-field,
+.hierarchy-search,
+.assets-search,
+.search,
+.component-menu-search,
+.panel-launcher-search,
+.asset-browser-search,
+.entity-field,
+.asset-field {
+  background-color: rgba(255, 255, 255, 0.04);
+}
+.number-field:hover,
+.text-field:hover,
+.select-field:hover,
+.settings-row:hover .settings-control > .number-field,
+.settings-row:hover .settings-control > .text-field,
+.settings-row:hover .settings-control > .select-field,
+.field-row:hover .number-field,
+.field-row:hover .text-field,
+.field-row:hover .select-field,
+.vector-fields .number-field:hover,
+.hierarchy-search:hover,
+.assets-search:hover,
+.search:hover,
+.entity-field:hover,
+.asset-field:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+}
+.number-field:focus,
+.text-field:focus,
+.select-field:focus,
+.settings-control > .number-field:focus,
+.settings-control > .text-field:focus,
+.settings-control > .select-field:focus,
+.field-row .number-field:focus,
+.field-row .text-field:focus,
+.field-row .select-field:focus,
+.vector-fields .number-field:focus,
+.hierarchy-search:focus-within,
+.assets-search:focus-within,
+.search:focus-within {
+  background-color: rgba(255, 255, 255, 0.11);
+}
+
+/* =====================================================================
+ * PREVIEWS, AND THE ROW THE LOCK USED TO NARROW
+ * (user, 2026-09-08: "geometry/material preview … still not centered and
+ * going outside their viewports … fix the layout a bit since we don't
+ * have borders", and "we have enough space to make scale the same size
+ * as position and rotation")
+ *
+ * THE PREVIEW WAS NOT OVERFLOWING — its box had gone invisible. The frame
+ * was `background: var(--bg-0)` with a 1 px border, and now that every
+ * surface token is #111 and the border is transparent, the frame is the
+ * same colour as the panel behind it. A sphere with no visible box around
+ * it has nothing to be centred IN, so it reads as a picture floating in
+ * the panel and spilling past where its edge ought to be.
+ *
+ * So the box comes back as a WASH, not a line — the same 4% white the
+ * fields use, which keeps it a surface rather than an outline. Then the
+ * picture is centred the bulletproof way: the image is never told to be
+ * 100% of anything, it is capped at the box's size and left to its own
+ * aspect, and the box centres it. `width: 100%` + `object-fit` gets the
+ * same result only while nothing else touches the height; a `max-height`
+ * or an `aspect-ratio` on the same element quietly changes what the fit
+ * is fitting into.
+ * ===================================================================== */
+
+/* 1 · a preview has a visible extent again */
+.asset-card-preview,
+.asset-browser-preview,
+.asset-preview,
+.asset-preview.material-preview,
+.asset-preview.equirect-preview,
+.asset-preview.geom-preview,
+.node-output-group .node-thumb.inline.picture,
+.asset-grid.view-large .asset-thumb,
+.asset-grid.view-large .asset-icon,
+.asset-grid.view-medium .asset-thumb,
+.asset-grid.view-medium .asset-icon {
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+/* 2 · the picture is capped and centred, never stretched */
+.asset-card-preview,
+.asset-browser-preview,
+.asset-preview.material-preview,
+.asset-preview.geom-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.asset-card-preview .asset-picture-img,
+.asset-browser-preview .asset-picture-img,
+.asset-preview.material-preview img,
+.asset-preview.geom-preview img,
+.geom-preview img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: auto;
+  object-fit: contain;
+}
+/* The hero previews have no fixed height of their own, so the image needs
+   a ceiling — it is the one that decides how tall the box gets. */
+.asset-preview.material-preview img,
+.asset-preview.geom-preview img,
+.geom-preview img {
+  max-height: 280px;
+}
+.asset-preview.material-preview,
+.asset-preview.geom-preview {
+  padding: 10px;
+  box-sizing: border-box;
+}
+/* A panorama is the exception: it is a 2:1 strip and should fill its box
+   edge to edge, so it keeps cover and takes no padding. */
+.asset-preview.equirect-preview {
+  padding: 0;
+}
+.asset-preview.equirect-preview img {
+  width: 100%;
+  max-width: none;
+  aspect-ratio: 2 / 1;
+  object-fit: cover;
+}
+
+/* 3 · the card reads as one object: picture, then its name */
+.asset-card-foot {
+  background-color: rgba(255, 255, 255, 0.02);
+}
+
+/* 4 · Scale's fields are the width of Position's and Rotation's
+   The uniform-scale lock was a flex item BETWEEN the label and the vector,
+   so it took 14 px out of that one row and pushed its three fields right —
+   the only row in the Transform section that did not line up. Out of the
+   flow and into the label's own column, where there is room for it. */
+.field-row {
+  position: relative;
+}
+.field-row .lock-btn.field-mod {
+  position: absolute;
+  left: 52px;
+  top: 50%;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  transform: translateY(-50%);
+}
+
+/* =====================================================================
+ * AMBIENT GLOW — the viewport's light under the panels
+ * (user, 2026-09-08: YouTube's trick, "the way it does not impact
+ * performance notably")
+ *
+ * THE ORDER HERE IS THE PERFORMANCE STORY. The canvas holds 32 pixels
+ * across and is left SMALL in layout; `filter` applies to an element's own
+ * box and `transform` happens afterwards, so the browser blurs a 220 px
+ * bitmap and then stretches the result over the viewport. Blurring at the
+ * final size instead would ask it to blur a three-thousand-pixel area every
+ * time the picture changed, which is the same effect at a hundred times the
+ * cost. The mask fades the edges so the glow has no border of its own.
+ *
+ * For the light to REACH the panels they have to let it through, so the
+ * dock's groups are a shade translucent and the container behind them is
+ * clear. Everything else about them is unchanged.
+ * ===================================================================== */
+/* ⛔ NO `contain` HERE. This element is a zero-size ANCHOR POINT — the
+   canvas hangs off its centre — and `contain: paint` clips descendants to
+   the box, which is 0x0. It clipped the entire glow away, which is why even
+   a flat magenta fill showed nothing. */
+.ambient-glow {
+  position: fixed;
+  z-index: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+/* The glow is FIXED, so it paints in the positioned layer; a static dock
+   would sit UNDER it and be tinted from in front instead of behind. Giving
+   the dock a position and a higher z-index puts the light back where it
+   belongs. */
+.dock-container {
+  position: relative;
+  z-index: 1;
+}
+/* ⚠ A RECTANGLE, NOT AN ELLIPSE. This started as one radial mask, which is
+   an ellipse inscribed in the box: the light reached out from the middle of
+   each edge and died at the corners, which is not how a screen spills onto
+   the wall behind it. A rectangular halo needs a fade per AXIS, and two
+   fades on one element need `mask-composite` — so they are split across two
+   elements instead, which every engine has always understood. The box
+   carries the horizontal fade, the transform and the strength; the canvas
+   inside it carries the vertical fade and the blur.
+
+   The earlier trap is worth keeping in mind if this ever goes radial again:
+   a radial gradient is sized to the farthest CORNER unless told otherwise,
+   so its transparent stop lands beyond the element and the mask still has
+   alpha where the box ends — which drew a straight cut across the screen.
+   A linear fade that reaches `transparent` at 100% cannot do that.
+
+   `--ambient-fade-x/y` are set per frame by AmbientGlow.jsx: the fade band
+   is exactly the spread, expressed as a share of a box that is stretched by
+   a different factor in each axis. */
+.ambient-glow-box {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 220px;
+  height: 124px;
+  transform-origin: 50% 50%;
+  /* Nothing stands in front of this any more, so it is dialled back to a
+     light rather than a wash. Project Settings → Viewport → Intensity. */
+  opacity: var(--ambient-strength, 0.55);
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--ambient-fade-x, 6%),
+    #000 calc(100% - var(--ambient-fade-x, 6%)),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--ambient-fade-x, 6%),
+    #000 calc(100% - var(--ambient-fade-x, 6%)),
+    transparent 100%
+  );
+  will-change: transform;
+}
+.ambient-glow-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  filter: blur(11px) saturate(1.9);
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--ambient-fade-y, 11%),
+    #000 calc(100% - var(--ambient-fade-y, 11%)),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--ambient-fade-y, 11%),
+    #000 calc(100% - var(--ambient-fade-y, 11%)),
+    transparent 100%
+  );
+}
+/* The dock lets the light through: the container is clear and a group is a
+   shade translucent. The seam between panels shows the glow rather than the
+   ground, which is what makes the light look like it is BEHIND them. */
+.dock-container {
+  background: transparent;
+}
+
+/* =====================================================================
+ * THE DOCK IS GLASS (user: "just make the dockviews not #111 but fully
+ * transparent")
+ *
+ * Every step of translucency — 78%, then 72%, then 62% — still left a sheet
+ * of #111 between the light and the eye, and each one only revealed the
+ * NEXT opaque layer: the group, then Dockview's own container, then every
+ * panel's own background. The answer is not a better percentage. The dock
+ * paints nothing at all, the window's own `--bg-0` is the colour you see
+ * where the glow is dim, and the light behind is simply the background.
+ *
+ * Panel CONTENT is untouched and still paints above the light, because the
+ * glow sits behind the dock rather than over it. Anything that floats — a
+ * menu, a popover, the viewport's overlays — keeps its own surface, since
+ * those have to be readable over whatever they cover.
+ * ===================================================================== */
+.dock-container,
+.dock-container .dv-dockview,
+.dock-container .dv-groupview,
+.dock-container .dv-content-container,
+.dock-container .dv-content-container > *,
+.dock-container .dv-tabs-and-actions-container,
+.dock-container .dv-pane-container {
+  background-color: transparent !important;
+}
+/* The tab strip and toolbars go with them: a band of #111 across the top of
+   every panel would cut the light off at exactly the place it enters. */
+.dock-container .panel-toolbar,
+.dock-container .assets-sidebar,
+.dock-container .hierarchy-panel,
+.dock-container .inspector-panel,
+.dock-container .assets-panel,
+.dock-container .shader-graph-panel {
+  background-color: transparent !important;
+}

@@ -1,8 +1,10 @@
 import { WATER_MATERIAL_PATH } from "../../engine/builtinMaterials.js";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X, ListChecks, Crosshair, Building2, PersonStanding } from "lucide-react";
+import { splitGeometryIslandsWithPrompt, canSplitEntity } from "../geometrySplit.js";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X, ListChecks, Crosshair, Building2, PersonStanding, Layers } from "../icons/index.jsx";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore, selectedIdSet } from "../store/selectionStore.js";
+import { usePlayStore } from "../store/playStore.js";
 import { buildSearchIndex, sortMatchIds, highlightFor } from "../hierarchySearch.js";
 import { parseQuery } from "../queryLang.js";
 // Written by the shared search-recents store; the hierarchy, the asset panel
@@ -20,6 +22,7 @@ import {
   SetEntityEnabledInGameCommand,
   isDescendantOf,
   topMostIds,
+  SetEntityEnabledCommand,
 } from "../commands/entityCommands.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
 import {
@@ -38,6 +41,7 @@ import {
 } from "../clipboard.js";
 import { groupSelection } from "../group.js";
 import { useAssetDrop } from "../assetDrag.js";
+import { hitTestEntityDrop, setEntityDropHover } from "../entityDrag.js";
 import { loadCollapsed, saveCollapsed } from "../hierarchyPrefs.js";
 import {
   instantiatePrefab,
@@ -61,10 +65,7 @@ import { newScene } from "../sceneIO.js";
 import { createTerrainAssets } from "../terrainAssetSetup.js";
 import { getCursor3DPosition } from "../threeDCursor.js";
 import { ContextMenu as SharedContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
-import { openPanel } from "../EditorShell.jsx";
-import { runWorkflow } from "../store/aiStore.js";
-import { getWorkflow } from "../ai/workflows.js";
-import { getActiveProvider } from "../ai/providers/index.js";
+import { askAiMenuItem, entitySelectionContext } from "../ai/askAi.js";
 
 const DROPPABLE_ASSET_EXTENSIONS = [...PREFAB_EXTENSIONS, ...MODEL_EXTENSIONS];
 
@@ -300,11 +301,11 @@ function isParentUiScreen(parentId) {
 const NO_COLLAPSE = new Set();
 
 /**
- * Row pitch in px — `.hierarchy-row` is a fixed 26px tall with a 1px margin top
- * and bottom. Fixed on purpose: it is what lets the search results be windowed
+ * Row pitch in px — `.hierarchy-row` is a fixed 24px tall (theme-v2.css) with a
+ * 1px margin top and bottom. Fixed on purpose: it is what lets the search results be windowed
  * with arithmetic instead of measurement.
  */
-const ROW_PITCH = 28;
+const ROW_PITCH = 26;
 
 /** Rows rendered beyond the viewport on each side, so a scroll shows content
  *  rather than blank space while React catches up. */
@@ -716,21 +717,17 @@ function performDropToRoot(draggedIds) {
 }
 
 /**
- * Per-row visibility icons. Two compact buttons toggle the entity's
- * editor-mode and game-mode enabled flags respectively — the first uses
- * an Eye/EyeOff pair (editor visibility is the most-edited), the second
- * uses Play/Pause so the two states are visually distinct in a narrow
- * row. Each click is a single, undoable command. The icons read live
- * values via `engine.getEntity(...)?.[flag]` rather than the React
- * mirror so toggles made from the inspector reflect immediately. They
- * live inside the row but stop propagation so they don't change
- * selection.
+ * The row's one eye: the entity's enabled flag (one flag, both modes — off,
+ * its components and its subtree's are detached). A single, undoable command
+ * per click. It reads the live entity rather than the React mirror so a
+ * toggle made from the inspector reflects immediately, and stops propagation
+ * so it never changes the selection. The editor's hide-while-authoring aid is
+ * the inspector's, not the row's.
  */
 function VisibilityIcons({ id }) {
   const live = engine.getEntity(id);
   if (!live) return null;
-  const editorOn = live.enabledInEditor !== false;
-  const gameOn = live.enabledInGame !== false;
+  const on = live.enabled !== false;
   return (
     <span
       className="hierarchy-vis-icons"
@@ -739,26 +736,49 @@ function VisibilityIcons({ id }) {
     >
       <button
         type="button"
-        className={`hierarchy-vis-icon ${editorOn ? "on" : "off"}`}
-        title={editorOn ? "Visible in editor — click to hide" : "Hidden in editor — click to show"}
-        onClick={() =>
-          commandBus.execute(new SetEntityEnabledInEditorCommand(id, !editorOn))
-        }
+        className={`hierarchy-vis-icon ${on ? "on" : "off"}`}
+        title={on ? "Enabled — click to disable" : "Disabled — click to enable"}
+        onClick={() => commandBus.execute(new SetEntityEnabledCommand(id, !on))}
       >
-        {editorOn ? <Eye size={12} /> : <EyeOff size={12} />}
-      </button>
-      <button
-        type="button"
-        className={`hierarchy-vis-icon ${gameOn ? "on" : "off"}`}
-        title={gameOn ? "Enabled in game — click to disable" : "Disabled in game — click to enable"}
-        onClick={() =>
-          commandBus.execute(new SetEntityEnabledInGameCommand(id, !gameOn))
-        }
-      >
-        {gameOn ? <Play size={10} /> : <Pause size={10} />}
+        {on ? <Eye size={12} /> : <EyeOff size={12} />}
       </button>
     </span>
   );
+}
+
+/**
+ * ⭐ WHAT A ROW MAY NOT DO PER RENDER (docs/ZERO_FREEZE_PLAN.md §2.3, unit 5.3).
+ *
+ * Two reads in the row body were O(subtree) and ran on every render of every
+ * visible row: `diffInstance(root)` fully SERIALISES a prefab instance's live
+ * subtree to decide whether one badge gets a dot, and `activeInHierarchy`
+ * walks to the root. With `EntityRow` un-memoized, a selection change
+ * re-rendered the newly-selected row and the previously-selected one *and
+ * their whole expanded subtrees*, so both costs were paid once per descendant.
+ *
+ * Both answers change only when the scene mirror changes. `sceneStore.refresh`
+ * mints a new `entities` object after every mutation, so its identity is an
+ * exact revision — and it is exact in the other direction too: a gizmo drag
+ * replaces it per pointermove, but rows deliberately do not subscribe to the
+ * whole map, so nothing re-renders and nothing recomputes. The prefab
+ * registry's own version is the second half of the key (apply / revert / a
+ * prefab asset changing move the diff without touching the mirror).
+ *
+ * Hatch: `globalThis.__hierarchyRowCache = false` recomputes every time.
+ */
+const rowCache = { rev: null, prefabVersion: null, playing: null, prefab: new Map(), active: new Map() };
+const NO_PREFAB = Object.freeze({});
+
+function rowCacheFor(prefabVersion, playing) {
+  const rev = useSceneStore.getState().entities;
+  if (rowCache.rev !== rev || rowCache.prefabVersion !== prefabVersion || rowCache.playing !== playing) {
+    rowCache.rev = rev;
+    rowCache.prefabVersion = prefabVersion;
+    rowCache.playing = playing;
+    rowCache.prefab.clear();
+    rowCache.active.clear();
+  }
+  return rowCache;
 }
 
 /**
@@ -768,10 +788,22 @@ function VisibilityIcons({ id }) {
  * created, applied or reverted.
  */
 function usePrefabRowInfo(id) {
-  usePrefabStore((s) => s.version);
+  const prefabVersion = usePrefabStore((s) => s.version);
+  // The mode flip changes WHICH flag `activeInHierarchy` reads, and
+  // Engine.setPlaying deliberately emits nothing — so the dim is driven by the
+  // play store instead of waiting for a hierarchy change that never comes.
+  const playing = usePlayStore((s) => s.playing);
+  const cache = rowCacheFor(prefabVersion, playing);
+  const cached = globalThis.__hierarchyRowCache !== false ? cache.prefab.get(id) : undefined;
+  const prefab = cached ?? computePrefabRowInfo(id);
+  if (cached === undefined) cache.prefab.set(id, prefab);
+  return { prefab, inactive: rowInactive(id, cache) };
+}
+
+function computePrefabRowInfo(id) {
   const live = engine.getEntity(id);
   const root = live ? getPrefabRoot(live) : null;
-  if (!root) return {};
+  if (!root) return NO_PREFAB;
   const isRoot = root === live;
   const guid = prefabRegistry.resolveLink(root.prefab);
   const def = guid ? prefabRegistry.getDef(guid) : null;
@@ -781,11 +813,25 @@ function usePrefabRowInfo(id) {
     path: guid ? prefabRegistry.pathOf(guid) : null,
     missing: !guid,
     // Only the root carries overrides, so only the root can look "modified".
+    // THE EXPENSIVE ONE: a full subtree serialise, now once per revision
+    // instead of once per render.
     dirty: isRoot && !!guid && diffInstance(root).length > 0,
   };
 }
 
-function EntityRow({
+/** `activeInHierarchy === false`, memoized on the same revision. */
+function rowInactive(id, cache) {
+  if (globalThis.__hierarchyRowCache !== false) {
+    const hit = cache.active.get(id);
+    if (hit !== undefined) return hit;
+  }
+  const live = engine.getEntity(id);
+  const value = live ? live.activeInHierarchy === false : false;
+  cache.active.set(id, value);
+  return value;
+}
+
+function EntityRowImpl({
   id,
   depth,
   renamingId,
@@ -807,7 +853,13 @@ function EntityRow({
   // on every selection change, and a 1500-row search result makes the linear
   // version quadratic.
   const selected = useSelectionStore((s) => selectedIdSet(s.ids).has(id));
-  const prefab = usePrefabRowInfo(id);
+  // An entity dimmed in the tree is one that cannot contribute in the CURRENT
+  // context: its own per-mode flag is off, or any ANCESTOR's is — exactly
+  // `Entity.activeInHierarchy`, the same definition the runtime attaches and
+  // detaches components by, so the tree never disagrees with the scene. Both
+  // reads come from one memo; see the rowCache header for why they are not
+  // computed per render.
+  const { prefab, inactive } = usePrefabRowInfo(id);
   // Assets-panel drags (.prefab/.entity/.glb) land on rows as "add as child".
   const assetDropRef = useAssetDrop({
     accepts: DROPPABLE_ASSET_EXTENSIONS,
@@ -871,6 +923,7 @@ function EntityRow({
   const rowClasses = [
     "hierarchy-row",
     selected ? "selected" : "",
+    inactive ? "inactive" : "",
     isDragging ? "row-dragging" : "",
     hintPos === "on" ? "drop-target" : "",
     hintPos === "before" ? "drop-before" : "",
@@ -884,7 +937,7 @@ function EntityRow({
     <>
       <div
         className={rowClasses}
-        style={{ paddingLeft: 8 + effectiveDepth * 14 }}
+        style={{ paddingLeft: 8 + effectiveDepth * 14, "--depth": effectiveDepth }}
         data-entity-id={id}
         ref={assetDropRef}
         onClick={onRowClick}
@@ -918,22 +971,19 @@ function EntityRow({
             <span className={`entity-name ${prefab.kind ? `prefab-${prefab.kind}` : ""}`}>
               <HighlightedName name={entity.name} query={searchHighlight} tier={searchMatch?.tier ?? null} />
             </span>
-            {prefab.kind === "root" && (
+            {/* A prefab is told by its name's colour; the only mark is a
+                dot on a root with overrides (red when the asset is gone). */}
+            {prefab.kind === "root" && (prefab.dirty || prefab.missing) && (
               <span
-                className={`prefab-badge ${prefab.dirty ? "dirty" : ""} ${prefab.missing ? "missing" : ""}`}
-                title={
-                  prefab.missing
-                    ? "Prefab asset is missing"
-                    : `Prefab instance: ${prefab.name}${prefab.dirty ? " (modified)" : ""} — double-click to open`
-                }
+                className={`prefab-mark${prefab.missing ? " missing" : ""}`}
+                title={prefab.missing ? "Prefab asset is missing" : `${prefab.name}: has overrides — click to open the prefab`}
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation();
                   if (prefab.path) openPrefabMode(prefab.path);
                 }}
               >
-                <Package size={11} />
-                {prefab.dirty && <span className="prefab-dot" />}
+                <span className="prefab-dot" />
               </span>
             )}
           </>
@@ -965,6 +1015,25 @@ function EntityRow({
     </>
   );
 }
+
+/**
+ * ⭐ A ROW RENDERS ITS OWN SUBTREE (docs/ZERO_FREEZE_PLAN.md §2.3, unit 5.3).
+ *
+ * `EntityRow` renders its children inline, so an un-memoized row re-rendered
+ * every expanded descendant it owns. A selection change flips `selected` on
+ * exactly two rows — the one arriving and the one leaving — and each of them
+ * then re-rendered its entire open branch, prefab diffs and ancestor walks
+ * included, for a result identical to the one on screen.
+ *
+ * The DEFAULT shallow comparator is the correct one here, and that is the
+ * whole point: a row forwards its own props to its children VERBATIM (only
+ * `id` and `depth` differ), and the panel does not re-render on a selection
+ * change whose count is unchanged — it subscribes to `s.ids.length`, not to
+ * `s.ids` — so every prop identity survives. A row's own state comes from
+ * store subscriptions inside the body, which `memo` cannot and must not
+ * block: the two rows that actually changed still re-render.
+ */
+const EntityRow = memo(EntityRowImpl);
 
 /**
  * The prefab half of the row context menu. What's on offer depends on whether
@@ -999,6 +1068,28 @@ function applyTransformMenuItems(single) {
         else console.warn(`Apply Transform: ${result.message}`);
       },
     })),
+  ];
+}
+
+/**
+ * "Split into Separate Meshes" — only for a single row that actually has a
+ * `.geom` behind its mesh. Offering it on a primitive or a multi-selection
+ * would be a menu entry that can only fail.
+ */
+function splitMenuItems(single) {
+  if (!single) return [];
+  const live = engine.getEntity(single);
+  if (!canSplitEntity(live)) return [];
+  return [
+    { separator: true },
+    {
+      label: "Split into Separate Meshes…",
+      // ⚠ The count is deliberately NOT computed here. Finding it means welding
+      // the whole mesh, and a context menu must not stall on right-click for a
+      // number the dialog is about to show anyway.
+      hint: "One entity per disconnected piece, under the same parent.",
+      action: () => splitGeometryIslandsWithPrompt({ entityId: single }),
+    },
   ];
 }
 
@@ -1050,16 +1141,6 @@ function ContextMenu({
   // that needs the number and it only exists while it is open.
   const rowCount = getRowOrder().length;
 
-  // A mutating workflow may only run on a provider that can close its own
-  // tool set (see aiStore.runWorkflow — this mirrors that check so the menu
-  // item is disabled rather than offered-then-refused).
-  const diagnoseWorkflow = getWorkflow("diagnose-selected");
-  const aiProvider = getActiveProvider();
-  const aiBlockedHint =
-    diagnoseWorkflow?.mutates && !aiProvider?.capabilities?.scopedTools
-      ? `${aiProvider?.label ?? "This provider"} cannot limit itself to this workflow's tools. Switch to a scoped provider (e.g. Ollama).`
-      : undefined;
-
   // Right-click on empty tree space is a "create here" gesture, not an
   // "operate on the selection" one — offering Delete/Rename for whatever
   // happened to be selected elsewhere would act on something off-screen.
@@ -1106,18 +1187,13 @@ function ContextMenu({
           action: () => onReveal(single),
         },
         ...applyTransformMenuItems(single),
+        ...splitMenuItems(single),
         ...prefabMenuItems(single),
         { separator: true },
-        {
-          label: "AI: Diagnose this",
-          icon: Sparkles,
-          disabled: !single || !!aiBlockedHint,
-          hint: aiBlockedHint,
-          action: () => {
-            openPanel("ai");
-            runWorkflow("diagnose-selected", single);
-          },
-        },
+        // Deliberately NOT restricted to a single row: "rename these twelve
+        // consistently" is a better question than anything you can ask about
+        // one entity, and the old single-only Diagnose item could not express it.
+        askAiMenuItem(entitySelectionContext(selection), { disabled: !selection.length }),
         { separator: true },
         { label: "Delete", shortcut: "Del", danger: true, action: deleteSelection },
       ];
@@ -1256,6 +1332,10 @@ export function HierarchyPanel() {
       setGhostPos({ x: e.clientX, y: e.clientY });
 
       const hit = hitTestRow(e.clientX, e.clientY);
+      // Outside the tree, a field anywhere in the editor may take the entity
+      // (a camera's target, a joint's body — see entityDrag.js).
+      const external = hit ? null : hitTestEntityDrop(e.clientX, e.clientY, dragSession.ids);
+      setEntityDropHover(external?.el ?? null);
       if (!hit || hit.id === null || dragSession.ids.includes(hit.id)) {
         setDropHint(null);
         clearHoverExpand();
@@ -1293,7 +1373,11 @@ export function HierarchyPanel() {
         if (hit && !dragSession.ids.includes(hit.id)) {
           if (hit.id === null) performDropToRoot(dragSession.ids);
           else performDrop(dragSession.ids, hit.id, hit.pos);
+        } else if (!hit) {
+          const external = hitTestEntityDrop(e.clientX, e.clientY, dragSession.ids);
+          external?.handler.onDrop(dragSession.ids, { clientX: e.clientX, clientY: e.clientY });
         }
+        setEntityDropHover(null);
       }
       dragSession = null;
       clearHoverExpand();
@@ -1699,9 +1783,11 @@ export function HierarchyPanel() {
           </span>
         </div>
       )}
-      <div className="panel-toolbar">
-        <div className="dropdown-wrap">
-          <button className="toolbar-btn" onClick={() => setMenuOpen((v) => !v)}> <Plus size={14} /> </button>
+      <div className="panel-toolbar hierarchy-toolbar">
+        <div className="dropdown-wrap hierarchy-add">
+          <button className="hierarchy-add-btn" title="Add" aria-label="Add" onClick={() => setMenuOpen((v) => !v)}>
+            <Plus size={13} />
+          </button>
           {menuOpen && (
             <>
               <div className="dropdown-overlay" onClick={() => setMenuOpen(false)} />
@@ -1725,21 +1811,13 @@ export function HierarchyPanel() {
             </>
           )}
         </div>
-        <button
-          className="toolbar-btn icon-only"
-          title="Delete selection (Del)"
-          disabled={!selectionCount}
-          onClick={deleteSelection}
-        >
-          <Trash2 size={14} />
-        </button>
         <div className="hierarchy-search">
           <Search size={12} className="hierarchy-search-icon" />
           <input
             ref={searchInputRef}
             className="hierarchy-search-input"
             type="text"
-            placeholder="Search…  Lamp...  mesh.castShadow=true  Mesh > light"
+            placeholder="Search"
             title={"Search by name, component type or tag.\nName:    Lamp (contains) \u00b7 Lamp... (starts with) \u00b7 ...Box (ends with) \u00b7 \"red lamp\" (quote spaces)\nFilter:  mesh.castShadow=true \u00b7 collider.shape=convex \u00b7 light.intensity>1 \u00b7 enabled=false\n         Lamp?enabled=true&light.intensity>1 combines a name with filters\nHas:     M...?cloth (has a cloth component) \u00b7 ?collider \u00b7 ?!sound (has none)\nInside:  Mesh > light (lights under something named Mesh) \u00b7 chains: A > B > C\n         the > needs spaces \u2014 light.intensity>1 is a comparison\nCtrl+Shift+A selects every result."}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
@@ -1815,6 +1893,7 @@ export function HierarchyPanel() {
         </div>
       </div>
       <div className="scene-label">
+        <Layers size={13} className="scene-label-glyph" aria-hidden="true" />
         <span className="scene-label-name">
           {sceneName}
           {dirty ? " •" : ""}

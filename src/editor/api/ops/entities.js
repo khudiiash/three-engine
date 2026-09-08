@@ -271,6 +271,9 @@ defineOp({
         // no options at all, against a description promising the options are the
         // only legal values.
         ...(descriptor.options ? { options: optionsOf(descriptor) ?? [] } : {}),
+        // Belongs to an optional module: the inspector hides the prop (and
+        // the runtime ignores it) until that module is enabled.
+        ...(descriptor.module ? { module: descriptor.module } : {}),
         ...(descriptor.min !== undefined ? { min: descriptor.min } : {}),
         ...(descriptor.max !== undefined ? { max: descriptor.max } : {}),
       }));

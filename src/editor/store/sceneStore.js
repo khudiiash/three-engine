@@ -2,6 +2,22 @@
 import { create } from "zustand";
 import { ensureEngine } from "../engineInstance.js";
 import { vmSingleton, oncePerVm } from "../singleton.js";
+import { freeze } from "../../engine/freezeLedger.js";
+
+/**
+ * How the mirror has been brought up to date, counted.
+ *
+ * `CommandBus.#afterMutation` reads these to answer ONE question: "did an
+ * engine event already re-read the mirror for this mutation?" It used to call
+ * `refresh()` unconditionally and the "hierarchy-changed" listener called it
+ * AGAIN a microtask later, so a single edit rebuilt the mirror of every entity
+ * TWICE with fresh object identities — which is why every Hierarchy row
+ * re-rendered on a light-intensity edit (ZERO_FREEZE_PLAN §2.4 step 3).
+ *
+ * A plain object rather than store state: nothing renders from it, and putting
+ * it in the store would make every mirror write a store publish of its own.
+ */
+export const sceneMirrorStats = { full: 0, incremental: 0 };
 
 /**
  * The plain-data row shape the hierarchy renders (and hierarchySearch matches
@@ -24,8 +40,12 @@ function mirrorEntity(entity) {
     components: Object.fromEntries(
       [...entity.components.values()].map((c) => [c.type, { ...c.props }]),
     ),
-    enabledInEditor: entity.enabledInEditor !== false,
-    enabledInGame: entity.enabledInGame !== false,
+    enabled: entity.enabled !== false,
+    visibleInEditor: entity.visibleInEditor !== false,
+    // The old per-mode keys, for readers not yet moved: the editor one is the
+    // viewing aid, the game one is `enabled`.
+    enabledInEditor: entity.visibleInEditor !== false,
+    enabledInGame: entity.enabled !== false,
   };
 }
 
@@ -35,7 +55,7 @@ function mirrorEntity(entity) {
  * engine, then call refresh() (or updateTransform for live gizmo drags).
  */
 export const useSceneStore = vmSingleton("sceneStore", () =>
-  create((set) => ({
+  create((set, get) => ({
     sceneName: "Untitled",
     scenePath: null,
     rootIds: [],
@@ -49,16 +69,50 @@ export const useSceneStore = vmSingleton("sceneStore", () =>
     refresh(scenePath = undefined) {
       const inst = engineInstanceCache;
       if (!inst) return;
-      const entities = {};
-      for (const entity of inst.entities.values()) {
-        entities[entity.id] = mirrorEntity(entity);
+      const token = freeze.begin("sceneStore:refresh");
+      try {
+        const entities = {};
+        for (const entity of inst.entities.values()) {
+          entities[entity.id] = mirrorEntity(entity);
+        }
+        set((state) => ({
+          entities,
+          rootIds: inst.rootEntities.map((e) => e.id),
+          sceneName: inst.sceneName,
+          ...(scenePath !== undefined ? { scenePath } : { scenePath: state.scenePath }),
+        }));
+        sceneMirrorStats.full++;
+      } finally {
+        freeze.end(token);
       }
-      set((state) => ({
-        entities,
-        rootIds: inst.rootEntities.map((e) => e.id),
-        sceneName: inst.sceneName,
-        ...(scenePath !== undefined ? { scenePath } : { scenePath: state.scenePath }),
-      }));
+    },
+
+    /**
+     * ── ONE ENTITY, NOT ALL OF THEM (2026-09-07, ZERO_FREEZE_PLAN §1.2) ────
+     *
+     * Re-mirrors the entity that changed and LEAVES EVERY OTHER MIRROR OBJECT
+     * ALONE. That identity stability is the whole point: `refresh()` allocates
+     * a fresh `{...c.props}` per component per entity, so after it ran every
+     * Hierarchy row's props were a new object and every memoised row
+     * re-rendered — on a light-intensity edit, twice. Here only the touched
+     * entity's object changes identity, so React re-renders one row.
+     *
+     * Deliberately NOT a place to notice structure: a new entity, a removed
+     * one, a re-parent and a component add/remove all emit "hierarchy-changed"
+     * and `refresh()` owns them. An id this mirror has never seen is skipped
+     * rather than inserted, because inserting it without its `rootIds`/
+     * `childIds` context would publish a tree that does not close.
+     */
+    refreshEntity(id) {
+      const inst = engineInstanceCache;
+      if (!inst) return;
+      const entity = inst.getEntity?.(id);
+      if (!entity || !get().entities[id]) return;
+      // The map object has to be replaced for zustand to see a change; the
+      // spread copies REFERENCES (one per entity), not mirrors, so it costs a
+      // fraction of what re-mirroring the scene costs. See updateTransform.
+      set((state) => ({ entities: { ...state.entities, [id]: mirrorEntity(entity) } }));
+      sceneMirrorStats.incremental++;
     },
 
     /**
@@ -108,6 +162,19 @@ export const useSceneStore = vmSingleton("sceneStore", () =>
 // without going through the throwing Proxy.
 let engineInstanceCache = null;
 
+/**
+ * Hands the mirror an engine directly.
+ *
+ * The editor fills this from `ensureEngine()` below. It is exported for the
+ * headless test of `refreshEntity`: whether an untouched entity's mirror keeps
+ * its OBJECT IDENTITY across an edit is the entire point of unit §1.2 (React
+ * re-renders on identity, so losing it means the incremental path bought
+ * nothing), and it cannot be observed from outside this module.
+ */
+export function attachSceneEngine(engine) {
+  engineInstanceCache = engine;
+}
+
 // Subscribe to engine events once the lazy engine has resolved. EditorShell
 // calls `await ensureEngine()` in its mount effect, but we also kick off the
 // load here so that subscribers attached by external modules (e.g. the
@@ -117,9 +184,28 @@ let engineInstanceCache = null;
 // second "hierarchy-changed" listener that refreshes the same store again —
 // harmless in outcome, but it doubles a scene-sized mirror rebuild on every
 // tree change, and the count grows with each hot reload.
-if (oncePerVm("sceneStore.subscribe")) {
+// `typeof document` because a headless import (node --test, for the mirror's
+// own unit test) has no editor to attach to, and `ensureEngine()` would pull in
+// the Tauri asset layer and reject where nothing can handle it.
+if (oncePerVm("sceneStore.subscribe") && typeof document !== "undefined") {
   ensureEngine().then((engine) => {
     engineInstanceCache = engine;
-    engine.on("hierarchy-changed", () => useSceneStore.getState().refresh());
+    // STRUCTURE: entities appearing/disappearing/moving in the tree, and the
+    // structural props of §1.1. Only this rebuilds the whole mirror.
+    // `__label` is how Engine._invoke names a listener in `profile.edit`; an
+    // anonymous one shows up as a blank row, which is exactly the row you need
+    // to read when an edit is expensive.
+    const refreshAll = () => useSceneStore.getState().refresh();
+    refreshAll.__label = "sceneStore.refresh";
+    engine.on("hierarchy-changed", refreshAll);
+    // VALUES: one entity's props changed. This is what keeps the inspector's
+    // controlled inputs live now that an ordinary prop edit no longer emits
+    // "hierarchy-changed" — and it costs one mirror instead of `entityCount`.
+    const refreshOne = (info) => {
+      if (globalThis.__editorMirrorIncremental === false) return refreshAll();
+      if (info?.entityId) useSceneStore.getState().refreshEntity(info.entityId);
+    };
+    refreshOne.__label = "sceneStore.refreshEntity";
+    engine.on("component-changed", refreshOne);
   });
 }

@@ -198,9 +198,73 @@ export class StatsSystem {
     this._phaseIndex = -1;
     this._phaseLast = 0;
 
+    // The breakdown: per-owner time while a capture armed with
+    // `{ attribute: true }` runs. Keyed by component instance, module or
+    // script path; read back per frame by `readPhaseCapture`.
+    this._attribArmed = false;
+    this._attrib = new Map();
+
     this._unsubUpdate = null;
     this._lastTickStart = 0;
     this._tick = this._tick.bind(this);
+  }
+
+  /**
+   * Charges `ms` of `stage` to the callback's owner: the component that
+   * registered it (`Component · Entity`), the module that did, or the engine
+   * itself for an unowned callback. Called by Engine.#tick while armed.
+   */
+  attribute(fn, stage, ms) {
+    const owner = fn?.__owner ?? null;
+    let key;
+    let row;
+    if (owner && owner.entity && owner.type) {
+      key = `c:${owner.type}:${owner.entity.id}`;
+      row = this._attrib.get(key);
+      if (!row) {
+        row = {
+          key,
+          kind: "component",
+          type: owner.type,
+          label: owner.constructor?.label ?? owner.type,
+          entity: owner.entity.name ?? owner.entity.id,
+          entityId: owner.entity.id,
+          ms: 0,
+          calls: 0,
+        };
+        this._attrib.set(key, row);
+      }
+    } else if (owner && owner.kind === "module") {
+      key = `m:${owner.id}`;
+      row = this._attrib.get(key);
+      if (!row) {
+        row = { key, kind: "module", label: owner.id, ms: 0, calls: 0 };
+        this._attrib.set(key, row);
+      }
+    } else {
+      key = `e:${stage}`;
+      row = this._attrib.get(key);
+      if (!row) {
+        row = { key, kind: "engine", label: `engine · ${stage}`, ms: 0, calls: 0 };
+        this._attrib.set(key, row);
+      }
+    }
+    row.ms += ms;
+    row.calls++;
+  }
+
+  /** Charges one script hook call to its script file. */
+  attributeScript(path, hook, ms) {
+    const key = `s:${path}`;
+    let row = this._attrib.get(key);
+    if (!row) {
+      const name = String(path ?? "script").split(/[\\/]/).pop();
+      row = { key, kind: "script", label: name, path, ms: 0, calls: 0, hooks: {} };
+      this._attrib.set(key, row);
+    }
+    row.ms += ms;
+    row.calls++;
+    row.hooks[hook] = (row.hooks[hook] ?? 0) + ms;
   }
 
   /**
@@ -314,7 +378,9 @@ export class StatsSystem {
    * sampled frame — a single tick on a scene with GC pauses is not a
    * measurement.
    */
-  beginPhaseCapture(frames = 60) {
+  beginPhaseCapture(frames = 60, { attribute = false } = {}) {
+    this._attrib.clear();
+    this._attribArmed = !!attribute;
     this._phaseTotals.fill(0);
     this._subTotals?.clear();
     this._subName = null;
@@ -527,7 +593,10 @@ export class StatsSystem {
     this._phaseIndex = -1;
     this._phaseFramesDone++;
     this.#closeSpikeFrame();
-    if (this._phaseFramesDone >= this._phaseFramesTarget) this._phaseArmed = false;
+    if (this._phaseFramesDone >= this._phaseFramesTarget) {
+      this._phaseArmed = false;
+      this._attribArmed = false;
+    }
   }
 
   /**
@@ -551,12 +620,25 @@ export class StatsSystem {
     const subPhases = [...(this._subTotals ?? new Map())]
       .map(([name, ms]) => ({ name, ms: +(ms / frames).toFixed(3) }))
       .sort((a, b) => b.ms - a.ms);
+    // The breakdown by owner, mean ms per frame, costliest first. Sums to at
+    // most the phases it was measured inside (update, lateUpdate, preRender,
+    // postRender); the rest of the frame is the phases themselves.
+    const owners = [...this._attrib.values()]
+      .map((row) => ({
+        ...row,
+        ms: +(row.ms / frames).toFixed(3),
+        hooks: row.hooks
+          ? Object.fromEntries(Object.entries(row.hooks).map(([h, v]) => [h, +(v / frames).toFixed(3)]))
+          : undefined,
+      }))
+      .sort((a, b) => b.ms - a.ms);
     return {
       frames: this._phaseFramesDone,
       totalMs: +totalMs.toFixed(3),
       complete: !this._phaseArmed,
       phases,
       subPhases,
+      owners,
     };
   }
 

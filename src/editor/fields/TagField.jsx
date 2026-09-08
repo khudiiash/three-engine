@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { X } from "../icons/index.jsx";
 
 /**
  * Tag chips + an add box, shared by the entity inspector and the asset

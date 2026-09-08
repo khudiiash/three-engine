@@ -1,4 +1,5 @@
 import { useProjectStore } from "./store/projectStore.js";
+import { freeze } from "../engine/freezeLedger.js";
 import { listProjectEntries } from "./assetLoader.js";
 import { loadAssetFlags } from "./assetFlags.js";
 import { assetCatalog } from "../engine/assets/catalog.js";
@@ -19,7 +20,16 @@ export async function loadProjectAssetCatalog() {
   const root = useProjectStore.getState().rootPath;
   assetCatalog.clear();
   if (!root) return;
-  const entries = await listProjectEntries(root);
-  await loadAssetFlags(entries);
+  // ⭐ MARKED. Walking a project and reading every `.meta` is hundreds of
+  // milliseconds on a real project (3 539 assets here), and nothing named it —
+  // so when it ran repeatedly it showed up in the freeze ledger only as
+  // `(unattributed)`, which is indistinguishable from a mystery. The two
+  // halves are marked separately because they fail differently: the walk is
+  // disk, the flags load is parsing.
+  const walk = freeze.begin("assets:listProject");
+  let entries;
+  try { entries = await listProjectEntries(root); } finally { freeze.end(walk); }
+  const flags = freeze.begin("assets:loadFlags");
+  try { await loadAssetFlags(entries); } finally { freeze.end(flags); }
   console.log(`Cataloged ${assetCatalog.all().length} asset(s)`);
 }

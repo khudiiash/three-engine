@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Download, ExternalLink, Loader2, Music, Search, KeyRound } from "lucide-react";
+import { Download, ExternalLink, Loader2, Music, Power, Search, KeyRound } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { CREDENTIAL_CHANGED_EVENT } from "../credentialEvents.js";
@@ -162,15 +162,9 @@ export function AudioLibraryPanel({ api } = {}) {
     return (
       <div className="audiolib-panel">
         <div className="audiolib-gate">
-          <Music size={28} />
-          <h3>Audio Library</h3>
-          <p>
-            Search hundreds of thousands of free sound effects and ambiences from Freesound and
-            Wikimedia Commons, audition them here, and import them straight into the project with
-            their licences recorded. Enable the Audio Library module to get started.
-          </p>
+          <Music size={28} className="empty-glyph" />
           <button className="toolbar-btn wide" onClick={() => setModuleEnabled("audio-library", true)}>
-            Enable Audio Library module
+            <Power size={13} /> Enable Audio Library module
           </button>
         </div>
       </div>
@@ -258,14 +252,8 @@ export function AudioLibraryPanel({ api } = {}) {
 
       <div className="audiolib-list" ref={listRef}>
         {needsKey ? (
-          <div className="audiolib-gate inline">
-            <KeyRound size={24} />
-            <h3>Freesound needs a free API key</h3>
-            <p>
-              Register an application on Freesound to get one — it's instant, free, and needs no
-              payment details. Paste the key into the Audio Library module in the Modules panel.
-              Commons works with no key at all if you'd rather start there.
-            </p>
+          <div className="audiolib-gate inline" title="Register an application on Freesound to get a free API key — Commons works with no key at all">
+            <KeyRound size={24} className="empty-glyph" />
             <button className="toolbar-btn wide" onClick={() => openApiKeyPage()}>
               <ExternalLink size={13} /> Get a Freesound API key
             </button>
@@ -274,11 +262,10 @@ export function AudioLibraryPanel({ api } = {}) {
           <div className="audiolib-status error">{error}</div>
         ) : loading && items.length === 0 ? (
           <div className="audiolib-status">
-            <Loader2 size={14} className="audiolib-spin" /> Searching…
+            <Loader2 size={14} className="audiolib-spin" />
           </div>
         ) : idle ? (
           <div className="audiolib-suggest">
-            <p>Search {PROVIDERS.find((p) => p.id === provider)?.label}, or start from one of these:</p>
             <div className="audiolib-suggest-chips">
               {(provider === "freesound" ? FREESOUND_EXAMPLES : COMMONS_EXAMPLES).map((example) => (
                 <button key={example} className="audiolib-chip" onClick={() => setQuery(example)}>
@@ -293,7 +280,7 @@ export function AudioLibraryPanel({ api } = {}) {
           <>
             {total != null && (
               <div className="audiolib-count">
-                {total.toLocaleString()} result{total === 1 ? "" : "s"}
+                <span className="cnt" title="results">{total.toLocaleString()}</span>
               </div>
             )}
             {/* Rows are not rendered while the tab is hidden: each one holds an

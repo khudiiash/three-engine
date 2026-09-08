@@ -1,10 +1,15 @@
-import { Suspense, lazy } from "react";
+import { Component, Suspense, lazy } from "react";
+import { RotateCcw, TriangleAlert } from "./icons/index.jsx";
 import { DockviewReact, themeAbyss } from "dockview-react";
+import { PANEL_SPECS } from "./panelCatalog.js";
+import { PanelTab } from "./PanelTab.jsx";
+import { PanelLauncherButton } from "./PanelLauncher.jsx";
 import { vmSingleton } from "./singleton.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { QuickSearch } from "./QuickSearch.jsx";
 import { Toasts } from "./Toasts.jsx";
 import { ConfirmDialogHost } from "./components/ConfirmDialog.jsx";
+import { AmbientGlow } from "./components/AmbientGlow.jsx";
 
 // Bumped to v2 when the "material" panel was removed (materials are edited only
 // through the Shader Graph now). A v1 layout can still contain a Material tab,
@@ -44,6 +49,7 @@ const ItchioPanel = lazy(() => import("./panels/ItchioPanel.jsx").then((m) => ({
 const AudioLibraryPanel = lazy(() => import("./panels/AudioLibraryPanel.jsx").then((m) => ({ default: m.AudioLibraryPanel })));
 const AudioEditorPanel = lazy(() => import("./panels/AudioEditorPanel.jsx").then((m) => ({ default: m.AudioEditorPanel })));
 const TerminalPanel = lazy(() => import("./panels/TerminalPanel.jsx").then((m) => ({ default: m.TerminalPanel })));
+const PerformancePanel = lazy(() => import("./panels/PerformancePanel.jsx").then((m) => ({ default: m.PerformancePanel })));
 const McpPanel = lazy(() => import("./panels/McpPanel.jsx").then((m) => ({ default: m.McpPanel })));
 const AiPanel = lazy(() => import("./panels/AiPanel.jsx").then((m) => ({ default: m.AiPanel })));
 const GamePanel = lazy(() => import("./panels/GamePanel.jsx").then((m) => ({ default: m.GamePanel })));
@@ -60,11 +66,54 @@ const GitPanel = lazy(() => import("./panels/GitPanel.jsx").then((m) => ({ defau
 function withPanelSuspense(LazyPanel, fallback = <PanelFallback />) {
   return function SuspendedDockPanel(props) {
     return (
-      <Suspense fallback={fallback}>
-        <LazyPanel {...props} />
-      </Suspense>
+      <PanelErrorBoundary>
+        <Suspense fallback={fallback}>
+          <LazyPanel {...props} />
+        </Suspense>
+      </PanelErrorBoundary>
     );
   };
+}
+
+/**
+ * A panel that throws while rendering must not take the editor with it.
+ *
+ * React unmounts the whole root on an uncaught render error, and with no
+ * boundary anywhere that was a black window with the scene still running
+ * behind it — one bad panel, the entire editor gone, nothing to read. Now the
+ * failing panel shows the error where the panel was (the message in the
+ * panel, the stack in its tooltip) and a retry, and every other panel keeps
+ * working. Per panel, not per group: the boundary sits inside Dockview's
+ * portal for that one panel.
+ */
+class PanelErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error(`Panel crashed: ${error?.message ?? error}
+${info?.componentStack ?? ""}`);
+  }
+
+  render() {
+    const { error } = this.state;
+    if (!error) return this.props.children;
+    return (
+      <div className="panel-error" role="alert" title={String(error?.stack ?? error)}>
+        <TriangleAlert size={28} className="empty-glyph" aria-hidden="true" />
+        <div className="panel-error-message">{String(error?.message ?? error)}</div>
+        <button className="toolbar-btn icon-only" title="Try again" onClick={() => this.setState({ error: null })}>
+          <RotateCcw size={13} />
+        </button>
+      </div>
+    );
+  }
 }
 
 const panelComponents = {
@@ -97,6 +146,7 @@ const panelComponents = {
   itchio: withPanelSuspense(ItchioPanel),
   audioLibrary: withPanelSuspense(AudioLibraryPanel),
   audioEditor: withPanelSuspense(AudioEditorPanel),
+  performance: withPanelSuspense(PerformancePanel),
   terminal: withPanelSuspense(TerminalPanel),
   mcp: withPanelSuspense(McpPanel),
   ai: withPanelSuspense(AiPanel),
@@ -119,75 +169,9 @@ function PanelFallback() {
   return <div className="panel-loading">Loading panel…</div>;
 }
 
-/** Where each panel prefers to (re)open. referencePanel falls back if closed too. */
-export const PANEL_SPECS = {
-  viewport: { title: "Viewport" },
-  // Tabbed WITH the viewport, not beside it: they show the same renderer canvas
-  // (only one exists — see viewportCanvas.js), so side-by-side would mean one of
-  // them is always a placeholder taking up half the screen.
-  game: { title: "Game", position: { referencePanel: "viewport", direction: "within" } },
-  hierarchy: { title: "Hierarchy", position: { referencePanel: "viewport", direction: "left" }, initialWidth: 260 },
-  inspector: { title: "Inspector", position: { referencePanel: "viewport", direction: "right" }, initialWidth: 320 },
-  assets: { title: "Assets", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 200 },
-  console: { title: "Console", position: { referencePanel: "assets", direction: "within" } },
-  shaderGraph: { title: "Shader Graph", position: { referencePanel: "assets", direction: "within" } },
-  // Node editors dock with Assets (the full-width strip under the viewport),
-  // NOT with the Inspector: the Inspector column is ~320px, and a graph fitted
-  // into 320px renders every node as an unreadable postage stamp.
-  vfx: { title: "VFX", position: { referencePanel: "assets", direction: "within" } },
-  particles: { title: "Particles", position: { referencePanel: "assets", direction: "within" } },
-  animator: { title: "Animator", position: { referencePanel: "assets", direction: "within" } },
-  // Same reasoning as the node editors: a dope sheet is a wide, short surface —
-  // it needs the full-width strip under the viewport, not the 320px column.
-  timeline: { title: "Timeline", position: { referencePanel: "assets", direction: "within" }, initialHeight: 260 },
-  sceneSettings: { title: "Scene Settings", position: { referencePanel: "inspector", direction: "within" } },
-  projectSettings: { title: "Project Settings", position: { referencePanel: "inspector", direction: "within" } },
-  build: { title: "Build", position: { referencePanel: "inspector", direction: "within" } },
-  modules: { title: "Modules", position: { referencePanel: "inspector", direction: "within" } },
-  input: { title: "Input", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 280 },
-  events: { title: "Events", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 300 },
-  eventGraph: { title: "Event Graph", position: { referencePanel: "viewport", direction: "within" } },
-  geometryEditor: { title: "Geometry Editor", position: { referencePanel: "viewport", direction: "within" } },
-  // Docks with the Assets strip, like the Shader Graph and Particles panels:
-  // a node graph in the 320px Inspector column is a postage stamp, and this
-  // one now also carries a document toolbar (which `.post`, save, save as).
-  postprocess: { title: "Post Process", position: { referencePanel: "assets", direction: "within" } },
-  polyhaven: { title: "Poly Haven", position: { referencePanel: "assets", direction: "within" } },
-  ambientcg: { title: "AmbientCG", position: { referencePanel: "assets", direction: "within" } },
-  sketchfab: { title: "Sketchfab", position: { referencePanel: "assets", direction: "within" } },
-  polypizza: { title: "Poly Pizza", position: { referencePanel: "assets", direction: "within" } },
-  kaykit: { title: "KayKit", position: { referencePanel: "assets", direction: "within" } },
-  fab: { title: "Fab", position: { referencePanel: "assets", direction: "within" } },
-  itchio: { title: "itch.io", position: { referencePanel: "assets", direction: "within" } },
-  audioLibrary: { title: "Audio Library", position: { referencePanel: "assets", direction: "within" } },
-  // Docks with the Assets strip for the same reason the Texture Editor does:
-  // track heads plus waveform lanes need width, not the 320px Inspector column.
-  audioEditor: { title: "Audio Editor", position: { referencePanel: "assets", direction: "within" }, initialHeight: 420 },
-  // Docks with the Assets strip like the other wide authoring surfaces: a
-  // paint canvas plus a tool column plus a layer column does not fit the
-  // 320px Inspector column, and the canvas is the point of the panel.
-  textureEditor: { title: "Texture Editor", position: { referencePanel: "assets", direction: "within" }, initialHeight: 420 },
-  // Docks with the Assets strip: a terminal wants width for wrapped output and
-  // the CLIs draw full-width boxes, so the 320px Inspector column would render
-  // Claude unusable.
-  terminal: { title: "Terminal", position: { referencePanel: "assets", direction: "within" } },
-  // Docks with the Inspector column: it's a narrow status/settings surface,
-  // read at a glance rather than worked in.
-  mcp: { title: "Assistant (MCP)", position: { referencePanel: "inspector", direction: "within" } },
-  // Same column as the Assistant panel it runs through — opened by context-menu
-  // AI actions, not something a user finds by browsing first.
-  ai: { title: "AI", position: { referencePanel: "inspector", direction: "within" } },
-  // Docks with the Assets strip: the changed-files list and the diff have to be
-  // side by side (see GitPanel's header), and a diff in the 320px Inspector
-  // column wraps every line into uselessness.
-  git: { title: "Source Control", position: { referencePanel: "assets", direction: "within" }, initialHeight: 420 },
-  // Code wants the viewport's real estate, not the Assets strip: you read a
-  // script down the page, and a 200px-tall pane shows eight lines of it.
-  code: { title: "Code", position: { referencePanel: "viewport", direction: "within" } },
-  // A font browser is a grid of specimens — same wide strip as the other
-  // asset-library panels it sits alongside.
-  fontLibrary: { title: "Fonts", position: { referencePanel: "assets", direction: "within" } },
-};
+// Panel titles, glyphs and preferred positions live in panelCatalog.js so the
+// tab renderer and the launcher can read them without importing this module.
+export { PANEL_SPECS } from "./panelCatalog.js";
 
 /**
  * Dockview's API handle and the queue of opens made before it exists.
@@ -465,7 +449,8 @@ export function openPanel(id) {
     );
     return;
   }
-  const { position, ...rest } = spec;
+  // `icon` is for the tab renderer, not for Dockview's addPanel options.
+  const { position, icon: _icon, ...rest } = spec;
   const options = { id, component: id, ...rest };
   // The Console panel uses a custom tab renderer so it can show an unread-error
   // dot — pin the renderer here so programmatic opens (via the menu, etc.)
@@ -682,9 +667,11 @@ function onDockReady(event) {
 export function EditorShell() {
   return (
     <div className="editor-root">
-      <Suspense fallback={<PanelFallback />}>
-        <EditorChrome />
-      </Suspense>
+      <PanelErrorBoundary>
+        <Suspense fallback={<PanelFallback />}>
+          <EditorChrome />
+        </Suspense>
+      </PanelErrorBoundary>
       <QuickSearch />
       <Toasts />
       {/* Statically imported and mounted unconditionally, not lazy: a
@@ -693,12 +680,16 @@ export function EditorShell() {
           host that arrives one Suspense tick late would silently refuse a
           delete the user did ask for. */}
       <ConfirmDialogHost />
+      <AmbientGlow />
       <div className="dock-container">
         <DockviewReact
           components={panelComponents}
           tabComponents={tabComponents}
+          // Icon-first tabs and the per-group "+" launcher — see PanelTab.jsx.
+          defaultTabComponent={PanelTab}
+          rightHeaderActionsComponent={PanelLauncherButton}
           onReady={onDockReady}
-          theme={themeAbyss}
+          theme={{ ...themeAbyss, gap: 1 }}
           // Tauri's embedded webview can swallow HTML5 drag/drop events.
           // Pointer DnD keeps tabs movable between dock groups as well as
           // reorderable within their current group.

@@ -1,5 +1,6 @@
 // @ts-check
 import { registerComponent, unregisterComponent } from "./components/registry.js";
+import { freeze } from "./freezeLedger.js";
 
 /**
  * Unity-style engine modules: optional feature packs (physics, audio, …)
@@ -55,13 +56,46 @@ export function getModuleDefinitions() {
   }));
 }
 
+/**
+ * A module's setup has to cost at least this much to earn a row in the boot
+ * table. Below it the module is not what is making the editor slow.
+ */
+const MODULE_MARK_MS = 30;
+
 /** Registers the module's components and runs its setup on this engine. */
 export async function enableEngineModule(engine, id) {
   if (engine.modules.has(id)) return engine.modules.get(id);
   const def = definitions.get(id);
   if (!def) throw new Error(`Unknown module "${id}"`);
   for (const cls of def.components ?? []) registerComponent(cls);
-  const handle = (await def.setup?.(engine)) ?? {};
+  // A module's `setup` is a dynamic import of its whole subtree plus its
+  // system's construction, and both are main-thread. Before this span the
+  // editor's boot showed ~650 ms of `(unattributed)` blocks sitting inside
+  // the "modules: import + enable" stage with nothing to name them.
+  // ⚠ THE SPAN ALONE IS NOT ENOUGH, and the boot table showed why: a freeze
+  // span only surfaces when its work happens to land inside a long TASK, so an
+  // await-heavy module setup (a dynamic import is mostly waiting) is invisible
+  // in it while still costing the user real seconds. The stage
+  // "modules: import + enable" measured 183-1118 ms across boots with 19
+  // modules enabled and no way to tell which one owned it.
+  //
+  // Only modules over the threshold are marked. Nineteen rows would bury the
+  // boot table's other stages, and a module that costs 4 ms is not a lead.
+  const tSetup = performance.now();
+  // Per-frame callbacks the module registers during setup are charged to it
+  // in the profiler's breakdown (Engine.`_registrant`). Setup is async, so
+  // the mark can only cover its synchronous part — which is where a system
+  // constructs and subscribes.
+  const previousRegistrant = engine._registrant;
+  engine._registrant = { kind: "module", id };
+  let handle;
+  try {
+    handle = (await freeze.runAsync(`module:setup ${id}`, () => def.setup?.(engine))) ?? {};
+  } finally {
+    engine._registrant = previousRegistrant;
+  }
+  const setupMs = performance.now() - tSetup;
+  if (setupMs >= MODULE_MARK_MS) freeze.bootMark(`module: ${id}`, setupMs);
   engine.modules.set(id, handle);
   engine.emit("modules-changed");
   return handle;

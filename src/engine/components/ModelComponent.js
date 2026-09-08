@@ -31,7 +31,7 @@ export class ModelComponent extends Component {
     { key: "path", label: "File", type: "asset", exts: ["glb"] },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
-    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"] },
+    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"], module: "physics-rapier" },
   ];
 
   onAttach() {

@@ -7,6 +7,7 @@
 // await; replace with `engineInstance` once it's resolved.
 
 import { vmSingleton } from "./singleton.js";
+import { freeze } from "../engine/freezeLedger.js";
 
 /**
  * The one Engine, and the one in-flight load, held VM-wide.
@@ -47,12 +48,19 @@ async function loadEngine() {
         { toBlobUrl, loadScriptModule, readAssetMeta, readSceneJson, readAssetBinary, writeAssetBinary, writeAssetBinaryAtomic, onAssetInvalidated },
         { useProjectStore },
         { invalidateGeometryAsset },
-      ] = await Promise.all([
-        import("../engine/index.js"),
-        import("./assetLoader.js"),
-        import("./store/projectStore.js"),
-        import("../engine/geometryAsset.js"),
-      ]);
+      ] = await (async () => {
+        // The engine bundle (three/webgpu + every component class) is one
+        // main-thread module evaluation; the boot table needs it named.
+        freeze.bootStage("engine: import module graph");
+        const loaded = await Promise.all([
+          import("../engine/index.js"),
+          import("./assetLoader.js"),
+          import("./store/projectStore.js"),
+          import("../engine/geometryAsset.js"),
+        ]);
+        freeze.bootStage("engine: construct");
+        return loaded;
+      })();
       // Debugging convenience only: reach the engine's three instance from a
       // console or a test harness. User scripts no longer need it — the
       // script-runtime proxies are real modules that import three themselves

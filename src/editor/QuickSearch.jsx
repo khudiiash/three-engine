@@ -10,7 +10,7 @@ import {
   Search,
   Settings2,
   X,
-} from "lucide-react";
+} from "./icons/index.jsx";
 import { useProjectStore } from "./store/projectStore.js";
 import { useSceneStore } from "./store/sceneStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
@@ -112,8 +112,19 @@ export function QuickSearch() {
         setOpen(false);
       }
     };
+    // The bar's search field asks for the same thing the shortcut does.
+    const onOpenRequest = () => {
+      setOpen(true);
+      setQuery("");
+      setActive(0);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    };
     window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    window.addEventListener("editor-quick-search", onOpenRequest);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("editor-quick-search", onOpenRequest);
+    };
   }, [open]);
 
   useEffect(() => {
@@ -359,18 +370,6 @@ export function QuickSearch() {
               ))}
             </>
           ) : <div className="quick-search-empty">No matching editor items</div>}
-        </div>
-        <div className="quick-search-footer">
-          <span className="quick-search-result-count">{results.length ? `${results.length} result${results.length === 1 ? "" : "s"}` : "No results"}</span>
-          <span className="quick-search-hint"><kbd><ChevronUp size={11} /><ChevronDown size={11} /></kbd> Navigate</span>
-          {/* Assets are the one type Enter doesn't finish: it lands you on the
-              tile in the Assets panel, and a second Enter there opens it. Say
-              so, rather than promising "Open" and revealing. */}
-          <span className="quick-search-hint">
-            <kbd><CornerDownLeft size={11} /></kbd>{" "}
-            {results[active]?.type === "asset" ? "Reveal (⏎ again opens)" : "Open"}
-          </span>
-          <span className="quick-search-hint"><kbd>Esc</kbd> Close</span>
         </div>
       </div>
     </div>

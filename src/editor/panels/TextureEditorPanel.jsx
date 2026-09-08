@@ -2,12 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Blend,
   Brush,
+  CheckSquare,
   ChevronDown,
   Check,
   ChevronUp,
   CircleDashed,
   CircleDot,
   Circle as CircleIcon,
+  Contrast,
   Copy,
   Droplet,
   Eraser,
@@ -15,6 +17,7 @@ import {
   EyeOff,
   CircleSlash2,
   Feather,
+  FilePlus,
   FolderOpen,
   Grid3x3,
   Image as ImageIcon,
@@ -38,6 +41,7 @@ import {
   SquareDot,
   SquareMinus,
   SquarePlus,
+  SquareX,
   Target,
   AlignCenter,
   AlignLeft,
@@ -50,7 +54,7 @@ import {
   X,
   ZoomIn,
   ZoomOut,
-} from "lucide-react";
+} from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
@@ -342,15 +346,20 @@ export function TextureEditorPanel() {
   if (!moduleOn) {
     return (
       <div className="panel-empty texture-editor-gate">
-        <ImageIcon size={26} />
-        <p>The Texture Editor module is not enabled for this project.</p>
-        <button className="tx-btn primary" onClick={() => setModuleEnabled("texture-editor", true)}>
+        <ImageIcon size={28} className="empty-glyph" />
+        <button className="tx-btn primary" title="The Texture Editor module is not enabled for this project" onClick={() => setModuleEnabled("texture-editor", true)}>
           Enable Texture Editor
         </button>
       </div>
     );
   }
-  if (!hasProject) return <div className="panel-empty">Open a project to edit textures.</div>;
+  if (!hasProject) {
+    return (
+      <div className="panel-empty" title="Open a project to edit textures">
+        <ImageIcon size={28} className="empty-glyph" />
+      </div>
+    );
+  }
 
   // Paint and Atlas are modes of one panel over one sheet, not two panels: the
   // two are used in the same breath (slice what you just erased; paint inside
@@ -1294,17 +1303,19 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
   return (
     <div className="texture-editor" ref={rootRef} tabIndex={-1}>
       <div className="texture-toolbar">
-        <button className="tx-btn" title="Open a texture from this project…" onClick={() => setShowPicker(true)}>
+        <button className="tx-btn icon" title="Open a texture from this project…" onClick={() => setShowPicker(true)}>
           <FolderOpen size={14} />
-          <span className="tx-label">Open</span>
         </button>
-        <button className="tx-btn" title="New texture…" onClick={() => setShowNew(true)}>
-          <Plus size={14} />
-          <span className="tx-label">New</span>
+        <button className="tx-btn icon" title="New texture…" onClick={() => setShowNew(true)}>
+          <FilePlus size={14} />
         </button>
-        <button className="tx-btn" title="Save (Ctrl+S)" disabled={!dirty || saving || !path} onClick={save}>
+        <button
+          className="tx-btn icon"
+          title={saving ? "Saving… (Ctrl+S)" : "Save (Ctrl+S)"}
+          disabled={!dirty || saving || !path}
+          onClick={save}
+        >
           <Save size={14} />
-          <span className="tx-label">{saving ? "Saving…" : "Save"}</span>
         </button>
         <span className="tx-sep" />
         <button className="tx-btn quiet icon" title="Undo (Ctrl+Z)" onClick={undo}>
@@ -1332,13 +1343,12 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
             is one more control than the toolbar needs. */}
         {!hasAtlas && (
           <button
-            className="tx-btn"
+            className="tx-btn icon"
             disabled={status !== "ready"}
             title="Cut this sheet into sprite regions — creates a .atlas beside it"
             onClick={onSliceIntoSprites}
           >
             <Scissors size={14} />
-            <span className="tx-label">Slice</span>
           </button>
         )}
         <span className="tx-spacer" />
@@ -1414,19 +1424,17 @@ function TextureWorkspace({ path, onPathChange, onAtlasChange, onSliceIntoSprite
           {status === "error" && <div className="panel-empty">Could not open this texture.</div>}
           {status === "empty" && (
             <div className="panel-empty texture-empty">
-              <ImageIcon size={28} />
-              <p>No texture open.</p>
+              <ImageIcon size={28} className="empty-glyph" title="Double-click any image in the Assets panel" />
               <div className="tx-row">
                 <button className="tx-btn primary" onClick={() => setShowPicker(true)}>
                   <FolderOpen size={14} />
                   <span>Open Texture…</span>
                 </button>
                 <button className="tx-btn" onClick={() => setShowNew(true)}>
-                  <Plus size={14} />
+                  <FilePlus size={14} />
                   <span>New Texture…</span>
                 </button>
               </div>
-              <p className="tx-hint">Or double-click any image in the Assets panel.</p>
             </div>
           )}
           {status === "ready" && doc && (
@@ -2766,11 +2774,10 @@ function TextureCanvas({
             }}
           />
           <div className="texture-text-actions">
-            <span className="hint">Ctrl+Enter to place · Esc to cancel</span>
-            <button className="tx-btn quiet" onClick={cancelText}>
-              Cancel
+            <button className="tx-btn quiet icon" title="Cancel (Esc)" onClick={cancelText}>
+              <X size={13} />
             </button>
-            <button className="tx-btn primary" onClick={commitText}>
+            <button className="tx-btn primary" title="Place (Ctrl+Enter)" onClick={commitText}>
               <Check size={13} />
               Place
             </button>
@@ -2940,14 +2947,14 @@ function ToolOptions(props) {
 
       <span className="tx-spacer" />
       <div className="tx-group">
-        <button className="tx-btn" title="Select all (Ctrl+A)" onClick={props.onSelectAll}>
-          All
+        <button className="tx-btn icon" title="Select all (Ctrl+A)" onClick={props.onSelectAll}>
+          <CheckSquare size={14} />
         </button>
-        <button className="tx-btn" title="Deselect (Ctrl+D)" disabled={!props.hasSelection} onClick={props.onDeselect}>
-          None
+        <button className="tx-btn icon" title="Deselect (Ctrl+D)" disabled={!props.hasSelection} onClick={props.onDeselect}>
+          <SquareX size={14} />
         </button>
-        <button className="tx-btn" title="Invert selection (Ctrl+I)" onClick={props.onInvert}>
-          Invert
+        <button className="tx-btn icon" title="Invert selection (Ctrl+I)" onClick={props.onInvert}>
+          <Contrast size={14} />
         </button>
       </div>
     </div>
@@ -3129,7 +3136,7 @@ function LayerColumn({
             <span className="tx-spacer" />
             <button
               className="tx-icon-btn"
-              title="Add an effect"
+              title="Add an effect — outline, shadow and glow follow the layer's shape"
               onClick={(event) => {
                 const rect = event.currentTarget.getBoundingClientRect();
                 setFxMenu({ x: rect.right, y: rect.bottom + 4 });
@@ -3138,7 +3145,6 @@ function LayerColumn({
               <Plus size={12} />
             </button>
           </div>
-          {!layer.effects?.length && <p className="tx-hint">Outline, shadow and glow follow the layer&apos;s shape.</p>}
           {!!layer.effects?.length && isFullyOpaque(layer.buffer) && (
             <p className="tx-hint warn">
               This layer is opaque edge to edge, so an outline, shadow or glow has nowhere to show.

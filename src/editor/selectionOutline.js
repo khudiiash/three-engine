@@ -3,6 +3,7 @@ import * as THREE from "three/webgpu";
 import { Fn, float, max, mix, step, texture, uniform, uv, vec2, vec4 } from "three/tsl";
 import { EDITOR_LAYER, SELECTION_ACTIVE_LAYER, SELECTION_MASK_LAYER } from "../engine/editorLayers.js";
 import { vmSingleton } from "./singleton.js";
+import { freeze } from "../engine/freezeLedger.js";
 
 /**
  * Blender-style silhouette outline for the selected entities.
@@ -617,10 +618,16 @@ export function applySelectionOutlineOverlay(colorNode) {
  * pipeline promises — so the override/target are restored immediately after
  * the call returns and the compiles finish in the background.
  *
- * LIMIT: `compileAsync` frustum-culls, so this warms the meshes the camera can
- * currently see — which covers click-selection by construction. Selecting an
- * OFF-SCREEN entity from the hierarchy can still compile on first draw; call
- * this again after big camera jumps if that ever reads as a hitch.
+ * ⚠ THREE'S compileAsync FRUSTUM-CULLS (zero-freeze plan unit 5.5, and the
+ * same trap GISystem.#compileWave documents at its `prevCulled`):
+ * `_projectObject` skips any `frustumCulled` object the camera cannot see, so
+ * this used to warm only the meshes the camera happened to be pointing at.
+ * Selecting an OFF-SCREEN entity from the HIERARCHY — which is most of how a
+ * hierarchy is used — then paid a synchronous `createRenderPipeline` inside
+ * the mask pass's own frame, which is the reported "it lags each time I select
+ * another object" surviving the prewarm that was supposed to have fixed it.
+ * The flag is lifted for the projection and restored in a `finally`, whatever
+ * happens; nothing renders in between, so no frame ever sees it off.
  */
 export async function precompileSelectionOutlineMasks({ renderer, scene, camera }) {
   if (!renderer || !scene || !camera) return;
@@ -644,8 +651,14 @@ export async function precompileSelectionOutlineMasks({ renderer, scene, camera 
   // pass will bind. Hide → synchronous projection → restore happens inside
   // one JS task per material, so no rendered frame ever sees the scene dark.
   const lights = [];
+  // Collected in the same walk as the lights, so the prewarm still costs one
+  // scene traversal. Hatch: `globalThis.__outlineWarmUnculled = false` restores
+  // the frustum-culled prewarm (i.e. the on-screen-only warm).
+  const unculled = [];
+  const lift = globalThis.__outlineWarmUnculled !== false;
   scene.traverse((obj) => {
     if (obj.isLight && obj.visible) lights.push(obj);
+    else if (lift && obj.isMesh && obj.frustumCulled) unculled.push(obj);
   });
   for (const material of [state.maskSelectedMaterial, state.maskActiveMaterial]) {
     const prevOverride = scene.overrideMaterial;
@@ -662,6 +675,7 @@ export async function precompileSelectionOutlineMasks({ renderer, scene, camera 
     let pending = null;
     try {
       for (const light of lights) light.visible = false;
+      for (const mesh of unculled) mesh.frustumCulled = false;
       scene.overrideMaterial = material;
       // (4) The target's GPU texture must EXIST before a compile against it
       // (2026-09-02): a pipeline's colour target format is read off the
@@ -686,12 +700,26 @@ export async function precompileSelectionOutlineMasks({ renderer, scene, camera 
       if (!renderer.backend?.get?.(state.maskTarget.texture)?.format) return;
       renderer.setRenderTarget(state.maskTarget);
       renderer.setMRT(null);
-      pending = renderer.compileAsync(scene, camera);
+      // Named for the ledger: compileAsync's SETUP is synchronous (projection,
+      // render-object creation, `createShaderModule` on every new variant), so
+      // with the cull lifted this walks the whole scene. If that ever blocks,
+      // the ledger must say it was the outline prewarm and not "(program)".
+      const span = freeze.begin("outline:prewarmMask");
+      try {
+        pending = renderer.compileAsync(scene, camera);
+      } finally {
+        freeze.end(span);
+      }
     } finally {
       renderer.setMRT(prevMrt);
       renderer.setRenderTarget(prevTarget);
       scene.overrideMaterial = prevOverride;
       for (const light of lights) light.visible = true;
+      // Restored before the await: `compileAsync`'s projection (the part that
+      // reads the flag) is synchronous, and leaving it off across a multi-
+      // second pipeline wait would hand the renderer a scene that draws every
+      // mesh in it — the culling this editor's frame budget depends on.
+      for (const mesh of unculled) mesh.frustumCulled = true;
     }
     await pending;
   }

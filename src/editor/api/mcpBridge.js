@@ -202,7 +202,7 @@ function connect() {
     // before anything is listening — the ordinary case for "enable the bridge
     // and immediately spawn a scoped client", not an edge case — missed its
     // first connect attempt and then never retried at all, silently stuck in
-    // "connecting" forever. Caught live: a fresh `runWorkflow` enabling the
+    // "connecting" forever. Caught live: a fresh AI turn enabling the
     // bridge and spawning `claude` within the same couple of seconds hit this
     // every time.
     scheduleReconnect();

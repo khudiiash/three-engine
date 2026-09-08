@@ -5,6 +5,7 @@ import { commandBus } from "./commands/CommandBus.js";
 import { useSceneStore } from "./store/sceneStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useProjectStore, lastProjectPath } from "./store/projectStore.js";
+import { freeze } from "../engine/freezeLedger.js";
 
 /**
  * The scene file on screen. VM-wide rather than a module-level `let`: "which
@@ -134,6 +135,24 @@ function bootCandidates() {
  * viewport can mount before `openProject` has resolved and a store miss would
  * silently put the destroy back.
  */
+/**
+ * ── ONE PARSE, NOT TWO (zero-freeze plan unit 4.1) ────────────────────────
+ * `peekBootRendererSettings` parses the scene file before the renderer is
+ * constructed; `restoreLastScene` then parsed the SAME file again a moment
+ * later. On a large scene that is two multi-hundred-millisecond synchronous
+ * `JSON.parse` blocks in one boot, for one object. The peek now keeps what it
+ * parsed and the restore takes it — one entry, consumed once, dropped after,
+ * so a scene re-opened later (or edited on disk in between) still re-reads.
+ */
+const parsedScenes = new Map();
+
+/** Hands the boot parse to `restoreLastScene`, at most once. */
+function takeParsedScene(path) {
+  const json = parsedScenes.get(path);
+  parsedScenes.delete(path);
+  return json ?? null;
+}
+
 export async function peekBootRendererSettings() {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
@@ -155,7 +174,14 @@ export async function peekBootRendererSettings() {
       if (legacy) candidates.push(legacy);
     }
     for (const path of [...new Set(candidates)]) {
+      const token = freeze.begin("boot:peekRendererSettings");
       const scene = await readJson(path).catch(() => null);
+      freeze.end(token);
+      // Keep it for `restoreLastScene`, whichever candidate wins there.
+      if (scene) {
+        parsedScenes.clear();
+        parsedScenes.set(path, scene);
+      }
       const renderer = scene?.settings?.renderer;
       if (renderer && typeof renderer === "object") return renderer;
     }
@@ -208,12 +234,21 @@ export async function restoreLastScene() {
         import("../engine/index.js"),
         import("./assetLoader.js"),
       ]);
+      freeze.bootStage("scene: read file");
       const contents = await invoke("load_scene", { path });
-      const json = JSON.parse(contents);
+      freeze.bootStage("scene: parse JSON", `${(contents.length / 1024).toFixed(0)} kB`);
+      // ⚠ The SECOND parse of this file in one boot — `peekBootRendererSettings`
+      // already parsed it to read `settings.renderer` before the renderer was
+      // constructed. Unit 4.1 of the zero-freeze plan removes the first one;
+      // until then the boot table shows both.
+      const json = takeParsedScene(path) ?? JSON.parse(contents);
+      freeze.bootStage("scene: preload assets");
       const assets = collectSceneAssets(json);
       await preloadAssetBinaries(assets);
       await preloadAssetBinaries(await expandMaterialAssets(assets));
+      freeze.bootStage("scene: deserialize");
       await deserializeScene(engine, json);
+      freeze.bootStage(null);
       engine.sceneName = sceneNameFromPath(path);
       if (path === candidates[0]) open.path = path;
       // Fell back past a `lastScene` that no longer exists — repair it, or
@@ -329,10 +364,30 @@ export async function saveScene({ saveAs = false } = {}) {
   const { invoke } = await import("@tauri-apps/api/core");
   const { serializeScene } = await import("../engine/index.js");
   engine.sceneName = sceneNameFromPath(path);
-  const contents = JSON.stringify(serializeScene(engine), null, 2);
+  // ── THE AUTOSAVE HITCH (2026-09-07, found by profile.freezes) ────────────
+  // The freeze ledger showed a ~57 ms main-thread block landing every ~10 s
+  // for the whole session — a rhythm, not an event, which is the worst kind of
+  // stutter because it never stops. It is this line: a full engine walk plus a
+  // pretty-printed `JSON.stringify` of a 326 kB document, on the autosave
+  // interval, while the user is working.
+  //
+  // Spanned in two halves because they have different fixes: the WALK is
+  // engine-shaped work, the STRINGIFY is bytes. Whichever dominates is the one
+  // to attack next.
+  const json = freeze.run("scene:serialize", () => serializeScene(engine));
+  const contents = freeze.run("scene:stringify", () => JSON.stringify(json, null, 2));
   await invoke("save_scene", { path, contents });
+  // The scene's picture, for every place assets show one (sceneThumbs.js).
+  // Throttled there; never lets a save fail.
+  import("./sceneThumbs.js").then((m) => m.captureSceneThumb(path)).catch(() => {});
   rememberScene(path);
-  useSceneStore.getState().refresh();
+  // ⛔ NO `sceneStore.refresh()` HERE. Saving changes no entity — it reads the
+  // scene, it does not edit it — but the refresh rebuilds the mirror of every
+  // entity with fresh object identities, so every Hierarchy row re-rendered
+  // once per autosave. `markDirty(false)` is the only thing a save actually
+  // has to publish, and it is the thing the chrome reads.
+  // `__editorSaveRefreshesMirror = true` restores the old behaviour.
+  if (globalThis.__editorSaveRefreshesMirror === true) useSceneStore.getState().refresh();
   useSceneStore.getState().markDirty(false);
   console.log(`Scene saved: ${path}`);
   return true;

@@ -128,7 +128,13 @@ export class ParticleComponent extends Component {
       if (subsystem) this.subsystems.push(subsystem);
     }
 
-    this.unsubUpdate = this.entity.engine.onUpdate(() => this.#tick());
+    this.unsubUpdate = this.entity.engine.onUpdate(() => {
+      // Held while a modal editor mode owns the viewport (the geometry
+      // editor). See Engine.suspendSimulation: advancing the rest of the
+      // scene while the user is inside one mesh is pure interference.
+      if (this.entity.engine.simulationSuspended === true) return;
+      this.#tick();
+    });
   }
 
   #buildSubsystem(sys) {

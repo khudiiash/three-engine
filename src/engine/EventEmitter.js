@@ -50,7 +50,21 @@ export class EventEmitter {
     const set = this.#listeners.get(event);
     if (EventEmitter.monitor) EventEmitter.monitor(this, event, args, set?.size ?? 0);
     if (!set) return;
-    for (const fn of [...set]) fn(...args);
+    for (const fn of [...set]) this._invoke(fn, event, args);
+  }
+
+  /**
+   * The one seam where a listener is actually called. Exists so a subclass can
+   * measure the fan-out without reimplementing `emit`: `Engine` overrides it to
+   * charge each listener's milliseconds to (event, listener) while
+   * `profile.edit` is armed. A coarse event like "hierarchy-changed" reaches
+   * ~20 listeners that each walk the scene, and before this there was no way to
+   * ask which of them a param edit was paying for.
+   *
+   * Base cost is one monomorphic call per listener.
+   */
+  _invoke(fn, _event, args) {
+    fn(...args);
   }
 
   async emitAsync(event, ...args) {

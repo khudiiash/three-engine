@@ -9,6 +9,7 @@ import { migrateLegacyGraph } from "./shaderGraph.js";
 
 import { compileShaderGraph, invalidateShaderTextureCache, loadShaderTexture, matchStockPbr, migrateGraph } from "./tslGraph.js";
 import { loadTextureAsset } from "./textureAsset.js";
+import { freeze } from "./freezeLedger.js";
 
 
 export const MATERIAL_PIPELINE_DEFAULTS = {

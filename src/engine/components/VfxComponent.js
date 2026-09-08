@@ -19,6 +19,9 @@ export class VfxComponent extends Component {
     this.time = 0; this.state = "stopped";
     this.rebuild();
     this._off = this.entity.engine.onUpdate((dt) => {
+      // Held while a modal editor mode owns the viewport (the geometry
+      // editor). See Engine.suspendSimulation.
+      if (this.entity.engine.simulationSuspended === true) return;
       const ownerVisible = this.ownerVisible();
       if (ownerVisible !== this._ownerVisible) { this._ownerVisible = ownerVisible; this.evaluate(this.time); }
       if (!this.enabled || !ownerVisible || this.state !== "playing") { this.alignBillboards(); return; }

@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { useEffect, useMemo, useState } from "react";
-import { FileCode2, X, Circle } from "lucide-react";
+import { FileCode2, X, Circle } from "../icons/index.jsx";
 import { CodeEditor } from "../components/CodeEditor.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { basename } from "../store/projectStore.js";
@@ -40,12 +40,11 @@ export function CodePanel({ api }) {
 
   if (!files.length) {
     return (
-      <div className="code-panel empty">
-        <FileCode2 size={26} strokeWidth={1.4} />
-        <p>No file open.</p>
-        <p className="asset-hint">
-          Double-click a script in Assets, or use Open in Code Editor from an asset's Inspector.
-        </p>
+      <div
+        className="code-panel empty"
+        title="Double-click a script in Assets, or use Open in Code Editor from an asset's Inspector"
+      >
+        <FileCode2 size={28} className="empty-glyph" strokeWidth={1.4} />
       </div>
     );
   }

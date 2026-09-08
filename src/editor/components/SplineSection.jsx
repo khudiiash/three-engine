@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, ArrowUp, ArrowDown, Pencil, Crosshair } from "lucide-react";
+import { Plus, Trash2, ArrowUp, ArrowDown, Pencil, Crosshair } from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";

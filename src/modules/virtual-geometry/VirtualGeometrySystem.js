@@ -221,7 +221,13 @@ export class VirtualGeometrySystem {
       }
     });
     this._offHier = engine.on("hierarchy-changed", () => (this._pruneNeeded = true));
-    this._offTick = engine.onUpdate(() => this.#tick());
+    this._offTick = engine.onUpdate(() => {
+      // Held while a modal editor mode owns the viewport (the geometry
+      // editor). This rewrites index buffers per frame; doing it to the
+      // rest of the scene while one mesh is being edited is interference.
+      if (engine.simulationSuspended === true) return;
+      this.#tick();
+    });
     activeSystems.add(this);
     // The module can be enabled after a scene (and its models) already loaded.
     for (const entity of engine.entities.values()) this.applyEntity(entity);

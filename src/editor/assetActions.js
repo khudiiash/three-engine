@@ -8,6 +8,7 @@ import {
   FONT_EXTENSIONS,
 } from "./assetLoader.js";
 import { openAssetPath } from "./openAsset.js";
+import { splitGeometryIslandsWithPrompt } from "./geometrySplit.js";
 import { openInIDE } from "./openInIde.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useProjectStore, basename } from "./store/projectStore.js";
@@ -143,6 +144,8 @@ function modelActions(path) {
 }
 
 function geometryActions(path) {
+  // See `splitGeometryIslandsWithPrompt` — the confirm is not politeness, it is
+  // the difference between three curtains and 671 vines.
   return [
     {
       id: "asset.open",
@@ -151,6 +154,13 @@ function geometryActions(path) {
       icon: "ExternalLink",
       primary: true,
       run: () => openAssetPath(path),
+    },
+    {
+      id: "geom.splitIslands",
+      label: "Split into Separate Meshes…",
+      hint: "One entity per disconnected piece — and every entity using this asset splits too.",
+      icon: "Scissors",
+      run: () => splitGeometryIslandsWithPrompt({ path }),
     },
     {
       id: "geom.exportGlb",

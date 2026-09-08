@@ -123,7 +123,7 @@ export function rippleSpeed({ waveSpeed = 2, waveLength = 10, horizontal = 40 } 
 
 /** The user's own configuration: a 40 x 10 x 40 body of water and a 5 m cube. */
 function pool({ bodyDensity = 500, waveHeight = .15, viscosity, waveLength = 10, worldWidth = 40, worldDepth = 10, bodySize = 5 } = {}) {
-  const engine = { playing: true, scene: new THREE.Scene(), on: () => () => {}, onUpdate: () => () => {}, config: {}, entities: new Map() };
+  const engine = { playing: true, scene: new THREE.Scene(), on: () => () => {}, onUpdate: () => () => {}, config: {}, entities: new Map(), batchHierarchy: (fn) => fn() };
   const physics = new PhysicsSystem(engine, RAPIER);
   physics.world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
   physics.eventQueue = new RAPIER.EventQueue(true);

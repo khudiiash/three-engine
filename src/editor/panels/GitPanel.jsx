@@ -20,7 +20,7 @@ import {
   Trash2,
   Undo2,
   UploadCloud,
-} from "lucide-react";
+} from "../icons/index.jsx";
 import { PopoverMenu } from "../fields/PopoverMenu.jsx";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
@@ -79,7 +79,13 @@ export function GitPanel() {
     }
   }, []);
 
-  if (!rootPath) return <div className="inspector-panel empty">Open a project to use version control.</div>;
+  if (!rootPath) {
+    return (
+      <div className="inspector-panel empty" title="Open a project to use version control">
+        <GitBranch size={28} className="empty-glyph" />
+      </div>
+    );
+  }
   if (!state.tools) {
     return (
       <div className="inspector-panel empty">
@@ -103,20 +109,20 @@ function NoGitView() {
   return (
     <div className="inspector-panel git-panel">
       <div className="git-hero">
-        <GitBranch size={22} />
-        <h3>Git isn&rsquo;t installed</h3>
-        <p>
-          Version control needs the git command-line tool. It is a small, free install, and the editor will find it
-          automatically afterwards.
-        </p>
+        <GitBranch
+          size={28}
+          className="empty-glyph"
+          title="Git isn't installed — it's a small, free install, and the editor will find it automatically afterwards"
+        />
         <div className="git-hero-actions">
-          <button className="toolbar-btn" onClick={() => openExternal("https://git-scm.com/downloads")}>
+          <button className="toolbar-btn" title="Download git" onClick={() => openExternal("https://git-scm.com/downloads")}>
             <ExternalLink size={12} />
             Get git
           </button>
           <button
             className="toolbar-btn"
             disabled={checking}
+            title="Look for git again"
             onClick={async () => {
               setChecking(true);
               await probeTools({ refresh: true });
@@ -146,24 +152,11 @@ function SetupView({ busy, error, run }) {
   return (
     <div className="inspector-panel git-panel">
       <div className="git-hero">
-        <GitBranch size={22} />
-        <h3>Track {projectName ?? basename(rootPath)} with git</h3>
-        <p>
-          A repository keeps every version of this project, so you can look at what changed, go back to a version that
-          worked, and publish it. Creating one changes nothing about how the editor behaves.
-        </p>
-        <ul className="git-hero-list">
-          <li>
-            Ignores <code>{outDir}/</code> and <code>engine-types/</code> — build output and generated type
-            definitions, both rebuilt on demand.
-          </li>
-          <li>Keeps <code>.meta</code> sidecars: they hold import settings you authored, not derived data.</li>
-          <li>
-            {lfsAvailable
-              ? "Stores models, textures and audio in Git LFS, so the repository stays small."
-              : "Git LFS is not installed, so binary assets will be stored directly. Installing it later is possible but means rewriting history."}
-          </li>
-        </ul>
+        <GitBranch
+          size={28}
+          className="empty-glyph"
+          title={`Track ${projectName ?? basename(rootPath)} with git — keeps every version so you can see what changed, go back, and publish it. Ignores ${outDir}/ and engine-types/; keeps .meta sidecars.`}
+        />
         <label className="git-check" title="Track binary asset formats with Git LFS from the first commit.">
           <input type="checkbox" checked={lfs && lfsAvailable} disabled={!lfsAvailable} onChange={(e) => setLfs(e.target.checked)} />
           Use Git LFS for binary assets
@@ -172,6 +165,11 @@ function SetupView({ busy, error, run }) {
           <button
             className="toolbar-btn primary"
             disabled={!!busy}
+            title={
+              lfsAvailable
+                ? "Create the repository — stores models, textures and audio in Git LFS"
+                : "Create the repository — Git LFS is not installed, so binary assets are stored directly"
+            }
             onClick={() =>
               run("Creating repository…", async () => {
                 const created = await service.initRepository({
@@ -318,9 +316,8 @@ function RepoView({ state, busy, error, setError, run }) {
             ]}
           />
           {!state.files.length ? (
-            <div className="git-empty">
-              <Check size={14} />
-              Nothing has changed since the last commit.
+            <div className="git-empty" title="Nothing has changed since the last commit">
+              <Check size={28} className="empty-glyph" />
             </div>
           ) : null}
           <GithubSection state={state} busy={busy} act={act} setError={setError} />
@@ -367,13 +364,12 @@ function GitToolbar({ state, busy, act }) {
       {menu ? <BranchMenu anchorRef={branchRef} state={state} act={act} onClose={() => setMenu(false)} /> : null}
 
       <button
-        className="toolbar-btn"
+        className="toolbar-btn icon-only"
         disabled={!!busy || !hasRemote}
-        title={hasRemote ? "Check the remote for new commits. Changes nothing on disk." : "No remote is configured yet."}
+        title={hasRemote ? "Fetch — check the remote for new commits. Changes nothing on disk." : "Fetch — no remote is configured yet."}
         onClick={() => act("Fetching…", () => service.fetch({}))}
       >
         <RefreshCw size={12} />
-        Fetch
       </button>
       <button
         className="toolbar-btn"
@@ -382,7 +378,7 @@ function GitToolbar({ state, busy, act }) {
         onClick={() => act("Pulling…", () => service.pull({}))}
       >
         <ArrowDown size={12} />
-        Pull{behind ? ` ${behind}` : ""}
+        {behind ? <span className="cnt" title={`${behind} commit${behind === 1 ? "" : "s"} behind`}>{behind}</span> : null}
       </button>
       <button
         className="toolbar-btn"
@@ -391,7 +387,7 @@ function GitToolbar({ state, busy, act }) {
         onClick={() => act("Pushing…", () => service.push({}))}
       >
         <ArrowUp size={12} />
-        Push{ahead ? ` ${ahead}` : ""}
+        {ahead ? <span className="cnt" title={`${ahead} commit${ahead === 1 ? "" : "s"} ahead`}>{ahead}</span> : null}
       </button>
       <div className="menu-spacer" />
       <button
@@ -503,7 +499,7 @@ function IdentityBanner({ identity, act }) {
       }}
     >
       <div>
-        <strong>Who is committing?</strong> Git stamps a name and email onto every commit.
+        <strong title="Git stamps a name and email onto every commit">Who is committing?</strong>
       </div>
       <input className="text-field" value={name} placeholder="Your name" onChange={(e) => setName(e.target.value)} />
       <input className="text-field" value={email} placeholder="you@example.com" onChange={(e) => setEmail(e.target.value)} />
@@ -521,11 +517,13 @@ function DirtySceneBanner() {
   const sceneName = useSceneStore((s) => s.sceneName);
   if (!dirty) return null;
   return (
-    <div className="git-banner">
+    <div
+      className="git-banner"
+      title="They are only in memory — save the scene (Ctrl+S) before committing, or they will not be part of it"
+    >
       <AlertTriangle size={13} />
       <div>
-        <strong>{sceneName} has unsaved edits.</strong> They are only in memory — save the scene (Ctrl+S) before
-        committing, or they will not be part of it.
+        <strong>{sceneName} has unsaved edits.</strong>
       </div>
     </div>
   );
@@ -553,11 +551,16 @@ function CommitBox({ message, setMessage, amend, setAmend, stagedCount, busy, on
         <button
           className="toolbar-btn primary"
           disabled={!!busy || (!message.trim() && !amend) || (!stagedCount && !amend)}
-          title="Ctrl+Enter"
+          title="Commit (Ctrl+Enter)"
           onClick={onCommit}
         >
           <GitCommitHorizontal size={12} />
-          Commit{stagedCount ? ` ${stagedCount}` : ""}
+          Commit
+          {stagedCount ? (
+            <span className="cnt" title={`${stagedCount} staged file${stagedCount === 1 ? "" : "s"}`}>
+              {stagedCount}
+            </span>
+          ) : null}
         </button>
       </div>
     </div>
@@ -694,9 +697,8 @@ function DiffPane({ root, selected, refreshedAt }) {
 
   if (!selected) {
     return (
-      <div className="git-detail-empty">
-        <FileDiff size={16} />
-        Select a file to see what changed in it.
+      <div className="git-detail-empty" title="Select a file to see what changed in it">
+        <FileDiff size={28} className="empty-glyph" />
       </div>
     );
   }
@@ -712,7 +714,11 @@ function DiffPane({ root, selected, refreshedAt }) {
 
 function DiffBody({ files }) {
   if (!files.length) {
-    return <div className="git-detail-empty">No textual difference — the file's contents are identical.</div>;
+    return (
+      <div className="git-detail-empty" title="No textual difference — the file's contents are identical">
+        <Check size={28} className="empty-glyph" />
+      </div>
+    );
   }
   return (
     <div className="git-diff">
@@ -780,7 +786,11 @@ function HistoryPane({ root, refreshedAt }) {
   };
 
   if (!commits.length) {
-    return <div className="git-detail-empty">No commits yet. Stage some files and make the first one.</div>;
+    return (
+      <div className="git-detail-empty" title="No commits yet — stage some files and make the first one">
+        <History size={28} className="empty-glyph" />
+      </div>
+    );
   }
   return (
     <div className="git-history">
@@ -847,8 +857,12 @@ function GithubSection({ state, busy, act, setError }) {
     return (
       <div className="git-github">
         <span className="git-github-label">GitHub</span>
-        <button className="git-link" onClick={() => openExternal("https://cli.github.com")}>
-          Install the GitHub CLI to publish from here
+        <button
+          className="git-link"
+          title="Install the GitHub CLI to publish from here"
+          onClick={() => openExternal("https://cli.github.com")}
+        >
+          Install GitHub CLI
           <ExternalLink size={11} />
         </button>
       </div>

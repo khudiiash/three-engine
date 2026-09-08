@@ -1,46 +1,16 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { useConsoleStore } from "../store/consoleStore.js";
+import { PanelTab } from "../PanelTab.jsx";
 
 /**
- * Custom Dockview tab renderer for the Console panel. Mirrors the default
- * tab's DOM (icon slot / title text / close button, with the same handlers
- * the default tab installs) so it slots in cleanly next to the other panels,
- * and adds a small red dot when error-level entries have arrived since the
- * user last opened the panel. The dot disappears as soon as the tab becomes
- * active — i.e. the user is now looking at the console.
+ * The Console's tab: the standard PanelTab plus a count of error-level entries
+ * that arrived since the user last looked. The count clears as soon as the tab
+ * becomes active — the user is now looking at the console. A number in a red
+ * chip replaced the earlier pulsing dot: it says how much, and it does not move.
  */
-export function ConsoleTab({ api, containerApi, params, tabLocation }) {
+export function ConsoleTab({ api, tabLocation }) {
   const unread = useConsoleStore((s) => s.unreadErrors);
   const markConsoleRead = useConsoleStore((s) => s.markConsoleRead);
-
-  // Mirror the default tab's middle-click-to-close and active-tracking
-  // behaviour so our swap-in doesn't change anything else about how the tab
-  // behaves.
-  const isMiddleMouseButton = useRef(false);
-
-  const onClose = useCallback((event) => {
-    event.preventDefault();
-    api.close();
-  }, [api]);
-
-  const onBtnPointerDown = useCallback((event) => {
-    event.preventDefault();
-  }, []);
-
-  const onPointerDown = useCallback((event) => {
-    isMiddleMouseButton.current = event.button === 1;
-  }, []);
-
-  const onPointerUp = useCallback((event) => {
-    if (isMiddleMouseButton.current && event.button === 1) {
-      isMiddleMouseButton.current = false;
-      onClose(event);
-    }
-  }, [onClose]);
-
-  const onPointerLeave = useCallback(() => {
-    isMiddleMouseButton.current = false;
-  }, []);
 
   useEffect(() => {
     const disposable = api.onDidActiveChange((event) => {
@@ -49,31 +19,16 @@ export function ConsoleTab({ api, containerApi, params, tabLocation }) {
     return () => disposable.dispose();
   }, [api, markConsoleRead]);
 
-  return (
-    <div
-      className="dv-default-tab console-tab"
-      onPointerDown={onPointerDown}
-      onPointerUp={onPointerUp}
-      onPointerLeave={onPointerLeave}
-    >
-      <span className="dv-default-tab-content">
-        {unread > 0 && (
-          <span
-            className="console-error-dot"
-            title={`${unread} unread error${unread === 1 ? "" : "s"}`}
-            aria-label={`${unread} unread error${unread === 1 ? "" : "s"}`}
-          />
-        )}
-        <span className="console-tab-title">Console</span>
+  const badge =
+    unread > 0 ? (
+      <span
+        className="panel-tab-badge"
+        title={`${unread} unread error${unread === 1 ? "" : "s"}`}
+        aria-label={`${unread} unread error${unread === 1 ? "" : "s"}`}
+      >
+        {unread > 99 ? "99+" : unread}
       </span>
-      <div className="dv-default-tab-action" onPointerDown={onBtnPointerDown} onClick={onClose}>
-        <svg width="11" height="11" viewBox="0 0 28 28" aria-hidden="true" className="dv-svg">
-          <path
-            d="M19 6.41L17.59 5 14 8.59 10.41 5 9 6.41 12.59 10 9 13.59 10.41 15 14 11.41 17.59 15 19 13.59 15.41 10z"
-            fill="currentColor"
-          />
-        </svg>
-      </div>
-    </div>
-  );
+    ) : null;
+
+  return <PanelTab api={api} tabLocation={tabLocation} badge={badge} />;
 }

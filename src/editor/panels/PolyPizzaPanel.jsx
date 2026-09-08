@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Download, ExternalLink, KeyRound, Loader2, Pizza, Search } from "lucide-react";
+import { Download, ExternalLink, KeyRound, Loader2, Pizza, Power, Search } from "../icons/index.jsx";
 import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import {
@@ -129,15 +129,9 @@ export function PolyPizzaPanel() {
     return (
       <div className="ph-panel">
         <div className="ph-gate">
-          <Pizza size={28} />
-          <h3>Poly Pizza</h3>
-          <p>
-            Browse thousands of free low-poly models — CC0 and CC-BY, including rigged and animated
-            characters and animals — and import them straight into the project. Enable the Poly
-            Pizza module to get started.
-          </p>
+          <Pizza size={28} className="empty-glyph" />
           <button className="toolbar-btn wide" onClick={() => setModuleEnabled("polypizza", true)}>
-            Enable Poly Pizza module
+            <Power size={13} /> Enable Poly Pizza module
           </button>
         </div>
       </div>
@@ -147,14 +141,8 @@ export function PolyPizzaPanel() {
   if (!token) {
     return (
       <div className="ph-panel">
-        <div className="ph-gate">
-          <KeyRound size={28} />
-          <h3>Connect Poly Pizza</h3>
-          <p>
-            Poly Pizza's API needs a free key before it will return anything at all — browsing and
-            downloading both go through it. Generate one on poly.pizza and save it in the Modules
-            panel.
-          </p>
+        <div className="ph-gate" title="Poly Pizza's API needs a free key before it will return anything at all — generate one on poly.pizza and save it in the Modules panel">
+          <KeyRound size={28} className="empty-glyph" />
           <button className="toolbar-btn wide" onClick={() => openModulesPanel()}>
             Open Modules
           </button>
@@ -175,7 +163,9 @@ export function PolyPizzaPanel() {
             onChange={(event) => setQuery(event.target.value)}
           />
         </div>
-        <button className="toolbar-btn" type="submit">Search</button>
+        <button className="toolbar-btn icon-only" type="submit" title="Search">
+          <Search size={13} />
+        </button>
         <select
           className="ph-category"
           value={filters.category}
@@ -212,7 +202,7 @@ export function PolyPizzaPanel() {
           ) : error && !items ? (
             <div className="ph-status">Couldn't reach Poly Pizza: {error}</div>
           ) : items === null ? (
-            <div className="ph-status"><Loader2 size={14} className="ph-spin" /> Loading catalog…</div>
+            <div className="ph-status"><Loader2 size={14} className="ph-spin" /></div>
           ) : items.length === 0 ? (
             <div className="ph-status">No models match those filters.</div>
           ) : (
@@ -289,7 +279,7 @@ function ModelDetail({ model, hasProject, onClose }) {
       <div className="ph-detail-meta">
         <span>by {model.author}</span>
         <span>{model.license}</span>
-        {model.triangles > 0 && <span>{model.triangles.toLocaleString()} tris</span>}
+        {model.triangles > 0 && <span className="cnt" title="triangles">{model.triangles.toLocaleString()}</span>}
         {model.animated && <span>Animated</span>}
       </div>
       {model.description && <p className="sf-description">{model.description.replace(/<[^>]*>/g, " ")}</p>}

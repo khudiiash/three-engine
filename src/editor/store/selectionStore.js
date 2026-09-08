@@ -17,6 +17,19 @@ export function selectedIdSet(ids) {
   return selectedCache.set;
 }
 
+/**
+ * The one empty asset selection (docs/ZERO_FREEZE_PLAN.md §2.3, unit 5.6).
+ *
+ * Selecting an ENTITY clears the asset selection, and every write below used
+ * to spell that clear as a fresh `[]`. zustand compares slices by identity, so
+ * a new empty array is a change: every panel subscribed to `s.assetPaths` —
+ * the Assets grid, the inspector's asset side, anything holding a tile
+ * selection — re-rendered on every click in the viewport or the hierarchy,
+ * for a value that had not changed. Frozen so a caller cannot make it a
+ * shared mutable.
+ */
+const NO_ASSETS = Object.freeze([]);
+
 // VM-wide: a duplicate copy of this module (HMR / Vite `?t=`) would give the
 // selection ops a store the mounted panels are not subscribed to, so selecting
 // from a script or over MCP would change nothing on screen. See singleton.js.
@@ -30,7 +43,7 @@ export const useSelectionStore = vmSingleton("selectionStore", () =>
     // several assets are selected, `assetPaths` holds all of them (including the
     // primary) and `assetAnchor` is the tile shift-click ranges extend from.
     assetPath: null,
-    assetPaths: [],
+    assetPaths: NO_ASSETS,
     assetAnchor: null,
 
     select(ids, anchorId) {
@@ -39,7 +52,7 @@ export const useSelectionStore = vmSingleton("selectionStore", () =>
         ids: list,
         anchorId: anchorId ?? list[0] ?? null,
         assetPath: null,
-        assetPaths: [],
+        assetPaths: NO_ASSETS,
         assetAnchor: null,
       });
     },
@@ -49,7 +62,7 @@ export const useSelectionStore = vmSingleton("selectionStore", () =>
       const ids = get().ids.includes(id)
         ? get().ids.filter((x) => x !== id)
         : [...get().ids, id];
-      set({ ids, anchorId: id, assetPath: null, assetPaths: [], assetAnchor: null });
+      set({ ids, anchorId: id, assetPath: null, assetPaths: NO_ASSETS, assetAnchor: null });
     },
 
     /**
@@ -69,7 +82,7 @@ export const useSelectionStore = vmSingleton("selectionStore", () =>
         ids: merged,
         anchorId: anchorId ?? get().anchorId ?? list[0] ?? null,
         assetPath: null,
-        assetPaths: [],
+        assetPaths: NO_ASSETS,
         assetAnchor: null,
       });
     },
@@ -122,7 +135,7 @@ export const useSelectionStore = vmSingleton("selectionStore", () =>
     },
 
     clear() {
-      set({ ids: [], anchorId: null, assetPath: null, assetPaths: [], assetAnchor: null });
+      set({ ids: [], anchorId: null, assetPath: null, assetPaths: NO_ASSETS, assetAnchor: null });
     },
 
     /**
@@ -133,7 +146,7 @@ export const useSelectionStore = vmSingleton("selectionStore", () =>
      * see assetReveal.js) would otherwise blank the panel you clicked from.
      */
     clearAssets() {
-      set({ assetPath: null, assetPaths: [], assetAnchor: null });
+      set({ assetPath: null, assetPaths: NO_ASSETS, assetAnchor: null });
     },
 
     /** Drop ids that no longer exist (after deletes / scene loads). */

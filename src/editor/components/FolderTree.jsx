@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Folder, FolderOpen } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder, FolderOpen } from "../icons/index.jsx";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { useAssetDrop } from "../assetDrag.js";
 import {

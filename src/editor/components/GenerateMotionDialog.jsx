@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronDown, Loader2, Sparkles, X } from "lucide-react";
+import { ChevronDown, Loader2, Sparkles, X } from "../icons/index.jsx";
 import { invoke } from "../assetOps.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { getKimodoPrefs, setKimodoPrefs } from "../kimodoPrefs.js";

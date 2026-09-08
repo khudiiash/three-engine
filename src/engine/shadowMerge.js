@@ -66,6 +66,7 @@
  */
 import * as THREE from "three/webgpu";
 import { mergeGeometries } from "./merging.js";
+import { freeze } from "./freezeLedger.js";
 import {
   SHADOW_PROXY_LAYER,
   GI_DEPTH_LAYER,
@@ -306,9 +307,26 @@ export class ShadowMergeSystem {
       const settling = now - (this._dirtiedAt ?? 0) < SETTLE_MS;
       const starving = now - (this._dirtySince ?? now) > MAX_DEFER_MS;
       if (settling && !starving && this.groups.length > 0) return;
+      // ── ONE REBUILD PER EDIT, NOT TWO (2026-09-07, ZERO_FREEZE_PLAN §1.5) ─
+      //
+      // THE FAILURE: this system and `merging.js` subscribe to the SAME
+      // events, and merging holds its rebuild behind a 400 ms settle and a
+      // 250 ms interval while this one only has the settle. So one edit ran
+      // this rebuild at its settle, merging rebuilt at ITS clock a moment
+      // later, the `_rebuildCount` check above then invalidated this system
+      // AGAIN, and the whole caster set — every mesh in the scene, and every
+      // proxy — was re-absorbed twice for one change.
+      //
+      // Waiting for merging to be quiet costs nothing (this rebuild is
+      // *defined* as running after merging's — see the ⚠ above) and halves it.
+      // Bounded by `starving` so a scene whose merge never settles still gets
+      // its shadows: the ceiling is MAX_DEFER_MS, not "forever".
+      const merging = this.engine.merging;
+      const mergePending = merging?.enabled === true && merging._dirty === true;
+      if (mergePending && !starving && globalThis.__shadowMergeFollowsMerge !== false) return;
       this._building = true;
       try {
-        this.#rebuild();
+        freeze.run("shadowMerge:rebuild", () => this.#rebuild());
       } finally {
         this._building = false;
         this._dirty = false;

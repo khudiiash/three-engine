@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   Box,
   Braces,
   ChevronDown,
+  ChevronUp,
   Download,
   EyeOff,
   File,
@@ -32,9 +33,13 @@ import {
   Film,
   Aperture,
   X,
-} from "lucide-react";
+} from "../icons/index.jsx";
+import { ICON_BY_EXT } from "../assetIcons.js";
+import { nextSort, readSort, sortEntries, writeSort } from "../assetSort.js";
+import { folderSizeOf, measureFolderSizes } from "../folderSizes.js";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
+import { askAiMenuItem, assetSelectionContext } from "../ai/askAi.js";
 import { useAssetProcessingStore } from "../store/assetProcessingStore.js";
 import {
   extOf,
@@ -105,33 +110,19 @@ import { ResizeAssetsDialog } from "../components/ResizeAssetsDialog.jsx";
 import { buildAtlasFromImages, createAtlasForImage, findAtlasForImage } from "../atlasFile.js";
 import { ContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
 import { requestGeometryThumb } from "../geometryThumb.js";
+import { useAssetThumb } from "../components/AssetThumb.jsx";
 
-const ICON_BY_EXT = {
-  glb: Box,
-  gltf: Box,
-  fbx: Box,
-  scene: Layers,
-  json: Braces,
-  js: FileCode2,
-  ts: FileCode2,
-  mat: Palette,
-  cubemap: Globe,
-  png: Image,
-  jpg: Image,
-  jpeg: Image,
-  webp: Image,
-  prefab: Package,
-  entity: Package, // legacy prefab snapshots
-  anim: Workflow,
-  geom: Shapes,
-  timeline: Film,
-  post: Aperture,
-  vfx: Workflow,
-  ttf: Type,
-  otf: Type,
-  woff: Type,
-  woff2: Type,
-};
+/** A scene's tile: the picture saved with it (sceneThumbs.js), else the glyph. */
+function SceneTileThumb({ path, size }) {
+  const url = useAssetThumb(path);
+  if (!url)
+    return (
+      <div className="asset-icon" style={{ width: size, height: size }}>
+        <Layers size={size * 0.65} strokeWidth={1.5} />
+      </div>
+    );
+  return <img className="asset-thumb scene-thumb" src={url} alt="" draggable={false} style={{ width: size, height: size }} />;
+}
 
 const TYPE_LABEL = {
   glb: "Model",
@@ -168,11 +159,37 @@ const VIEW_MODES = [
   { id: "details", title: "Details", Icon: List, thumb: 18 },
   { id: "small", title: "Small icons", Icon: Grid3x3, thumb: 24 },
   { id: "medium", title: "Medium icons", Icon: Grid2x2, thumb: 40 },
-  { id: "large", title: "Large icons", Icon: LayoutGrid, thumb: 72 },
+  { id: "large", title: "Large icons", Icon: LayoutGrid, thumb: 96 },
 ];
 
-const VIEW_KEY = "engine.assets.viewMode.v1";
+// v2: the default became the large, thumbnail-first grid (2026-09-08).
+const VIEW_KEY = "engine.assets.viewMode.v2";
 const TREE_KEY = "engine.assets.showTree.v1";
+/** What the list's Type column shows, and so what "sort by type" orders. */
+const typeLabelOf = (entry) => (entry.is_dir ? "" : (TYPE_LABEL[entry.ext] ?? entry.ext ?? ""));
+
+/** A list header cell: click (or Enter / Space) sorts by its column. */
+function SortHeader({ column, label, sort, onSort, className }) {
+  const active = sort.by === column;
+  return (
+    <div
+      className={`${className} asset-sort${active ? " sorted" : ""}`}
+      role="button"
+      tabIndex={0}
+      aria-sort={active ? (sort.dir > 0 ? "ascending" : "descending") : "none"}
+      onClick={() => onSort(column)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSort(column);
+        }
+      }}
+    >
+      {label}
+      {active ? sort.dir > 0 ? <ChevronUp size={11} aria-hidden="true" /> : <ChevronDown size={11} aria-hidden="true" /> : null}
+    </div>
+  );
+}
 
 /** New Script lands in the folder the user is browsing (the inspector's
  *  inline version writes to `<root>/scripts` instead — see scriptAsset.js). */
@@ -276,6 +293,9 @@ function MaterialThumb({ path, size }) {
   const [def, setDef] = useState(null);
   const [mapUrl, setMapUrl] = useState(null);
   const [liveColor, setLiveColor] = useState(null);
+  // The lit sphere from assetThumbs.js; the swatch + map below is what shows
+  // until it has rendered (and what stays if it cannot).
+  const rendered = useAssetThumb(path);
   useEffect(() => {
     let live = true;
     (async () => {
@@ -319,7 +339,11 @@ function MaterialThumb({ path, size }) {
       style={{ width: size, height: size, background: color ?? "#888" }}
       title={unset ? "Default color — open in the Shader Graph panel to set a real color" : undefined}
     >
-      {mapUrl && <img className="mat-thumb-map" src={mapUrl} alt="" draggable={false} />}
+      {rendered ? (
+        <img className="mat-thumb-render" src={rendered} alt="" draggable={false} />
+      ) : (
+        mapUrl && <img className="mat-thumb-map" src={mapUrl} alt="" draggable={false} />
+      )}
     </div>
   );
 }
@@ -452,6 +476,7 @@ function Thumb({ entry, size }) {
   if (entry.ext === "cubemap") return <CubemapThumb path={entry.path} size={size} />;
   if (entry.ext === "geom") return <GeometryThumb path={entry.path} size={size} />;
   if (FONT_EXTENSIONS.includes(entry.ext)) return <FontThumb path={entry.path} size={size} />;
+  if (entry.ext === "scene") return <SceneTileThumb path={entry.path} size={size} />;
   const Icon = ICON_BY_EXT[entry.ext] ?? File;
   return (
     <div className="asset-icon" style={{ width: size, height: size }}>
@@ -564,7 +589,7 @@ function FlagBadges({ path }) {
   );
 }
 
-function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextMenu, subtitle }) {
+function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextMenu, subtitle, folderSize }) {
   const draggable = entry.is_dir || DRAGGABLE_EXTENSIONS.includes(entry.ext);
   const selected = useSelectionStore((s) => s.assetPaths.includes(entry.path));
   // "Revealed" is the inspector pointing at this file (see assetReveal.js) —
@@ -635,7 +660,7 @@ function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextM
           )}
         </div>
         <div className="asset-col">{entry.is_dir ? "Folder" : (TYPE_LABEL[entry.ext] ?? entry.ext.toUpperCase())}</div>
-        <div className="asset-col">{entry.is_dir ? "—" : formatBytes(entry.size)}</div>
+        <div className="asset-col">{formatBytes(entry.is_dir ? folderSize : entry.size)}</div>
         <div className="asset-col">{formatDate(entry.modified)}</div>
       </div>
     );
@@ -775,6 +800,11 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries, onRes
           ? [{ label: "Open in Default App", action: () => openInIDE(entry.path) }]
           : []),
         { separator: true },
+        // Anchored to every selected path, folders included: "what is in this
+        // folder and is any of it unused" is exactly the question the asset
+        // browser cannot answer on its own.
+        askAiMenuItem(assetSelectionContext(targets.map((t) => t.path))),
+        { separator: true },
         {
           label: multi ? `Delete ${targets.length} items` : "Delete",
           shortcut: "Del",
@@ -794,6 +824,9 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries, onRes
         { label: "New Post Process Graph", action: createPostFx },
         { label: "New Particle Graph", action: () => createVfxDocument("NewParticles.vfx", createVfxAsset("particles", DEFAULT_PARTICLE_GRAPH)) },
         { separator: true },
+        // Right-clicking empty space anchors on the folder being browsed —
+        // the same "here" that New Script and New Folder write into.
+        askAiMenuItem(assetSelectionContext([useProjectStore.getState().currentPath].filter(Boolean))),
         { label: "Refresh", action: () => useProjectStore.getState().refresh() },
       ];
 
@@ -940,8 +973,23 @@ export function AssetsPanel() {
   const [resizePaths, setResizePaths] = useState(null); // pending "Resize Images…"
   const [resizing, setResizing] = useState(false);
   const [fileDropActive, setFileDropActive] = useState(false);
-  const [viewId, setViewId] = useState(() => localStorage.getItem(VIEW_KEY) ?? "medium");
+  const [viewId, setViewId] = useState(() => localStorage.getItem(VIEW_KEY) ?? "large");
   const [showTree, setShowTree] = useState(() => localStorage.getItem(TREE_KEY) !== "0");
+  const [sort, setSort] = useState(() => readSort());
+  // Folder totals for the open folder's subtree (see folderSizes.js), taken
+  // only while a size is on screen (the list view) or decides the order.
+  const [folderSizes, setFolderSizes] = useState(null);
+  const sizeOf = useCallback(
+    (entry) => (entry.is_dir ? folderSizeOf(folderSizes, entry.path) : entry.size),
+    [folderSizes],
+  );
+  const toggleSort = useCallback((by) => {
+    setSort((prev) => {
+      const next = nextSort(prev, by);
+      writeSort(next);
+      return next;
+    });
+  }, []);
   const [query, setQuery] = useState("");
   const [typeId, setTypeId] = useState("all");
   const [typeMenuOpen, setTypeMenuOpen] = useState(false);
@@ -997,16 +1045,21 @@ export function AssetsPanel() {
   const metaVersion = useAssetMetaStore((s) => s.version);
   const visible = useMemo(
     () =>
-      searching
-        ? filterEntries(pool, {
-            typeId,
-            query,
-            usedPaths: usedOnly ? usedPaths : null,
-            getMeta: getAssetMeta,
-          })
-        : pool,
+      sortEntries(
+        searching
+          ? filterEntries(pool, {
+              typeId,
+              query,
+              usedPaths: usedOnly ? usedPaths : null,
+              getMeta: getAssetMeta,
+            })
+          : pool,
+        sort,
+        typeLabelOf,
+        sizeOf,
+      ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pool, searching, typeId, query, usedOnly, usedPaths, flagVersion, metaVersion],
+    [pool, searching, typeId, query, usedOnly, usedPaths, flagVersion, metaVersion, sort, sizeOf],
   );
   const selectedEntries = useMemo(
     () => visible.filter((e) => assetPaths.includes(e.path)),
@@ -1040,6 +1093,18 @@ export function AssetsPanel() {
   // itself doesn't depend on `query` or `typeId`; once it's in `projectEntries`
   // the filter is pure over it, so a cached scan answers every keystroke.
   const changeCounter = useProjectStore((s) => s.changeCounter);
+  const wantFolderSizes = view.id === "details" || sort.by === "size";
+  useEffect(() => {
+    const from = currentPath ?? rootPath;
+    if (!wantFolderSizes || !from) return undefined;
+    let live = true;
+    measureFolderSizes(from, changeCounter, folderEntries.filter((e) => e.is_dir).map((e) => e.path))
+      .then((totals) => live && setFolderSizes(totals))
+      .catch((err) => console.warn(`Folder sizes failed: ${err}`));
+    return () => {
+      live = false;
+    };
+  }, [wantFolderSizes, currentPath, rootPath, changeCounter, folderEntries]);
   const wasSearching = useRef(false);
   useEffect(() => {
     const from = currentPath ?? rootPath;
@@ -1382,14 +1447,13 @@ export function AssetsPanel() {
         >
           <FolderOpen size={14} />
         </button>
-      </div>
-      <div className="assets-filterbar">
+        <span className="assets-toolbar-gap" aria-hidden="true" />
         <div className="assets-search">
           <Search size={12} className="assets-search-icon" />
           <input
             className="assets-search-input"
             type="text"
-            placeholder="Search assets…  texture?width>1920  tag:wall"
+            placeholder="Search assets"
             title={"Search by name, or with the query language.\nName:   rock \u00b7 wall... (starts with) \u00b7 ..._diffuse (ends with) \u00b7 \"red brick\" (quote spaces)\nKind:   texture \u00b7 material \u00b7 model \u00b7 audio \u00b7 script \u00b7 prefab \u00b7 scene \u00b7 font \u00b7 folder\nFilter: texture?width>1920 \u00b7 material?roughness=0 \u00b7 size>1000 \u00b7 ext=png\nTags:   tag:wall \u00b7 ?tag=wall\nTerms separated by spaces AND together."}
             value={query}
             spellCheck={false}
@@ -1505,10 +1569,10 @@ export function AssetsPanel() {
           )}
           {view.id === "details" && visible.length > 0 && (
             <div className="asset-row header">
-              <div className="asset-row-name">Name</div>
-              <div className="asset-col">Type</div>
-              <div className="asset-col">Size</div>
-              <div className="asset-col">Modified</div>
+              <SortHeader column="name" label="Name" sort={sort} onSort={toggleSort} className="asset-row-name" />
+              <SortHeader column="type" label="Type" sort={sort} onSort={toggleSort} className="asset-col" />
+              <SortHeader column="size" label="Size" sort={sort} onSort={toggleSort} className="asset-col" />
+              <SortHeader column="modified" label="Modified" sort={sort} onSort={toggleSort} className="asset-col" />
             </div>
           )}
           {visible.map((entry) => (
@@ -1521,6 +1585,7 @@ export function AssetsPanel() {
               setRenamingPath={setRenamingPath}
               onContextMenu={onTileContextMenu}
               subtitle={relativeFolder(entry)}
+              folderSize={entry.is_dir ? folderSizeOf(folderSizes, entry.path) : undefined}
             />
           ))}
           {box && (

@@ -1,6 +1,19 @@
 // @ts-check
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Save, Play, Trash2, Zap, ChevronUp, ChevronDown, Layers, Sparkles, X } from "lucide-react";
+import {
+  Plus,
+  Save,
+  Play,
+  Trash2,
+  Zap,
+  ChevronUp,
+  ChevronDown,
+  Layers,
+  Sparkles,
+  X,
+  SlidersHorizontal,
+  Bone,
+} from "../icons/index.jsx";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -463,10 +476,17 @@ function ParametersSection({
           State: <span className="animator-current-state-name">{currentState ?? "—"}</span>
         </div>
       )}
-      {!playMode && parameters.length === 0 && <div className="asset-hint">No parameters</div>}
+      {!playMode && parameters.length === 0 && (
+        <div className="asset-hint" title="No parameters">
+          <SlidersHorizontal className="empty-glyph" size={28} />
+        </div>
+      )}
       {playMode && !drivenComponent?.runtime && (
-        <div className="asset-hint">
-          No bound entity with a live runtime — add an Animation component using this controller to drive values.
+        <div
+          className="asset-hint"
+          title="No bound entity with a live runtime — add an Animation component using this controller to drive values"
+        >
+          <Zap className="empty-glyph" size={28} />
         </div>
       )}
       {parameters.map((p, i) => (
@@ -709,7 +729,7 @@ function BlendTreeEditor({ state, clipNames, parameters, onPatch, live }) {
           ))}
         </select>
       ) : (
-        <span className="field-hint">add a number parameter first</span>
+        <span className="field-hint" title="Add a number parameter first">—</span>
       )}
     </div>
   );
@@ -877,9 +897,8 @@ function StateSection({ node, clipNames, parameters, onPatch, onPreview, live })
         <span className="field-label">Loop</span>
         <input type="checkbox" checked={state.loop !== false} onChange={(e) => onPatch({ loop: e.target.checked })} />
       </div>
-      <button className="toolbar-btn wide" onClick={onPreview}>
+      <button className="toolbar-btn wide" onClick={onPreview} title="Preview">
         <Play size={12} />
-        Preview
       </button>
     </div>
   );
@@ -909,14 +928,17 @@ function MaskEditor({ mask, bones, onChange, onClose }) {
   return (
     <div className="inspector-section anim-mask-editor">
       <div className="section-header">
-        Avatar Mask
+        Avatar mask
         <button className="icon-btn" title="Close" onClick={onClose}>
           <X size={12} />
         </button>
       </div>
       {!bones.length ? (
-        <div className="field-hint">
-          No skeleton in the scene yet — add an Animation component on a rigged model to list its bones.
+        <div
+          className="field-hint"
+          title="No skeleton in the scene yet — add an Animation component on a rigged model to list its bones"
+        >
+          <Bone className="empty-glyph" size={28} />
         </div>
       ) : (
         <>
@@ -952,8 +974,13 @@ function MaskEditor({ mask, bones, onChange, onClose }) {
               </label>
             ))}
           </div>
-          <button className="toolbar-btn wide" disabled={!mask} onClick={() => onChange(null)}>
-            Clear mask (full body)
+          <button
+            className="toolbar-btn wide"
+            disabled={!mask}
+            onClick={() => onChange(null)}
+            title="Clear mask (full body)"
+          >
+            <Trash2 size={13} />
           </button>
         </>
       )}
@@ -964,7 +991,10 @@ function MaskEditor({ mask, bones, onChange, onClose }) {
 function LayersSection({ layers, active, onSelect, onChange, onAdd, onRemove, onMove, onEditMask, liveWeights }) {
   return (
     <div className="inspector-section">
-      <div className="section-header">
+      <div
+        className="section-header"
+        title="Layers higher in this list win — the base layer is always at full weight"
+      >
         Layers
         <button className="icon-btn" title="Add layer" onClick={onAdd}>
           <Plus size={12} />
@@ -1044,16 +1074,16 @@ function LayersSection({ layers, active, onSelect, onChange, onAdd, onRemove, on
                   title="Default weight — scripts drive this with setLayerWeight()"
                   onChange={(e) => onChange(i, { weight: parseFloat(e.target.value) })}
                 />
-                <button className="toolbar-btn" onClick={() => onEditMask(i)}>
-                  {layer.mask?.bones?.length ? `Mask (${layer.mask.bones.length})` : "Mask"}
+                <button className="toolbar-btn" onClick={() => onEditMask(i)} title="Edit mask">
+                  Mask
+                  {layer.mask?.bones?.length ? (
+                    <span className="cnt" title="bones">{layer.mask.bones.length}</span>
+                  ) : null}
                 </button>
               </div>
             )}
           </div>
         ))}
-      </div>
-      <div className="field-hint">
-        Layers higher in this list win. The base layer is always at full weight.
       </div>
     </div>
   );
@@ -1163,8 +1193,11 @@ function TransitionSection({ edge, parameters, stateNames, onPatch }) {
         {stateNames[edge.source] ?? (isStart ? "Start" : "Any State")} → {stateNames[edge.target] ?? "?"}
       </div>
       {conditions.length === 0 && (
-        <div className="asset-hint">
-          {isStart ? "No conditions — this is the default entry" : "No conditions — fires at exit time"}
+        <div
+          className="asset-hint"
+          title={isStart ? "No conditions — this is the default entry" : "No conditions — fires at exit time"}
+        >
+          <Plus className="empty-glyph" size={28} />
         </div>
       )}
       {conditions.map(conditionRow)}
@@ -1763,9 +1796,13 @@ function AnimatorEditor({ animPath }) {  const [nodes, setNodes, onNodesChange] 
         >
           <Zap size={14} />
         </button>
-        <button className="toolbar-btn" disabled={!dirty || autosave} onClick={save}>
-          <Save size={13} />
-          Save{dirty ? " •" : ""}
+        <button
+          className="toolbar-btn icon-only"
+          disabled={!dirty || autosave}
+          onClick={save}
+          title={autosave ? "Autosave is on" : dirty ? "Save" : "No changes to save"}
+        >
+          <Save size={13} />{dirty ? " •" : ""}
         </button>
       </div>
       <div className="animator-body">
@@ -1882,9 +1919,6 @@ function AnimatorEditor({ animPath }) {  const [nodes, setNodes, onNodesChange] 
           )}
         </div>
       </div>
-      <div className="shader-graph-hint">
-        Click a state to preview · drag between states to add a transition · Save applies to the scene
-      </div>
       {generate && (
         <GenerateMotionDialog
           busy={generate.busy}
@@ -1907,8 +1941,11 @@ export function AnimatorPanel() {
 
   if (!animPath) {
     return (
-      <div className="shader-graph-panel empty">
-        Select a .anim asset (or an entity whose Animation component has a controller) to edit it.
+      <div
+        className="shader-graph-panel empty"
+        title="Select a .anim asset (or an entity whose Animation component has a controller) to edit it"
+      >
+        <Sparkles className="empty-glyph" size={28} />
       </div>
     );
   }

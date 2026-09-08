@@ -6,6 +6,7 @@ import {
   Circle,
   Diamond,
   Film,
+  Magnet,
   Pause,
   Play,
   Plus,
@@ -14,8 +15,9 @@ import {
   Trash2,
   Volume2,
   VolumeX,
+  X,
   Zap,
-} from "lucide-react";
+} from "../icons/index.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import { engine } from "../engineInstance.js";
@@ -387,11 +389,11 @@ function AddTrackPopover({ onAdd, onClose }) {
         </>
       )}
       <div className="timeline-add-actions">
-        <button className="toolbar-btn" onClick={onClose}>
-          Cancel
+        <button className="toolbar-btn icon-only" onClick={onClose} title="Cancel">
+          <X size={13} />
         </button>
-        <button className="toolbar-btn primary" onClick={add}>
-          Add Track
+        <button className="toolbar-btn primary" onClick={add} title="Add track">
+          <Plus size={13} /> Add Track
         </button>
       </div>
     </div>
@@ -448,8 +450,11 @@ function ValueField({ valueType, value, onCommit }) {
 function ItemInspector({ track, item, entities, onPatch, onDelete }) {
   if (!track || !item) {
     return (
-      <div className="timeline-inspector empty">
-        Select a key or clip — double-click an empty lane to make one.
+      <div
+        className="timeline-inspector empty"
+        title="Select a key or clip — double-click an empty lane to make one"
+      >
+        <Diamond className="empty-glyph" size={28} />
       </div>
     );
   }
@@ -621,8 +626,8 @@ function ItemInspector({ track, item, entities, onPatch, onDelete }) {
     <div className="timeline-inspector">
       <span className="timeline-insp-title">{KIND_LABELS[track.kind]}</span>
       {rows}
-      <button className="toolbar-btn danger" onClick={() => onDelete(track.id, item.id)}>
-        Delete
+      <button className="toolbar-btn danger icon-only" onClick={() => onDelete(track.id, item.id)} title="Delete">
+        <Trash2 size={13} />
       </button>
     </div>
   );
@@ -1217,10 +1222,12 @@ export function TimelinePanel() {
 
   if (!path) {
     return (
-      <div className="timeline-panel empty" ref={rootRef}>
-        <Film size={22} opacity={0.5} />
-        <p>Select a .timeline asset, or an entity with a Timeline component.</p>
-        <p className="dim">Assets → right-click → New Timeline.</p>
+      <div
+        className="timeline-panel empty"
+        ref={rootRef}
+        title="Select a .timeline asset, or an entity with a Timeline component (Assets → right-click → New Timeline)"
+      >
+        <Film className="empty-glyph" size={28} />
       </div>
     );
   }
@@ -1284,11 +1291,11 @@ export function TimelinePanel() {
           />
         </label>
         <button
-          className={`toolbar-btn${snap ? " active" : ""}`}
-          title="Snap edits to the frame grid"
+          className={`toolbar-btn icon-only${snap ? " active" : ""}`}
+          title={snap ? "Snap to frame grid: on" : "Snap to frame grid: off"}
           onClick={() => setSnap((s) => !s)}
         >
-          Snap
+          <Magnet size={13} />
         </button>
         <span className="game-toolbar-spacer" />
         <div className="timeline-add-wrap">
@@ -1314,15 +1321,20 @@ export function TimelinePanel() {
         >
           <Zap size={13} />
         </button>
-        <button className="toolbar-btn" disabled={!dirty || autosave} onClick={save}>
-          <Save size={12} /> Save
+        <button
+          className="toolbar-btn icon-only"
+          disabled={!dirty || autosave}
+          onClick={save}
+          title={autosave ? "Autosave is on" : dirty ? "Save" : "No changes to save"}
+        >
+          <Save size={12} />
         </button>
       </div>
 
       <div className="timeline-body">
         <div className="timeline-list" ref={listRef} style={{ width: LIST_WIDTH }}>
           <div className="timeline-list-head" style={{ height: RULER_HEIGHT }}>
-            {timeline.tracks.length} {timeline.tracks.length === 1 ? "track" : "tracks"}
+            <span className="cnt" title="tracks">{timeline.tracks.length}</span>
           </div>
           {timeline.tracks.map((track) => (
             <TrackRow
@@ -1337,7 +1349,9 @@ export function TimelinePanel() {
             />
           ))}
           {!timeline.tracks.length && (
-            <div className="timeline-empty-hint">No tracks yet — add one above.</div>
+            <div className="timeline-empty-hint" title="No tracks yet — add one above">
+              <Plus className="empty-glyph" size={28} />
+            </div>
           )}
         </div>
 

@@ -19,7 +19,8 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 import { parseAgentLinePayload, parseStreamEvent } from "../src/editor/ai/parseStreamEvent.js";
-import { WORKFLOWS, getWorkflow, resolveAllowedTools, resolveToolSchemas } from "../src/editor/ai/workflows.js";
+import { WORKFLOWS, getWorkflow, workflowTools, resolveAllowedTools, resolveToolSchemas } from "../src/editor/ai/workflows.js";
+import { makeAiContext, describeContexts, addContext, contextKey } from "../src/editor/ai/context.js";
 import { createToolLoopProvider } from "../src/editor/ai/providers/toolLoop.js";
 import { defineOp, resetOps } from "../src/editor/api/registry.js";
 import { MCP_SERVER_NAME } from "../src/editor/mcpClients.js";
@@ -105,47 +106,94 @@ check(
   ),
 );
 
+// The transcript shows a call's IDENTITY, never its arguments in full. The raw
+// form (full MCP name + JSON.stringify(input)) is what buried the answer under
+// a wall of escaped JSON in the shipped panel — see ToolTrail's note.
 check(
-  "an assistant tool_use block with input becomes a tool_call line with the args inlined",
+  "a tool_use line strips the mcp__<server>__ prefix and reads as a dotted op name",
   deepEqual(
     parseStreamEvent({
       type: "assistant",
-      message: { content: [{ type: "tool_use", name: "entity_getBounds", input: { id: "e1" } }] },
+      message: { content: [{ type: "tool_use", name: "mcp__three-engine__entity_get", input: { id: "e1" } }] },
     }).lines,
-    [{ kind: "tool_call", text: '→ entity_getBounds {"id":"e1"}' }],
+    [{ kind: "tool_call", text: "entity.get e1" }],
+  ),
+  JSON.stringify(
+    parseStreamEvent({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "mcp__three-engine__entity_get", input: { id: "e1" } }] },
+    }).lines,
   ),
 );
 
 check(
-  "a tool_use block with no input omits the trailing JSON",
+  "a tool_use block with no input is just the name",
   deepEqual(
     parseStreamEvent({
       type: "assistant",
-      message: { content: [{ type: "tool_use", name: "console_read", input: {} }] },
+      message: { content: [{ type: "tool_use", name: "mcp__three-engine__console_read", input: {} }] },
     }).lines,
-    [{ kind: "tool_call", text: "→ console_read" }],
+    [{ kind: "tool_call", text: "console.read" }],
   ),
 );
 
 check(
-  "a user tool_result with string content becomes a tool_result line",
+  "a non-MCP built-in tool keeps its own name",
+  parseStreamEvent({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", name: "Bash", input: { command: "ls" } }] },
+  }).lines[0].text === "Bash ls",
+);
+
+{
+  // The exact shape from the live panel that prompted this: a Bash call whose
+  // command is a 300-character `cd ... && node -e ...` one-liner.
+  const long = `cd "C:/Users/Khudiiash/Documents/GAME" && node -e "${"x".repeat(400)}"`;
+  const { lines } = parseStreamEvent({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", name: "Bash", input: { command: long } }] },
+  });
+  check(
+    "a long command argument is clipped to a hint, never printed in full",
+    lines[0].text.length <= 60 && lines[0].text.endsWith("…"),
+    `${lines[0].text.length} chars: ${lines[0].text}`,
+  );
+}
+
+{
+  // A big object argument with no hint key must not fall back to dumping JSON.
+  const { lines } = parseStreamEvent({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", name: "mcp__three-engine__batch", input: { ops: [1, 2, 3], extra: { a: 1 } } }] },
+  });
+  check(
+    "arguments with no recognizable hint key produce the bare name, NOT a JSON dump",
+    lines[0].text === "batch",
+    lines[0].text,
+  );
+}
+
+// Successful results are dropped entirely: one `entity_list` is 120 kB, and
+// even a clipped preview reads as escaped garbage between question and answer.
+check(
+  "a SUCCESSFUL tool_result produces no line at all",
   deepEqual(
     parseStreamEvent({
       type: "user",
-      message: { content: [{ type: "tool_result", content: "3 warnings found" }] },
+      message: { content: [{ type: "tool_result", content: "a".repeat(5000) }] },
     }).lines,
-    [{ kind: "tool_result", text: "3 warnings found" }],
+    [],
   ),
 );
 
 check(
-  "a user tool_result with object content is stringified",
+  "…but a FAILED tool_result still surfaces, because the call line alone isn't the whole story",
   deepEqual(
     parseStreamEvent({
       type: "user",
-      message: { content: [{ type: "tool_result", content: { ok: true } }] },
+      message: { content: [{ type: "tool_result", is_error: true, content: "No entity with id \"e9\"." }] },
     }).lines,
-    [{ kind: "tool_result", text: '{"ok":true}' }],
+    [{ kind: "tool_result", text: 'No entity with id "e9".' }],
   ),
 );
 
@@ -153,13 +201,11 @@ check(
   const long = "x".repeat(500);
   const { lines } = parseStreamEvent({
     type: "user",
-    message: { content: [{ type: "tool_result", content: long }] },
+    message: { content: [{ type: "tool_result", is_error: true, content: long }] },
   });
   check(
-    "a long tool_result is truncated with an ellipsis rather than dumped in full — kept SHORT (120 chars) " +
-      "on purpose, since the call itself already says what happened and results are the 'ton of text we " +
-      "don't need to see'",
-    lines[0].text.length === 121 && lines[0].text.endsWith("…"),
+    "a long ERROR is truncated rather than dumped in full",
+    lines[0].text.length === 161 && lines[0].text.endsWith("…"),
     `got length ${lines[0].text.length}`,
   );
 }
@@ -194,6 +240,24 @@ check(
   }),
 );
 
+// The session id is what makes the panel a CONVERSATION rather than a series
+// of strangers: it is fed back as `--resume` on the next message.
+check(
+  "a system/init event surfaces the session id alongside the model",
+  deepEqual(
+    parseStreamEvent({ type: "system", subtype: "init", model: "m", session_id: "sess-42" }).meta,
+    { model: "m", sessionId: "sess-42" },
+  ),
+);
+check(
+  "a result event carries the session id too, so a resumed turn keeps the thread",
+  parseStreamEvent({ type: "result", result: "ok", session_id: "sess-42" }).meta.sessionId === "sess-42",
+);
+check(
+  "a result event WITHOUT a session id omits the key rather than merging a null over the live one",
+  !("sessionId" in parseStreamEvent({ type: "result", result: "ok" }).meta),
+);
+
 check(
   "a raw event (from parseAgentLinePayload's fallback) passes its text through",
   deepEqual(parseStreamEvent({ type: "raw", stream: "stderr", text: "hm" }).lines, [{ kind: "raw", text: "hm" }]),
@@ -208,75 +272,157 @@ check(
 
 // --- 3. workflows.js: the registry and its allowedTools resolution ----------
 
-check("exactly one workflow is registered for this phase", WORKFLOWS.length === 1, `${WORKFLOWS.length} workflows`);
-check("getWorkflow finds it by id", getWorkflow("diagnose-selected")?.label === "Diagnose this");
+check("exactly one workflow is registered", WORKFLOWS.length === 1, `${WORKFLOWS.length} workflows`);
+check("getWorkflow finds `ask` by id", getWorkflow("ask")?.label === "Ask AI");
 check("getWorkflow returns null for an unknown id", getWorkflow("nope") === null);
+check(
+  "the retired one-shot diagnose workflow is gone — the panel is a conversation now",
+  getWorkflow("diagnose-selected") === null,
+);
 
-const diagnose = getWorkflow("diagnose-selected");
+const ask = getWorkflow("ask");
 
-// resolveAllowedTools only needs opNames() to know about the names the
-// workflow references — register fakes for exactly those (mirroring
-// run-mcp-test.mjs's FAKE_TOOLS) rather than importing the real ops files,
-// which pull in the live engine and can't run outside a browser/Tauri host.
+check(
+  "`ask` is marked interactive, which is what exempts it from the unattended-mutating-run guard",
+  ask.interactive === true && ask.mutates === true,
+);
+
+// `"*"` means the whole live registry. Register a couple of fakes and confirm
+// the resolution follows the registry rather than any list pinned in the file.
 resetOps();
-for (const name of diagnose.allowedTools) {
-  defineOp({ name, description: "fake", readOnly: true, run: () => null });
-}
+defineOp({ name: "entity.get", description: "fake", readOnly: true, run: () => null });
+defineOp({ name: "entity.create", description: "fake", readOnly: false, run: () => null });
 
 {
-  const resolved = resolveAllowedTools(diagnose);
+  const tools = workflowTools(ask);
   check(
-    "resolveAllowedTools returns one mcp__<server>__<tool> name per allowed op, dots underscored",
-    deepEqual(
-      resolved,
-      diagnose.allowedTools.map((n) => `mcp__${MCP_SERVER_NAME}__${n.replaceAll(".", "_")}`),
-    ),
+    'allowedTools "*" resolves to EVERY registered op, not a hardcoded subset',
+    deepEqual([...tools].sort(), ["entity.create", "entity.get"]),
+    tools.join(", "),
+  );
+
+  const resolved = resolveAllowedTools(ask);
+  check(
+    "resolveAllowedTools returns one mcp__<server>__<tool> name per op, dots underscored",
+    deepEqual(resolved, ["entity.create", "entity.get"].map((n) => `mcp__${MCP_SERVER_NAME}__${n.replaceAll(".", "_")}`)),
     resolved.join(", "),
   );
   check(
-    "none of diagnose-selected's tools slipped in a dotted name (would break --allowedTools)",
+    "no resolved name kept a dot (would break --allowedTools)",
     resolved.every((n) => !n.slice(`mcp__${MCP_SERVER_NAME}__`.length).includes(".")),
+  );
+}
+
+{
+  // A new op appearing in the registry must widen "*" with no edit here — the
+  // whole reason "*" exists rather than a pinned list that silently goes stale.
+  defineOp({ name: "scene.get", description: "fake", readOnly: true, run: () => null });
+  check(
+    'a newly registered op is picked up by "*" automatically',
+    workflowTools(ask).includes("scene.get"),
   );
 }
 
 {
   let threw = null;
   try {
-    resolveAllowedTools({ id: "fake", allowedTools: ["entity.get", "not.a.real.op"] });
+    workflowTools({ id: "fake", allowedTools: ["entity.get", "not.a.real.op"] });
   } catch (err) {
     threw = err;
   }
   check(
-    "an unknown op name in allowedTools throws instead of silently narrowing to nothing",
+    "an EXPLICIT allowedTools list with an unknown op still throws instead of silently narrowing",
     threw !== null && /not\.a\.real\.op/.test(threw.message),
     threw?.message,
   );
 }
 resetOps();
 
-// --- 4. static consistency: every allowedTools name is a REAL registered op -
-//
-// The checks above use fake ops on purpose (importing the real ones needs a
-// live engine). This closes the resulting gap statically: grep the actual ops
-// source for `name: "<op>"` and confirm each name every workflow references
-// really is registered somewhere, so a typo or a renamed op fails this test
-// instead of failing silently as "the model says it has no such tool".
+// --- 4. context.js: the anchors, and the paragraph the model reads ---------
+
+check(
+  "makeAiContext normalizes a bare string ref into an array",
+  deepEqual(makeAiContext("entity", "e1").refs, ["e1"]),
+);
+check(
+  "…and drops non-string junk rather than passing it to the model",
+  deepEqual(makeAiContext("entity", ["e1", null, 7, ""]).refs, ["e1"]),
+);
+check(
+  "a single asset context labels itself with the basename, not the whole path",
+  makeAiContext("asset", ["textures/rock/albedo.png"]).label === "albedo.png",
+);
+check(
+  "an attached FILE labels itself with the basename too — an absolute path is unreadable in a chip",
+  makeAiContext("file", ["C:\\Users\\me\\notes.md"]).label === "notes.md",
+  makeAiContext("file", ["C:\\Users\\me\\notes.md"]).label,
+);
+check(
+  "a multi-ref context labels itself with a count and a REAL plural (not 'entitys')",
+  makeAiContext("entity", ["a", "b", "c"]).label === "3 entities",
+  makeAiContext("entity", ["a", "b", "c"]).label,
+);
+check("an explicit label wins over the derived one", makeAiContext("entity", ["e1"], "Player").label === "Player");
+
+// Chips are a SET, keyed by what they point at: dragging the same entity in
+// twice must not grow the row.
 {
-  const opsDir = path.join(here, "..", "src", "editor", "api", "ops");
-  const registered = new Set();
-  for (const file of fs.readdirSync(opsDir)) {
-    if (!file.endsWith(".js")) continue;
-    const text = fs.readFileSync(path.join(opsDir, file), "utf8");
-    for (const m of text.matchAll(/name:\s*"([a-zA-Z0-9_.]+)"/g)) registered.add(m[1]);
-  }
-  for (const workflow of WORKFLOWS) {
-    const missing = workflow.allowedTools.filter((name) => !registered.has(name));
-    check(
-      `workflow "${workflow.id}"'s allowedTools all exist as real registered ops`,
-      missing.length === 0,
-      missing.join(", "),
-    );
-  }
+  const a = makeAiContext("entity", ["e1"]);
+  const b = makeAiContext("entity", ["e1"], "Renamed");
+  const c = makeAiContext("asset", ["rock.png"]);
+  check("contextKey ignores the label — the same ref is the same chip", contextKey(a) === contextKey(b));
+  check("addContext replaces a chip naming the same thing", deepEqual(addContext([a], b), [b]));
+  check("…and appends a chip naming something different", addContext([a], c).length === 2);
+  check(
+    "a different KIND with the same ref string is a different chip",
+    contextKey(makeAiContext("asset", ["x"])) !== contextKey(makeAiContext("file", ["x"])),
+  );
+}
+
+check("describeContexts returns '' for no chips — a real state, not an error", describeContexts([]) === "");
+check("…and for null", describeContexts(null) === "");
+check(
+  "an entity chip names the ids AND points at the op that reads them",
+  /e1/.test(describeContexts([makeAiContext("entity", ["e1"])])) &&
+    /entity\.get/.test(describeContexts([makeAiContext("entity", ["e1"])])),
+);
+check(
+  "an asset chip names the paths and points at asset.read",
+  /rock\.png/.test(describeContexts([makeAiContext("asset", ["rock.png"])])) &&
+    /asset\.read/.test(describeContexts([makeAiContext("asset", ["rock.png"])])),
+);
+check(
+  "a file chip tells the model to read the attached path",
+  /notes\.md/.test(describeContexts([makeAiContext("file", ["/tmp/notes.md"])])),
+);
+check(
+  "a viewport chip asks the model to TAKE the screenshot rather than staging bytes",
+  /viewport\.screenshot/.test(describeContexts([makeAiContext("viewport", [])])),
+);
+check(
+  "a scene chip points at scene.get rather than naming refs it doesn't have",
+  /scene\.get/.test(describeContexts([makeAiContext("scene", [])])),
+);
+check(
+  "several chips all appear in one paragraph — the question can be about more than one thing",
+  (() => {
+    const text = describeContexts([makeAiContext("entity", ["e1"]), makeAiContext("asset", ["rock.png"])]);
+    return text.includes("e1") && text.includes("rock.png");
+  })(),
+);
+
+// buildPrompt: chips ride along with the message they were attached to.
+{
+  const contexts = [makeAiContext("entity", ["e1"])];
+  const prompt = ask.buildPrompt({ text: "why is this dark?", contexts });
+  check(
+    "buildPrompt prepends the context paragraph and keeps the user's text last",
+    prompt.includes("e1") && prompt.endsWith("why is this dark?"),
+  );
+  check(
+    "with no chips at all, the prompt is exactly what the user typed",
+    ask.buildPrompt({ text: "hello", contexts: [] }) === "hello",
+  );
 }
 
 // --- 5. resolveToolSchemas: the OpenAI-shaped tool list toolLoop.js sends ---
@@ -638,6 +784,90 @@ function makeLoopProvider(impl) {
     threw !== null && threw.message.includes("http://fake-host"),
     threw?.message,
   );
+  resetOps();
+}
+
+// 6g. multi-turn: prior history is replayed into the request, because this
+// loop holds no session of its own the way the `claude` CLI does. Without it
+// the second question in a conversation reaches an assistant with amnesia.
+{
+  resetOps();
+  defineOp({ name: "entity.get", description: "Get an entity.", readOnly: true, run: () => ({ ok: true }) });
+  const workflow = { id: "loop-history", allowedTools: ["entity.get"] };
+
+  let sent = null;
+  const provider = makeLoopProvider(async ({ body }) => {
+    sent = JSON.parse(body);
+    return JSON.stringify({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: "still Player" } }] });
+  });
+  await provider.runTurn(
+    {
+      workflow,
+      prompt: "and what was its name again?",
+      systemPrompt: "CUSTOM SYSTEM",
+      history: [
+        { role: "user", content: "what is selected?" },
+        { role: "assistant", content: "An entity called Player." },
+      ],
+    },
+    () => {},
+  );
+
+  check(
+    "prior history is replayed between the system prompt and the new message, in order",
+    deepEqual(
+      sent.messages.map((m) => m.role),
+      ["system", "user", "assistant", "user"],
+    ),
+    JSON.stringify(sent.messages.map((m) => m.role)),
+  );
+  check(
+    "...carrying the actual earlier text, not just the roles",
+    sent.messages[2].content === "An entity called Player." && sent.messages[3].content === "and what was its name again?",
+  );
+  check(
+    "the workflow's own system prompt is used when it supplies one",
+    sent.messages[0].content === "CUSTOM SYSTEM",
+    sent.messages[0].content,
+  );
+  resetOps();
+}
+
+// 6h. the allowlist guard must follow the RESOLVED tool set, not the literal
+// `allowedTools` value — a workflow declaring "*" would otherwise guard against
+// the string "*", which matches nothing, and refuse every call it just offered.
+{
+  resetOps();
+  let getCalls = 0;
+  defineOp({
+    name: "entity.get",
+    description: "Get an entity.",
+    readOnly: true,
+    run: () => {
+      getCalls += 1;
+      return { ok: true };
+    },
+  });
+  const workflow = { id: "loop-star", allowedTools: "*" };
+
+  let call = 0;
+  const provider = makeLoopProvider(async () => {
+    call += 1;
+    if (call === 1) {
+      return JSON.stringify({
+        choices: [
+          {
+            finish_reason: "tool_calls",
+            message: { role: "assistant", tool_calls: [{ id: "c1", function: { name: "entity_get", arguments: "{}" } }] },
+          },
+        ],
+      });
+    }
+    return JSON.stringify({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: "done" } }] });
+  });
+  await provider.runTurn({ workflow, prompt: "x" }, () => {});
+
+  check('a workflow declaring "*" can actually CALL the ops it was offered', getCalls === 1, `getCalls=${getCalls}`);
   resetOps();
 }
 

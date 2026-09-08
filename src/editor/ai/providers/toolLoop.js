@@ -18,10 +18,11 @@
  * already destructures from a claudeCli event, without going through it.
  */
 import { resolveToolSchemas } from "../workflows.js";
+import { summarizeCall } from "../parseStreamEvent.js";
 import { callTool } from "../../api/registry.js";
 
 const MAX_ITERATIONS = 12;
-const TOOL_RESULT_TRUNCATE = 120;
+const TOOL_RESULT_TRUNCATE = 160;
 
 function truncate(text, max) {
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -77,14 +78,10 @@ async function defaultTransport({ url, apiKey, body }) {
   return invoke("ai_chat", { url, apiKey, body });
 }
 
-function systemPrompt() {
-  return (
-    "You are an assistant embedded in a three.js/WebGPU game editor. You have a small set of " +
-    "tools to inspect the currently open scene — use them to gather real information before " +
-    "answering; do not guess at entity state you have not looked up. Once you have enough " +
-    "information, answer concisely in plain text without calling any more tools."
-  );
-}
+const FALLBACK_SYSTEM_PROMPT =
+  "You are an assistant embedded in a three.js/WebGPU game editor. Use your tools to gather real " +
+  "information before answering; do not guess at state you have not looked up. Once you have enough " +
+  "information, answer concisely in plain text without calling any more tools.";
 
 /**
  * `createToolLoopProvider({ id, label, baseUrl, model, apiKey, capabilities })`
@@ -110,14 +107,20 @@ export function createToolLoopProvider({ id, label, baseUrl, model, apiKey, capa
   // shaving those seconds off cancel latency.
   let cancelled = false;
 
-  async function runTurn({ workflow, prompt }, onEvent) {
+  async function runTurn({ workflow, prompt, history = [], systemPrompt }, onEvent) {
     const resolvedBaseUrl = typeof baseUrl === "function" ? baseUrl() : baseUrl;
     const resolvedModel = typeof model === "function" ? model() : model;
     const resolvedApiKey = typeof apiKey === "function" ? apiKey() : apiKey;
 
     const tools = resolveToolSchemas(workflow);
+    // This loop is stateless across calls — it holds no session the way the
+    // `claude` CLI does — so the conversation's memory has to be re-sent every
+    // turn. `history` is the store's own transcript (user text and final
+    // assistant answers only; the tool calls that produced them are not worth
+    // the context on a local model).
     const messages = [
-      { role: "system", content: systemPrompt() },
+      { role: "system", content: systemPrompt ?? FALLBACK_SYSTEM_PROMPT },
+      ...history.map((m) => ({ role: m.role, content: m.content })),
       { role: "user", content: prompt },
     ];
 
@@ -171,11 +174,23 @@ export function createToolLoopProvider({ id, label, baseUrl, model, apiKey, capa
       if (choice?.finish_reason === "tool_calls" && toolCalls.length) {
         messages.push(message);
 
-        const known = new Set(workflow.allowedTools.map((n) => n.replaceAll(".", "_")));
+        // Derived from the SAME resolution the request's `tools` came from,
+        // so a workflow declaring `"*"` guards against the live registry
+        // rather than against a literal `"*"` that matches nothing.
+        const known = new Set(tools.map((t) => t.function.name));
         for (const call of toolCalls) {
           const fn = call.function ?? {};
+          // Same quiet shape the claudeCli path produces, from the same
+          // helper — a transcript that reads differently depending on which
+          // provider answered is its own kind of confusing.
+          let parsedArgs = null;
+          try {
+            parsedArgs = fn.arguments ? JSON.parse(fn.arguments) : null;
+          } catch {
+            parsedArgs = null;
+          }
           onEvent({
-            lines: [{ kind: "tool_call", text: `→ ${fn.name} ${fn.arguments ?? ""}` }],
+            lines: [{ kind: "tool_call", text: summarizeCall(fn.name, parsedArgs) }],
             result: null,
             meta: null,
           });
@@ -200,11 +215,22 @@ export function createToolLoopProvider({ id, label, baseUrl, model, apiKey, capa
             }
           }
 
-          onEvent({
-            lines: [{ kind: "tool_result", text: truncate(toolResultText, TOOL_RESULT_TRUNCATE) }],
-            result: null,
-            meta: null,
-          });
+          // Only failures earn a line; a successful result is already implied
+          // by the call above, and printing it is what made the panel a wall
+          // of JSON.
+          let failed = true;
+          try {
+            failed = JSON.parse(toolResultText)?.ok === false;
+          } catch {
+            failed = false;
+          }
+          if (failed) {
+            onEvent({
+              lines: [{ kind: "tool_result", text: truncate(toolResultText, TOOL_RESULT_TRUNCATE) }],
+              result: null,
+              meta: null,
+            });
+          }
 
           messages.push({ role: "tool", tool_call_id: call.id, content: toolResultText });
         }

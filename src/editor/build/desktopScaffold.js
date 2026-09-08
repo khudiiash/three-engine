@@ -72,8 +72,26 @@ export function desktopTauriConfig({ title, identifier, version = "0.1.0", width
             // Chrome, 2026-08-13). This string REPLACES wry's defaults, so
             // the msWebOOUI/msPdfOOUI/msSmartScreenProtection disables ride
             // along rather than being silently dropped.
+            //
+            // ── THE PIPELINE CACHE (zero-freeze plan unit 3.6) ────────────
+            // WebGPU exposes no application-owned pipeline blob, so the ONLY
+            // thing that makes a second launch cheaper than the first is
+            // Chromium/Dawn's own disk cache, keyed on WGSL source. Measured
+            // 2026-09-07 on the editor's profile: `DawnWebGPUCache` held
+            // 13 MB in ~65 entries against a boot that creates 250-320
+            // pipelines whose WGSL runs to 1 MB+ — i.e. it was evicting most
+            // of a scene every session, and every morning was a cold compile.
+            // The harness has measured the difference this makes on a stable
+            // shader: 19,082 ms cold vs 9 ms warm for the same kernel set.
+            //
+            // SIZED FROM THAT MEASUREMENT rather than picked: 13 MB held ~65
+            // entries, so an entry averages ~200 kB and a 320-pipeline boot is
+            // ~64 MB. 256 MB is four boots' worth of headroom, which covers a
+            // session that opens several scenes. ⚠ Bigger is not free — the
+            // number is a promise the GPU process has to keep — and 256 MB was
+            // reached by arithmetic, not by doubling until it felt safe.
             additionalBrowserArgs:
-              "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --enable-unsafe-webgpu --force-high-performance-gpu --force_high_performance_gpu",
+              "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --enable-unsafe-webgpu --force-high-performance-gpu --force_high_performance_gpu --gpu-program-cache-size-kb=262144 --gpu-disk-cache-size-mb=1024",
           },
         ],
         security: { csp: null },

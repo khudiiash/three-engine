@@ -24,6 +24,8 @@
  */
 import { create } from "zustand";
 import { vmSingleton } from "../singleton.js";
+import { freeze } from "../../engine/freezeLedger.js";
+import { gitStateUnchanged } from "./gitStateDiff.js";
 import { useProjectStore } from "../store/projectStore.js";
 import {
   findRepoRoot,
@@ -82,6 +84,19 @@ const shared = vmSingleton("gitStore", () => {
 
 export const useGitStore = shared.store;
 
+/** Writes only if something a reader could see actually differs. */
+function commit(next) {
+  if (gitStateUnchanged(shared.store.getState(), next)) {
+    // ⛔ NOT EVEN AN EMPTY WRITE. zustand notifies whenever the partial is not
+    // the state object itself, so `setState({})` would re-render every reader
+    // and undo the entire fix. The only write left is clearing a spinner that
+    // is genuinely showing.
+    if (shared.store.getState().loading) shared.store.setState({ loading: false });
+    return;
+  }
+  shared.store.setState(next);
+}
+
 /**
  * Re-reads everything.
  *
@@ -89,33 +104,40 @@ export const useGitStore = shared.store;
  * a just-finished action can all ask within the same tick, and three overlapping
  * `git status` invocations would be three processes producing one answer.
  */
-export async function refreshGit() {
+export async function refreshGit({ silent = false } = {}) {
   if (shared.runtime.inFlight) return shared.runtime.inFlight;
   shared.runtime.inFlight = (async () => {
     const projectRoot = useProjectStore.getState().rootPath;
-    shared.store.setState({ loading: true });
+    // ⚠ A BACKGROUND POLL IS NOT "LOADING". The spinner exists so a person who
+    // clicked Refresh sees that something happened; showing it for a timer
+    // nobody asked about is a render every 8 s AND a flickering chip.
+    if (!silent) shared.store.setState({ loading: true });
     try {
       const tools = await probeTools();
       if (!tools?.git?.found) {
-        shared.store.setState({ ...EMPTY, tools, loading: false, refreshedAt: Date.now() });
+        commit({ ...EMPTY, tools, loading: false, refreshedAt: Date.now() });
         return shared.store.getState();
       }
       if (!projectRoot) {
-        shared.store.setState({ ...EMPTY, tools, loading: false, refreshedAt: Date.now() });
+        commit({ ...EMPTY, tools, loading: false, refreshedAt: Date.now() });
         return shared.store.getState();
       }
       const root = await findRepoRoot(projectRoot);
       if (!root) {
-        shared.store.setState({ ...EMPTY, tools, root: null, isRepo: false, loading: false, refreshedAt: Date.now() });
+        commit({ ...EMPTY, tools, root: null, isRepo: false, loading: false, refreshedAt: Date.now() });
         return shared.store.getState();
       }
 
-      const [status, branches, remotes, identity] = await Promise.all([
-        readStatus(root),
-        readBranches(root),
-        readRemotes(root),
-        readIdentity(root),
-      ]);
+      const readSpan = freeze.begin("git:read");
+      let status, branches, remotes, identity;
+      try {
+        [status, branches, remotes, identity] = await Promise.all([
+          readStatus(root),
+          readBranches(root),
+          readRemotes(root),
+          readIdentity(root),
+        ]);
+      } finally { freeze.end(readSpan); }
 
       // `gh auth status` shells out to a second binary and hits the network on
       // some paths, so it is not part of the poll — once a minute is plenty for
@@ -129,7 +151,7 @@ export async function refreshGit() {
         shared.runtime.githubCheckedAt = Date.now();
       }
 
-      shared.store.setState({
+      commit({
         tools,
         root,
         isRepo: true,
@@ -171,7 +193,7 @@ function schedule() {
     // spawning git processes on a timer is the kind of thing people notice in
     // a battery graph.
     if (typeof document !== "undefined" && document.hidden) return;
-    refreshGit();
+    refreshGit({ silent: true });
   }, period);
 }
 

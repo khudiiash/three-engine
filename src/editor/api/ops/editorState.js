@@ -314,7 +314,7 @@ defineOp({
       type: "object",
       required: true,
       description:
-        "Any of: editor{autosaveSeconds,snapTranslate,snapRotateDeg,snapScale,gridSize,gridDivisions,showGrid,watchProject,keybindings}, scripts{hotReload,reloadIntervalMs}, rendering{pixelRatioCap}, game{title,saveId,saveVersion}, physics{layers,matrix,autoCollidersEnabled}. Sections are merged, so one key does not wipe its siblings.",
+        "Any of: editor{autosaveSeconds,accent,snapTranslate,snapRotateDeg,snapScale,gridSize,gridDivisions,showGrid,watchProject,keybindings,layers,playLayers,ambientGlowSpread,ambientGlowIntensity}, scripts{hotReload,reloadIntervalMs}, rendering{pixelRatioCap}, game{title,saveId,saveVersion}, physics{layers,matrix,autoCollidersEnabled}. Sections are merged, so one key does not wipe its siblings.",
     },
   },
   async run({ patch }) {

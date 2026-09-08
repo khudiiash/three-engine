@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Check, ChevronDown } from "lucide-react";
+import { Check, ChevronDown } from "../icons/index.jsx";
 import { PopoverMenu } from "./PopoverMenu.jsx";
 
 /**

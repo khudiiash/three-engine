@@ -14,7 +14,8 @@ import {
   Copy as Duplicate,
   AlertTriangle,
   FileSearch,
-} from "lucide-react";
+  Zap,
+} from "../icons/index.jsx";
 import { useEventsStore } from "../store/eventsStore.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { engine } from "../engineInstance.js";
@@ -55,19 +56,19 @@ export function EventsPanel() {
           Events
           {count > 0 && <span className="events-count">{count}</span>}
         </span>
-        <button className="toolbar-btn" onClick={add} title="Declare a new event">
-          <Plus size={13} /> Event
+        <button className="toolbar-btn icon-only" onClick={add} title="Declare a new event">
+          <Plus size={13} />
         </button>
         <button
-          className="toolbar-btn"
+          className="toolbar-btn icon-only"
           disabled={!dirty}
           onClick={revert}
           title="Discard changes since the last save"
         >
-          <Undo2 size={13} /> Revert
+          <Undo2 size={13} />
         </button>
         <button
-          className="toolbar-btn"
+          className="toolbar-btn icon-only"
           disabled={!dirty || !hasProject || saving}
           onClick={commit}
           title={
@@ -76,7 +77,7 @@ export function EventsPanel() {
               : "Open a project to save"
           }
         >
-          <Save size={13} /> Save{dirty ? " •" : ""}
+          <Save size={13} />{dirty ? " •" : ""}
         </button>
         <div className="events-tabs">
           <button
@@ -169,10 +170,14 @@ function CatalogTab() {
           // NOT `.inspector-panel.empty` — that class is `display:flex` with no
           // direction, so a text node plus a sibling element become two
           // side-by-side columns, each squeezed to one word per line.
-          <div className="events-rail-empty">No events yet.</div>
+          <div className="events-rail-empty">
+            <Zap className="empty-glyph" size={28} />
+          </div>
         )}
         {events.length > 0 && visible.length === 0 && (
-          <div className="events-rail-empty">Nothing matches “{filter}”.</div>
+          <div className="events-rail-empty" title={`Nothing matches "${filter}"`}>
+            <Search className="empty-glyph" size={28} />
+          </div>
         )}
         {groups.map(([category, list]) => (
           <div key={category || "_"} className="events-group">
@@ -278,40 +283,24 @@ function NothingSelected({ hasEvents }) {
 
   return (
     <div className="events-splash">
-      <h2>Project events</h2>
-      <p>
-        An event declared here is typed in every script straight away —{" "}
-        <code>emit</code> knows what payload it must be given, <code>on</code> knows what it will
-        receive, and a misspelled name is a compile error rather than a handler that never fires.
-      </p>
-      <pre className="events-splash-code">
-        <span className="k">this</span>.engine.emit(<span className="s">"score-changed"</span>, 120);
-        {"\n"}
-        <span className="k">this</span>.engine.on(<span className="s">"score-changed"</span>, (total) =&gt; …);
-      </pre>
-      <p className="events-splash-sub">
-        {hasEvents
-          ? "Pick one on the left to edit it, or start from a common shape:"
-          : "Start from a common shape, or use “+ Event” for an empty one:"}
-      </p>
+      <Zap className="empty-glyph" size={28} />
       <div className="events-starters">
         {STARTERS.map((starter) => (
-          <button key={starter.name} className="events-starter" onClick={() => create(starter)}>
+          <button
+            key={starter.name}
+            className="events-starter"
+            onClick={() => create(starter)}
+            title={starter.description}
+          >
             <span className="events-starter-name">
               {starter.name}
               <span className="events-row-params">
                 ({starter.params.map((p) => p.name).join(", ")})
               </span>
             </span>
-            <span className="events-starter-desc">{starter.description}</span>
           </button>
         ))}
       </div>
-      <p className="events-splash-foot">
-        Wiring one up without a script is the <strong>Events</strong> component in the Inspector —
-        and the <strong>Monitor</strong> tab above shows everything firing at runtime, including the
-        emissions nothing is listening to.
-      </p>
     </div>
   );
 }
@@ -409,18 +398,21 @@ function EventEditor({ event }) {
 
       <div className="events-field">
         <label>Scope</label>
-        <select value={event.scope} onChange={(e) => update(event.name, { scope: e.target.value })}>
+        <select
+          value={event.scope}
+          onChange={(e) => update(event.name, { scope: e.target.value })}
+          title={
+            event.scope === "entity"
+              ? "Fires on one entity — entity.emit(…) reaches only that entity's listeners."
+              : "Fires on the engine — every listener anywhere hears it."
+          }
+        >
           {Object.entries(EVENT_SCOPES).map(([key, { label }]) => (
             <option key={key} value={key}>
               {label}
             </option>
           ))}
         </select>
-      </div>
-      <div className="events-scope-hint">
-        {event.scope === "entity"
-          ? "Fires on one entity — entity.emit(…) reaches only that entity's listeners."
-          : "Fires on the engine — every listener anywhere hears it."}
       </div>
 
       <div className="events-field">
@@ -445,13 +437,15 @@ function EventEditor({ event }) {
 
       <div className="events-section-header">
         <span>Parameters</span>
-        <button className="toolbar-btn" onClick={() => addParam(event.name)}>
-          <Plus size={12} /> Parameter
+        <button className="toolbar-btn icon-only" onClick={() => addParam(event.name)} title="Add parameter">
+          <Plus size={12} />
         </button>
       </div>
 
       {event.params.length === 0 && (
-        <div className="events-empty-params">No parameters — the event carries no payload.</div>
+        <div className="events-empty-params" title="No parameters — the event carries no payload">
+          <Plus className="empty-glyph" size={28} />
+        </div>
       )}
 
       {event.params.map((param, index) => (
@@ -529,7 +523,9 @@ function EventEditor({ event }) {
       {usages && (
         <div className="events-usages">
           {usages.length === 0 ? (
-            <div className="events-empty-params">No script references this event yet.</div>
+            <div className="events-empty-params" title="No script references this event yet">
+              <FileSearch className="empty-glyph" size={28} />
+            </div>
           ) : (
             usages.map((hit, i) => (
               <button
@@ -624,16 +620,20 @@ function ListenerCount({ event }) {
 
   if (event.scope !== "global") {
     return (
-      <div className="events-listeners">
-        Per-entity events have their own listeners on each entity — there is no global count.
+      <div
+        className="events-listeners"
+        title="Per-entity events have their own listeners on each entity — there is no global count"
+      >
+        <span className="cnt">—</span>
       </div>
     );
   }
   return (
-    <div className={`events-listeners ${count === 0 ? "none" : ""}`}>
-      {count === 0
-        ? "Nothing is listening right now — an emit would go nowhere."
-        : `${count} listener${count === 1 ? "" : "s"} attached right now.`}
+    <div
+      className={`events-listeners ${count === 0 ? "none" : ""}`}
+      title={count === 0 ? "Nothing is listening right now — an emit would go nowhere" : "listeners attached"}
+    >
+      <span className="cnt">{count ?? 0}</span>
     </div>
   );
 }
@@ -709,8 +709,8 @@ function MonitorTab({ onDeclared }) {
   return (
     <div className="events-monitor">
       <div className="events-monitor-bar">
-        <span className={`events-rec ${monitoring ? "on" : ""}`}>
-          <Radio size={12} /> {monitoring ? "Recording" : "Paused"}
+        <span className={`events-rec ${monitoring ? "on" : ""}`} title={monitoring ? "Recording" : "Paused"}>
+          <Radio size={12} />
         </span>
         <div className="events-filter">
           <Search size={12} />
@@ -725,15 +725,14 @@ function MonitorTab({ onDeclared }) {
           <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} />
           Follow
         </label>
-        <button className="toolbar-btn" onClick={clearEmissions}>
-          <Trash2 size={12} /> Clear
+        <button className="toolbar-btn icon-only" onClick={clearEmissions} title="Clear">
+          <Trash2 size={12} />
         </button>
       </div>
 
       {rows.length === 0 ? (
         <div className="inspector-panel empty">
-          Nothing yet. Press Play — every emission on every bus shows up here, including the ones
-          with no listeners.
+          <Radio className="empty-glyph" size={28} />
         </div>
       ) : (
         <div className="events-monitor-list">
@@ -755,7 +754,7 @@ function MonitorTab({ onDeclared }) {
                   title="Add this event to the catalog"
                   onClick={() => declare(row)}
                 >
-                  <Plus size={10} /> Declare
+                  <Plus size={10} />
                 </button>
               )}
             </div>

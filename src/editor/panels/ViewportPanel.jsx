@@ -2,8 +2,7 @@
 // errors unrelated to events (Camera/Engine.scene typing too narrow, import.meta.env),
 // a follow-up outside the events-system pass.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Play, Square, Pause, StepForward, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair, Monitor, Wifi, Smartphone, QrCode, Share2, Link2, Loader2, Sparkles } from "lucide-react";
-import qrcode from "qrcode-generator";
+import { Play, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair } from "../icons/index.jsx";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
@@ -11,6 +10,7 @@ import { ensureEngine, engine, isEngineReady } from "../engineInstance.js";
 import { installEditorFramePacing } from "../editorFramePacing.js";
 import { installWheelZoom } from "../viewportZoom.js";
 import { isPickVisible } from "../pickVisibility.js";
+import { installPickAcceleration, invalidatePickBoundsTrees, schedulePickBoundsTrees } from "../pickAcceleration.js";
 import { findEntityId, outermostPrefabRoot, resolveSelectionTarget } from "../pickTarget.js";
 import { selectInScreenRect } from "../selectionRect.js";
 // The viewport's window-level shortcuts are single letters, so "is the user
@@ -27,14 +27,6 @@ import {
   ndcRectFromPixels,
 } from "../boxSelect.js";
 import { setupBoxSelect } from "../viewportBoxSelect.js";
-import {
-  openBrowserPreviewUrl,
-  getBrowserPreviewState,
-  onBrowserPreviewChanged,
-  setBrowserPreviewMessage,
-  toggleBrowserPreview,
-  toggleShareTunnel,
-} from "../browserPreview.js";
 import { DEBUG_LAYER, EDITOR_LAYER, PHYSICS_DEBUG_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
@@ -84,15 +76,11 @@ import { extOf, invalidateBlobUrl, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS, SCRIPT_
 import { basename, useProjectStore } from "../store/projectStore.js";
 import { getEditorCameraStorageKey, loadEditorCamera, saveEditorCamera } from "../cameraPrefs.js";
 import { usePlayStore } from "../store/playStore.js";
-import { toggle as togglePlay, togglePaused, stepFrame } from "../playMode.js";
 import { useAssetDrop } from "../assetDrag.js";
 import { instantiatePrefab } from "../prefab.js";
 import { getProjectSettings, onProjectSettingsApplied, applyProjectSettings } from "../projectSettings.js";
 import { setViewportHandle } from "../viewportHandle.js";
-import { openPanel } from "../EditorShell.jsx";
-import { runWorkflow } from "../store/aiStore.js";
-import { getWorkflow } from "../ai/workflows.js";
-import { getActiveProvider } from "../ai/providers/index.js";
+import { askAiMenuItem, entitySelectionContext, sceneContext } from "../ai/askAi.js";
 import {
   setSharedCanvas,
   claimCanvas,
@@ -113,7 +101,7 @@ import {
 import { useModulesStore } from "../modules.js";
 import { setupBlockoutTool } from "../blockoutTool.js";
 import { dispatchLevelToolKey, getLevelTool, subscribeLevelTool } from "../levelTool.js";
-import { LevelToolButton, LevelToolbar } from "../components/LevelToolbar.jsx";
+import { LevelToolbar } from "../components/LevelToolbar.jsx";
 import { createStroke, resetStroke, strokeDabs } from "../brush.js";
 import { SetTerrainHeightsCommand, SetTerrainScatterCommand, SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
 import { GeometryEditorPanel } from "./GeometryEditorPanel.jsx";
@@ -175,9 +163,11 @@ const LAYER_TOGGLES = [
   // the viewport the way the player will see it — without entering Play.
   { key: "uiOverlay", label: "UI Overlay" },
   { key: "virtualGeometry", label: "Virtual Geometry" },
+  { key: "ambient", label: "Ambient Glow" },
 ];
 
 const EDIT_LAYER_DEFAULTS = {
+  ambient: true,
   gizmos: true,
   cursor3D: true,
   colliders: true,
@@ -422,17 +412,22 @@ async function ensureViewport() {
       // are picked up by `applyLayerVisibility`; colliders come from
       // individual components attached at any time, so we sync them
       // whenever the scene tree changes.
-      applyLayerVisibility();
+      applyLayerVisibility({ force: true });
       const unsubHierarchy = engine.on("hierarchy-changed", () => {
         // The outline caches the flattened mesh list under each selected root,
         // so anything that rebuilds a subtree (a prefab respawn, a model
         // finishing its load) has to invalidate it — otherwise it keeps
         // tracing meshes that were destroyed, or misses ones just added.
         invalidateSelectionOutline();
-        // Cheap-ish — walks every entity looking for a collider.
-        // Sets visibility to the user's current preference; new colliders
-        // added since the last tick get their `visible` corrected here.
+        // New meshes want bounds trees too; existing trees are kept, because a
+        // tree lives ON its geometry and dies with it.
+        invalidatePickBoundsTrees();
+        // Walks every entity looking for a collider. This is the ONE place
+        // that still needs the whole scene: a new collider (or camera model)
+        // has no visibility set yet, and only a tree change can add one.
+        // The per-click walks it used to share the cost with are gone (5.6).
         setCollidersVisible(viewport.layers.colliders);
+        applyCameraModelVisibility(viewport.layers.gizmos);
 
         // Some operations rebuild an entity's Object3D while keeping its id —
         // prefab respawns (apply / revert / a prefab asset changing) destroy
@@ -655,7 +650,9 @@ function setupGizmo(canvas) {
     // Geometry-derived collider outlines are selection-scoped in Edit, so
     // they have to be re-evaluated whenever selection moves — not just when
     // the layer toggle flips. Play deliberately requests all of them.
-    setCollidersVisible(viewport.layers.colliders);
+    // Over the DELTA, not the scene: this used to be a full `engine.entities`
+    // walk per click (§2.3), and `applyLayerVisibility` ran a second one.
+    refreshSelectionOutlines();
   });
   engine.on("play-changed", () => attachSelection(useSelectionStore.getState().ids));
   // Rebuild the light helper when the selected light's `kind` changes —
@@ -688,12 +685,12 @@ function findSceneCamera() {
 }
 
 /** Switches rendering between the editor's orbit camera and the scene's own
- * camera entity. Play gets a separate, all-off debug-layer profile so its
- * toggles never overwrite the author's Edit-mode choices. */
+ * camera entity. Play gets a separate debug-layer profile so its toggles never
+ * overwrite the author's Edit-mode choices — and it is the profile the user
+ * left behind (persisted in project.json), not a fresh all-off one. */
 function setupPlayCamera() {
   engine.on("play-changed", (playing) => {
     if (playing) {
-      viewport.playLayers = { ...PLAY_LAYER_DEFAULTS };
       viewport.layers = viewport.playLayers;
     } else {
       engine.camera?.layers.disable(PHYSICS_DEBUG_LAYER);
@@ -1307,6 +1304,17 @@ function rebuildGrid(editorSettings) {
 }
 
 /**
+ * Which entities currently have their collider outline REQUESTED. This is the
+ * whole point of unit 5.6 (docs/ZERO_FREEZE_PLAN.md §2.3): the walk below is
+ * O(entities) and ran at least TWICE on every selection change — once from the
+ * selection subscription, once from `applyLayerVisibility`. Nothing in a
+ * selection change can alter a collider's GIZMO visibility (only the layer
+ * toggle and play mode can), so a selection change only has to touch the ids
+ * that entered and left the selection. See `refreshSelectionOutlines`.
+ */
+const shownOutlineIds = new Set();
+
+/**
  * Walks every entity in the scene and applies `visible` to the gizmo of its
  * physics-shape components (Collider + CharacterController). Both gizmos live
  * on PHYSICS_DEBUG_LAYER and follow the same "Colliders" layer toggle so a
@@ -1330,7 +1338,58 @@ function setCollidersVisible(visible) {
     if (character?.setDebugVisible) character.setDebugVisible(visible);
     else if (character?.gizmo) character.gizmo.visible = visible && character.enabled;
   }
+  shownOutlineIds.clear();
+  if (selected) for (const id of selected) shownOutlineIds.add(id);
 }
+
+/**
+ * The selection-change path: outlines off for what left, on for what arrived,
+ * and nothing at all for the rest of the scene.
+ *
+ * Falls back to the full walk in Play (where every collider shows an outline,
+ * so the set is the scene) and when the Colliders layer is off (the walk has
+ * gizmos to hide too). Hatch: `globalThis.__editorColliderDelta = false`.
+ */
+function refreshSelectionOutlines() {
+  const visible = viewport.layers.colliders;
+  if (!visible || engine.playing || globalThis.__editorColliderDelta === false) {
+    setCollidersVisible(visible);
+    return;
+  }
+  const next = new Set(useSelectionStore.getState().ids);
+  for (const id of shownOutlineIds) {
+    if (next.has(id)) continue;
+    const collider = engine.getEntity(id)?.getComponent?.("collider");
+    collider?.setDebugVisible?.(true, false);
+  }
+  for (const id of next) {
+    if (shownOutlineIds.has(id)) continue;
+    const collider = engine.getEntity(id)?.getComponent?.("collider");
+    collider?.setDebugVisible?.(true, true);
+  }
+  shownOutlineIds.clear();
+  for (const id of next) shownOutlineIds.add(id);
+}
+
+/**
+ * The camera / virtual-camera model gizmos, which are per-component and so
+ * need a walk. Split out of `applyLayerVisibility` for unit 5.6: this walk
+ * only depends on the `gizmos` flag and on which entities exist, and neither
+ * of those can change because the SELECTION changed — yet `attachSelection`
+ * calls `applyLayerVisibility` on every click, so it used to run one full
+ * `engine.entities` walk per click for a result that never differed.
+ */
+function applyCameraModelVisibility(gizmos) {
+  for (const entity of engine.entities.values()) {
+    for (const type of ["camera", "virtualcamera"]) {
+      const component = entity.getComponent?.(type);
+      if (component?.model) component.model.visible = gizmos && component.enabled;
+    }
+  }
+}
+
+/** The flags the last `applyLayerVisibility` actually walked the scene for. */
+let appliedLayerFlags = null;
 
 /**
  * Apply all three Layers-toggle states at once. Used both at init
@@ -1338,8 +1397,13 @@ function setCollidersVisible(visible) {
  * The gizmo lives as a singleton on `viewport.*` and the selection outline
  * owns its own module state, so both are controlled directly; colliders are
  * per-component so we walk.
+ *
+ * `force` makes it walk regardless — for the paths where the ENTITIES may have
+ * changed under unchanged flags (a hierarchy change, a model finishing its
+ * load). Hatch: `globalThis.__editorLayerFlagGate = false` walks every time,
+ * as it did before unit 5.6.
  */
-function applyLayerVisibility() {
+function applyLayerVisibility({ force = false } = {}) {
   const { gizmos, cursor3D, colliders, grid, virtualGeometry, debugDraw, uiOverlay } = viewport.layers;
   engine.uiSystem?.setOverlayPreview?.(uiOverlay === true);
   // Turned off at the SOURCE, not by hiding the mesh: a script drawing a
@@ -1355,12 +1419,13 @@ function applyLayerVisibility() {
   if (gizmoHelper) gizmoHelper.visible = gizmos && gizmoAttached;
   if (viewport.cameraHelper) viewport.cameraHelper.visible = gizmos;
   if (viewport.lightHelper) viewport.lightHelper.visible = gizmos;
-  for (const entity of engine.entities.values()) {
-    for (const type of ["camera", "virtualcamera"]) {
-      const component = entity.getComponent?.(type);
-      if (component?.model) component.model.visible = gizmos && component.enabled;
-    }
-  }
+  const flagsChanged =
+    globalThis.__editorLayerFlagGate === false
+    || force
+    || appliedLayerFlags?.gizmos !== gizmos
+    || appliedLayerFlags?.colliders !== colliders
+    || appliedLayerFlags?.playing !== engine.playing;
+  if (flagsChanged) applyCameraModelVisibility(gizmos);
   setSelectionOutlineEnabled(gizmos);
   if (viewport.grid) viewport.grid.visible = grid;
   if (engine.camera) {
@@ -1369,7 +1434,11 @@ function applyLayerVisibility() {
     if (gizmos || cursor3D || grid || virtualGeometry) engine.camera.layers.enable(EDITOR_LAYER);
     else engine.camera.layers.disable(EDITOR_LAYER);
   }
-  setCollidersVisible(colliders);
+  // Same gate: with the flags unchanged the only thing that can have moved is
+  // which entities are selected, and that is the delta pass's whole job.
+  if (flagsChanged) setCollidersVisible(colliders);
+  else refreshSelectionOutlines();
+  appliedLayerFlags = { gizmos, colliders, playing: engine.playing };
   setVirtualGeometryDebugVisible(virtualGeometry);
   // 3D cursor visibility also depends on the user's layer toggle. The
   // module's own `visible` flag stays the source of truth for the snap
@@ -1378,36 +1447,50 @@ function applyLayerVisibility() {
   setCursor3DVisible(cursor3D);
 }
 
-// Hydrate `viewport.layers` from project settings (settings.editor.layers)
-// on every apply. Used at boot and when the user changes settings in the
-// project settings panel. We only call `applyLayerVisibility` +
-// `notifyLayersChanged` if the value actually differs, so a no-op apply
-// (which happens after every `setLayerVisible` write) doesn't trigger
-// React re-renders.
-onProjectSettingsApplied((settings) => {
-  const incoming = settings?.editor?.layers;
-  if (!incoming) return;
-  let next = viewport.editLayers;
+/** A stored profile folded over the live one, toggle by toggle (a project
+ *  saved before a toggle existed keeps that toggle's default). Returns the
+ *  same object when nothing differs, so a no-op apply changes nothing. */
+function foldLayerProfile(current, incoming) {
+  let next = current;
   for (const { key } of LAYER_TOGGLES) {
-    if (key in incoming && incoming[key] !== next[key]) {
+    if (key in incoming && !!incoming[key] !== next[key]) {
       next = { ...next, [key]: !!incoming[key] };
     }
   }
-  if (next === viewport.editLayers) return;
-  viewport.editLayers = next;
-  if (!engine.playing) viewport.layers = next;
-  if (viewport.initPromise && !engine.playing) {
+  return next;
+}
+
+// Hydrate both layer profiles from project settings (settings.editor.layers
+// for Edit, settings.editor.playLayers for Play) on every apply. Used at boot
+// and when the user changes settings in the project settings panel. We only
+// call `applyLayerVisibility` + `notifyLayersChanged` if the ACTIVE profile
+// actually differs, so a no-op apply (which happens after every
+// `setLayerVisible` write) doesn't trigger React re-renders.
+onProjectSettingsApplied((settings) => {
+  const editIncoming = settings?.editor?.layers;
+  const playIncoming = settings?.editor?.playLayers;
+  if (!editIncoming && !playIncoming) return;
+  const nextEdit = editIncoming ? foldLayerProfile(viewport.editLayers, editIncoming) : viewport.editLayers;
+  const nextPlay = playIncoming ? foldLayerProfile(viewport.playLayers, playIncoming) : viewport.playLayers;
+  const changed = engine.playing ? nextPlay !== viewport.playLayers : nextEdit !== viewport.editLayers;
+  viewport.editLayers = nextEdit;
+  viewport.playLayers = nextPlay;
+  if (!changed) return;
+  viewport.layers = engine.playing ? nextPlay : nextEdit;
+  if (viewport.initPromise) {
     applyLayerVisibility();
     notifyLayersChanged();
   }
 });
 
-// Persist `viewport.layers` into project.json so the user's preferred
-// view survives reloads / sessions. The project settings panel already
-// uses `updateMeta` for similar "fire and forget" saves; we do the same
-// here, fanning the write into the existing `settings.editor.layers`
-// slot without going through `applyProjectSettings` (which would re-run
-// every settings listener for what's really just a viewport state change).
+// Persist both layer profiles into project.json so the user's preferred
+// view survives reloads / sessions — Play's as much as Edit's, or entering
+// Play on a fresh start would blank every debug view the user set up last
+// session. The project settings panel already uses `updateMeta` for similar
+// "fire and forget" saves; we do the same here, fanning the write into the
+// existing `settings.editor.layers` / `playLayers` slots without going
+// through `applyProjectSettings` (which would re-run every settings listener
+// for what's really just a viewport state change).
 function persistLayersNow() {
   // Lazy import — projectStore touches the Tauri bridge which only exists
   // in the built editor, and avoiding it during module init keeps tests
@@ -1416,7 +1499,10 @@ function persistLayersNow() {
     .then(({ useProjectStore }) => {
       const current = getProjectSettings();
       return useProjectStore.getState().updateMeta({
-        settings: { ...current, editor: { ...current.editor, layers: { ...viewport.editLayers } } },
+        settings: {
+          ...current,
+          editor: { ...current.editor, layers: { ...viewport.editLayers }, playLayers: { ...viewport.playLayers } },
+        },
       });
     })
     .catch((err) => console.warn(`Couldn't persist layers to project.json: ${err}`));
@@ -1435,7 +1521,7 @@ export function setLayerVisible(key, visible) {
   else viewport.editLayers = viewport.layers;
   applyLayerVisibility();
   notifyLayersChanged();
-  if (!engine.playing) persistLayersNow();
+  persistLayersNow();
 }
 
 /** Subscribe to layer-toggle changes. Returns an unsubscribe. */
@@ -1946,12 +2032,23 @@ function isSolidPick(object) {
 }
 
 function setupPicking(canvas) {
+  installPickAcceleration();
   const raycaster = new THREE.Raycaster();
   // Pick against every layer so the camera model (EDITOR_LAYER), gizmo
   // helpers, etc. are still selectable — they only differ from the rest
   // of the scene by which camera renders them, not by whether clicks land
   // on them.
   raycaster.layers.enableAll();
+  // ⚠ THIS IS SAFE ONLY BECAUSE EVERY PREDICATE IN THE HIT LOOP IS PER-OBJECT
+  // (`isPickVisible`, `findEntityId`, `isSolidPick`). `firstHitOnly` is
+  // three-mesh-bvh's fast path — it stops at the nearest triangle instead of
+  // collecting and sorting every surface the ray crosses — and it keeps one
+  // hit PER MESH, not one hit for the whole scene, so the loop below still
+  // walks every object the ray touched, in order, and still falls back to a
+  // line hit. The hits it drops are the SECOND, THIRD… hit on a mesh the loop
+  // had already resolved identically. Meshes with no bounds tree ignore the
+  // flag entirely and return their full sorted list as before.
+  raycaster.firstHitOnly = true;
   const pointer = new THREE.Vector2();
   let downPos = null;
   let lastClick = { t: 0, x: 0, y: 0 };
@@ -1986,6 +2083,10 @@ function setupPicking(canvas) {
     raycaster.params.Line.threshold = wpp * LINE_PICK_PX;
     raycaster.params.Points.threshold = wpp * LINE_PICK_PX;
 
+    // This click pays the stock scan for anything that has no tree yet; the
+    // scan+build it queues here drains in idle time, so the NEXT click is the
+    // one that gets the acceleration. Nothing is ever built on this stack.
+    schedulePickBoundsTrees(engine.scene);
     const hits = raycaster.intersectObjects(engine.scene.children, true);
     // Nearest solid hit wins; a helper-line hit is only a fallback for when
     // nothing solid was under the cursor (clicking the bare selection cage of
@@ -3936,14 +4037,6 @@ function selectAllInView() {
 function viewportMenuItems() {
   const ids = useSelectionStore.getState().ids;
   const has = ids.length > 0;
-  // Mirrors the same check in aiStore.runWorkflow — see HierarchyPanel.jsx's
-  // context menu for the longer version of this comment.
-  const diagnoseWorkflow = getWorkflow("diagnose-selected");
-  const aiProvider = getActiveProvider();
-  const aiBlockedHint =
-    diagnoseWorkflow?.mutates && !aiProvider?.capabilities?.scopedTools
-      ? `${aiProvider?.label ?? "This provider"} cannot limit itself to this workflow's tools. Switch to a scoped provider (e.g. Ollama).`
-      : undefined;
   return [
     { label: "Focus Selected", shortcut: "F", disabled: !has, action: () => focusSelection() },
     { separator: true },
@@ -3967,16 +4060,10 @@ function viewportMenuItems() {
     { label: "3D Cursor → Selection", disabled: !has, action: () => snapCursorToSelection() },
     { label: "3D Cursor → World Origin", action: () => snapCursorToWorldOrigin() },
     { separator: true },
-    {
-      label: "AI: Diagnose this",
-      icon: Sparkles,
-      disabled: ids.length !== 1 || !!aiBlockedHint,
-      hint: aiBlockedHint,
-      action: () => {
-        openPanel("ai");
-        runWorkflow("diagnose-selected", ids[0]);
-      },
-    },
+    // With nothing selected the viewport's subject is the scene itself, which
+    // is the more useful anchor for "why does this look wrong" anyway — so the
+    // item is never disabled here, unlike in the hierarchy.
+    askAiMenuItem(has ? entitySelectionContext(ids) : sceneContext()),
     { separator: true },
     { label: "Delete", shortcut: "Del", danger: true, disabled: !has, action: () => deleteSelection() },
   ];
@@ -4023,36 +4110,6 @@ export function ViewportPanel() {
   const [layers, setLayers] = useState(viewport.layers);
   const [layersOpen, setLayersOpen] = useState(false);
   const levelDesignEnabled = useModulesStore((s) => s.enabled.includes("level-design"));
-  // Mirrored from browserPreview.js rather than owned here: the server
-  // outlives this panel (dockview remounts it on every tab move) and can be
-  // started by things that are not this toolbar — the boot autostart, an
-  // agent. Subscribing is what makes those visible here.
-  const [browserPreview, setBrowserPreview] = useState(getBrowserPreviewState);
-  useEffect(() => onBrowserPreviewChanged(setBrowserPreview), []);
-  // Separate from `busy`: only the share endpoint should spin while a tunnel
-  // starts, not while the preview itself builds.
-  const shareBusy = browserPreview.sharing;
-  // The public link wins the QR slot when it exists: it works from any phone
-  // with no certificate warning, which is what a scanned code is for.
-  const browserPreviewQrUrl = browserPreview.share?.url || browserPreview.urls?.lanUrl || "";
-  const browserPreviewQr = useMemo(() => {
-    if (!browserPreviewQrUrl) return "";
-    const qr = qrcode(0, "M");
-    qr.addData(browserPreviewQrUrl);
-    qr.make();
-    const svg = qr.createSvgTag({ cellSize: 3, margin: 2, scalable: true });
-    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-  }, [browserPreviewQrUrl]);
-
-  const openPreviewEndpoint = async (url) => {
-    try {
-      await openBrowserPreviewUrl(url);
-    } catch (error) {
-      console.error(`Could not open preview URL ${url}: ${error?.message ?? error}`);
-      navigator.clipboard?.writeText(url).catch(() => {});
-      setBrowserPreviewMessage(`Could not open URL; copied to clipboard: ${url}`);
-    }
-  };
 
   const dropRef = useAssetDrop({
     accepts: [...MODEL_EXTENSIONS, ...TEXTURE_EXTENSIONS, ...SCRIPT_EXTENSIONS, ...MATERIAL_EXTENSIONS, ...PREFAB_EXTENSIONS],
@@ -4309,131 +4366,12 @@ export function ViewportPanel() {
       )}
       {levelDesignEnabled && !playing && <LevelToolbar />}
       <div className="viewport-toolbar">
-        <button
-          className={`toolbar-btn play-btn ${playing ? "active" : ""}`}
-          title={playing ? "Stop (Ctrl+P)" : "Play (Ctrl+P)"}
-          onClick={() => togglePlay()}
-        >
-          {playing ? <Square size={13} /> : <Play size={13} />}
-        </button>
-        {/* Pause freezes game time, not the render loop — the paused frame
-            stays inspectable and Step advances it one slice at a time. */}
-        {playing && (
-          <>
-            <button
-              className={`toolbar-btn icon-only ${paused ? "active" : ""}`}
-              title={paused ? "Resume (Ctrl+Shift+P)" : "Pause (Ctrl+Shift+P)"}
-              onClick={() => togglePaused()}
-            >
-              <Pause size={13} />
-            </button>
-            <button
-              className="toolbar-btn icon-only"
-              title="Step one frame (Ctrl+.)"
-              onClick={() => stepFrame()}
-            >
-              <StepForward size={13} />
-            </button>
-          </>
-        )}
         {/* Blockout tools. Gated on the module rather than always shown: the
             palette is modal over the viewport, and an editor that offers it
             without the components registered would arm a tool that can't
             create anything. */}
-        {levelDesignEnabled && !playing && <LevelToolButton />}
-        <div className={`browser-preview-launcher ${browserPreview.urls ? "is-active" : ""} ${shareBusy ? "is-sharing" : ""}`}>
-          <button
-            className={`toolbar-btn icon-only ${browserPreview.urls ? "active" : ""}`}
-            disabled={!rootPath || browserPreview.busy}
-            title={browserPreview.urls
-              ? "Stop browser preview server (this project stops serving on startup too)"
-              : browserPreview.message || (playing
-                ? "Stop Play mode, then build and serve it"
-                : "Build and serve on localhost and local Wi-Fi over HTTPS — stays on across editor restarts")}
-            onClick={() => toggleBrowserPreview()}
-          >
-            <Wifi size={13} />
-          </button>
-          {browserPreview.urls && (
-            <div className="browser-preview-endpoints" aria-label="Browser preview links">
-              {browserPreview.urls.lanUrl && (
-                <span
-                  className="browser-preview-endpoint"
-                  role="button"
-                  tabIndex={0}
-                  title={`Open Wi-Fi HTTPS preview (phones/tablets)\n${browserPreview.urls.lanUrl}\nAccept the local certificate once on this device.`}
-                  onClick={() => openPreviewEndpoint(browserPreview.urls.lanUrl)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") openPreviewEndpoint(browserPreview.urls.lanUrl);
-                  }}
-                >
-                  <Smartphone size={13} />
-                </span>
-              )}
-              {browserPreview.urls.localUrl && (
-                <span
-                  className="browser-preview-endpoint"
-                  role="button"
-                  tabIndex={0}
-                  title={`Open localhost\n${browserPreview.urls.localUrl}`}
-                  onClick={() => openPreviewEndpoint(browserPreview.urls.localUrl)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") openPreviewEndpoint(browserPreview.urls.localUrl);
-                  }}
-                >
-                  <Monitor size={13} />
-                </span>
-              )}
-              <span
-                className={`browser-preview-endpoint ${browserPreview.share ? "active" : ""}`}
-                role="button"
-                tabIndex={0}
-                title={shareBusy
-                  ? browserPreview.message || "Creating public link…"
-                  : browserPreview.share
-                    ? `Stop public share link\n${browserPreview.share.url}`
-                    : "Create a public share link anyone can open (Cloudflare quick tunnel)"}
-                aria-label={browserPreview.share ? "Stop public share link" : "Create public share link"}
-                onClick={toggleShareTunnel}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") toggleShareTunnel();
-                }}
-              >
-                {shareBusy ? <Loader2 size={13} className="endpoint-spin" /> : <Share2 size={13} />}
-              </span>
-              {browserPreview.share && (
-                <span
-                  className="browser-preview-endpoint"
-                  role="button"
-                  tabIndex={0}
-                  title={`Open public link (click also copies it)\n${browserPreview.share.url}`}
-                  onClick={() => {
-                    navigator.clipboard?.writeText(browserPreview.share.url).catch(() => {});
-                    openPreviewEndpoint(browserPreview.share.url);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") openPreviewEndpoint(browserPreview.share.url);
-                  }}
-                >
-                  <Link2 size={13} />
-                </span>
-              )}
-              {browserPreviewQr && (
-                <span
-                  className="browser-preview-endpoint browser-preview-qr"
-                  tabIndex={0}
-                  title={browserPreview.share ? "Show public link QR code" : "Show Wi-Fi QR code"}
-                  aria-label="Show preview QR code"
-                >
-                  <QrCode size={13} />
-                  <span className="browser-preview-qr-popover">
-                    <img src={browserPreviewQr} alt={`QR code for ${browserPreviewQrUrl}`} />
-                  </span>
-                </span>
-              )}
-            </div>
-          )}
-        </div>
+        {/* The level tool lives in the Level panel; the viewport toolbar is the gizmo cluster only. */}
+        <div className="viewport-hud-cluster">
         {[
           ["translate", "Move (G)", Move],
           ["rotate", "Rotate (R)", Rotate3d],
@@ -4480,11 +4418,11 @@ export function ViewportPanel() {
             </>
           )}
         </div>
+        </div>
         {/* The unfocused-viewport pause lives in Project Settings → Editor: it
             is a set-once machine preference, not something worth a permanent
             seat in a toolbar you look at every minute. */}
-        {playing && <span className="backend-badge playing">Playing</span>}
-        {backend && <span className={`backend-badge ${backend === "WebGPU" ? "webgpu" : "webgl"}`}>{backend}</span>}
+        {/* The backend is in the console at boot; the viewport shows the scene, not the API. */}
       </div>
       {canvasElsewhere && (
         <div className="viewport-canvas-moved">

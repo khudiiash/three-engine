@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Plus, X, Trash2, RotateCcw, Gamepad2, Keyboard, Mouse, Smartphone, Crosshair, Save } from "lucide-react";
+import { Plus, X, Trash2, RotateCcw, Gamepad2, Keyboard, Mouse, Smartphone, Crosshair, Save, Link2 } from "../icons/index.jsx";
 import { useInputStore } from "../store/inputStore.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { describePath, rebindNextInput, suggestedPaths } from "../input/bindingLabels.js";
@@ -69,26 +69,30 @@ export function InputPanel() {
   return (
     <div className="input-panel">
       <div className="panel-toolbar">
-        <span className="asset-path" title="Input">Action Maps</span>
-        <button className="toolbar-btn" onClick={addMap} title="Add a new action map">
-          <Plus size={13} /> Map
+        <span className="asset-path" title="Input">Action maps</span>
+        <button className="toolbar-btn icon-only" onClick={addMap} title="Add action map">
+          <Plus size={13} />
         </button>
-        <button className="toolbar-btn" onClick={resetDefaults} title="Reset to defaults (Player + UI)">
-          <RotateCcw size={13} /> Defaults
+        <button className="toolbar-btn icon-only" onClick={resetDefaults} title="Reset to defaults (Player + UI)">
+          <RotateCcw size={13} />
         </button>
         <button
-          className="toolbar-btn"
+          className="toolbar-btn icon-only"
           disabled={!dirty || !hasProject}
           onClick={commit}
-          title={hasProject ? "Save to project.json" : "Open a project to save"}
+          title={hasProject ? `Save to project.json${dirty ? " (unsaved changes)" : ""}` : "Open a project to save"}
         >
-          <Save size={13} /> Save{dirty ? " •" : ""}
+          <Save size={13} />{dirty ? " •" : ""}
         </button>
       </div>
 
       <div className="input-layout">
         <aside className="input-maps">
-          {maps.length === 0 && <div className="inspector-panel empty">No maps yet — click “+ Map”.</div>}
+          {maps.length === 0 && (
+            <div className="inspector-panel empty">
+              <Gamepad2 className="empty-glyph" size={28} />
+            </div>
+          )}
           {maps.map((m) => {
             const enabled = (snap.stack ?? []).includes(m.name);
             const active = activeMap?.name === m.name;
@@ -116,7 +120,9 @@ export function InputPanel() {
           {activeMap ? (
             <MapEditor map={activeMap} selectedAction={selectedAction} onSelectAction={(a) => selectAction(activeMap.name, a)} onPatch={patch} />
           ) : (
-            <div className="inspector-panel empty">Pick a map on the left.</div>
+            <div className="inspector-panel empty">
+              <Gamepad2 className="empty-glyph" size={28} />
+            </div>
           )}
         </main>
       </div>
@@ -214,13 +220,15 @@ function MapEditor({ map, selectedAction, onSelectAction, onPatch }) {
     <div className="input-map-editor">
       <div className="input-map-header">
         <div className="input-map-title">{map.name}</div>
-        <button className="toolbar-btn" onClick={addAction}>
-          <Plus size={13} /> Action
+        <button className="toolbar-btn icon-only" onClick={addAction} title="Add action">
+          <Plus size={13} />
         </button>
       </div>
 
       {(map.actions ?? []).length === 0 && (
-        <div className="inspector-panel empty">No actions — click “+ Action”.</div>
+        <div className="inspector-panel empty">
+          <Crosshair className="empty-glyph" size={28} />
+        </div>
       )}
 
       {(map.actions ?? []).map((action) => {
@@ -241,7 +249,7 @@ function MapEditor({ map, selectedAction, onSelectAction, onPatch }) {
             >
               <span className="input-action-name">{action.name}</span>
               <span className="input-action-type">{action.type}</span>
-              <span className="input-action-bindings">{action.bindings.length} binding{action.bindings.length === 1 ? "" : "s"}</span>
+              <span className="cnt" title="bindings">{action.bindings.length}</span>
               <button
                 className="icon-btn"
                 title="Remove action"
@@ -298,7 +306,9 @@ function BindingList({ action, onAdd, onRemove, onUpdate }) {
         <span className="field-label">Bindings</span>
       </div>
       {action.bindings.length === 0 && (
-        <div className="input-bindings-empty">No bindings — add one below.</div>
+        <div className="input-bindings-empty">
+          <Link2 className="empty-glyph" size={28} />
+        </div>
       )}
       {action.bindings.map((b) =>
         b?.kind === "composite" ? (
@@ -392,7 +402,7 @@ function BindingAdder({ onAdd }) {
     { id: "mouse", label: "Mouse", Icon: Mouse },
     { id: "gamepad", label: "Gamepad", Icon: Gamepad2 },
     { id: "touch", label: "Touch", Icon: Smartphone },
-    { id: "virtualjoystick", label: "V-Joy", Icon: Crosshair },
+    { id: "virtualjoystick", label: "Virtual Joystick", Icon: Crosshair },
   ];
   const [open, setOpen] = useState(null);
   const [custom, setCustom] = useState("");
@@ -400,8 +410,8 @@ function BindingAdder({ onAdd }) {
     <div className="input-binding-adder">
       {families.map((f) => (
         <div key={f.id} className="input-adder-family">
-          <button className="toolbar-btn tiny" onClick={() => setOpen(open === f.id ? null : f.id)}>
-            <f.Icon size={12} /> {f.label}
+          <button className="toolbar-btn tiny icon-only" title={f.label} onClick={() => setOpen(open === f.id ? null : f.id)}>
+            <f.Icon size={12} />
           </button>
           {open === f.id && (
             <div className="input-adder-menu">
@@ -427,11 +437,12 @@ function BindingAdder({ onAdd }) {
           }}
         />
         <button
-          className="toolbar-btn tiny"
+          className="toolbar-btn tiny icon-only"
           disabled={!custom}
           onClick={() => { if (custom) { onAdd(custom); setCustom(""); } }}
+          title="Add binding"
         >
-          Add
+          <Plus size={12} />
         </button>
       </div>
     </div>
@@ -441,11 +452,11 @@ function BindingAdder({ onAdd }) {
 function DeviceLegend() {
   return (
     <div className="input-legend">
-      <span><Keyboard size={11} /> Keyboard</span>
-      <span><Mouse size={11} /> Mouse</span>
-      <span><Gamepad2 size={11} /> Gamepad</span>
-      <span><Smartphone size={11} /> Touch</span>
-      <span><Crosshair size={11} /> Virtual Joystick</span>
+      <span title="Keyboard"><Keyboard size={11} /></span>
+      <span title="Mouse"><Mouse size={11} /></span>
+      <span title="Gamepad"><Gamepad2 size={11} /></span>
+      <span title="Touch"><Smartphone size={11} /></span>
+      <span title="Virtual Joystick"><Crosshair size={11} /></span>
     </div>
   );
 }

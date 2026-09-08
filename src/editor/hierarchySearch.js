@@ -79,8 +79,9 @@ export function candidateFromMirror(entity) {
     componentTypes: Object.keys(entity.components ?? {}),
     components: entity.components,
     childIds: entity.childIds,
-    enabled: entity.enabledInEditor !== false,
-    enabledInGame: entity.enabledInGame !== false,
+    enabled: (entity.enabled ?? entity.enabledInGame) !== false,
+    enabledInGame: (entity.enabled ?? entity.enabledInGame) !== false,
+    visibleInEditor: (entity.visibleInEditor ?? entity.enabledInEditor) !== false,
   };
 }
 
@@ -103,8 +104,9 @@ export function candidateFromLive(entity) {
     // `?childcount>0` has to mean the same thing on both sides: the mirror
     // carries `childIds` already, and a live Entity holds child OBJECTS.
     childIds: (entity.children ?? []).map((child) => child.id),
-    enabled: entity.enabledInEditor !== false,
-    enabledInGame: entity.enabledInGame !== false,
+    enabled: (entity.enabled ?? entity.enabledInGame) !== false,
+    enabledInGame: (entity.enabled ?? entity.enabledInGame) !== false,
+    visibleInEditor: (entity.visibleInEditor ?? entity.enabledInEditor) !== false,
   };
 }
 

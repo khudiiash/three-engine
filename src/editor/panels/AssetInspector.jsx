@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { useEffect, useRef, useState } from "react";
+import { EquirectPreview, MaterialPreview } from "../components/AssetThumb.jsx";
 import {
   Archive,
   AudioWaveform,
@@ -26,7 +27,7 @@ import {
   Trash2,
   Type,
   Workflow,
-} from "lucide-react";
+} from "../icons/index.jsx";
 import * as THREE from "three/webgpu";
 import { createGltfLoader } from "../../engine/gltfLoader.js";
 import { useSelectionStore } from "../store/selectionStore.js";
@@ -667,7 +668,7 @@ function ModelPreview({ path }) {
   return (
     <>
       <div className="asset-preview model-preview">
-        {error ? <div className="asset-hint">Preview unavailable: {error}</div> : <canvas ref={canvasRef} />}
+        {error ? <div className="asset-hint error">Preview unavailable: {error}</div> : <canvas ref={canvasRef} />}
       </div>
       {info && (
         <div className="inspector-section">
@@ -1200,11 +1201,12 @@ function MaterialSummary({ path }) {
     <>
       <div className="inspector-section">
           <div className="section-header">Material</div>
-          <div className="asset-info-row">
-            {def.shaderGraph?.nodes?.length
-              ? `${def.shaderGraph.nodes.length} nodes · ${(def.shaderGraph.edges ?? []).length} connections`
-              : "No shader graph — open the editor to build one"}
-          </div>
+          {def.shaderGraph?.nodes?.length ? (
+            <div className="asset-info-row material-graph-counts">
+              <span className="cnt" title="nodes">{def.shaderGraph.nodes.length}</span>
+              <span className="cnt" title="connections">{(def.shaderGraph.edges ?? []).length}</span>
+            </div>
+          ) : null}
           <button
             className="toolbar-btn wide"
             onClick={() => {
@@ -1669,29 +1671,26 @@ function AssetActionsSection({ path, isDir = false }) {
 
   return (
     <div className="inspector-section asset-actions">
-      <div className="section-header">Actions</div>
-      {visible.map((action) => {
-        const Icon = ACTION_ICONS[action.icon] ?? ChevronRight;
-        const enabled = action.enabled ? action.enabled() : true;
-        return (
-          <button
-            key={action.id}
-            className={`asset-action${action.primary ? " primary" : ""}${action.danger ? " danger" : ""}`}
-            disabled={!enabled || running === action.id}
-            onClick={() => run(action)}
-            title={enabled ? action.hint : `${action.hint} (select an entity first)`}
-          >
-            <Icon size={14} className="asset-action-icon" />
-            <span className="asset-action-text">
-              <span className="asset-action-label">{action.label}</span>
-              <span className="asset-action-hint">{action.hint}</span>
-            </span>
-          </button>
-        );
-      })}
-      {!selectedIds.length && visible.some((action) => action.enabled) && (
-        <div className="asset-hint">Some actions need an entity selected in the scene.</div>
-      )}
+      <div className="section-header"><span className="section-title">Actions</span></div>
+      {/* One glyph per verb; the label and what it does live in the tooltip. */}
+      <div className="asset-action-row">
+        {visible.map((action) => {
+          const Icon = ACTION_ICONS[action.icon] ?? ChevronRight;
+          const enabled = action.enabled ? action.enabled() : true;
+          return (
+            <button
+              key={action.id}
+              className={`toolbar-btn icon-only asset-action${action.primary ? " primary" : ""}${action.danger ? " danger" : ""}`}
+              disabled={!enabled || running === action.id}
+              onClick={() => run(action)}
+              aria-label={action.label}
+              title={`${action.label} — ${enabled ? action.hint : `${action.hint} (select an entity first)`}`}
+            >
+              <Icon size={14} />
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -1840,7 +1839,7 @@ function FontPreview({ path }) {
     <>
       <div className="asset-preview font-preview">
         {error ? (
-          <div className="asset-hint">Can't load this font: {error}</div>
+          <div className="asset-hint error">Can't load this font: {error}</div>
         ) : (
           <>
             <div className="font-specimen-alphabet" style={{ fontFamily: family }}>
@@ -2188,16 +2187,12 @@ function GeometryPreview({ path }) {
  * is more than the old Inspector gave a `.txt`, a `.hdr` or an unrecognised
  * import, all of which used to render an empty panel that looked broken.
  */
-function GenericPreview({ path, ext }) {
-  return (
-    <div className="inspector-section">
-      <div className="section-header">File</div>
-      <div className="asset-hint">
-        No dedicated editor for <code>.{ext || "?"}</code> files. It's still part of the project — tag it,
-        control whether it ships, and open it with whatever your OS uses for it.
-      </div>
-    </div>
-  );
+function GenericPreview() {
+  // A file with no dedicated editor has nothing to preview: the name, size,
+  // tags, build flags and actions above and below already say everything
+  // there is to say, and a section whose only content is a sentence
+  // explaining that is exactly the kind of text the inspector no longer has.
+  return null;
 }
 
 /**
@@ -2287,6 +2282,8 @@ export function AssetInspector({ path }) {
           order matches how someone reads an unfamiliar asset: see it, learn
           what it's for, then tune it. */}
       {isTexture && <TexturePreview path={path} />}
+      {ext === "mat" && <MaterialPreview path={path} />}
+      {HDRI_EXTENSIONS.includes(ext) && <EquirectPreview path={path} />}
       {ext === "glb" && <ModelPreview path={path} />}
       {ext === "geom" && <GeometryPreview path={path} />}
       {isFont && <FontPreview path={path} />}

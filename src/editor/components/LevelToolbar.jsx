@@ -16,7 +16,7 @@ import {
   Settings2,
   Square,
   TriangleRight,
-} from "lucide-react";
+} from "../icons/index.jsx";
 import { engine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";

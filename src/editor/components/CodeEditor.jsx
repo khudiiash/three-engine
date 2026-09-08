@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Save, ExternalLink, RotateCcw, WrapText, Braces, Command } from "lucide-react";
+import { Save, ExternalLink, RotateCcw, WrapText, Braces, Command } from "../icons/index.jsx";
 import { loadMonaco, getModel, ensureThreeTypes, languageForPath } from "../code/monaco.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { openInIDE } from "../openInIde.js";
