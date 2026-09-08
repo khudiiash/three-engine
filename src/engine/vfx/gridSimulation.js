@@ -1872,7 +1872,17 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // The tail starts from `positions` (what `collide` last wrote), so it leads
   // with solveB; an even count returns it to `positions`.
   if (kind === "cloth") steps.push(...Array.from({ length: CLOTH_SOLVE_PASSES - split }, (_, i) => (i % 2 === 0 ? solveB : solveA)));
-  if (pinEntities) steps.push(pinEntities);
+  // ⛔ `pinEntities` IS NOT IN `steps`, BECAUSE IT IS USUALLY A NO-OP DISPATCH.
+  // Its whole body is `Loop({ start: 0, end: anchorCount })`, so a cloth with no
+  // entity anchors — which is every cloth in Sponza — dispatched a kernel that
+  // did nothing, once per substep AND once more per frame. Three of a mesh
+  // cloth's thirty-four dispatches a frame, and the solver is DISPATCH-bound:
+  // ten cloths made that thirty wasted dispatches every frame. `pushSteps`
+  // below adds it only when there is an anchor to enforce.
+  const substepQueue = (queue) => {
+    queue.push(...steps);
+    if (pinEntities && anchorCount.value > 0) queue.push(pinEntities);
+  };
   let initialized = false, accumulator = 0, elapsed = 0, lastStep = h;
   // The sea's settings and its CPU copy (for buoyancy), see `tick`.
   let lastProps = props, configuredDepth = 0, seaSample = null, seaReadbackPending = false, seaFrame = 0;
@@ -2343,18 +2353,20 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
           velocityScale.value = clothVelocityScale(hEff, lastStep, u.damping.value, h);
           stepSq.value = hEff * hEff;
           lastStep = hEff;
-          for (let i = 0; i < n; i++) queue.push(...steps);
+          for (let i = 0; i < n; i++) substepQueue(queue);
         }
       } else {
         stepSq.value = h * h;
         velocityScale.value = u.damping.value;
         lastStep = h;
-        for (let i = 0; accumulator + 1e-9 >= h && i < maxSubsteps; i++, accumulator -= h) queue.push(...steps);
+        for (let i = 0; accumulator + 1e-9 >= h && i < maxSubsteps; i++, accumulator -= h) substepQueue(queue);
         // A cloth too big to keep up must not hoard time it will never spend,
         // or the next frame starts already owing six substeps again.
         if (accumulator > h * maxSubsteps) accumulator = h * maxSubsteps;
       }
-      if(pinEntities)queue.push(pinEntities);
+      // The authoritative pass still runs on a zero-delta frame so a gizmo drag
+      // moves its attachment immediately — but only when an anchor exists.
+      if (pinEntities && anchorCount.value > 0) queue.push(pinEntities);
       // ⚠ THE CAUSTIC DRAW GOES FIRST, AND NOT AFTER THE DISPATCH.
       //
       // It is a nested `renderer.render` into a render target. Issued right
