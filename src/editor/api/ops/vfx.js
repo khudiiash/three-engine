@@ -85,7 +85,9 @@ function describePrimitiveColliders(component) {
     const extent = [0, 1, 2].map((k) => Math.abs(axes[0][k]) * half[0] + Math.abs(axes[1][k]) * half[1] + Math.abs(axes[2][k]) * half[2]);
     const min = centre.map((v, k) => v - extent[k]);
     const max = centre.map((v, k) => v + extent[k]);
-    const id = byRow.get(i) ?? null;
+    // `rowEntities` names EVERY row; `entityIndices` only holds an islanded
+    // collider's first, so without it the urns after the first read "(unknown)".
+    const id = field.rowEntities?.[i] ?? byRow.get(i) ?? null;
     const entity = id ? engine.entities.get(id) : null;
     const collider = entity?.getComponent?.("collider");
     const overlaps = clothBox

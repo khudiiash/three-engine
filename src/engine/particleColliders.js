@@ -190,6 +190,8 @@ export class ParticleColliderField {
     // collider stood then. Keyed by entity id, not by row, because a row index
     // belongs to whichever collider happened to be packed there this frame.
     this.moved = new Uint8Array(MAX_COLLIDERS);
+    /** The entity each packed ROW came from — an islanded collider owns several. */
+    this.rowEntities = new Array(MAX_COLLIDERS).fill(null);
     this._lastCentre = new Map();
   }
   addUser() { this.activeUsers++; }
@@ -243,6 +245,7 @@ export class ParticleColliderField {
         // ⚠ The map holds the FIRST row: `collisionSkip` can only name one, so
         // an islanded collider skips its first piece against its own cloth.
         if (wrote === 0) this.entityIndices.set(entity.id, count);
+        this.rowEntities[count] = entity.id;
         count++;
         wrote++;
       }
