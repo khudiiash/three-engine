@@ -253,6 +253,29 @@ export function clothFlocks(engine) {
       for (const flock of flocks.values()) flock.tick(renderer, delta);
     },
   };
+  // ⭐ NAME THE ZERO-SIZED BINDING. A failed bind group fails the command buffer
+  // every cloth kernel was encoded into, and the device only says "[Buffer
+  // (unlabeled)]" once before hundreds of cascade errors bury it. Wrapping
+  // `createBindGroup` catches the descriptor itself, with every sibling
+  // buffer's label and size, which identifies the kernel even when the empty
+  // one is not ours. Dev only, and only while the flock is on.
+  if (FLOCK_ENABLED() && !engine.__clothBindGroupWatch) {
+    engine.__clothBindGroupWatch = true;
+    const device = engine.renderer?.backend?.device;
+    if (device?.createBindGroup) {
+      const original = device.createBindGroup.bind(device);
+      device.createBindGroup = (descriptor) => {
+        const entries = descriptor?.entries ?? [];
+        const empty = entries.find((e) => e.resource?.buffer && e.resource.buffer.size === 0);
+        if (empty) {
+          console.error("[cloth] ZERO-SIZED BINDING in", descriptor.label, "at binding", empty.binding,
+            "— siblings:", entries.map((e) => `${e.binding}:${e.resource?.buffer?.label || "(unlabeled)"}=${e.resource?.buffer?.size ?? "?"}`).join(", "));
+        }
+        return original(descriptor);
+      };
+    }
+  }
+
   // The flock solves from inside the shared submission's `beforeFlush`, so its
   // kernels are queued no matter which preRender listener registered first.
   clothComputeBatch(engine)?.beforeFlush.add(() => {

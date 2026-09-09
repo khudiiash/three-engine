@@ -91,6 +91,32 @@ test('the spring family and the thickness sentinel survive the merge', () => {
     'a thickness spring that stops being one is a shell that collapses');
 });
 
+/**
+ * ⛔⛔ The fan successor is a PARTICLE INDEX, not a slot. The surface kernel
+ * closes a triangle with `positions.element(spring.w)`, and the shell rebuild
+ * displaces the vertex along the normal that builds — so an unrebased successor
+ * moves the geometry, not just its shading.
+ */
+test('the fan successor is rebased like any other particle index', () => {
+  const count = 3, stride = 2;
+  const rest = Float32Array.from([0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0]);
+  const springs = new Float32Array(count * stride * 4).fill(SPRING_END);
+  // particle 0 springs to 1, closing its fan on particle 2
+  springs[0] = 1; springs[1] = 1; springs[2] = 0; springs[3] = 2;
+  springs[4] = SPRING_END;
+  for (let v = 1; v < count; v++) for (let s = 0; s < stride; s++) springs[(v * stride + s) * 4] = SPRING_END;
+  const piece = { count, stride, rest, springs, lra: null, contactRadius: null, shellThickness: 0 };
+
+  const { topology } = mergeClothTopologies([{ topology: piece }, { topology: piece }]);
+  assert.equal(topology.springs[3], 2, 'cloth 0 is unchanged');
+  const second = (count * topology.stride) * 4;
+  assert.equal(topology.springs[second], count + 1, 'the neighbour is rebased');
+  assert.equal(topology.springs[second + 3], count + 2,
+    'and so is the successor — unrebased it closes the triangle on cloth 0');
+  // The sentinels are not indices and must survive untouched.
+  assert.equal(topology.springs[second + 4], SPRING_END);
+});
+
 test('a member without long-range attachments reads as no cap, not a cap to the origin', () => {
   const withLra = fixture({ lra: true });
   const without = fixture({ lra: false });

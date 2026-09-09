@@ -233,17 +233,32 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const e = Math.floor(k / rimN);
     return e === 0 ? [0, 0, -1] : e === 1 ? [1, 0, 0] : e === 2 ? [0, 0, 1] : [-1, 0, 0];
   };
-  const positions = instancedArray(particleCount, "vec4");
-  const previous = instancedArray(particleCount, "vec4");
-  const scratch = instancedArray(particleCount, "vec4");
+  // ⭐ NAME EVERY BUFFER. three copies `bufferAttribute.name` into the WebGPU
+  // buffer's label, and a device validation failure prints that label — the
+  // difference between "Binding size for [Buffer (unlabeled)] is zero" and
+  // being told exactly which of a dozen storage buffers came out empty.
+  const label = flock ? "flockMember" : (solverFirst ? "flock" : kind);
+  const named = (node, name) => {
+    if (!node?.value) return node;
+    node.value.name = `${label}:${name}`;
+    // ⛔ AND CATCH AN EMPTY ONE HERE, where it can still be named. A zero-sized
+    // storage binding fails the whole command buffer at dispatch, and by then
+    // the console is a flood of "invalid due to a previous error" cascades that
+    // scroll the one useful line away.
+    if (!(node.value.array?.byteLength > 0)) console.warn(`[cloth] EMPTY BUFFER ${label}:${name}`);
+    return node;
+  };
+  const positions = named(instancedArray(particleCount, "vec4"), "positions");
+  const previous = named(instancedArray(particleCount, "vec4"), "previous");
+  const scratch = named(instancedArray(particleCount, "vec4"), "scratch");
   // (x, y, z, pinned) and (neighbour, restLength, weight, fanSuccessor). One
   // binding each: the graph uses a FIXED STRIDE with a sentinel rather than
   // CSR ranges, because this solver already binds positions, previous,
   // scratch, anchors and both collider fields, and WebGPU only guarantees
   // eight storage buffers per stage.
-  const clothRest = meshCloth ? instancedArray(meshCloth.rest, "vec4") : null;
-  const clothSprings = meshCloth ? instancedArray(meshCloth.springs, "vec4") : null;
-  const clothSimIndex = meshCloth ? instancedArray(meshCloth.simIndex, "float") : null;
+  const clothRest = named(meshCloth ? instancedArray(meshCloth.rest, "vec4") : null, "clothRest");
+  const clothSprings = named(meshCloth ? instancedArray(meshCloth.springs, "vec4") : null, "clothSprings");
+  const clothSimIndex = named(meshCloth ? instancedArray(meshCloth.simIndex, "float") : null, "clothSimIndex");
   // ⭐⭐⭐ A FLOCK MEMBER SOLVES NOTHING; IT READS THE SHARED PARTICLE SET.
   //
   // Ten curtains issued ten times the dispatches for the same work — 165 a
@@ -266,13 +281,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // along the normal. A shell is simulated as its MID-SURFACE — one particle
   // per front/back pair — and both faces are rebuilt from this. Null when the
   // cloth is a single surface, and then nothing is added.
-  const clothOffset = meshCloth?.shellOffset ? instancedArray(meshCloth.shellOffset, "float") : null;
+  const clothOffset = named(meshCloth?.shellOffset ? instancedArray(meshCloth.shellOffset, "float") : null, "clothOffset");
   // ⛔ PER PARTICLE, because shell thickness is a property of ONE PIECE and a
   // `.geom` holds several. Sponza's curtain file carries a 5.47 cm shell and a
   // 2.74 cm shell; a single figure for the file gave every curtain the
   // thinnest one's cap — half the contact two of them needed, because of a
   // different curtain elsewhere in the same asset. 0 means "no shell, no cap".
-  const clothRadius = meshCloth?.contactRadius ? instancedArray(meshCloth.contactRadius, "float") : null;
+  const clothRadius = named(meshCloth?.contactRadius ? instancedArray(meshCloth.contactRadius, "float") : null, "clothRadius");
   /**
    * ⭐⭐⭐ THE LAST PLACE THIS PARTICLE WAS KNOWN TO BE CLEAR OF THE GEOMETRY,
    * and the origin the contact sweep uses instead of `previous`.
@@ -313,7 +328,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
    * `__clothSafeSweep = false` turns the recovery off.
    */
   const clothSafe = meshCloth && globalThis.__clothSafeSweep !== false
-    ? instancedArray(new Float32Array(particleCount * 4), "vec4")
+    ? named(instancedArray(new Float32Array(particleCount * 4), "vec4"), "clothSafe")
     : null;
   // xyz = the nearest pin's rest position, w = the length of fabric between —
   // see `longRangeAttachments`. w == 0 means "no pin reaches here".
@@ -336,7 +351,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // factor is the whole question (see `u.lraRelax`), and a build-time flag
   // cannot be turned until you have already decided — which is how the first
   // attempt shipped hard-projected and hoisting.
-  const clothLra = meshCloth?.lra ? instancedArray(meshCloth.lra, "vec4") : null;
+  const clothLra = named(meshCloth?.lra ? instancedArray(meshCloth.lra, "vec4") : null, "clothLra");
   // The flow: .xy the column's horizontal velocity (local units per second),
   // .zw the accumulated drift the wake pattern rides (local units).
   const flow = kind === "water" ? instancedArray(wCount, "vec4") : null;
@@ -361,8 +376,12 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const foamAttribute = kind === "water" ? new THREE.StorageBufferAttribute(total, 1) : null;
   const foamOut = foamAttribute ? storage(foamAttribute, "float", total) : null;
   const normalAttribute = new THREE.StorageBufferAttribute(total, 3);
+  normalAttribute.name = `${label}:normalAttribute`;
+  if (!(normalAttribute.array?.byteLength > 0)) console.warn(`[cloth] EMPTY BUFFER ${label}:normalAttribute (total ${total})`);
   const normals = storage(normalAttribute, "vec3", total);
   const positionAttribute = new THREE.StorageBufferAttribute(total, 3);
+  positionAttribute.name = `${label}:positionAttribute`;
+  if (!(positionAttribute.array?.byteLength > 0)) console.warn(`[cloth] EMPTY BUFFER ${label}:positionAttribute (total ${total})`);
   const output = storage(positionAttribute, "vec3", total);
   const waterSurfaceTexture = rippleTexture;
   const u = { damping: uniform(.99), gravity: uniform(9.81),

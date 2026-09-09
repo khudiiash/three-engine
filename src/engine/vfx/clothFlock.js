@@ -135,10 +135,17 @@ export function mergeClothTopologies(members) {
         springs[to + slot * 4] = t.springs[from + slot * 4] + base;   // GLOBAL index
         springs[to + slot * 4 + 1] = t.springs[from + slot * 4 + 1] * scale;
         springs[to + slot * 4 + 2] = t.springs[from + slot * 4 + 2];
-        // The successor is a SLOT within this particle's own fan, or a
-        // sentinel. It is not an index into the particle table, so it is
-        // carried through untouched.
-        springs[to + slot * 4 + 3] = t.springs[from + slot * 4 + 3];
+        // ⛔⛔ THE FAN SUCCESSOR IS A PARTICLE INDEX TOO, AND IT MUST BE
+        // REBASED. The surface kernel closes each triangle around a vertex with
+        // `positions.element(spring.w)`, so an unrebased successor reaches into
+        // cloth 0 — and because the shell rebuild displaces every vertex ALONG
+        // that normal, a wrong normal moves the geometry, not just its shading.
+        // On the user's Sponza that drew every curtain out into a long cone
+        // pointing at one shared place: "they look unnatural and broken when
+        // moving" (2026-09-09). Only a real successor is an index; SPRING_END
+        // (-1) and SPRING_THICKNESS (-2) are sentinels and stay as they are.
+        const successor = t.springs[from + slot * 4 + 3];
+        springs[to + slot * 4 + 3] = successor >= 0 ? successor + base : successor;
       }
     }
     ranges.push({ base, count: t.count, scale, cloth });
