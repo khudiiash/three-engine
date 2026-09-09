@@ -1716,7 +1716,31 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // outside the frustum: `GridSimulationComponent`'s `isInView()` gate, which
     // exists precisely so an off-screen cloth costs nothing, could not fire.
     // Ten Sponza curtains all ticked every frame at ~0.5 ms of CPU each.
+    // ⛔⛔ **AND `radius * 2` IS NOT ENOUGH — IT FREEZES A CLOTH MID-DRAG.**
+    // A character dragging a curtain pulls it clean out of a sphere fitted to
+    // its REST pose, and a cloth outside its own sphere is frustum-culled while
+    // still on screen: it stops simulating with the collider inside it, which
+    // reads as "collisions started looking wrong" (user, 2026-09-09).
+    //
+    // The true bound is exact and already computed. The fabric-length cap
+    // guarantees every particle is within `lra.w` of its nearest pin, and every
+    // pin sits inside the rest sphere, so nothing can be further from the
+    // centre than (furthest pin) + (longest fabric run). Measured on the user's
+    // curtain: 1.57 + 2.20 = 3.77 m, against the 3.21 m that `radius * 2` gave
+    // — and against the 11.31 m the grid's props were producing before.
     clothViewRadius = source.radius * 2;
+    if (meshCloth.lra) {
+      let pinFar = 0, fabric = 0;
+      const c = source.center;
+      for (let v = 0; v < meshCloth.count; v++) {
+        if (meshCloth.lra[v * 4 + 3] > fabric) fabric = meshCloth.lra[v * 4 + 3];
+        if (meshCloth.rest[v * 4 + 3] > .5) {
+          pinFar = Math.max(pinFar, Math.hypot(
+            meshCloth.rest[v * 4] - c.x, meshCloth.rest[v * 4 + 1] - c.y, meshCloth.rest[v * 4 + 2] - c.z));
+        }
+      }
+      if (fabric > 0) clothViewRadius = Math.max(clothViewRadius, pinFar + fabric);
+    }
   } else geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, kind === "cloth" ? height / 2 : 0, 0), Math.hypot(width, height) * 2);
   const ownsMaterial=kind === "water" && !sourceMaterial;
   const material = sourceMaterial ?? new THREE.MeshPhysicalNodeMaterial({ color: "#168aab", roughness: .15, metalness: 0, side: THREE.DoubleSide });

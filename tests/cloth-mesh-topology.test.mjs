@@ -1572,3 +1572,57 @@ test("⛔ AND IT COSTS NOTHING AT REST — the reason it can be on by default", 
     }
   }
 });
+
+/**
+ * ⛔⛔ THE CULLING SPHERE MUST CONTAIN EVERYWHERE THE CLOTH CAN GO.
+ *
+ * A cloth outside its own bounding sphere is frustum-culled while still on
+ * screen, and a culled cloth does not simulate — so it freezes with the
+ * collider inside it. "collisions started looking wrong" (user, 2026-09-09),
+ * after a sphere of `restRadius * 2` shipped: 3.21 m on a curtain a character
+ * can drag 3.77 m.
+ *
+ * The bound is exact and free, because the fabric-length cap already
+ * guarantees it: no particle is further from its nearest pin than the geodesic
+ * run of cloth between them, and every pin lies inside the rest sphere. So
+ * (furthest pin from the centre) + (longest fabric run) contains every pose the
+ * solver can reach.
+ */
+test("⭐⭐ the cloth's reach is bounded by pin distance plus fabric run", () => {
+  const { rest, pinned, lra, n } = strip();
+
+  // The strip hangs 11 units from its single pinned end.
+  let fabric = 0;
+  for (let v = 0; v < n; v++) fabric = Math.max(fabric, lra[v * 4 + 3]);
+  assert.ok(fabric > 10, `the fixture must have a real fabric run, got ${fabric}`);
+
+  // Centre of the rest pose, and the furthest pin from it.
+  let cy = 0;
+  for (let v = 0; v < n; v++) cy += rest[v * 3 + 1];
+  cy /= n;
+  let pinFar = 0, restRadius = 0;
+  for (let v = 0; v < n; v++) {
+    const d = Math.abs(rest[v * 3 + 1] - cy);
+    restRadius = Math.max(restRadius, d);
+    if (pinned[v]) pinFar = Math.max(pinFar, d);
+  }
+  const bound = pinFar + fabric;
+
+  // ⭐ THE CLAIM: swing the free end anywhere the cap allows, and it stays
+  // inside `bound` — but escapes `restRadius * 2`, which is what shipped.
+  const tip = n - 1;
+  for (const angle of [0, Math.PI / 4, Math.PI / 2, Math.PI]) {
+    // The tip at its full fabric reach from the pin, in an arbitrary direction.
+    const px = rest[0], py = rest[1];
+    const x = px + Math.sin(angle) * lra[tip * 4 + 3];
+    const y = py - Math.cos(angle) * lra[tip * 4 + 3];
+    const fromCentre = Math.hypot(x, y - cy);
+    assert.ok(fromCentre <= bound + 1e-6,
+      `a reachable pose at ${angle.toFixed(2)} rad sits ${fromCentre.toFixed(2)} outside the bound ${bound.toFixed(2)}`);
+  }
+
+  // ⛔ AND THE CONTROL: the old bound genuinely fails, so this test has a subject.
+  const swungOut = Math.hypot(lra[tip * 4 + 3], Math.abs(rest[1] - cy));
+  assert.ok(swungOut > restRadius * 2,
+    `restRadius * 2 (${(restRadius * 2).toFixed(2)}) must be too small for a swung tip (${swungOut.toFixed(2)}) — otherwise this proves nothing`);
+});
