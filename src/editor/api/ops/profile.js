@@ -15,6 +15,7 @@
  * measurement window) and restores it afterwards.
  */
 import { defineOp } from "../registry.js";
+import { isViewportFreezeEnabled } from "../../viewportFreeze.js";
 import { readTexturePixelsGPU } from "../../../modules/gi/giScreen.js";
 import { engine } from "../../engineInstance.js";
 import { getViewportHandle } from "../../viewportHandle.js";
@@ -692,7 +693,7 @@ defineOp({
   name: "profile.frameStats",
   readOnly: true,
   description:
-    "Live frame-rate and renderer counters — the same numbers the viewport's Stats overlay shows. `fps` counts frames the renderer actually PRESENTED over a one-second window; ticks that ran but skipped the draw (a GI compile wave, a renderer resize) are reported separately as `skippedFps`, and an idle viewport the editor has suspended reports 0 for both. Use this to check whether a change actually made the editor faster. `culling.view` is the overlay's de-duplicated frustum + occlusion total and retains both breakdowns; `culling.occlusion.occluders` is 0 when no object in the scene is large enough to be an occluder.",
+    "Live frame-rate and renderer counters — the same numbers the viewport's Stats overlay shows. `fps` counts frames the renderer actually PRESENTED over a one-second window; ticks that ran but skipped the draw (a GI compile wave, a renderer resize) are reported separately as `skippedFps`, and an idle viewport the editor has suspended reports 0 for both. `frameMs` is the interval between frames and `idleMs` the part of it the loop spent waiting (vsync, the browser's frame callback, the editor's frame limiter), so cpuMs + idleMs ≈ frameMs and a frame far longer than its work reads as paced rather than slow. Three fields SPLIT that wait, and the first suspect is `viewportFreezeWhenUnfocused`: with it on, an editor whose focus is in another panel stops drawing entirely, which reads as a huge idle and is power saved rather than time lost — measured on Sponza, 34 fps / 70% idle frozen against 65 fps / 19% idle with it off, at identical work. `frameLimitFps` names an explicit cap when the editor has set one. `callbackFps` counts callbacks that reached the tick, before the limiter could turn one away — but note it CANNOT see a stopped loop, since a frozen viewport receives no callbacks at all, so a low `callbackFps` means 'we were not running', not 'the browser was not asking'. Only once all three are ruled out is the wait the display's, the compositor's, or an occluded window's. Use this to check whether a change actually made the editor faster. `culling.view` is the overlay's de-duplicated frustum + occlusion total and retains both breakdowns; `culling.occlusion.occluders` is 0 when no object in the scene is large enough to be an occluder.",
   params: {
     settleMs: {
       type: "number",
@@ -715,7 +716,21 @@ defineOp({
     return {
       fps: Math.round(r.fps),
       skippedFps: Math.round(r.skippedFps),
+      // Offered vs drawn. See the description: this is the one number that
+      // says whether the idle is the app's choice or the browser's.
+      callbackFps: Math.round(r.callbackFps || 0),
+      frameLimitFps: engine.frameRateLimit || 0,
+      // The first thing to check against a big idleMs: an unfocused viewport
+      // that has been told to stop drawing is the commonest cause by far.
+      viewportFreezeWhenUnfocused: isViewportFreezeEnabled(),
       cpuMs: +(r.workMs || r.frameMs).toFixed(2),
+      // The whole frame interval and the part of it the loop did NOT execute
+      // (vsync, the browser's frame callback, the editor's frame limiter).
+      // `cpuMs` alone cannot answer "why is the frame 29 ms when the work is
+      // 9 ms" — idleMs is that answer, and a high one means paced or
+      // presentation-bound, not CPU-bound.
+      frameMs: +(r.frameMs || 0).toFixed(2),
+      idleMs: +Math.max((r.frameMs || 0) - (r.workMs || r.frameMs || 0), 0).toFixed(2),
       gpuMs: +(r.gpuMs > 0 ? r.gpuMs : r.renderMs).toFixed(2),
       gpuMsIsReal: r.gpuMs > 0,
       // §18: the frame's GPU time split — render (scene draw, GI prepass,
@@ -1662,6 +1677,44 @@ defineOp({
       listeners: rows.slice(0, 40),
       blocksDuringCapture: freeze.tasks.slice(before),
       note: "`emits` is how many times that event fired during the window — a NumberField drag fires one per pointer event. A listener with a high `calls` and a small `ms` each is still a storm: the cost is that everything else in the fan-out ran too.",
+    };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// ⭐⭐⭐ IS THE IDLE REAL? The performance panel computes idle as a RESIDUAL
+// (`frameMs - workMs`), so every millisecond the engine does not mark is
+// displayed as rest — React, the DOM's style/layout/paint, GC, WebGPU
+// submission after the tick returns. This op measures the thread from outside
+// instead, with a heartbeat that can only run when the thread is free.
+// ---------------------------------------------------------------------------
+
+defineOp({
+  name: "profile.frameAudit",
+  readOnly: true,
+  description:
+    "Whether the frame's 'idle' is really idle. profile.frameStats reports idle as frameMs minus the work the engine marks, so anything OUTSIDE the engine tick — React re-rendering the editor, the browser's style/layout/paint, a GC pause, WebGPU submission after the tick returns — is counted as rest and the frame looks like it is waiting when the main thread is flat out. This op runs a MessageChannel heartbeat, which can only execute when the thread is free: every gap between beats is a contiguous busy block, measured from outside with no cooperation from the code being measured. Blocks containing an engine update stamp are the engine's own tick (render included); the rest are `other`, and a large `other` is the answer to 'the fps is low but every engine number is small'. `idle` is what is left, and only that part is really the display's vsync wait. Read `hostFps` first: it counts the browser's raw frame offers, so a low one means the window is throttled (unfocused, or the editor's own limiter) and no other number in the report is about your machine's speed.",
+  params: {
+    ms: { type: "number", default: 2000, description: "Window length in ms (200-20000)." },
+  },
+  async run({ ms = 2000 }) {
+    const { auditFrames } = await import("../../../engine/frameAudit.js");
+    const report = await auditFrames(engine, { ms });
+    // ⚠ A LOW hostFps IS NOT AUTOMATICALLY A THROTTLED WINDOW. It is only that
+    // if the engine is ALSO missing frames the browser offered; when the engine
+    // ticks on every single offer, the browser is pacing us to a whole number
+    // of vsync intervals because the frame does not fit in one.
+    const busyPerFrame = report.engine.perFrameMs + report.other.perFrameMs;
+    const missed = report.hostFrames - report.engineTicks;
+    const verdict = missed > report.hostFrames * 0.1
+      ? `The engine skipped ${missed} of ${report.hostFrames} frames the browser offered — a frame limiter or a suspended viewport, not a speed problem.`
+      : report.other.perFrameMs > busyPerFrame * 0.35
+        ? "The thread is BUSY outside the engine tick — `other` is real work the profiler has been calling idle. `loaf` names it when a block exceeds 50 ms."
+        : `The main thread is free ${report.idle.pct}% of the time and the engine ticks on every frame offered, so the pacing is VSYNC: ${busyPerFrame.toFixed(1)} ms of main-thread work plus present does not fit one refresh interval, and the browser rounds the frame up to the next whole one. The lever is total main-thread ms per frame, not the idle.`;
+    return {
+      ...report,
+      verdict,
+      note: "`engine` is the marked tick, `other` is every other contiguous busy block, `idle` is the thread genuinely parked. perFrameMs divides by the browser's frame offers, so the three perFrameMs values sum to one frame's period. The heartbeat keeps the thread hot and can itself suppress idle behaviour: run a window, read it, and do not leave it on.",
     };
   },
 });

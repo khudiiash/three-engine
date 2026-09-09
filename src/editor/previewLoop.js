@@ -47,3 +47,35 @@ export function throttlePreviewFrame(canvas, onFrame, fps = PREVIEW_FPS) {
     onFrame();
   };
 }
+
+/**
+ * ⛔⛔ **`setAnimationLoop(null)` DOES NOT STOP THE FRAME CALLBACK.** three's
+ * `Renderer.setAnimationLoop` only assigns `_animation._animationLoop`; the rAF
+ * chain itself is started once by `Renderer.init()` and stopped by nothing —
+ * not by passing null, and not by `dispose()`, which merely calls
+ * `setAnimationLoop(null)` on its way out.
+ *
+ * So EVERY secondary renderer this editor has ever created keeps a callback
+ * running on the main thread for the life of the page, re-arming itself every
+ * frame and calling `info.reset()` and `nodes.nodeFrame.update()` each time,
+ * long after its panel closed and its device went away. They are invisible to
+ * the engine's own profiler, which only measures inside its own tick, and they
+ * land in the frame as time the profiler then reports as idle.
+ *
+ * Measured on 2026-09-09: one extra chain, ~2.0 ms of every frame, in a frame
+ * whose whole budget at 120 Hz is 8.3 ms.
+ *
+ * Call this instead of `setAnimationLoop(null)` when a preview is torn down.
+ * `_animation` is private API; treat its absence as "nothing to stop" rather
+ * than an error, so a three upgrade that renames it degrades to today's
+ * behaviour instead of throwing on every panel close.
+ */
+export function stopPreviewRenderer(renderer) {
+  if (!renderer) return;
+  renderer.setAnimationLoop(null);
+  try {
+    renderer._animation?.stop?.();
+  } catch {
+    /* private API: a rename must not break panel teardown */
+  }
+}

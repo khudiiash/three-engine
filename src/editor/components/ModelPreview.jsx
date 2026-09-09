@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three/webgpu";
 import { createGltfLoader } from "../../engine/gltfLoader.js";
-import { throttlePreviewFrame } from "../previewLoop.js";
+import { throttlePreviewFrame, stopPreviewRenderer } from "../previewLoop.js";
 
 /**
  * An interactive GLB preview: drag to turn it, pick which animation plays.
@@ -230,7 +230,7 @@ export function ModelPreview({ src, load = null, onError = null, className = "" 
       disposed = true;
       playRef.current = null;
       resizeObserver?.disconnect();
-      renderer?.setAnimationLoop(null);
+      stopPreviewRenderer(renderer);
       renderer?.dispose();
       // After the renderer, so nothing is mid-submit against a disposed buffer.
       if (loaded) disposeScene(loaded);

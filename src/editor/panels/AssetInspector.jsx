@@ -76,7 +76,7 @@ import {
 import { openPrefabMode } from "../prefab.js";
 import { useModulesStore } from "../modules.js";
 import { prefabRegistry, resolvePrefab, isPrefabDef } from "../../engine/index.js";
-import { throttlePreviewFrame } from "../previewLoop.js";
+import { throttlePreviewFrame, stopPreviewRenderer } from "../previewLoop.js";
 
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 const stemOf = (name) => name.replace(/\.[^.]+$/, "");
@@ -660,7 +660,7 @@ function ModelPreview({ path }) {
     return () => {
       disposed = true;
       resizeObserver?.disconnect();
-      renderer?.setAnimationLoop(null);
+      stopPreviewRenderer(renderer);
       renderer?.dispose();
     };
   }, [path]);

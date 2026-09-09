@@ -32,7 +32,7 @@ import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";
 import { engine } from "../engineInstance.js";
 import { createDefaultMaterialFork } from "../defaultMaterialFork.js";
-import { throttlePreviewFrame } from "../previewLoop.js";
+import { throttlePreviewFrame, stopPreviewRenderer } from "../previewLoop.js";
 import { invalidateBlobUrl } from "../assetLoader.js";
 
 /** Resolve the existing material def for `matPath`. Prefers the in-memory
@@ -204,7 +204,7 @@ function MaterialPreview({ material }) {
       disposed = true;
       resizeObserver?.disconnect();
       if (renderer) {
-        renderer.setAnimationLoop(null);
+        stopPreviewRenderer(renderer);
         renderer.dispose();
       }
     };
