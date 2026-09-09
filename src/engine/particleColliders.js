@@ -6,6 +6,8 @@ const MAX_COLLIDERS = 64;
 // [type, center.xyz], [right.xyz, halfX|radius], [up.xyz, halfY], [forward.xyz, halfZ].
 const FLOATS_PER_COLLIDER = 16;
 const TYPE_BOX = 0, TYPE_SPHERE = 1;
+// A collider that shifted less than this in a frame counts as standing still.
+const MOVE_EPSILON = 1e-4;
 const pos = new THREE.Vector3(), scale = new THREE.Vector3(), center = new THREE.Vector3();
 const quat = new THREE.Quaternion(), localQuat = new THREE.Quaternion(), euler = new THREE.Euler();
 const right = new THREE.Vector3(), up = new THREE.Vector3(), forward = new THREE.Vector3();
@@ -116,6 +118,12 @@ export class ParticleColliderField {
     this.countUniform = uniform(0, "int");
     this.activeUsers = 0;
     this.entityIndices = new Map();
+    this._scannedFrame = -1;
+    // Which packed rows moved since the last scan, and where each entity's
+    // collider stood then. Keyed by entity id, not by row, because a row index
+    // belongs to whichever collider happened to be packed there this frame.
+    this.moved = new Uint8Array(MAX_COLLIDERS);
+    this._lastCentre = new Map();
   }
   addUser() { this.activeUsers++; }
   removeUser() { this.activeUsers = Math.max(0, this.activeUsers - 1); }
@@ -123,19 +131,68 @@ export class ParticleColliderField {
     this.entityIndices.clear();
     if (this.engine.particleColliders === this) delete this.engine.particleColliders;
   }
+  /**
+   * ⛔⛔ **ONCE A FRAME, NOT ONCE PER USER.** This field is SHARED — one
+   * `engine.particleColliders` serves every cloth and every particle system —
+   * but it was refreshed from each one's own tick, so a full walk of every
+   * entity in the level, plus a `writeParticleCollider` pose decompose for each
+   * collider found, ran once per CLOTH per frame and produced the identical
+   * answer every time. The cost was CLOTHS x ENTITIES.
+   *
+   * This is the same fault `ClothMeshColliderField.refresh` was fixed for on
+   * 2026-09-08, in the other collider field; only the mesh/concave half was
+   * caught then. `renderer.info.frame` increments once per rendered frame, so
+   * the first user to ask does the work and the rest read what it published.
+   */
   refresh() {
     if (this.activeUsers <= 0) return;
+    const frame = this.engine?.renderer?.info?.frame;
+    if (frame !== undefined && frame === this._scannedFrame) return;
+    this._scannedFrame = frame ?? -1;
     this.entityIndices.clear();
+    if (this._lastCentre.size > MAX_COLLIDERS * 2) this._lastCentre.clear();
     let count = 0;
     for (const entity of this.engine.entities.values()) {
       if (count >= MAX_COLLIDERS) break;
       const collider = characterAsCollider(entity) ?? entity.getComponent?.("collider");
       if (!collider || collider.enabled === false || collider.props.isSensor || !enabledInHierarchy(entity, this.engine.playing)) continue;
-      if (!writeParticleCollider(entity, collider, this.data, count * FLOATS_PER_COLLIDER)) continue;
+      const base = count * FLOATS_PER_COLLIDER;
+      if (!writeParticleCollider(entity, collider, this.data, base)) continue;
+      const cx = this.data[base + 1], cy = this.data[base + 2], cz = this.data[base + 3];
+      const last = this._lastCentre.get(entity.id);
+      this.moved[count] = !last || Math.abs(last[0] - cx) > MOVE_EPSILON
+        || Math.abs(last[1] - cy) > MOVE_EPSILON || Math.abs(last[2] - cz) > MOVE_EPSILON ? 1 : 0;
+      if (last) { last[0] = cx; last[1] = cy; last[2] = cz; } else this._lastCentre.set(entity.id, [cx, cy, cz]);
       this.entityIndices.set(entity.id, count++);
     }
     this.countUniform.value = count;
     this.buffer.value.needsUpdate = true;
+  }
+  /**
+   * ⭐⭐⭐ **IS SOMETHING WALKING THROUGH THIS?** Conservative sphere test of a
+   * simulation's own reach against every collider that MOVED this frame.
+   *
+   * It exists so that culling a simulation nobody is looking at cannot break
+   * the one thing an unwatched cloth still has to get right: a character
+   * pushing through it. A collider that is merely standing still near the
+   * cloth — the wall it hangs on, the floor under it — does not qualify, because
+   * a cloth at rest against static geometry stays where it is.
+   *
+   * The row's bound is `hypot(hx, hy, hz)`, the half-extents' diagonal, which
+   * over-covers a sphere row (its three half-extents are all the radius) by
+   * design: this test may only ever keep a simulation running needlessly, never
+   * stop one that was needed.
+   */
+  nearAnyMovingCollider(centre, radius) {
+    const d = this.data;
+    for (let i = 0, n = this.countUniform.value; i < n; i++) {
+      if (!this.moved[i]) continue;
+      const b = i * FLOATS_PER_COLLIDER;
+      const reach = radius + Math.hypot(d[b + 7], d[b + 11], d[b + 15]);
+      const dx = d[b + 1] - centre.x, dy = d[b + 2] - centre.y, dz = d[b + 3] - centre.z;
+      if (dx * dx + dy * dy + dz * dz <= reach * reach) return true;
+    }
+    return false;
   }
 }
 

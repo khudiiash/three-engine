@@ -87,3 +87,55 @@ test('hollow mesh colliders are not silently replaced by solid bounding boxes', 
   const { field } = fixture({shape:'mesh'});
   field.refresh(); assert.equal(field.countUniform.value,0);
 });
+
+/**
+ * ⛔ ONE SHARED FIELD, ONE SCAN A FRAME. The field is `engine.particleColliders`
+ * for every cloth AND every particle system, and each of them called `refresh`
+ * from its own tick — so the walk of every entity in the level ran once per
+ * USER per frame and produced the same answer every time.
+ */
+test('the shared field scans once per rendered frame, not once per user', () => {
+  const { engine, entity, field } = fixture();
+  const info = { frame: 7 };
+  engine.renderer = { info };
+  let walks = 0;
+  const entities = engine.entities;
+  engine.entities = { values: () => { walks++; return entities.values(); } };
+
+  field.refresh(); field.refresh(); field.refresh();
+  assert.equal(walks, 1, 'three users in one frame must share one scan');
+  assert.equal(field.entityIndices.get(entity.id), 0, 'and the published answer stays readable');
+
+  info.frame = 8;
+  field.refresh();
+  assert.equal(walks, 2, 'the next rendered frame scans again');
+});
+
+/**
+ * ⭐⭐⭐ The wake test behind the cloth frustum gate: a culled cloth that
+ * something is walking through must still simulate, and one that is merely
+ * hanging next to a wall must not.
+ */
+test('only a collider that MOVED wakes a simulation in its reach', () => {
+  const { entity, field } = fixture();
+  entity.object3D.position.set(0, 0, 0);
+  field.refresh();
+  // First sighting counts as movement — the collider has just appeared.
+  assert.equal(field.nearAnyMovingCollider(new THREE.Vector3(0, 0, 0), 1), true);
+
+  // Standing still: in reach, but nothing to react to.
+  field._scannedFrame = -1;
+  field.refresh();
+  assert.equal(field.nearAnyMovingCollider(new THREE.Vector3(0, 0, 0), 1), false,
+    'a static wall next to a curtain must not keep it simulating');
+
+  // Walking through it.
+  entity.object3D.position.set(1, 0, 0);
+  entity.object3D.updateMatrixWorld(true);
+  field._scannedFrame = -1;
+  field.refresh();
+  assert.equal(field.nearAnyMovingCollider(new THREE.Vector3(0, 0, 0), 1), true);
+  // The box is 4 x 2 x 6, so its half-extent diagonal is ~3.74 from centre (1,0,0).
+  assert.equal(field.nearAnyMovingCollider(new THREE.Vector3(40, 0, 0), 1), false,
+    'and a collider moving on the far side of the level wakes nothing');
+});

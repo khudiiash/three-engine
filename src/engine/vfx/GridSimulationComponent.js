@@ -11,6 +11,7 @@ import { seaQuality } from "./waterSpectrum.js";
 import { analyseClothMesh, packClothTopology } from "./clothMeshTopology.js";
 
 const _cameraWorld = new Vector3(), _waterInverse = new Matrix4();
+const _reachCentre = new Vector3(), _reachScale = new Vector3();
 
 /**
  * Shapes that fill their volume. A convex hull, a box, a sphere and a capsule
@@ -63,13 +64,46 @@ export class GridSimulationComponent extends Component {
       // resumes from where the solver stood, because nothing is torn down.
       if (this.entity.engine.simulationSuspended === true) return;
       if (["cloth", "water"].includes(this.constructor.type)) this.syncPlane();
-      if (!this.enabled || !this.graphEnabled || !this.simulation?.mesh.visible || (this.constructor.type !== "water" && !this.isInView())) return;
+      if (!this.enabled || !this.graphEnabled || !this.simulation?.mesh.visible) return;
+      if (this.constructor.type !== "water" && !this.isInView() && !this.disturbed()) return;
       this.simulation.tick(this.entity.engine.renderer, this.entity.engine.deltaTime ?? 0);
       this.refreshWaterSlot();
     });
     this.unsubscribeMesh = ["cloth", "water"].includes(this.constructor.type) ? this.entity.engine.on?.("component-changed", (event) => {
       if (event?.entityId === this.entity.id && event.componentType === "mesh") this.syncPlane();
     }) : null;
+  }
+  /**
+   * ⭐⭐⭐ **A CULLED CLOTH THAT SOMETHING IS WALKING THROUGH MUST STILL SIMULATE.**
+   *
+   * The frustum gate above is worth 3.3 ms of the frame, but on its own it
+   * bought that by breaking the thing the user noticed at once: "collisions
+   * with character got broken" (2026-09-09). Off-screen is not the same as
+   * untouched — a curtain at the edge of the view, or one the character walks
+   * into while the camera looks elsewhere, was frozen mid-contact and resumed
+   * from a stale pose when it came back into view.
+   *
+   * So the gate is now "nobody can see it AND nothing is moving through it".
+   * The second half is a sphere test against the colliders that MOVED this
+   * frame, which is a handful of rows of arithmetic; static geometry never
+   * wakes a cloth, because a cloth resting against a wall is already at rest.
+   *
+   * ⚠ It refreshes the shared field itself, because a cloth that returns false
+   * here never reaches `simulation.tick`, which is where the refresh otherwise
+   * happens — and a scene where every cloth is culled would then be testing
+   * last frame's collider poses forever. The refresh is guarded to once per
+   * rendered frame, so asking here costs nothing extra.
+   */
+  disturbed() {
+    const field = this.entity.engine.particleColliders;
+    const mesh = this.simulation?.mesh;
+    const sphere = mesh?.geometry?.boundingSphere;
+    if (!field?.activeUsers || !mesh || !(sphere?.radius > 0)) return false;
+    field.refresh();
+    _reachCentre.copy(sphere.center).applyMatrix4(mesh.matrixWorld);
+    _reachScale.setFromMatrixScale(mesh.matrixWorld);
+    const scale = Math.max(Math.abs(_reachScale.x), Math.abs(_reachScale.y), Math.abs(_reachScale.z));
+    return field.nearAnyMovingCollider(_reachCentre, sphere.radius * scale);
   }
   /**
    * The source mesh this simulation replaces. A Plane for either kind; for
