@@ -18,6 +18,9 @@ export function simulationNodeTypes(kind) {
     ? [number("gravity", "Gravity", 9.81, -100, 100), vector("wind", "Wind (m/s²)", [0, 0, 2]), number("stiffness", "Stretch stiffness", .95, 0, 1, .01),
       number("shear", "Shear stiffness", 1, 0, 1, .01), number("bend", "Bend resistance", .1, 0, 1, .01),
       number("gust", "Wind gust strength", 0, 0, 100), number("gustFrequency", "Wind gust frequency", 1, 0, 10),
+      // ⚠ SCENE BY DEFAULT. Ten curtains in one arcade each running their own
+      // wind is a visual mismatch, not ten microclimates — see clothWind.js.
+      select("windSource", "Wind source", "scene", ["scene", "custom"]),
       select("pinning", "Pinned vertices", "top", ["top", "topCorners", "left", "leftCorners", "none"]),
       select("fabric", "Fabric", "cotton", ["cotton", "silk", "canvas"]),
       { key: "sceneCollision", label: "Scene colliders", type: "boolean", default: true },

@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { CLOTH_SOLVE_PASSES, clothSolveSplit, clothSubsteps, clothVelocityScale } from "./clothHealth.js";
 import { clothComputeBatch } from "./computeBatch.js";
+import { resolveClothWind } from "./clothWind.js";
 import { Fn, If, Break, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, texture, ivec2 } from "three/tsl";
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
 import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt, seaFoldNode } from "./waterSpectrum.js";
@@ -670,8 +671,15 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // to +Z; with a vector wind it has to be a modulation ALONG the wind, or
       // a sideways breeze would still gust north.
       const speed = u.wind.length();
-      const gust = u.simTime.mul(u.gustFrequency).mul(Math.PI * 2).add(p.x.mul(.8)).add(p.y.mul(.6)).sin().mul(u.gust.add(speed.mul(.35)))
-        .add(u.simTime.mul(.731).add(p.y.mul(1.4)).sin().mul(speed).mul(.15));
+      // ⭐ THE GUST'S PHASE IS SAMPLED IN WORLD SPACE. It is a travelling wave,
+      // so two cloths sharing one wind are offset by where they STAND — which
+      // is what a gust crossing a courtyard looks like. Sampled in each cloth's
+      // own local space instead, every curtain would sit at the same phase and
+      // the shared field would read as lockstep. (Identical for a cloth whose
+      // entity transform is the identity, which is why it went unnoticed.)
+      const wp = simulationWorld.mul(vec4(p, 1)).xyz;
+      const gust = u.simTime.mul(u.gustFrequency).mul(Math.PI * 2).add(wp.x.mul(.8)).add(wp.y.mul(.6)).sin().mul(u.gust.add(speed.mul(.35)))
+        .add(u.simTime.mul(.731).add(wp.y.mul(1.4)).sin().mul(speed).mul(.15));
       // A still wind has no direction to gust along, so the gust is carried on
       // the normalised wind and vanishes with it rather than dividing by zero.
       const heading = u.wind.div(speed.max(1e-4));
@@ -2371,6 +2379,16 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // One uniform write, so the recovery can be disarmed against a running
       // cloth rather than only at build time.
       if (kind === "cloth") {
+        // ⭐ THE SCENE'S WIND, READ EVERY TICK. Uniforms, not a rebuild — so
+        // dragging the scene's wind moves every curtain that inherits it at
+        // once, and a flock (which built its solver from one member's props)
+        // still tracks it.
+        const wind = resolveClothWind(lastProps, anchorEngine?.settings?.wind);
+        if (wind.inherited) {
+          u.wind.value.set(wind.vector[0], wind.vector[1], wind.vector[2]);
+          u.gust.value = wind.gust;
+          u.gustFrequency.value = wind.gustFrequency;
+        }
         u.safeRecovery.value = globalThis.__clothSafeSweep === false ? 0 : 1;
         const lraOverride = Number(globalThis.__clothLraRelax);
         u.lraRelax.value = Number.isFinite(lraOverride) ? Math.min(1, Math.max(0, lraOverride)) : .5;

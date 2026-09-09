@@ -14,6 +14,7 @@ import { isEquirectPath } from "../../engine/environmentAsset.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { openPanel } from "../EditorShell.jsx";
 import { Row, Toggle, Note, Section } from "./settingsUi.jsx";
+import { SCENE_WIND_DEFAULTS } from "../../engine/vfx/clothWind.js";
 
 const TONE_MAPPING_OPTIONS = [
   ["neutral", "Neutral (Khronos)"],
@@ -204,6 +205,13 @@ export function SceneSettingsPanel() {
   const commit = (patch, label) => commandBus.execute(new SetSceneSettingsCommand(patch, label));
   const commitFog = (fogPatch, label) =>
     commit({ fog: { ...settings.fog, ...fogPatch } }, label ?? "Change fog");
+  // ⚠ A scene saved before the wind existed has no block; the defaults stand in
+  // so the panel edits a whole one rather than writing a partial.
+  const wind = { ...SCENE_WIND_DEFAULTS, ...(settings.wind ?? {}) };
+  const commitWind = (windPatch, label) =>
+    commit({ wind: { ...wind, ...windPatch } }, label ?? "Change wind");
+  const commitWindAxis = (axis, value) =>
+    commitWind({ vector: wind.vector.map((v, i) => (i === axis ? value : v)) });
   const commitRenderer = (rendererPatch, label) =>
     commit(
       { renderer: { ...settings.renderer, ...rendererPatch } },
@@ -394,6 +402,47 @@ export function SceneSettingsPanel() {
             />
           </Row>
         )}
+      </Section>
+
+      {/* ⭐ ONE WIND FOR THE SCENE. Cloth reads this unless a cloth opts out with
+          its own "Wind source: custom" — ten curtains each running their own
+          weather is a visual mismatch, not ten microclimates. */}
+      <Section id="scene.wind" title="Wind">
+        <Row label="Direction (m/s²)">
+          <div style={{ display: "flex", gap: 4, minWidth: 0 }}>
+            {["X", "Y", "Z"].map((axis, i) => (
+              <PlainNumberInput
+                key={axis}
+                value={wind.vector[i] ?? 0}
+                step={0.1}
+                onCommit={(v) => commitWindAxis(i, v)}
+              />
+            ))}
+          </div>
+        </Row>
+        <Row label="Gust strength">
+          <NumberInput
+            value={wind.gust}
+            min={0}
+            max={100}
+            step={0.1}
+            onCommit={(v) => commitWind({ gust: v })}
+          />
+        </Row>
+        <Row label="Gust frequency (Hz)">
+          <NumberInput
+            value={wind.gustFrequency}
+            min={0}
+            max={10}
+            step={0.01}
+            onCommit={(v) => commitWind({ gustFrequency: v })}
+          />
+        </Row>
+        <Note>
+          The gust is a travelling wave, so cloths sharing this field are offset
+          by where they stand rather than moving in lockstep. A cloth can opt out
+          with its own Wind source.
+        </Note>
       </Section>
 
       <Section id="scene.rendering" title="Rendering">

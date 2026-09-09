@@ -180,11 +180,16 @@ export function mergeClothTopologies(members) {
 const SHELL_STEP = 1e-4;
 
 export function flockKey(props = {}, topology = null) {
+  // ⭐ A CLOTH THAT INHERITS THE SCENE'S WIND CARRIES NO WIND OF ITS OWN, so its
+  // authored (and now unused) values must not split the flock. This is what
+  // lets a colonnade of curtains — identical but for the gust each was given —
+  // collapse into ONE solver once they share the scene's weather.
+  const custom = props.windSource === "custom";
   return JSON.stringify([
     props.stiffness ?? null, props.bend ?? null, props.damping ?? null,
-    props.gravity ?? null, props.wind ?? null, props.gust ?? null,
-    props.gustFrequency ?? null, props.pinning ?? props.pin ?? null,
+    props.gravity ?? null, props.pinning ?? props.pin ?? null,
     props.friction ?? null, props.thickness ?? null, props.collisionRadius ?? null,
+    custom ? [props.wind ?? null, props.gust ?? null, props.gustFrequency ?? null] : "scene",
     Math.round((topology?.shellThickness ?? 0) / SHELL_STEP),
   ]);
 }

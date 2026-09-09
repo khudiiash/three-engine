@@ -36,6 +36,15 @@ export const SCENE_SETTINGS_DEFAULTS = {
     far: 80,
     density: 0.02,
   },
+  // ⭐ THE SCENE'S WIND, and there is one of it. Cloth reads this unless a
+  // cloth opts out with `windSource: "custom"` — see vfx/clothWind.js for why
+  // one shared field is what makes neighbouring curtains look like they are in
+  // the same weather without moving in lockstep.
+  wind: {
+    vector: [0, 0, 2],   // m/s², the same units and default as the cloth solver
+    gust: 0,             // gust strength on top of the steady wind
+    gustFrequency: 1,    // Hz
+  },
   toneMapping: "neutral", // "none" | "linear" | "reinhard" | "cineon" | "aces" | "agx" | "neutral"
   exposure: 1,
   shadows: true,

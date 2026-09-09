@@ -20,5 +20,13 @@ export class ClothComponent extends GridSimulationComponent {
   static defaults = { asset: "", graph: null, resolution: 32, anchors: [], ...simulationNodeDefaults("cloth", "cloth") };
   static schema = [gridSchema[0], simulationNodeTypes("cloth").grid.params[0], ...simulationNodeTypes("cloth").cloth.params,
     {key:"anchors",label:"Entity anchors",type:"clothAnchors"}]
-    .map((field) => field.key === "asset" || field.key === "anchors" ? field : { ...field, showIf: (props) => !props.asset });
+    .map((field) => {
+      if (field.key === "asset" || field.key === "anchors") return field;
+      // The wind fields belong to the SCENE unless this cloth opts out, so
+      // showing them while they do nothing would be a lie the inspector tells.
+      if (["wind", "gust", "gustFrequency"].includes(field.key)) {
+        return { ...field, showIf: (props) => !props.asset && props.windSource === "custom" };
+      }
+      return { ...field, showIf: (props) => !props.asset };
+    });
 }

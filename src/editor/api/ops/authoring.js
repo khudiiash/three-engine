@@ -201,13 +201,13 @@ defineOp({
   name: "scene.setSettings",
   undoable: true,
   description:
-    "Patch the scene's look. Top-level keys are merged, so pass only what you want to change — e.g. { fog: { type: 'exp2', color: '#101018', density: 0.03 }, toneMapping: 'agx' }. This is how you express 'make it feel like dusk'.",
+    "Patch the scene's look. Top-level keys are merged, so pass only what you want to change — e.g. { fog: { type: 'exp2', color: '#101018', density: 0.03 }, toneMapping: 'agx' }. This is how you express 'make it feel like dusk'. `wind` is the scene's ONE wind: every cloth reads it unless that cloth sets windSource: 'custom', and because the gust is a travelling wave the cloths sharing it are offset by position rather than moving in lockstep.",
   params: {
     patch: {
       type: "object",
       required: true,
       description:
-        "Any of: background, ambientColor, ambientIntensity, environment{cubemap,background,lighting,intensity,rotation,blur}, fog{type,color,near,far,density}, toneMapping, exposure, shadow{...}, renderer{...}, performance{maxDevicePixelRatio,renderScale,dynamicResolution,targetFps,volumeStepScale,autoBatching,staticMerging,occlusionCulling}. Nested blocks are merged key-by-key, so passing one performance knob keeps the rest. Call scene.getSettings first to see the current shape.",
+        "Any of: background, ambientColor, ambientIntensity, environment{cubemap,background,lighting,intensity,rotation,blur}, fog{type,color,near,far,density}, wind{vector,gust,gustFrequency}, toneMapping, exposure, shadow{...}, renderer{...}, performance{maxDevicePixelRatio,renderScale,dynamicResolution,targetFps,volumeStepScale,autoBatching,staticMerging,occlusionCulling}. Nested blocks are merged key-by-key, so passing one performance knob keeps the rest. Call scene.getSettings first to see the current shape.",
     },
     label: { type: "string", default: "Change scene settings", description: "Undo-menu label." },
   },

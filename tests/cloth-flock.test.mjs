@@ -143,8 +143,20 @@ test('a non-uniform scale is refused rather than quietly stretching the fabric',
   assert.ok(Math.abs(uniformScaleOf([c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) - 1) < 1e-9);
 });
 
+test('cloths inheriting the scene wind flock together whatever wind they were authored with', () => {
+  // The whole point of a scene wind: a colonnade of curtains that differ only
+  // in the gust each was given collapses into ONE solver.
+  const base = { stiffness: 1, bend: 0.1 };
+  assert.equal(flockKey({ ...base, gust: 10.23, gustFrequency: 0.517 }, null),
+    flockKey({ ...base, gust: 3.54, gustFrequency: 0.386 }, null));
+  // ...and a cloth that opts out keeps its own solver.
+  assert.notEqual(flockKey({ ...base, windSource: "custom", gust: 10.23 }, null),
+    flockKey({ ...base, windSource: "custom", gust: 3.54 }, null));
+  assert.notEqual(flockKey({ ...base }, null), flockKey({ ...base, windSource: "custom" }, null));
+});
+
 test('cloths only share a solver when every uniform the solver reads matches', () => {
-  const a = { stiffness: 1, bend: 0.1, wind: [0, 0, 2] };
+  const a = { stiffness: 1, bend: 0.1, windSource: "custom", wind: [0, 0, 2] };
   assert.equal(flockKey(a, { shellThickness: 0.02 }), flockKey({ ...a }, { shellThickness: 0.02 }));
   assert.notEqual(flockKey(a, { shellThickness: 0.02 }), flockKey({ ...a, bend: 0.5 }, { shellThickness: 0.02 }));
   assert.notEqual(flockKey(a, { shellThickness: 0.02 }), flockKey(a, { shellThickness: 0.03 }),
