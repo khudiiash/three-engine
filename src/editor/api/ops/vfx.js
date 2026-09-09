@@ -1,3 +1,4 @@
+import * as THREE from "three/webgpu";
 import { defineOp } from "../registry.js";
 import { engine } from "../../engineInstance.js";
 import { commandBus } from "../../commands/CommandBus.js";
@@ -11,10 +12,11 @@ import { invoke } from "../../assetOps.js";
 import { useProjectStore } from "../../store/projectStore.js";
 import { normalizeEffectTimeline, createEffectPreset, EFFECT_KINDS } from "../../../engine/vfx/effectTimeline.js";
 import { classifyClothIsland } from "../../../engine/vfx/clothHealth.js";
+import { PARTICLE_COLLIDER_STRIDE, PARTICLE_COLLIDER_TYPE_SPHERE } from "../../../engine/particleColliders.js";
 
 defineOp({
   name: "vfx.cloth.status", readOnly: true,
-  description: "Inspect a live cloth simulation and the scene colliders it can use. Reports missing plane, active primitive/triangle collision fields and GPU position bounds without changing the scene.",
+  description: "Inspect a live cloth simulation and the scene colliders it can use. Reports missing plane, the triangle AND primitive collision fields, and GPU position bounds, without changing the scene. `primitiveColliders` names every box/sphere the solver actually feels, with the box it uses rather than the shape you can see — a convex collider is fitted as an ORIENTED BOX around its whole mesh, so a long thin one becomes a slab through the scene. Read `overlapsCloth` and `fill` together: an overlapping box with a low `fill` is an invisible wall sitting inside the cloth.",
   params: { entityId: { type: "string", required: true }, readPositions: { type: "boolean", default: false } },
   async run({entityId, readPositions}) {
     const c = requireComponent(entityId, "cloth"), sim = c.simulation;
@@ -27,6 +29,7 @@ defineOp({
       triangleCount: c.meshColliderField?.triangleCount ?? 0,
       triangleCollisionAvailable: !!c.meshColliderField,
       triangleColliders: c.meshColliderField?.diagnostics ?? [],
+      primitiveColliders: describePrimitiveColliders(c),
       collisionError: c.meshColliderField?.error ?? null,
       colliders: [...engine.entities.values()].flatMap((entity) => { const collider=entity.getComponent("collider"); return collider ? [{id:entity.id,name:entity.name,shape:collider.props.shape,enabled:collider.enabled,sensor:!!collider.props.isSensor}] : []; }),
     };
@@ -38,6 +41,81 @@ defineOp({
     return result;
   },
 });
+
+/**
+ * ⭐⭐⭐ WHICH PRIMITIVES CAN THIS CLOTH FEEL, AND IS ONE OF THEM INSIDE IT?
+ *
+ * `primitiveCount` was a NUMBER and nothing else, so "the hem is blocked by
+ * some invisible collider" (user, 2026-09-09) could only be chased by
+ * disabling colliders one at a time and looking — five rounds of it. The
+ * triangle colliders had names from the start; these did not.
+ *
+ * ⚠ AND THE DANGEROUS ONE IS A CONVEX HULL. `writeParticleCollider` fits every
+ * convex collider as an ORIENTED BOX around the whole mesh, which is right for
+ * a crate and catastrophic for a long thin one: Sponza's 21.8 m decorative
+ * ledge becomes a solid slab through the entire arcade from 0.64 m to 2.12 m
+ * up — exactly where the curtains hang, invisible because the thing you can
+ * see is a moulding and the thing the cloth feels is its bounding box.
+ *
+ * So each row reports the box the SOLVER actually uses, whether it overlaps
+ * this cloth's own rest bounds, and `fill` — how much of that box the collider
+ * mesh really occupies. A low `fill` on an overlapping box is the shape of
+ * this bug.
+ */
+function describePrimitiveColliders(component) {
+  const field = component.colliderField;
+  const count = field?.countUniform?.value ?? 0;
+  if (!field || !count) return [];
+  const data = field.data;
+  const byRow = new Map();
+  for (const [id, row] of field.entityIndices ?? []) byRow.set(row, id);
+
+  const mesh = component.simulation?.mesh;
+  const source = mesh?.geometry?.userData?.__clothSourceBox;
+  const clothBox = source && mesh ? source.clone().applyMatrix4(mesh.matrixWorld) : null;
+
+  const rows = [];
+  for (let i = 0; i < count; i++) {
+    const b = i * PARTICLE_COLLIDER_STRIDE;
+    const centre = [data[b + 1], data[b + 2], data[b + 3]];
+    const axes = [[data[b + 4], data[b + 5], data[b + 6]], [data[b + 8], data[b + 9], data[b + 10]], [data[b + 12], data[b + 13], data[b + 14]]];
+    const half = [data[b + 7], data[b + 11], data[b + 15]];
+    // The oriented box's conservative world AABB: the axes are unit vectors,
+    // so each world component grows by |axis| * halfExtent summed over axes.
+    const extent = [0, 1, 2].map((k) => Math.abs(axes[0][k]) * half[0] + Math.abs(axes[1][k]) * half[1] + Math.abs(axes[2][k]) * half[2]);
+    const min = centre.map((v, k) => v - extent[k]);
+    const max = centre.map((v, k) => v + extent[k]);
+    const id = byRow.get(i) ?? null;
+    const entity = id ? engine.entities.get(id) : null;
+    const collider = entity?.getComponent?.("collider");
+    const overlaps = clothBox
+      ? min[0] <= clothBox.max.x && max[0] >= clothBox.min.x
+        && min[1] <= clothBox.max.y && max[1] >= clothBox.min.y
+        && min[2] <= clothBox.max.z && max[2] >= clothBox.min.z
+      : null;
+    // How much of the fitted box the collider's own geometry occupies. A
+    // convex hull fitted to a long thin mesh is mostly air.
+    let fill = null;
+    if (entity?.object3D) {
+      const own = new THREE.Box3().setFromObject(entity.object3D);
+      if (!own.isEmpty()) {
+        const size = own.getSize(new THREE.Vector3());
+        const boxVolume = 8 * half[0] * half[1] * half[2];
+        if (boxVolume > 1e-9) fill = +Math.min(1, (size.x * size.y * size.z) / boxVolume).toFixed(3);
+      }
+    }
+    rows.push({
+      entityId: id, name: entity?.name ?? "(unknown)",
+      shape: collider?.props?.shape ?? "?",
+      type: data[b] === PARTICLE_COLLIDER_TYPE_SPHERE ? "sphere" : "box",
+      centre: centre.map((v) => +v.toFixed(3)),
+      size: extent.map((v) => +(v * 2).toFixed(3)),
+      min: min.map((v) => +v.toFixed(3)), max: max.map((v) => +v.toFixed(3)),
+      overlapsCloth: overlaps, fill,
+    });
+  }
+  return rows.sort((a, b) => (b.overlapsCloth === true) - (a.overlapsCloth === true));
+}
 
 /**
  * ⛔ THE PARAMETER THAT DID NOTHING.

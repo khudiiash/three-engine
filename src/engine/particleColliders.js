@@ -196,6 +196,8 @@ export class ParticleColliderField {
   }
 }
 
+/** Floats per packed row, for anything decoding `field.data`. */
+export const PARTICLE_COLLIDER_STRIDE = FLOATS_PER_COLLIDER;
 export const PARTICLE_COLLIDER_TYPE_BOX = TYPE_BOX;
 export const PARTICLE_COLLIDER_TYPE_SPHERE = TYPE_SPHERE;
 export const PARTICLE_COLLIDER_MAX = MAX_COLLIDERS;
