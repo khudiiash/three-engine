@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { editorFrameRateFor } from "../src/editor/editorFramePacing.js";
+import { editorFrameRateFor, shouldSuspendViewport } from "../src/editor/framePolicy.js";
 
 test("editor frame pacing leaves cheap and play-mode frames uncapped", () => {
   assert.equal(editorFrameRateFor(10), 0);
@@ -16,4 +16,28 @@ test("editor frame pacing yields progressively more time for expensive frames", 
 test("a direct viewport gesture is never capped, whatever the frame costs", () => {
   assert.equal(editorFrameRateFor(50, { gesture: true }), 0);
   assert.equal(editorFrameRateFor(25, { interacting: true, gesture: true }), 0);
+});
+
+test("a hold keeps an unfocused viewport drawing, but never a hidden one", () => {
+  // The profiler docked beside the viewport: it owns the focus, and pausing
+  // the viewport would make it measure its own side effect.
+  assert.equal(
+    shouldSuspendViewport({ visible: true, focused: false, freeze: true, held: true }),
+    false,
+  );
+  // Without the hold, the same state is exactly what the freeze is for.
+  assert.equal(
+    shouldSuspendViewport({ visible: true, focused: false, freeze: true }),
+    true,
+  );
+  // Hidden behind another dock tab beats a hold: nothing is watching either.
+  assert.equal(
+    shouldSuspendViewport({ visible: false, focused: false, freeze: true, held: true }),
+    true,
+  );
+  // And a hold changes nothing when the viewport was going to draw anyway.
+  assert.equal(
+    shouldSuspendViewport({ visible: true, focused: true, freeze: true, held: true }),
+    false,
+  );
 });

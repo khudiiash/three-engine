@@ -2236,6 +2236,42 @@ input.number-field,
   background: transparent;
   box-shadow: none;
 }
+/* Draggable: anywhere that isn't one of its own controls moves it, and a drop
+   outside the viewport docks it as the Performance panel (StatsOverlay). */
+.stats-overlay.perf-hud {
+  cursor: move;
+}
+.stats-overlay.perf-hud button,
+.stats-overlay.perf-hud select {
+  cursor: pointer;
+}
+.stats-overlay.perf-hud.dragging {
+  opacity: 0.35;
+}
+.perf-hud-ghost {
+  position: fixed;
+  z-index: 500;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-card);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  box-shadow: var(--shadow-menu);
+  pointer-events: none;
+}
+.perf-hud-ghost.docking {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.perf-hud-drop-target {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
 .stats-overlay.perf-hud.size-medium {
   width: 232px;
 }
@@ -2248,8 +2284,17 @@ input.number-field,
   color: var(--text);
   font-variant-numeric: tabular-nums;
 }
+/* The toolbar holds still and the readings scroll under it — a button that
+   scrolls away is a button nobody finds twice. */
 .perf-panel {
   height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+.perf-panel-body {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 8px;
 }
@@ -2434,7 +2479,7 @@ input.number-field,
 .perf-pause.on { color: var(--accent); border-color: var(--accent); }
 .perf-tiles {
   display: grid;
-  grid-template-columns: 1.3fr 1fr 1fr 1fr 1.2fr;
+  grid-template-columns: 1.3fr 1fr 1fr 1fr 1fr 1.2fr;
   gap: 1px;
   margin-top: 10px;
   border: 1px solid var(--border);
@@ -2449,6 +2494,65 @@ input.number-field,
   min-width: 0;
   padding: 8px 10px;
   background: var(--bg-2);
+}
+/* The one tile that DOES something: it prices the number above it.
+   ⚠ THE AFFORDANCE IS THE ICON, NOT A SENTENCE. It said "click to find out"
+   under the number, which is a tile apologising for not looking clickable
+   and a line of filler in a panel where every other line is a measurement.
+   The icon sits on the label's baseline, dim until the tile is hovered, and
+   the sub-line is then free to carry the ANSWER or nothing at all. */
+.perf-tile-action {
+  position: relative;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.perf-tile-action .perf-tile-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.perf-tile-icon {
+  flex: 0 0 auto;
+  opacity: 0.35;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+.perf-tile-action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text-1) 5%, transparent);
+}
+.perf-tile-action:hover:not(:disabled) .perf-tile-icon {
+  opacity: 1;
+  color: var(--accent);
+}
+.perf-tile-action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.perf-tile-action:disabled {
+  cursor: progress;
+}
+/* While it measures, the icon breathes rather than spins: the run is a
+   sequence of one-second windows, and a spinner would promise smoothness the
+   thing behind it does not have. */
+.perf-tile-action:disabled .perf-tile-icon {
+  opacity: 1;
+  color: var(--accent);
+  animation: perf-tile-measuring 1.2s ease-in-out infinite;
+}
+@keyframes perf-tile-measuring {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .perf-tile-action:disabled .perf-tile-icon { animation: none; }
+}
+.perf-tile-action .perf-tile-sub {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
 }
 .perf-tile-label {
   font-size: 10.5px;
@@ -2762,6 +2866,30 @@ input.number-field,
 .perf-group-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
 .perf-group-title { font-size: 11.5px; font-weight: 600; color: var(--text); }
 .perf-group-sum { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+/* The census is an ACTION, so its control sits in the group head where the
+   total would be — the one place in this panel that is not a reading. */
+.perf-census-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  height: auto;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.perf-census-btn .perf-tile-icon { opacity: 0.55; }
+.perf-census-btn:hover:not(:disabled) .perf-tile-icon { opacity: 1; color: var(--accent); }
+.perf-census-btn:disabled {
+  opacity: 0.75;
+  cursor: progress;
+}
+.perf-census-btn:disabled .perf-tile-icon {
+  opacity: 1;
+  color: var(--accent);
+  animation: perf-tile-measuring 1.2s ease-in-out infinite;
+}
 .perf-rows { margin: 0; padding: 0; list-style: none; }
 .perf-row { display: grid; grid-template-columns: minmax(0, 1fr) 64px 44px; align-items: center; gap: 8px; height: 22px; font-size: 11px; }
 .perf-row-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text); }
@@ -3677,9 +3805,7 @@ input.number-field,
    each edge and died at the corners, which is not how a screen spills onto
    the wall behind it. A rectangular halo needs a fade per AXIS, and two
    fades on one element need `mask-composite` — so they are split across two
-   elements instead, which every engine has always understood. The box
-   carries the horizontal fade, the transform and the strength; the canvas
-   inside it carries the vertical fade and the blur.
+   elements instead, which every engine has always understood.
 
    The earlier trap is worth keeping in mind if this ever goes radial again:
    a radial gradient is sized to the farthest CORNER unless told otherwise,
@@ -3687,54 +3813,117 @@ input.number-field,
    alpha where the box ends — which drew a straight cut across the screen.
    A linear fade that reaches `transparent` at 100% cannot do that.
 
-   `--ambient-fade-x/y` are set per frame by AmbientGlow.jsx: the fade band
-   is exactly the spread, expressed as a share of a box that is stretched by
-   a different factor in each axis. */
-.ambient-glow-box {
+   ⛔⛔ THE FADES DO NOT LIVE ON THE SCALED ELEMENT (user: "those gradient
+   rings", 2026-09-09). They used to: the box carried both the masks and the
+   `scale()` that stretches 220 px of layout across most of the window. A
+   composited layer — and `will-change: transform` guarantees one — is
+   RASTERIZED AT ITS LAYOUT SIZE and then stretched by the compositor, so a
+   fade band of 13 layout pixels became 400 screen pixels holding 13 pixels'
+   worth of alpha steps: rings, ~30 px apart, exactly where the light dies.
+
+   So the frame and the veil are sized in REAL pixels by AmbientGlow.jsx and
+   carry the two fades at full resolution; only the box inside them is
+   scaled, and all it holds is the blurred bitmap, where a smooth photo-ish
+   gradient hides what is left of the 8-bit steps. Same blur cost as before:
+   the filter still applies to a small element.
+
+   The ramps are EASED rather than linear for the same reason a linear fade
+   always looks like it has an edge — the eye finds the corner where the
+   slope changes (Mach banding). Four stops per side approximate a
+   smoothstep, which has no corner at either end.
+
+   `--ambient-fade-x/y` are set by AmbientGlow.jsx: the fade band is exactly
+   the spread, as a share of the frame — which is now the real size, so the
+   two are the same percentage in both axes' own terms. */
+.ambient-glow-frame {
   position: absolute;
   left: 0;
   top: 0;
-  width: 220px;
-  height: 124px;
-  transform-origin: 50% 50%;
+  transform: translate(-50%, -50%);
+  mask-image: linear-gradient(
+    to right,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 0.04) calc(var(--ambient-fade-x, 6%) * 0.25),
+    rgba(0, 0, 0, 0.24) calc(var(--ambient-fade-x, 6%) * 0.5),
+    rgba(0, 0, 0, 0.63) calc(var(--ambient-fade-x, 6%) * 0.75),
+    #000 var(--ambient-fade-x, 6%),
+    #000 calc(100% - var(--ambient-fade-x, 6%)),
+    rgba(0, 0, 0, 0.63) calc(100% - var(--ambient-fade-x, 6%) * 0.75),
+    rgba(0, 0, 0, 0.24) calc(100% - var(--ambient-fade-x, 6%) * 0.5),
+    rgba(0, 0, 0, 0.04) calc(100% - var(--ambient-fade-x, 6%) * 0.25),
+    rgba(0, 0, 0, 0) 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to right,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 0.04) calc(var(--ambient-fade-x, 6%) * 0.25),
+    rgba(0, 0, 0, 0.24) calc(var(--ambient-fade-x, 6%) * 0.5),
+    rgba(0, 0, 0, 0.63) calc(var(--ambient-fade-x, 6%) * 0.75),
+    #000 var(--ambient-fade-x, 6%),
+    #000 calc(100% - var(--ambient-fade-x, 6%)),
+    rgba(0, 0, 0, 0.63) calc(100% - var(--ambient-fade-x, 6%) * 0.75),
+    rgba(0, 0, 0, 0.24) calc(100% - var(--ambient-fade-x, 6%) * 0.5),
+    rgba(0, 0, 0, 0.04) calc(100% - var(--ambient-fade-x, 6%) * 0.25),
+    rgba(0, 0, 0, 0) 100%
+  );
+  mask-repeat: no-repeat;
+  -webkit-mask-repeat: no-repeat;
+  mask-size: 100% 100%;
+  -webkit-mask-size: 100% 100%;
+}
+.ambient-glow-veil {
+  position: relative;
+  width: 100%;
+  height: 100%;
   /* Nothing stands in front of this any more, so it is dialled back to a
      light rather than a wash. Project Settings → Viewport → Intensity. */
   opacity: var(--ambient-strength, 0.55);
   mask-image: linear-gradient(
-    to right,
-    transparent 0,
-    #000 var(--ambient-fade-x, 6%),
-    #000 calc(100% - var(--ambient-fade-x, 6%)),
-    transparent 100%
+    to bottom,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 0.04) calc(var(--ambient-fade-y, 11%) * 0.25),
+    rgba(0, 0, 0, 0.24) calc(var(--ambient-fade-y, 11%) * 0.5),
+    rgba(0, 0, 0, 0.63) calc(var(--ambient-fade-y, 11%) * 0.75),
+    #000 var(--ambient-fade-y, 11%),
+    #000 calc(100% - var(--ambient-fade-y, 11%)),
+    rgba(0, 0, 0, 0.63) calc(100% - var(--ambient-fade-y, 11%) * 0.75),
+    rgba(0, 0, 0, 0.24) calc(100% - var(--ambient-fade-y, 11%) * 0.5),
+    rgba(0, 0, 0, 0.04) calc(100% - var(--ambient-fade-y, 11%) * 0.25),
+    rgba(0, 0, 0, 0) 100%
   );
   -webkit-mask-image: linear-gradient(
-    to right,
-    transparent 0,
-    #000 var(--ambient-fade-x, 6%),
-    #000 calc(100% - var(--ambient-fade-x, 6%)),
-    transparent 100%
+    to bottom,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 0.04) calc(var(--ambient-fade-y, 11%) * 0.25),
+    rgba(0, 0, 0, 0.24) calc(var(--ambient-fade-y, 11%) * 0.5),
+    rgba(0, 0, 0, 0.63) calc(var(--ambient-fade-y, 11%) * 0.75),
+    #000 var(--ambient-fade-y, 11%),
+    #000 calc(100% - var(--ambient-fade-y, 11%)),
+    rgba(0, 0, 0, 0.63) calc(100% - var(--ambient-fade-y, 11%) * 0.75),
+    rgba(0, 0, 0, 0.24) calc(100% - var(--ambient-fade-y, 11%) * 0.5),
+    rgba(0, 0, 0, 0.04) calc(100% - var(--ambient-fade-y, 11%) * 0.25),
+    rgba(0, 0, 0, 0) 100%
   );
+  mask-repeat: no-repeat;
+  -webkit-mask-repeat: no-repeat;
+  mask-size: 100% 100%;
+  -webkit-mask-size: 100% 100%;
+  overflow: hidden;
+}
+.ambient-glow-box {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 440px;
+  height: 248px;
+  transform-origin: 0 0;
   will-change: transform;
 }
 .ambient-glow-canvas {
   display: block;
   width: 100%;
   height: 100%;
-  filter: blur(11px) saturate(1.9);
-  mask-image: linear-gradient(
-    to bottom,
-    transparent 0,
-    #000 var(--ambient-fade-y, 11%),
-    #000 calc(100% - var(--ambient-fade-y, 11%)),
-    transparent 100%
-  );
-  -webkit-mask-image: linear-gradient(
-    to bottom,
-    transparent 0,
-    #000 var(--ambient-fade-y, 11%),
-    #000 calc(100% - var(--ambient-fade-y, 11%)),
-    transparent 100%
-  );
+  filter: blur(22px) saturate(1.9);
 }
 /* The dock lets the light through: the container is clear and a group is a
    shade translucent. The seam between panels shows the glow rather than the

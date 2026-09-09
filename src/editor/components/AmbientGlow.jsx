@@ -42,8 +42,13 @@ import {
 const HEARTBEAT_MS = 500;
 /** How much of each new sample is taken. Lower is smoother and slower. */
 const EASE = 0.5;
-const BOX_W = 220;
-const BOX_H = 124;
+// The blurred bitmap's LAYOUT size. Bigger than the sample and much smaller
+// than the screen: the blur is paid at this size (see the render note above),
+// and the compositor stretches the result. Doubling it from 220×124 halved
+// what was left of the colour banding after the masks moved off the scaled
+// element — the blur radius doubles with it, so the light looks the same.
+const BOX_W = 440;
+const BOX_H = 248;
 
 /** Each distinct state is reported once, so a glow that never appears can be
  *  told apart from one that is merely faint without adding a debug flag. */
@@ -71,6 +76,8 @@ function poseChanged(camera, pose) {
 export function AmbientGlow() {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
+  const frameRef = useRef(null);
+  const veilRef = useRef(null);
   const boxRef = useRef(null);
   const scratchRef = useRef(null);
   const placeRef = useRef(null);
@@ -108,8 +115,9 @@ export function AmbientGlow() {
     // re-place the light immediately instead of waiting for the next sample.
     const place = (rect = getViewportHandle()?.canvas?.getBoundingClientRect()) => {
       const wrap = wrapRef.current;
+      const frame = frameRef.current;
       const box = boxRef.current;
-      if (!wrap || !box || !rect || !(rect.width > 0) || !(rect.height > 0)) return;
+      if (!wrap || !frame || !box || !rect || !(rect.width > 0) || !(rect.height > 0)) return;
       // How far past the viewport's edges the light reaches, in CSS pixels.
       // A fixed distance rather than a multiple of the viewport: a halo
       // should look the same whether the viewport is a third of the window
@@ -119,12 +127,16 @@ export function AmbientGlow() {
       const height = rect.height + reach * 2;
       wrap.style.left = `${rect.left + rect.width / 2}px`;
       wrap.style.top = `${rect.top + rect.height / 2}px`;
-      box.style.transform = `translate(-50%, -50%) scale(${width / BOX_W}, ${height / BOX_H})`;
-      // The masks fade exactly the band OUTSIDE the picture, so the fade is
-      // the reach expressed as a share of the whole box — per axis, because
-      // the box is stretched by a different factor in each.
-      box.style.setProperty("--ambient-fade-x", `${(reach / width) * 100}%`);
-      box.style.setProperty("--ambient-fade-y", `${(reach / height) * 100}%`);
+      // The frame is the halo at its REAL size, so its two fades rasterize at
+      // screen resolution; only the bitmap inside is scaled. Scaling the
+      // masked element instead is what drew rings — see the sheet.
+      frame.style.width = `${width}px`;
+      frame.style.height = `${height}px`;
+      box.style.transform = `scale(${width / BOX_W}, ${height / BOX_H})`;
+      // The fades cover exactly the band OUTSIDE the picture: the reach as a
+      // share of the frame, per axis.
+      frame.style.setProperty("--ambient-fade-x", `${(reach / width) * 100}%`);
+      frame.style.setProperty("--ambient-fade-y", `${(reach / height) * 100}%`);
     };
     placeRef.current = place;
 
@@ -214,16 +226,22 @@ export function AmbientGlow() {
   useEffect(() => () => disposeAmbientSampler(), []);
 
   if (!visible) return null;
-  // Two elements, one fade each. A single radial mask is an ELLIPSE inscribed
-  // in the box, so the light reached out from the middle of each edge and
-  // died at the corners — not how a screen spills. One linear fade per axis
-  // keeps the halo rectangular, and splitting them across two elements does
-  // it without `mask-composite`, which needs a newer engine than anything
-  // else in this sheet.
+  // Four elements, and each one earns its place: the WRAP is a point at the
+  // viewport's centre, the FRAME is the halo at its real size and carries the
+  // horizontal fade, the VEIL carries the vertical one and the strength, and
+  // only the BOX is scaled — it holds nothing but the blurred bitmap. Two
+  // fades on one element would need `mask-composite` (newer than anything
+  // else in this sheet), and a single radial mask is an ellipse inscribed in
+  // the box: the light would reach out from the middle of each edge and die
+  // at the corners, which is not how a screen spills.
   return (
     <div className="ambient-glow" ref={wrapRef} aria-hidden="true">
-      <div className="ambient-glow-box" ref={boxRef}>
-        <canvas ref={canvasRef} className="ambient-glow-canvas" width={SAMPLE_WIDTH} height={18} />
+      <div className="ambient-glow-frame" ref={frameRef}>
+        <div className="ambient-glow-veil" ref={veilRef}>
+          <div className="ambient-glow-box" ref={boxRef}>
+            <canvas ref={canvasRef} className="ambient-glow-canvas" width={SAMPLE_WIDTH} height={18} />
+          </div>
+        </div>
       </div>
     </div>
   );

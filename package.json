@@ -82,7 +82,7 @@
     "smoke:query-search": "node scripts/run-query-search-smoke.mjs",
     "test:query-lang": "node --test tests/query-lang.test.mjs tests/query-eval-entity.test.mjs tests/query-eval-asset.test.mjs tests/hierarchy-search-query.test.mjs tests/asset-meta-index.test.mjs",
     "test:image-dimensions": "node --test tests/image-dimensions.test.mjs",
-    "test:editor-prefs": "node --test tests/inspector-prefs.test.mjs tests/search-recents.test.mjs tests/asset-sort.test.mjs tests/folder-sizes.test.mjs tests/stats-attribution.test.mjs tests/ambient-glow-look.test.mjs",
+    "test:editor-prefs": "node --test tests/inspector-prefs.test.mjs tests/search-recents.test.mjs tests/asset-sort.test.mjs tests/folder-sizes.test.mjs tests/stats-attribution.test.mjs tests/ambient-glow-look.test.mjs tests/frame-audit-spans.test.mjs",
     "smoke:shadergraph-select": "node scripts/run-shadergraph-select-smoke.mjs",
     "test:quicksearch-rank": "node scripts/run-quicksearch-rank-test.mjs",
     "test:paint": "node scripts/run-mesh-paint-test.mjs",

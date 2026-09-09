@@ -22,6 +22,8 @@ import { vmSingleton } from "./singleton.js";
 const KEY = "engine.viewport.freezeWhenUnfocused";
 
 const state = vmSingleton("viewportFreeze", () => ({
+  // How many things currently need the viewport to keep drawing regardless.
+  holds: 0,
   // Absent means "never set" — default on. Only an explicit "0" turns it off,
   // so a cleared localStorage comes back to the sane default rather than to
   // whatever `Boolean(null)` happens to be.
@@ -59,7 +61,41 @@ export function setViewportFreezeEnabled(enabled) {
   } catch {
     /* preference only */
   }
-  for (const listener of state.listeners) listener(next);
+  notify();
+}
+
+/**
+ * Keeps the viewport rendering while something needs to WATCH it, whatever
+ * the preference says. Returns a release; balance every call.
+ *
+ * ⚠ THE PROFILER IS THE CASE THIS EXISTS FOR. Docked, it owns the focus, so
+ * the ordinary policy paused the very viewport it was measuring — and the
+ * panel then reported a 25 ms frame made of 5 ms of work and 20 ms of
+ * waiting, which is a true measurement of a paused viewport and a useless
+ * one of the scene. An instrument must not change what it measures. The
+ * Animator's audition exemption is the same idea for the same reason: it
+ * owns dock focus at exactly the moment you asked to watch something play.
+ *
+ * A hold does NOT override a viewport that is genuinely hidden behind
+ * another dock tab; nothing is being watched then either.
+ */
+export function holdViewportAwake() {
+  state.holds++;
+  if (state.holds === 1) notify();
+  return () => {
+    if (state.holds === 0) return;
+    state.holds--;
+    if (state.holds === 0) notify();
+  };
+}
+
+/** Whether anything currently needs the viewport awake. */
+export function isViewportHeldAwake() {
+  return state.holds > 0;
+}
+
+function notify() {
+  for (const listener of state.listeners) listener(state.enabled);
 }
 
 /** Subscribes to changes. Returns an unsubscribe. */

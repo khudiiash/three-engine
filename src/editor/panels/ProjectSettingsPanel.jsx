@@ -9,6 +9,7 @@ import { NumberField } from "../fields/NumberField.jsx";
 import { currentScenePath } from "../sceneIO.js";
 import { KEY_BINDING_ACTIONS, describeBinding, keyTokenFromEvent } from "../keybindings.js";
 import { AMBIENT_GLOW_DEFAULTS, setAmbientGlowLook } from "../ambientGlowLook.js";
+import { setLayerVisible, subscribeLayers } from "../panels/ViewportPanel.jsx";
 import {
   isViewportFreezeEnabled,
   onViewportFreezeChanged,
@@ -270,6 +271,12 @@ export function ProjectSettingsPanel() {
   // the moment it is clicked and is untouched by Save. See viewportFreeze.js.
   const [freezeUnfocused, setFreezeUnfocused] = useState(isViewportFreezeEnabled);
   useEffect(() => onViewportFreezeChanged(setFreezeUnfocused), []);
+  // Also not part of `settings`: the viewport OWNS its layer toggles and
+  // persists them itself the moment they change. Reading the live value here
+  // instead of the draft is what keeps this switch and the viewport's
+  // Visibility menu from ever disagreeing.
+  const [glowOn, setGlowOn] = useState(true);
+  useEffect(() => subscribeLayers((layers) => setGlowOn(layers.ambient !== false)), []);
   const [mainDraft, setMainDraft] = useState(mainScene);
   const [mainDirty, setMainDirty] = useState(false);
   // null = unknown/checking, true = exists, false = missing
@@ -316,7 +323,21 @@ export function ProjectSettingsPanel() {
 
   const save = async () => {
     try {
-      await saveProjectSettings(settings);
+      // ⚠ THE LAYERS ARE NOT OURS TO WRITE. This draft was snapshotted when
+      // the panel mounted, and the viewport persists its own toggles the
+      // moment they change — so writing the draft back would silently undo
+      // every Visibility-menu change made since the panel opened, switching
+      // things (the ambient glow among them) back on behind the user. The
+      // live values go in instead.
+      const live = getProjectSettings();
+      await saveProjectSettings({
+        ...settings,
+        editor: {
+          ...settings.editor,
+          layers: live.editor.layers,
+          playLayers: live.editor.playLayers,
+        },
+      });
       setDirty(false);
       console.log("Project settings saved");
     } catch (err) {
@@ -552,22 +573,21 @@ export function ProjectSettingsPanel() {
         >
           <Toggle checked={freezeUnfocused} onChange={setViewportFreezeEnabled} />
         </Row>
-        {/* The glow's switch is `editor.layers.ambient` — the SAME value the
-            viewport's Visibility menu writes, so the two surfaces can never
-            disagree about whether the light is on. Its two numbers apply the
-            moment they change (like the accent above) because a light you
-            cannot watch move is a light you cannot tune; Save is what keeps
-            them. */}
+{/* ⚠ THIS SWITCH IS LIVE, and it has to be. Written as a draft edit like
+            the rows below it, flipping it did nothing at all until Save — and
+            a switch that does nothing when you click it is a broken switch,
+            whatever it does later. It is `editor.layers.ambient`, the SAME
+            value the viewport's Visibility menu writes, so it applies and
+            persists exactly the way that menu does and the two can never
+            disagree. Its two numbers still ride on Save; they apply as they
+            change, which is feedback enough to tune by. */}
         <Row
           label="Ambient glow"
-          hint="Spill the viewport's own light under the panels around it. Also in the viewport's Visibility menu — it is one setting."
+          hint="Spill the viewport's own light under the panels around it. Applies immediately and saves itself, like the viewport's Visibility menu — it is one setting, shown in two places."
         >
-          <Toggle
-            checked={editor.layers?.ambient !== false}
-            onChange={(v) => patch("editor", { layers: { ...(editor.layers ?? {}), ambient: v } })}
-          />
+          <Toggle checked={glowOn} onChange={(v) => setLayerVisible("ambient", v)} />
         </Row>
-        <Row label="Spread" sub disabled={editor.layers?.ambient === false} hint="How far the light reaches past the viewport's edges, in pixels.">
+        <Row label="Spread" sub disabled={!glowOn} hint="How far the light reaches past the viewport's edges, in pixels.">
           <Num
             value={editor.ambientGlowSpread ?? AMBIENT_GLOW_DEFAULTS.spread}
             min={0}
@@ -580,7 +600,7 @@ export function ProjectSettingsPanel() {
           />
           <span className="settings-unit">px</span>
         </Row>
-        <Row label="Intensity" sub disabled={editor.layers?.ambient === false} hint="How visible the light is, from 0 to 1.">
+        <Row label="Intensity" sub disabled={!glowOn} hint="How visible the light is, from 0 to 1.">
           <Num
             value={editor.ambientGlowIntensity ?? AMBIENT_GLOW_DEFAULTS.intensity}
             min={0}

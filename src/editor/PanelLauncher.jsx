@@ -58,26 +58,38 @@ export function PanelLauncherButton({ group, containerApi }) {
  * in the strip changes width as messages arrive.
  */
 function ConsoleSignals({ group, containerApi }) {
-  const errors = useConsoleStore((s) => s.errorCount);
-  const warnings = useConsoleStore((s) => s.warnCount);
+  // BOOLEANS, never the counts: a WebGPU fault logs hundreds of lines a second
+  // and a count in a subscription would re-render this button on every one of
+  // them, in every tab strip. These flip once. The counts are read on hover
+  // instead, straight off the store, and written onto the live title.
+  const hasErrors = useConsoleStore((s) => s.errorCount > 0);
+  const hasWarnings = useConsoleStore((s) => s.warnCount > 0);
   const host = useSignalHostGroup(group, containerApi);
-  if (!host || (errors === 0 && warnings === 0)) return null;
-  const parts = [];
-  if (errors) parts.push(`${errors} error${errors === 1 ? "" : "s"}`);
-  if (warnings) parts.push(`${warnings} warning${warnings === 1 ? "" : "s"}`);
-  const label = `${parts.join(", ")} — open the Console`;
+  if (!host || (!hasErrors && !hasWarnings)) return null;
   return (
     <button
       type="button"
       className="dock-signals"
-      title={label}
-      aria-label={label}
+      title={consoleSignalLabel()}
+      aria-label={consoleSignalLabel()}
+      onPointerEnter={(e) => {
+        e.currentTarget.title = consoleSignalLabel();
+      }}
       onClick={() => openPanelInGroup(containerApi, group, "console")}
     >
-      {errors > 0 && <i className="dock-signal error" aria-hidden="true" />}
-      {warnings > 0 && <i className="dock-signal warn" aria-hidden="true" />}
+      {hasErrors && <i className="dock-signal error" aria-hidden="true" />}
+      {hasWarnings && <i className="dock-signal warn" aria-hidden="true" />}
     </button>
   );
+}
+
+/** "3 errors, 5 warnings — open the Console", from the store as it is now. */
+function consoleSignalLabel() {
+  const { errorCount, warnCount } = useConsoleStore.getState();
+  const parts = [];
+  if (errorCount) parts.push(`${errorCount} error${errorCount === 1 ? "" : "s"}`);
+  if (warnCount) parts.push(`${warnCount} warning${warnCount === 1 ? "" : "s"}`);
+  return `${parts.join(", ")} — open the Console`;
 }
 
 /**

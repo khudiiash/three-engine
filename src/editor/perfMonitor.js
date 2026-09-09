@@ -28,6 +28,7 @@ export const FRAME_BUDGET_MS = 1000 / 60;
 export const PERF_SIZES = ["fps", "medium", "full"];
 export const PERF_WINDOWS = [5, 15, 60];
 const SIZE_KEY = "engine.viewport.stats.size";
+const POS_KEY = "engine.viewport.stats.pos";
 
 function readSize() {
   try {
@@ -38,6 +39,17 @@ function readSize() {
   }
 }
 
+/** The HUD's place in its viewport, `{ x, y }` from the viewport's top-left,
+ *  or null for its default corner. Written by dragging it (StatsOverlay). */
+function readPos() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(POS_KEY) ?? "null");
+    return Number.isFinite(raw?.x) && Number.isFinite(raw?.y) ? { x: raw.x, y: raw.y } : null;
+  } catch {
+    return null;
+  }
+}
+
 export const usePerfStore = vmSingleton("perfStore", () =>
   create(() => ({
     tick: 0,
@@ -45,10 +57,19 @@ export const usePerfStore = vmSingleton("perfStore", () =>
     windowSec: 5,
     tab: "cpu",
     size: readSize(),
+    pos: readPos(),
     // The breakdown (a phase capture with owners) and the memory-by-owner
     // walk, kept fresh only while a view watches them.
     breakdown: null,
     memory: null,
+    // The measured engine/other/idle split, refreshed in short windows while
+    // the Breakdown tab is open. Null until the first window completes.
+    audit: null,
+    // The by-removal census: what each component/module actually costs. Run
+    // on demand (it takes seconds and the viewport visibly changes), so it
+    // is null until the user asks for it.
+    census: null,
+    censusProgress: null,
   })),
 );
 
@@ -57,6 +78,17 @@ export function setPerfSize(size) {
   usePerfStore.setState({ size });
   try {
     localStorage.setItem(SIZE_KEY, size);
+  } catch {
+    /* forgotten between reloads, nothing more */
+  }
+}
+
+/** Moves the HUD to `{ x, y }` in its viewport, or back to its corner (null). */
+export function setPerfPos(pos) {
+  usePerfStore.setState({ pos });
+  try {
+    if (pos) localStorage.setItem(POS_KEY, JSON.stringify({ x: Math.round(pos.x), y: Math.round(pos.y) }));
+    else localStorage.removeItem(POS_KEY);
   } catch {
     /* forgotten between reloads, nothing more */
   }
@@ -73,6 +105,12 @@ const ring = {
   data: Object.fromEntries(SERIES.map((k) => [k, new Float32Array(CAP)])),
 };
 let latest = null;
+// The frame interval, smoothed. `readout.frameMs` is ONE tick's interval and
+// `readout.workMs` is the engine's own EMA over ~10 frames: reading the two
+// side by side compares a smoothed number to an unsmoothed one, which is how
+// the tiles came to disagree with each other. Same treatment for both.
+let frameEma = 0;
+const FRAME_EMA = 0.25;
 let geometryBytes = 0;
 let geometryStamp = 0;
 let timer = null;
@@ -119,6 +157,8 @@ function sample() {
   const gpuReal = r.gpuMs > 0;
   const gpu = gpuReal ? r.gpuMs : cpuRender;
   const heap = r.jsHeapBytes ?? 0;
+  const frame = r.frameMs || 0;
+  frameEma = frameEma > 0 ? frameEma + (frame - frameEma) * FRAME_EMA : frame;
   push({
     cpuGame,
     cpuRender,
@@ -132,10 +172,22 @@ function sample() {
   latest = {
     fps: r.fps || 0,
     skippedFps: r.skippedFps || 0,
-    frameMs: r.frameMs || 0,
+    frameMs: frameEma,
+    frameRawMs: frame,
     workMs: work,
     cpuGame,
     cpuRender,
+    // What the loop did NOT spend executing: the display's vsync wait, the
+    // browser's own frame scheduling, and the editor's frame limiter. The
+    // frame's arithmetic closes on it — game + render + idle = the frame —
+    // and without it a 29 ms frame made of 9 ms of work reads as a lie.
+    idle: Math.max(frameEma - work, 0),
+    // What the idle is MADE of. `callbackFps` is how often the host offered
+    // us a frame and `frameLimit` is the cap we answered with, so together
+    // they say whether the wait was ours to give or the browser's to impose.
+    callbackFps: r.callbackFps || 0,
+    hostFps: hostHz,
+    frameLimit: engineRef?.frameRateLimit ?? 0,
     gpu,
     gpuReal,
     gpuRenderMs: r.gpuRenderMs ?? 0,
@@ -150,6 +202,152 @@ function sample() {
     running: (r.fps || 0) > 0 || (r.skippedFps || 0) > 0,
   };
   if (!usePerfStore.getState().paused) usePerfStore.setState((s) => ({ tick: s.tick + 1 }));
+}
+
+/**
+ * True while the viewport HUD is standing down because it was DRAGGED into
+ * the dock as the Performance panel.
+ *
+ * The profiler has to end up in exactly one place, and both places have to be
+ * reachable from the other. Dragging the HUD onto a tab strip is a one-way
+ * gesture without this flag: the HUD switches itself off to avoid two live
+ * profilers, and then closing the panel leaves the profiler nowhere at all —
+ * which is the dead end the user actually hit. The panel reads this on its
+ * way out and gives the HUD back.
+ */
+let handedOff = false;
+export function setPerfHandedOff(value) {
+  handedOff = !!value;
+}
+export function isPerfHandedOff() {
+  return handedOff;
+}
+
+/**
+ * How many frames the BROWSER offers a second, counted outside the engine.
+ *
+ * ⚠ THIS IS THE ONE THE ENGINE CANNOT MEASURE. `readout.callbackFps` counts
+ * callbacks that reach the tick, and when the editor STOPS the loop — an
+ * unfocused viewport freezing, idle pacing suspending it — no callback
+ * reaches the tick at all. Read from inside, that state is indistinguishable
+ * from a browser that has stopped offering frames, and the profiler duly
+ * blamed the display for a 70% idle the editor had chosen itself.
+ *
+ * A bare requestAnimationFrame that increments a counter is immune to that,
+ * because nothing in the app can stop it. The gap between this and `fps` is
+ * then exactly the frames the editor declined to draw.
+ *
+ * Only runs while a profiler is on screen: it costs almost nothing, but it
+ * is not free, and the editor's whole idle policy is about not doing work
+ * nobody asked for.
+ */
+let hostWatchers = 0;
+let hostRaf = 0;
+let hostFrames = 0;
+let hostWindowStart = 0;
+let hostHz = 0;
+
+function hostTick(now) {
+  hostRaf = requestAnimationFrame(hostTick);
+  hostFrames++;
+  if (!hostWindowStart) hostWindowStart = now;
+  const span = now - hostWindowStart;
+  if (span >= 1000) {
+    hostHz = (hostFrames * 1000) / span;
+    hostFrames = 0;
+    hostWindowStart = now;
+  }
+}
+
+/** Counts the browser's frame offers while anything is watching. Returns an unsubscribe. */
+export function watchHostFrameRate() {
+  if (hostWatchers++ === 0) {
+    hostFrames = 0;
+    hostWindowStart = 0;
+    hostRaf = requestAnimationFrame(hostTick);
+  }
+  return () => {
+    if (--hostWatchers > 0) return;
+    cancelAnimationFrame(hostRaf);
+    hostRaf = 0;
+    hostHz = 0;
+  };
+}
+
+/**
+ * ⭐ THE IDLE, MEASURED INSTEAD OF SUBTRACTED.
+ *
+ * `latest.idle` is `frameMs - workMs`, and a residual cannot tell waiting
+ * from working: React rendering these very panels, the browser's style,
+ * layout and paint, a GC pause, the WebGPU submission after the tick returns
+ * — none of it is marked by the engine, so all of it was being displayed as
+ * rest. `engine/frameAudit.js` measures the difference properly, with a
+ * MessageChannel heartbeat that can only run when the thread is free, and
+ * splits the frame into engine / other / genuinely parked.
+ *
+ * ⚠ IT IS NOT FREE AND NOT NEUTRAL — a heartbeat keeps the thread hot and
+ * can suppress the browser's own idle behaviour — so it runs in SHORT
+ * WINDOWS on a duty cycle rather than continuously, and only while a
+ * profiler is actually showing the split. The reading between windows is
+ * the last one taken, which is why it is stamped with its own age.
+ */
+const AUDIT_WINDOW_MS = 600;
+const AUDIT_PERIOD_MS = 4000;
+let auditWatchers = 0;
+let auditTimer = 0;
+let auditing = false;
+
+async function runAudit() {
+  if (auditing || !engineRef) return;
+  auditing = true;
+  try {
+    const { auditFrames } = await import("../engine/frameAudit.js");
+    const report = await auditFrames(engineRef, { ms: AUDIT_WINDOW_MS });
+    if (auditWatchers > 0) usePerfStore.setState({ audit: { ...report, at: Date.now() } });
+  } catch (err) {
+    console.warn(`Frame audit unavailable: ${err?.message ?? err}`);
+  } finally {
+    auditing = false;
+  }
+}
+
+/** Measures what the frame's idle is really made of, in windows. Returns an unsubscribe. */
+export function watchFrameAudit() {
+  if (auditWatchers++ === 0) {
+    runAudit();
+    auditTimer = setInterval(runAudit, AUDIT_PERIOD_MS);
+  }
+  return () => {
+    if (--auditWatchers > 0) return;
+    clearInterval(auditTimer);
+    auditTimer = 0;
+  };
+}
+
+/**
+ * Prices every component and module by taking it away, and keeps the result.
+ *
+ * The one measurement that can see work the page has no clock for — issuing
+ * GPU dispatches costs almost nothing on every timer in here and can still be
+ * most of the frame. See frameCensus.js.
+ */
+export async function measureFrameCensus() {
+  if (usePerfStore.getState().censusProgress) return;
+  usePerfStore.setState({ censusProgress: { done: 0, total: 0, label: "starting" } });
+  try {
+    const [{ runFrameCensus }, engine] = await Promise.all([
+      import("./frameCensus.js"),
+      engineRef ? Promise.resolve(engineRef) : import("./engineInstance.js").then((m) => m.ensureEngine()),
+    ]);
+    const census = await runFrameCensus(engine, {
+      onProgress: (done, total, label) => usePerfStore.setState({ censusProgress: { done, total, label } }),
+    });
+    usePerfStore.setState({ census });
+  } catch (err) {
+    console.warn(`Frame census failed: ${err?.message ?? err}`);
+  } finally {
+    usePerfStore.setState({ censusProgress: null });
+  }
 }
 
 /** Starts the sampler on `engine` (idempotent; re-pointing follows an engine rebuild). */

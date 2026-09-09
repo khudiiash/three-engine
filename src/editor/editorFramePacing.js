@@ -6,7 +6,7 @@ import { onAssetInvalidated } from "./assetLoader.js";
 import { useHistoryStore } from "./commands/CommandBus.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useGeometryEditStore } from "./store/geometryEditStore.js";
-import { isViewportFreezeEnabled, onViewportFreezeChanged } from "./viewportFreeze.js";
+import { isViewportFreezeEnabled, isViewportHeldAwake, onViewportFreezeChanged } from "./viewportFreeze.js";
 
 // Re-exported so existing importers (and the smokes) keep working.
 export { editorFrameRateFor, shouldSuspendViewport };
@@ -285,6 +285,7 @@ export function installEditorFramePacing() {
         visible: viewportVisible(),
         focused: viewportFocused(),
         freeze: isViewportFreezeEnabled(),
+        held: isViewportHeldAwake(),
       });
     // A change still settling keeps the loop alive even when nobody is looking
     // directly: the alternative is a viewport that is only correct for whoever

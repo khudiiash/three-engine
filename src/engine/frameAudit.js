@@ -45,6 +45,47 @@ const BEAT_FLOOR_MS = 0.6;
 const nowMs = () => performance.now();
 
 /**
+ * ⭐ THE BILL: overlapping spans charged to whoever was INNERMOST.
+ *
+ * The engine's tick runs inside three's frame callback, which runs inside the
+ * browser's frame task — three nested spans over the same milliseconds. Adding
+ * their durations would bill that time three times over and produce a "frame"
+ * twice as long as the frame. Charging each instant to the DEEPEST span
+ * covering it gives every millisecond exactly one owner, and the totals then
+ * add up to the wall clock, which is the only way an accounting can be
+ * checked.
+ *
+ * Returns ms per label, exclusive.
+ */
+export function exclusiveSpanTotals(spans) {
+  const events = [];
+  for (const span of spans) {
+    if (!(span.end > span.start)) continue;
+    events.push({ t: span.start, open: true, span });
+    events.push({ t: span.end, open: false, span });
+  }
+  // Closes before opens at the same instant, so two adjacent spans do not
+  // briefly look nested.
+  events.sort((a, b) => a.t - b.t || (a.open === b.open ? 0 : a.open ? 1 : -1));
+  const totals = new Map();
+  const stack = [];
+  let last = events.length ? events[0].t : 0;
+  for (const event of events) {
+    if (event.t > last && stack.length) {
+      const owner = stack[stack.length - 1];
+      totals.set(owner.label, (totals.get(owner.label) ?? 0) + (event.t - last));
+    }
+    if (event.open) stack.push(event.span);
+    else {
+      const at = stack.lastIndexOf(event.span);
+      if (at >= 0) stack.splice(at, 1);
+    }
+    last = event.t;
+  }
+  return totals;
+}
+
+/**
  * Watch the main thread for `ms` and report what it was doing.
  *
  * @param {object} engine       the live engine, for the tick stamp (optional)
@@ -78,6 +119,16 @@ export async function auditFrames(engine, { ms = 2000 } = {}) {
   // matters because the editor is a React app on the same thread as the
   // renderer, and its per-frame callbacks are invisible from inside the engine.
   const rafRows = new Map();
+  // ⭐ EVERY INSTRUMENTED CALLBACK LEAVES A SPAN, and the spans are what turn
+  // a pile of busy blocks into a bill. A block says "the thread was busy for
+  // 6 ms"; the spans inside it say which 6 ms belonged to whom, and the part
+  // of the block no span covers is the browser's own — style, layout, paint,
+  // garbage collection — which is a real answer and not a leftover.
+  const spans = [];
+  const openSpan = (label, kind) => {
+    const start = nowMs();
+    return () => spans.push({ label, kind, start, end: nowMs() });
+  };
   const originalRaf = globalThis.requestAnimationFrame.bind(globalThis);
   const site = () => {
     const line = (new Error().stack ?? "").split(String.fromCharCode(10))[3] ?? "";
@@ -88,8 +139,10 @@ export async function auditFrames(engine, { ms = 2000 } = {}) {
     const where = site();
     return originalRaf((t) => {
       const start = nowMs();
+      const close = openSpan(label === "onFrame" ? "audit heartbeat" : label, "raf");
       try { return callback(t); }
       finally {
+        close();
         const key = `${label} @ ${where}`;
         const took = nowMs() - start;
         const row = rafRows.get(key) ?? { callback: label, at: where, ms: 0, calls: 0, minMs: Infinity, maxMs: 0, chainMs: [0, 0] };
@@ -108,6 +161,44 @@ export async function auditFrames(engine, { ms = 2000 } = {}) {
       }
     });
   };
+
+  // ⭐ THE OTHER DOOR ONTO THE THREAD. Everything that is not a frame
+  // callback arrives as a task, and in this editor that is overwhelmingly a
+  // timer: the perf sampler, the project watcher's poll, React's own deferred
+  // work, every debounce in the UI. Unwrapped they are indistinguishable from
+  // browser work, and a 16 ms block with no name against it is exactly the
+  // kind of thing that gets waved at.
+  const timerRows = new Map();
+  const originalSetTimeout = globalThis.setTimeout.bind(globalThis);
+  const originalSetInterval = globalThis.setInterval.bind(globalThis);
+  const wrapTimer = (fn, kindLabel) => {
+    const label = fn.name || "(anonymous)";
+    const where = site();
+    return (...args) => {
+      const start = nowMs();
+      const close = openSpan(label, kindLabel);
+      try {
+        return fn(...args);
+      } finally {
+        close();
+        const key = `${label} @ ${where}`;
+        const took = nowMs() - start;
+        const row = timerRows.get(key) ?? { callback: label, at: where, kind: kindLabel, ms: 0, calls: 0, maxMs: 0 };
+        row.ms += took;
+        row.calls++;
+        if (took > row.maxMs) row.maxMs = took;
+        timerRows.set(key, row);
+      }
+    };
+  };
+  globalThis.setTimeout = (fn, delay, ...rest) =>
+    typeof fn === "function"
+      ? originalSetTimeout(wrapTimer(fn, "timeout"), delay, ...rest)
+      : originalSetTimeout(fn, delay, ...rest);
+  globalThis.setInterval = (fn, delay, ...rest) =>
+    typeof fn === "function"
+      ? originalSetInterval(wrapTimer(fn, "interval"), delay, ...rest)
+      : originalSetInterval(fn, delay, ...rest);
 
   let raf = 0;
   const onFrame = (t) => { hostFrames.push(t); if (running) raf = originalRaf(onFrame); };
@@ -162,10 +253,13 @@ export async function auditFrames(engine, { ms = 2000 } = {}) {
   const started = nowMs();
   channel.port2.postMessage(0);
   raf = requestAnimationFrame(onFrame);
-  await new Promise((resolve) => setTimeout(resolve, window_));
+  // The unwrapped timer: the instrument must not bill itself.
+  await new Promise((resolve) => originalSetTimeout(resolve, window_));
   running = false;
   const ended = nowMs();
   globalThis.requestAnimationFrame = originalRaf;
+  globalThis.setTimeout = originalSetTimeout;
+  globalThis.setInterval = originalSetInterval;
   if (nodeFrame && originalNodeUpdate) nodeFrame.update = originalNodeUpdate;
   cancelAnimationFrame(raf);
   channel.port1.onmessage = null;
@@ -197,6 +291,17 @@ export async function auditFrames(engine, { ms = 2000 } = {}) {
     engineBlocks.push(row);
   }
 
+  // The engine's tick is a span like any other, and a NESTED one: it lives
+  // inside three's frame callback, which is why the flattener exists.
+  {
+    let end = 0;
+    for (const opened of tickStamps) {
+      while (end < endStamps.length && endStamps[end] < opened) end++;
+      const closed = end < endStamps.length ? endStamps[end++] : null;
+      if (closed !== null) spans.push({ label: "engine tick", kind: "engine", start: opened, end: closed });
+    }
+  }
+
   const span = ended - started;
   const sum = (rows) => rows.reduce((t, b) => t + b.ms, 0);
   const engineMs = sum(engineBlocks), otherMs = sum(otherBlocks);
@@ -211,6 +316,34 @@ export async function auditFrames(engine, { ms = 2000 } = {}) {
     meanMs: rows.length ? +(total / rows.length).toFixed(2) : 0,
     maxMs: rows.length ? +Math.max(...rows.map((b) => b.ms)).toFixed(2) : 0,
   });
+
+  // ── THE COMPLETE BILL ────────────────────────────────────────────────
+  // Every millisecond of the window is charged once: to the innermost
+  // instrumented callback that was running, to the browser for the busy time
+  // no callback claims (style, layout, paint, GC), or to the thread being
+  // parked. The rows sum to the window, so the accounting can be CHECKED
+  // rather than believed — `unbilledMs` is the residual and should be ~0.
+  const exclusive = exclusiveSpanTotals(spans.filter((sp) => sp.end > started && sp.start < ended));
+  let namedMs = 0;
+  const billed = [];
+  for (const [label, ms] of exclusive) {
+    if (label === "audit heartbeat") continue; // the instrument does not bill
+    namedMs += ms;
+    billed.push({ name: label, ms, kind: label === "engine tick" ? "engine" : "callback" });
+  }
+  // Busy time inside a block that no instrumented callback covers: the
+  // browser's own style, layout, paint and GC.
+  //
+  // ⚠ AND ONE HONEST CAVEAT, WHICH THE ROW'S NAME CARRIES. Wrapping
+  // `setTimeout`/`setInterval` only catches timers SCHEDULED DURING the
+  // window; a repeating interval registered before it started keeps running
+  // through its original, unwrapped callback and lands here. Naming the row
+  // "browser" alone would be the same sin as calling a subtraction "idle".
+  const browserMs = Math.max(0, busyMs - namedMs);
+  billed.push({ name: "Browser and untagged tasks", ms: browserMs, kind: "browser" });
+  billed.push({ name: "Thread parked", ms: idleMs, kind: "parked" });
+  billed.sort((a, b) => b.ms - a.ms);
+  const perFrame = (ms) => +(ms / frames).toFixed(2);
 
   return {
     windowMs: +span.toFixed(0),
@@ -243,5 +376,15 @@ export async function auditFrames(engine, { ms = 2000 } = {}) {
     longestOther: otherBlocks.sort((a, b) => b.ms - a.ms).slice(0, 8).map((b) => ({ ms: +b.ms.toFixed(2) })),
     loaf: loaf.sort((a, b) => b.ms - a.ms).slice(0, 6),
     loafSupported: !!observer,
+    // One frame, itemised. `perFrameMs` over the rows sums to
+    // `hostFramePeriodMs`; `unbilledMs` is what that sum misses.
+    frame: billed
+      .filter((row) => row.ms / frames >= 0.005)
+      .map((row) => ({ name: row.name, kind: row.kind, perFrameMs: perFrame(row.ms), pct: +(row.ms / span * 100).toFixed(1) })),
+    unbilledMs: +((span - (namedMs + browserMs + idleMs)) / frames).toFixed(3),
+    timers: [...timerRows.values()]
+      .map((r) => ({ ...r, ms: +r.ms.toFixed(1), perFrameMs: +(r.ms / frames).toFixed(2), maxMs: +r.maxMs.toFixed(2) }))
+      .sort((a, b) => b.ms - a.ms)
+      .slice(0, 8),
   };
 }

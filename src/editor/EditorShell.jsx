@@ -3,7 +3,7 @@ import { RotateCcw, TriangleAlert } from "./icons/index.jsx";
 import { DockviewReact, themeAbyss } from "dockview-react";
 import { PANEL_SPECS } from "./panelCatalog.js";
 import { PanelTab } from "./PanelTab.jsx";
-import { PanelLauncherButton } from "./PanelLauncher.jsx";
+import { openPanelInGroup, PanelLauncherButton } from "./PanelLauncher.jsx";
 import { vmSingleton } from "./singleton.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { QuickSearch } from "./QuickSearch.jsx";
@@ -416,6 +416,30 @@ export function maximizePanel(id, maximized = true) {
     console.warn(`maximizePanel(${id}): ${err.message}`);
     return false;
   }
+}
+
+/**
+ * The Dockview group under a point on screen, or null.
+ *
+ * For drags the editor runs ITSELF with pointer events — the viewport's
+ * performance HUD dragged onto a tab strip to become the Performance panel is
+ * the first — because HTML5 drag-and-drop, which Dockview's own drop targets
+ * use, never fires under Tauri's webview. A drop is therefore a hit test at
+ * pointer-up, and this is it.
+ */
+export function dockGroupAt(clientX, clientY) {
+  if (!dock.api) return null;
+  const element = document.elementFromPoint(clientX, clientY);
+  const groupElement = element instanceof Element ? element.closest(".dv-groupview") : null;
+  if (!groupElement) return null;
+  return dock.api.groups.find((group) => group.element === groupElement) ?? null;
+}
+
+/** Opens `id` as a tab of `group` — the drop half of the same gesture. */
+export function openPanelInDockGroup(id, group) {
+  if (!dock.api || !group) return false;
+  openPanelInGroup(dock.api, group, id);
+  return true;
 }
 
 /** Opens any panel (focuses it if already present), even after it was closed. */

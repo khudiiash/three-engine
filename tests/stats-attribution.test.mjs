@@ -71,3 +71,35 @@ test("re-arming clears the previous owners", () => {
   stats.endPhaseFrame();
   assert.deepEqual(stats.readPhaseCapture().owners, []);
 });
+
+test("GPU dispatches are charged to the callback that issued them", () => {
+  const stats = new StatsSystem();
+  const cloth = { type: "cloth", entity: { id: "e1", name: "Curtain" } };
+  const tick = () => {};
+  tick.__owner = cloth;
+  stats.beginPhaseCapture(1, { attribute: true });
+
+  // What the engine does around one per-frame callback.
+  stats._dispatchOwner = stats.rowFor(tick, "update");
+  stats.attributeDispatches(306);
+  stats.attribute(tick, "update", 0.008);
+  stats._dispatchOwner = null;
+
+  // ...and work dispatched with no callback on the stack belongs to nobody,
+  // which is itself worth seeing rather than silently folding into someone.
+  stats.attributeDispatches(4);
+
+  const row = [...stats._attrib.values()].find((r) => r.type === "cloth");
+  assert.equal(row.dispatches, 306);
+  assert.equal(row.calls, 1, "looking the row up must not count as a call");
+  assert.ok(Math.abs(row.ms - 0.008) < 1e-9);
+  assert.equal(stats._dispatchesUnowned, 4);
+});
+
+test("a dispatch with no owner never invents one", () => {
+  const stats = new StatsSystem();
+  stats.beginPhaseCapture(1, { attribute: true });
+  stats.attributeDispatches(7);
+  assert.equal(stats._attrib.size, 0);
+  assert.equal(stats._dispatchesUnowned, 7);
+});

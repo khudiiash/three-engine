@@ -113,6 +113,23 @@ export class Engine extends EventEmitter {
     // `__owner`, which is how the profiler's breakdown names a callback's
     // time after the fact without every call site passing itself in.
     this._registrant = null;
+    /**
+     * Owners whose per-frame callbacks are skipped right now.
+     *
+     * ⭐ THE ONLY HONEST WAY TO PRICE GPU WORK PER OWNER. A component that
+     * hands the GPU three hundred dispatches costs almost no main thread and
+     * almost no measurable pass time, and the frame still triples — the cost
+     * is in issuing the work, which lives outside every clock this page can
+     * read. What CAN be read is the frame with the component and the frame
+     * without it, which is exactly the comparison a person makes by hand
+     * when they untick something and watch the counter. This makes that
+     * comparison an instrument instead of a habit.
+     *
+     * Nothing about the scene changes: the callback is skipped, the
+     * component keeps its state, and the set is cleared when the census
+     * finishes or throws. One `size` check per frame when it is empty.
+     */
+    this._mutedOwners = new Set();
     // Ordered post-update stage, for work that must observe the *final* pose of
     // the frame. Unlike `updateCallbacks` (a Set, so ordered only by when each
     // subscriber happened to attach) these carry an explicit `order`, because
@@ -1289,6 +1306,9 @@ export class Engine extends EventEmitter {
 
   #tick() {
     const frameStarted = performance.now();
+    // Counted BEFORE the limiter can turn this callback away, so the profiler
+    // can tell a frame rate the app chose from one the browser imposed.
+    this.stats.recordFrameCallback(frameStarted);
     if (this.frameRateLimit > 0) {
       const interval = 1000 / this.frameRateLimit;
       // A small tolerance avoids a nominal 30 fps cap becoming 20 fps because
@@ -1425,12 +1445,15 @@ export class Engine extends EventEmitter {
     // (see `_registrant`); otherwise the loop is the bare loop it always was.
     if (this.stats._attribArmed) {
       for (const fn of this.updateCallbacks) {
+        if (this.#muted(fn)) continue;
         const t0 = performance.now();
+        this.stats._dispatchOwner = this.stats.rowFor(fn, "update");
         fn(dt);
         this.stats.attribute(fn, "update", performance.now() - t0);
+        this.stats._dispatchOwner = null;
       }
     } else {
-      for (const fn of this.updateCallbacks) fn(dt);
+      for (const fn of this.updateCallbacks) { if (!this.#muted(fn)) fn(dt); }
     }
     // Snapshot: a late callback that unsubscribes itself (an IK component
     // detaching on the frame its target is destroyed) would otherwise mutate
@@ -1438,12 +1461,15 @@ export class Engine extends EventEmitter {
     if (this.lateUpdateCallbacks.length) {
       if (this.stats._attribArmed) {
         for (const entry of [...this.lateUpdateCallbacks]) {
+          if (this.#muted(entry.fn)) continue;
           const t0 = performance.now();
+          this.stats._dispatchOwner = this.stats.rowFor(entry.fn, "lateUpdate");
           entry.fn(dt);
           this.stats.attribute(entry.fn, "lateUpdate", performance.now() - t0);
+          this.stats._dispatchOwner = null;
         }
       } else {
-        for (const entry of [...this.lateUpdateCallbacks]) entry.fn(dt);
+        for (const entry of [...this.lateUpdateCallbacks]) { if (!this.#muted(entry.fn)) entry.fn(dt); }
       }
     }
     // Audio updates go after the script tick so per-frame transforms are
@@ -1544,12 +1570,15 @@ export class Engine extends EventEmitter {
       try {
         if (this.stats._attribArmed) {
           for (const fn of this.preRenderCallbacks) {
+            if (this.#muted(fn)) continue;
             const t0 = performance.now();
+            this.stats._dispatchOwner = this.stats.rowFor(fn, "preRender");
             fn();
             this.stats.attribute(fn, "preRender", performance.now() - t0);
+            this.stats._dispatchOwner = null;
           }
         } else {
-          for (const fn of this.preRenderCallbacks) fn();
+          for (const fn of this.preRenderCallbacks) { if (!this.#muted(fn)) fn(); }
         }
       } finally {
         freeze.end(preRenderSpan);
@@ -1647,6 +1676,7 @@ export class Engine extends EventEmitter {
       // frame, before user code runs. See StatsSystem header for the
       // timing rationale.
       this.stats.recordRenderInfo();
+      this.#countDispatches();
       this.#resolveGpuTimestamps();
       this.#updateDynamicResolution();
       // §18 W3, and deliberately in the same slot as the DRS loop: both read
@@ -1670,12 +1700,15 @@ export class Engine extends EventEmitter {
     this.stats.markPhase(PHASE.postRender);
     if (this.stats._attribArmed) {
       for (const fn of this.postRenderCallbacks) {
+        if (this.#muted(fn)) continue;
         const t0 = performance.now();
+        this.stats._dispatchOwner = this.stats.rowFor(fn, "postRender");
         fn();
         this.stats.attribute(fn, "postRender", performance.now() - t0);
+        this.stats._dispatchOwner = null;
       }
     } else {
-      for (const fn of this.postRenderCallbacks) fn();
+      for (const fn of this.postRenderCallbacks) { if (!this.#muted(fn)) fn(); }
     }
     this.stats.endPhaseFrame();
     this.stats.recordFrameWorkMs(performance.now() - frameStarted);
@@ -1694,6 +1727,64 @@ export class Engine extends EventEmitter {
    * without the timestamp-query feature the backend no-ops and the value
    * stays 0; StatsSystem falls back to submit time in that case.
    */
+  /**
+   * Counts every compute dispatch and charges it to the callback that asked.
+   *
+   * ⚠ THIS IS THE HOLE THE CLOTH FELL THROUGH. A cloth component's own update
+   * measures 0.008 ms — it builds a queue and hands it to `renderer.compute`
+   * — so every CPU profiler in this editor called it free while the frame sat
+   * at 30 ms. The work is real and it is enormous (two to six substeps of
+   * about fifty kernels each, three hundred dispatches a frame), it just is
+   * not on the main thread. Counting dispatches per owner shows it without
+   * needing per-dispatch GPU timing, and for a dispatch-bound solver the
+   * count IS the cost.
+   *
+   * Idempotent, and a no-op when the profiler is not armed: one property read
+   * per compute call.
+   */
+  #countDispatches() {
+    const renderer = this.renderer;
+    if (!renderer || renderer.__dispatchCounted) return;
+    renderer.__dispatchCounted = true;
+    const stats = this.stats;
+    for (const name of ["compute", "computeAsync"]) {
+      const original = renderer[name];
+      if (typeof original !== "function") continue;
+      renderer[name] = function countedCompute(node, ...rest) {
+        if (stats._attribArmed) {
+          stats.attributeDispatches(Array.isArray(node) ? node.length : 1);
+        }
+        return original.call(this, node, ...rest);
+      };
+    }
+  }
+
+  /** True while this callback's owner is being measured by its absence. */
+  #muted(fn) {
+    return this._mutedOwners.size > 0 && !!fn?.__owner && this._mutedOwners.has(fn.__owner);
+  }
+
+  /** Skip these owners' per-frame callbacks until `unmuteOwners`. */
+  muteOwners(owners) {
+    for (const owner of owners) if (owner) this._mutedOwners.add(owner);
+  }
+
+  /** Restore every muted owner. Always call this, including on failure. */
+  unmuteOwners() {
+    this._mutedOwners.clear();
+  }
+
+  /** Every distinct owner that has a per-frame callback registered. */
+  frameOwners() {
+    const out = new Set();
+    const add = (fn) => { if (fn?.__owner) out.add(fn.__owner); };
+    for (const fn of this.updateCallbacks) add(fn);
+    for (const entry of this.lateUpdateCallbacks) add(entry.fn);
+    for (const fn of this.preRenderCallbacks) add(fn);
+    for (const fn of this.postRenderCallbacks) add(fn);
+    return [...out];
+  }
+
   #resolveGpuTimestamps() {
     const renderer = this.renderer;
     if (!renderer?.backend?.trackTimestamp || this._gpuTimestampInFlight) return;

@@ -148,6 +148,14 @@ export class StatsSystem {
       // rather than merely excluded, because "0 fps, 70 skipped" says the
       // engine is alive and stalled, which "0 fps" alone does not.
       skippedFps: 0,
+      // Frame callbacks the HOST handed us in the last second, counted before
+      // any frame limiter can turn one away. This is the difference between
+      // "the frame rate is ours" and "the frame rate is the browser's": with
+      // fps 33 and callbacks 60 the loop is being paced from inside the app,
+      // and with fps 33 and callbacks 33 nothing here is pacing anything —
+      // the display, the compositor or an occluded window is. Without it, a
+      // 30 ms frame made of 10 ms of work has no visible explanation at all.
+      callbackFps: 0,
       frameMs: 0,
       // Main-thread time actually spent executing one engine frame. Unlike
       // frameMs this excludes time deliberately yielded by a host-side frame
@@ -188,11 +196,18 @@ export class StatsSystem {
     this._skippedTimes = new Float64Array(PRESENT_RING);
     this._skippedHead = 0;
     this._skippedFilled = 0;
+    this._callbackTimes = new Float64Array(PRESENT_RING);
+    this._callbackHead = 0;
+    this._callbackFilled = 0;
 
     // CPU phase profiler. Disarmed by default: `markPhase` returns on the
     // first line, so an unprofiled frame pays one boolean test per phase.
     this._phaseTotals = new Float64Array(PHASES.length);
     this._phaseArmed = false;
+    // The attribution row of the callback currently running, so GPU work it
+    // issues can be charged to it. Null outside a per-frame callback.
+    this._dispatchOwner = null;
+    this._dispatchesUnowned = 0;
     this._phaseFramesTarget = 0;
     this._phaseFramesDone = 0;
     this._phaseIndex = -1;
@@ -215,6 +230,14 @@ export class StatsSystem {
    * itself for an unowned callback. Called by Engine.#tick while armed.
    */
   attribute(fn, stage, ms) {
+    const row = this.rowFor(fn, stage);
+    row.ms += ms;
+    row.calls++;
+    return row;
+  }
+
+  /** The attribution row for a callback, created on first sight. No charge. */
+  rowFor(fn, stage) {
     const owner = fn?.__owner ?? null;
     let key;
     let row;
@@ -249,8 +272,30 @@ export class StatsSystem {
         this._attrib.set(key, row);
       }
     }
-    row.ms += ms;
-    row.calls++;
+    return row;
+  }
+
+  /**
+   * ⭐ GPU DISPATCHES, CHARGED TO WHOEVER ASKED FOR THEM.
+   *
+   * A millisecond count is only half of what a component costs, and for some
+   * of them it is the wrong half. A cloth's own update is 0.008 ms of CPU and
+   * then it hands the GPU three hundred compute dispatches; the profiler read
+   * 0.008 ms and called it free, while the frame sat at 30 ms waiting for a
+   * queue nobody was counting. Charging the dispatch to the callback that
+   * issued it makes that visible without any GPU timing at all, because a
+   * dispatch-bound solver is bound by the COUNT.
+   *
+   * The owner is whichever per-frame callback is on the stack; work dispatched
+   * outside one is charged to nobody, which is itself worth seeing.
+   */
+  attributeDispatches(count) {
+    const row = this._dispatchOwner;
+    if (!row || !(count > 0)) {
+      this._dispatchesUnowned += count > 0 ? count : 0;
+      return;
+    }
+    row.dispatches = (row.dispatches ?? 0) + count;
   }
 
   /** Charges one script hook call to its script file. */
@@ -326,6 +371,21 @@ export class StatsSystem {
     if (this._presentFilled < PRESENT_RING) this._presentFilled++;
   }
 
+  /**
+   * One frame callback arrived from the host, whatever became of it.
+   *
+   * Called at the very top of the tick, BEFORE the frame limiter's gate, so a
+   * callback the limiter turns away still counts here. That is the whole
+   * point: `fps` says how often we drew, this says how often we were ASKED
+   * to, and the gap between them is time the app chose to give back rather
+   * than time it was denied.
+   */
+  recordFrameCallback(now = performance.now()) {
+    this._callbackTimes[this._callbackHead] = now;
+    this._callbackHead = (this._callbackHead + 1) % PRESENT_RING;
+    if (this._callbackFilled < PRESENT_RING) this._callbackFilled++;
+  }
+
   /** A tick that ran the update phase and then returned without drawing. */
   recordSkippedFrame(now = performance.now()) {
     this._skippedTimes[this._skippedHead] = now;
@@ -347,6 +407,9 @@ export class StatsSystem {
     this.readout.fps = countWithin(this._presentTimes, this._presentHead, this._presentFilled, now);
     this.readout.skippedFps = countWithin(
       this._skippedTimes, this._skippedHead, this._skippedFilled, now,
+    );
+    this.readout.callbackFps = countWithin(
+      this._callbackTimes, this._callbackHead, this._callbackFilled, now,
     );
     return this.readout;
   }
@@ -380,6 +443,8 @@ export class StatsSystem {
    */
   beginPhaseCapture(frames = 60, { attribute = false } = {}) {
     this._attrib.clear();
+    this._dispatchesUnowned = 0;
+    this._dispatchOwner = null;
     this._attribArmed = !!attribute;
     this._phaseTotals.fill(0);
     this._subTotals?.clear();
@@ -623,10 +688,15 @@ export class StatsSystem {
     // The breakdown by owner, mean ms per frame, costliest first. Sums to at
     // most the phases it was measured inside (update, lateUpdate, preRender,
     // postRender); the rest of the frame is the phases themselves.
+    // Per frame, like `ms` beside it — a total over the capture next to a
+    // mean per frame is two units in one row, and somebody will read the big
+    // number as the cost of one frame.
+    const dispatchesUnowned = +(this._dispatchesUnowned / frames).toFixed(1);
     const owners = [...this._attrib.values()]
       .map((row) => ({
         ...row,
         ms: +(row.ms / frames).toFixed(3),
+        dispatches: row.dispatches ? +(row.dispatches / frames).toFixed(1) : undefined,
         hooks: row.hooks
           ? Object.fromEntries(Object.entries(row.hooks).map(([h, v]) => [h, +(v / frames).toFixed(3)]))
           : undefined,
@@ -639,6 +709,7 @@ export class StatsSystem {
       phases,
       subPhases,
       owners,
+      dispatchesUnowned,
     };
   }
 

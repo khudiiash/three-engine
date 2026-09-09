@@ -839,6 +839,250 @@ back before it returns. General rule: state shared with a live render loop
 must be restored in the same synchronous turn it was taken, never in an
 async `finally`.
 
+### 09-09 — three controls that did not close their own loop
+
+⚠ **The ambient glow could not be switched off.** Written as a draft edit
+like the two rows below it, the toggle did nothing at all until Save — and a
+switch that does nothing when you click it is a broken switch, whatever it
+does afterwards. Worse, the panel's Save wrote its whole draft back, and
+that draft held a snapshot of `editor.layers` taken when the panel MOUNTED:
+saving anything at all silently undid every Visibility-menu change made
+since, switching the glow back on behind the user. The switch is live now
+(it calls `setLayerVisible`, exactly what the Visibility menu calls, and
+persists the same way), and Save merges the LIVE layers over the draft
+rather than the stale ones. Proven by measurement before the fix: with the
+layer on, the strip below the viewport reads 32.82/31.67/27.50 — warm; with
+it off, 17.93 flat neutral. The path was always fine; the control was not.
+
+⚠ **"I still can't see where the rest of the frame is coming from."** The
+breakdown lists only ever added up to the WORK — 10 ms of engine inside a
+30 ms frame, with nothing on screen to say what the other 20 were. Two
+things were missing. First a group, **Where the frame went**: game, render
+and the wait, adding up to the frame. Second, and the real gap, a
+MEASUREMENT that could name the wait. `StatsSystem.recordFrameCallback` now
+counts frame callbacks at the top of the tick, BEFORE the limiter's gate, so
+`callbackFps` says how often the host offered us a frame and `fps` says how
+often we drew one. The two answers are then distinguishable and the panel
+says which: fewer draws than offers is the editor pacing itself on purpose
+(and it names the cap), offers already equal to draws means nothing in the
+app is pacing anything and no engine change will move it.
+
+⚠ **A gesture with no inverse.** The profiler HUD becomes the Performance
+panel by being dragged onto a tab strip, and the only way home was a toast
+that said "Layers ▸ Stats" and then vanished. The inverse now lives on the
+panel itself, pinned above the scrolling readings: it puts the HUD back over
+the viewport and closes the panel, so the profiler is in exactly one place
+either way.
+
+**And then the answer, which was not a performance problem at all.** 70% of
+the frame idle, and the caption above confidently blamed the display — 33
+callbacks offered, 33 drawn, nothing in the app pacing. It was wrong, and
+the way it was wrong is worth keeping: `callbackFps` counts callbacks that
+reach the TICK, and a viewport the editor has FROZEN receives none at all,
+so a stopped loop and a browser that has stopped asking are the same reading
+from inside the engine. The instrument could not see its subject.
+
+A bare `requestAnimationFrame` that increments a counter can, because
+nothing in the app can stop it — `watchHostFrameRate()` in perfMonitor.js,
+running only while a profiler is on screen. With it, the three cases
+separate cleanly and the caption names the real one.
+
+The measurement, on Sponza at identical work:
+
+| viewport freeze | fps | frame | idle |
+| --- | --- | --- | --- |
+| on, another panel focused | 34 | 30.4 ms | 20.2 ms (70%) |
+| off | 65 | 8.5 ms | 1.65 ms (19%) |
+
+Under an orbit — which is a change, so the freeze lifts — 105.7 fps over 634
+frames. The idle was power saved, not time lost. `profile.frameStats` now
+reports `viewportFreezeWhenUnfocused` beside `idleMs` so the next reader
+does not have to rediscover this, and its description says plainly that a
+low `callbackFps` means "we were not running", never "the browser was not
+asking".
+
+⚠ **AND THE PROFILER WAS CAUSING THE IDLE IT REPORTED.** Naming the freeze
+was not the end of it: docked beside the viewport, the Performance panel
+OWNS THE FOCUS, so the unfocused-viewport policy paused the very viewport
+the panel was reading. Every number it showed was a true measurement of a
+paused viewport and said nothing at all about the scene — and no amount of
+explaining that in a caption makes the reading useful. An instrument must
+not change what it measures.
+
+`holdViewportAwake()` in viewportFreeze.js is the fix, and the Animator
+already had the same exemption for the same reason: a state auditioned from
+the Animator panel must not be put to sleep by the panel you clicked it in.
+The profiler takes a hold while it is showing frame numbers worth trusting,
+and drops it at the smallest size — the frame-rate pill is a glance, not a
+measurement, and holding for it would cancel the idle saving for as long as
+the overlay is switched on. A hold never overrides a viewport HIDDEN behind
+another dock tab; nothing is watching then either. Pinned by
+`shouldSuspendViewport`'s fourth case in `test:editor-frame-pacing`.
+
+**What was left once the panel stopped causing it.** With the hold in place
+`profile.frameAudit` (the MessageChannel heartbeat, which measures busy time
+from OUTSIDE the engine and needs no cooperation from it) reads: 122 host
+frames in 3 s, 122 engine ticks — the editor now draws EVERY frame it is
+offered, which is the proof the hold works. Engine 6.39 ms a frame, other
+main-thread work 0.51 ms, thread genuinely parked 71.9%.
+
+So the residual is the offer rate itself: **40.7 frames a second, from the
+browser**. Confirmed from outside the app that the editor window was not the
+foreground window at the time (`GetForegroundWindow` named another). Windows
+refuses to let a background process steal focus, so the last step of that
+A/B belongs to whoever is sitting there. Chromium throttles frame callbacks
+for a window that is not in front, and the frame audit's own verdict says
+the same thing first: "hostFps is low: the browser is not offering frames
+(unfocused window, or a frame limiter). Fix that before reading anything
+else here."
+
+⚠ The lesson twice over in one afternoon: the FIRST question about a high
+idle is not "which engine stage" but "was anyone asking for frames, and was
+the thing doing the asking the thing I am staring at".
+
+⚠⚠ **"You write into Idle something you just don't measure."** Correct, and
+it was the same fault as the caption that blamed the display: a number
+arrived at by SUBTRACTION was given a name that claims it was observed.
+`frameMs - workMs` cannot tell waiting from working, so the editor's own
+React renders, the browser's style, layout and paint, GC pauses and the
+WebGPU submit after the tick all landed in a box labelled "Idle / Wait".
+
+`engine/frameAudit.js` already measured the difference properly and only
+`profile.frameAudit` was using it. The panel uses it now. The Breakdown tab's
+frame accounting shows three MEASUREMENTS — engine tick, other main-thread
+work, thread parked — taken with a MessageChannel heartbeat that can only
+run when the thread is free, in 600 ms windows every 4 s, and only while
+that tab is open, because a heartbeat keeps the thread hot and must never be
+left running. Its rows total to what they actually sum to (one offered
+frame's period), rather than to a frame interval with a silent remainder.
+
+The CPU tab's tile keeps the residual, since that is all it has, but it is
+called **Unaccounted** now and its tooltip says what is in it. A profiler
+may show a residual; it may not call one an observation.
+
+### The frame, itemised, with nothing left over
+
+"We need to measure everything, and now exactly what each frame time
+consists of." The audit already named the frame callbacks; two things were
+still anonymous and one was double-counted waiting to happen.
+
+**Timers were invisible.** Everything that is not a frame callback arrives as
+a task, and in this editor that is overwhelmingly a timer — the perf
+sampler, the project watcher's poll, every debounce in the UI. Unwrapped,
+they were indistinguishable from browser work, and a 16 ms block with no
+name against it is exactly the sort of thing that gets waved at.
+`setTimeout` and `setInterval` are wrapped for the window now, and the
+instrument uses the UNWRAPPED timer for its own wait so it does not bill
+itself.
+
+**Nesting would have billed the same millisecond three times.** The engine's
+tick runs inside three's frame callback, which runs inside the browser's
+frame task. Adding those durations produces a "frame" twice as long as the
+frame. `exclusiveSpanTotals` charges each instant to the DEEPEST span
+covering it, so every millisecond has exactly one owner and the totals add
+up to the wall clock — which is the only way an accounting can be checked
+rather than believed. Six cases in `tests/frame-audit-spans.test.mjs`: three
+levels deep, adjacent-not-nested, gaps, repeats, zero-length.
+
+**The residual is now a row with a name, and its own residual is reported.**
+Busy time that no instrumented callback covers is the browser's own style,
+layout, paint and GC — a real answer, not a leftover. What the whole sum
+still misses is `unbilledMs`, shown in the panel whenever it is not
+negligible. An accounting that cannot be checked is an assertion.
+
+### ⛔⛔ THE CLOTH WAS FREE ON EVERY INSTRUMENT AND COST TWO THIRDS OF THE FRAME
+
+The user: "that unaccounted time almost completely comes from the cloth
+component (i disabled it, and fps is 120 now, and unaccounted is 4ms)."
+
+Every number the editor had said cloth was free. `profile.cpuFrame` charged
+each cloth component **0.003 to 0.008 ms**, total CPU 4.37 ms, total GPU
+3.48 ms, verdict "bound: cpu" — against a 30 ms frame. The frame audit said
+the main thread was genuinely parked 79% of the time, which was TRUE and
+useless: the thread was parked waiting for a GPU queue nobody was counting.
+
+**What cloth actually does** (traced, not guessed): it is fully synchronous,
+registered through the ordinary component update path, correctly owned, and
+does no per-frame readback. Its update builds a substep queue and hands it
+to `renderer.compute(queue)` — two to six substeps of about fifty kernels,
+and its own source notes **306 compute dispatches per frame** measured at
+`gpuComputeMs 30.69` against `gpuRenderMs 2.23`. The main thread's share of
+that is the 0.008 ms it took to hand it over.
+
+**So a millisecond count is the wrong half of what a component costs**, and
+for anything that hands work to the GPU it is the misleading half. Dispatches
+are now charged to whoever issued them: the engine names the callback on the
+stack while it runs, `renderer.compute`/`computeAsync` are wrapped to tally
+against it, and every component and module row in the profiler carries
+"N GPU dispatches/frame" beside its milliseconds. Work dispatched with no
+callback on the stack is counted as `dispatchesUnowned` rather than folded
+into somebody — an unowned cost that is visible is worth more than a tidy
+one that is wrong.
+
+⚠ The general lesson, which cost most of a day across three separate
+instruments: **an instrument that only watches the main thread reports that
+the main thread is fine.** Idle was a subtraction; then it was a measurement
+of a paused viewport; then it was a true measurement of a thread waiting on
+work no instrument here could see. Each fix was right and none of them was
+the answer until the question became "what is this frame WAITING for".
+
+**Dispatch counts were still not an answer, and the caption was wrong twice.**
+Counting dispatches per owner put cloth at the top of a list; it did not put
+a number of milliseconds against it, and the frame accounting still ended in
+a large row nobody owned. Worse, the paragraph under it confidently blamed
+the display's refresh rate for a wait cloth was causing. It is deleted — the
+conclusion was wrong and a wall of prose is the wrong shape for a readout.
+
+**`profile.frameCensus` is the instrument that was missing.** Every other
+profiler here reads a clock inside the page, and issuing three hundred
+dispatches costs almost nothing on any of them: main thread +1.65 ms, GPU
+pass time +2.49 ms, frame +26.1 ms. The cost is in the issuing, which
+happens where no clock in this page can see it. What CAN be seen is the
+frame with the thing and the frame without it. `Engine.muteOwners` skips an
+owner's per-frame callbacks — the scene is untouched, nothing is undoable,
+and the set is cleared in a `finally` — and the census walks every component
+type, module and system in turn.
+
+First run, and it reproduces by measurement what the user found by hand:
+
+| owner | fps without | frame without | cost |
+| --- | --- | --- | --- |
+| Cloth (10) | 120 | 8.33 ms | **21.08 ms** |
+| gi (module) | 34 | 29.41 ms | 0 |
+| Scripts, Camera, Animation, Light | 34 | 29.41 ms | 0 |
+
+Baseline 29.41 ms and restored 29.41 ms agree exactly, which is the check
+that says the scene did not drift underneath the census.
+
+⛔ **RETRACTION: cloth's GPU work was never invisible to the timestamps.**
+I wrote above that the cost "happens where no clock in this page can see
+it". That is wrong, and it was wrong on the strength of a single reading —
+`gpuComputeMs 2.79` against a 34 ms frame. Measured again with the same
+scene actually simulating: **gpuComputeMs 30.29 of a 33.5 ms frame**, GPU
+render 0.51, CPU 5.03. The frame is GPU-bound on cloth compute and the
+profiler's own GPU tile says so.
+
+Two things made that reading look like blindness, and both are real:
+
+- **Cloth is view-gated.** A culled cloth costs nothing, correctly. Half the
+  early readings were taken with the curtains off-camera, so the GPU number
+  was small because the work was not happening — not because it was unseen.
+- **The GPU number lags, worst when it matters most.**
+  `#resolveGpuTimestamps` skips while a readback is in flight, and a 30 ms
+  GPU frame means the readback frequently cannot keep up, so the displayed
+  figure can be several frames stale during exactly the wave that caused it.
+
+The census is still worth having — it prices things the GPU tile cannot
+separate, and it answers "which of these" rather than "how much in total".
+But the first question for a big unaccounted number is now the one that was
+on screen the whole time: **what does the GPU tile say?** The tile answers it
+itself now, reading "waiting on the GPU (30.8 ms)" whenever GPU time is most
+of the frame, without anybody having to run anything.
+
+⚠ The method failure is the one this project already has a rule for: I
+believed a single reading that agreed with the story I was building, and did
+not re-measure it when the scene state changed underneath.
+
 ## 5. Decisions so far, and what is still open
 
 Decided 2026-09-07 (user): keep the system font; no explainer text anywhere;

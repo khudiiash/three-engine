@@ -34,9 +34,16 @@ export function shouldSuspendViewport({
   visible = true,
   focused = true,
   freeze = false,
+  held = false,
 } = {}) {
   if (playing) return false;
+  // Hidden behind another dock tab beats everything: nothing is watching it
+  // then either, and a "hold" is a request to watch, not a request to burn.
   if (!visible) return true;
+  // Something is watching the viewport itself rather than the panel that
+  // happens to hold focus — the profiler, an animation audition. See
+  // `holdViewportAwake`.
+  if (held) return false;
   return freeze && !focused;
 }
 
