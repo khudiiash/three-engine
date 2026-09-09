@@ -1,5 +1,6 @@
 import * as THREE from "three/webgpu";
 import { CLOTH_SOLVE_PASSES, clothSolveSplit, clothSubsteps, clothVelocityScale } from "./clothHealth.js";
+import { clothComputeBatch } from "./computeBatch.js";
 import { Fn, If, Break, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, texture, ivec2 } from "three/tsl";
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
 import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt, seaFoldNode } from "./waterSpectrum.js";
@@ -2452,7 +2453,11 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       }
       queue.push(surface);
       if (slotKernel) queue.push(...slotKernel.compute);
-      renderer.compute(queue);
+      // ⭐ ONE SUBMIT FOR EVERY CLOTH, NOT ONE EACH — see computeBatch.js. Water
+      // keeps its own submission because its ordering against the caustic
+      // render and `spectrum.afterCompute` is load-bearing.
+      const batch = kind === "cloth" ? clothComputeBatch(anchorEngine) : null;
+      if (batch) batch.push(queue); else renderer.compute(queue);
       // ── THE SEA, FOR THE CPU ──────────────────────────────────────────────
       //
       // Buoyancy floats on the sea the eye sees: the cascades that carry
