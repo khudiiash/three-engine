@@ -1167,7 +1167,7 @@ defineOp({
       type: "boolean",
       default: true,
       description:
-        "Also charge every per-frame callback to its owner — the component (with its entity), the module, or the script file — and return them as `owners`, mean ms per frame, costliest first. This is the 'which component / script costs what' answer; the phases say which engine stage.",
+        "Also charge every per-frame callback to its owner — the component (with its entity), the module, or the script file — and return them as `owners`, mean ms per frame, costliest first. This is the 'which component / script costs what' answer; the phases say which engine stage. ⚠ AND READ `dispatches` BESIDE `ms`: a component that hands the GPU work costs almost no main-thread time, so milliseconds alone call it free. A cloth solver measures 0.008 ms of CPU and then issues three hundred compute dispatches a frame; the frame waits for those, and the wait shows up as idle with no owner. `dispatchesUnowned` counts compute issued with no per-frame callback on the stack.",
     },
     frames: {
       type: "number",
@@ -1690,10 +1690,75 @@ defineOp({
 // ---------------------------------------------------------------------------
 
 defineOp({
+  name: "profile.frameCensus",
+  description:
+    "What each component, module and system ACTUALLY costs this frame, measured by taking it away. " +
+    "⭐ USE THIS WHEN THE FRAME IS LONGER THAN ANYTHING ACCOUNTS FOR. Every other profiler here reads a clock " +
+    "inside the page, and a component that hands work to the GPU is invisible to all of them: a cloth solver " +
+    "measures 0.008 ms of main thread and about 2 ms of GPU pass time and still costs 26 ms of frame, because the " +
+    "cost is in ISSUING three hundred dispatches, which happens where no clock in this page can see it. The frame " +
+    "WITH it and the frame WITHOUT it can be seen, and that difference is what this reports — the same comparison a " +
+    "person makes by unticking something and watching the counter, run for every owner in turn. " +
+    "Skips each owner's per-frame callbacks for a window and compares; the scene is NOT modified, nothing is " +
+    "undoable, and the callbacks are restored afterwards even if it fails. Costs about a second per row, so it is a " +
+    "deliberate action rather than a readout. `costMs` is how much shorter the frame gets when that owner stops.",
+  params: {
+    windowMs: {
+      type: "number",
+      description:
+        "How long to watch each arm, in ms. The frame-rate window is one second, so below ~1000 the reading is partial. Default 1200, max 4000.",
+    },
+    by: {
+      type: "string",
+      description:
+        "'type' (default) prices all ten cloths together, which is how people think about a component; 'instance' prices each separately and takes ten times as long.",
+    },
+  },
+  async run({ windowMs = 1200, by = "type" } = {}) {
+    // The measurement itself lives in editor/frameCensus.js so the profiler
+    // panel's button and this op are the same instrument rather than two
+    // implementations that can disagree about what a component costs.
+    const { runFrameCensus } = await import("../../frameCensus.js");
+    const report = await runFrameCensus(engine, { windowMs, by });
+    const top = report.rows[0];
+    return {
+      ...report,
+      note:
+        "Each row is the frame with that owner's per-frame callbacks skipped. costMs = the baseline frame (" +
+        report.baseline.frameMs +
+        " ms) minus the frame without it, so a large positive number is the thing to look at" +
+        (top && top.costMs > 0 ? ": " + top.label + " at " + top.costMs + " ms" : "") +
+        ". Compare `restored` against `baseline`: if they disagree the scene drifted during the census (an asset " +
+        "finished loading, GI rebuilt) and the rows are only as trustworthy as that agreement.",
+    };
+  },
+});
+
+defineOp({
+  name: "profile.clothFlag",
+  readOnly: false,
+  description: "DEV: set a `__cloth...` global on the editor page (bisecting the cloth solver), then report it. Needs an editor.reload for anything read when a simulation is built.",
+  params: {
+    name: { type: "string", description: "The global's name, must start with `__cloth`." },
+    value: { type: ["string", "number", "boolean", "object", "array", "null"], description: "The value, or null to delete." },
+  },
+  run({ name, value = null }) {
+    if (!name?.startsWith("__cloth")) throw new Error("Only `__cloth...` globals are accepted.");
+    if (value === null) delete globalThis[name]; else globalThis[name] = value;
+    try {
+      const store = JSON.parse(localStorage.getItem("cloth.devFlags.v1") ?? "{}");
+      if (value === null) delete store[name]; else store[name] = value;
+      localStorage.setItem("cloth.devFlags.v1", JSON.stringify(store));
+    } catch { /* private mode: the flag still applies to this session */ }
+    return { name, value: globalThis[name] ?? null, note: "Reload the editor for flags read while a simulation is built." };
+  },
+});
+
+defineOp({
   name: "profile.frameAudit",
   readOnly: true,
   description:
-    "Whether the frame's 'idle' is really idle. profile.frameStats reports idle as frameMs minus the work the engine marks, so anything OUTSIDE the engine tick — React re-rendering the editor, the browser's style/layout/paint, a GC pause, WebGPU submission after the tick returns — is counted as rest and the frame looks like it is waiting when the main thread is flat out. This op runs a MessageChannel heartbeat, which can only execute when the thread is free: every gap between beats is a contiguous busy block, measured from outside with no cooperation from the code being measured. Blocks containing an engine update stamp are the engine's own tick (render included); the rest are `other`, and a large `other` is the answer to 'the fps is low but every engine number is small'. `idle` is what is left, and only that part is really the display's vsync wait. Read `hostFps` first: it counts the browser's raw frame offers, so a low one means the window is throttled (unfocused, or the editor's own limiter) and no other number in the report is about your machine's speed.",
+    "Whether the frame's 'idle' is really idle. profile.frameStats reports idle as frameMs minus the work the engine marks, so anything OUTSIDE the engine tick — React re-rendering the editor, the browser's style/layout/paint, a GC pause, WebGPU submission after the tick returns — is counted as rest and the frame looks like it is waiting when the main thread is flat out. This op runs a MessageChannel heartbeat, which can only execute when the thread is free: every gap between beats is a contiguous busy block, measured from outside with no cooperation from the code being measured. Blocks containing an engine update stamp are the engine's own tick (render included); the rest are `other`, and a large `other` is the answer to 'the fps is low but every engine number is small'. `idle` is what is left, and only that part is really the display's vsync wait. Read `hostFps` first: it counts the browser's raw frame offers, so a low one means the window is throttled (unfocused, or the editor's own limiter) and no other number in the report is about your machine's speed. `frame` is the whole thing ITEMISED — one row per instrumented callback (engine tick, each rAF, each timer), one for the browser's own style/layout/paint/GC, one for the thread parked — each charged to whoever was INNERMOST, so nested spans are never billed twice and the rows sum to `hostFramePeriodMs`. `unbilledMs` is what that sum still misses and should be near zero; a large one means work is arriving through a door this does not wrap. `timers` names the setTimeout/setInterval callbacks, which is where non-frame work in this editor lives — but only those SCHEDULED DURING the window, since a repeating interval registered earlier still runs through its original callback and is billed to `Browser and untagged tasks` instead.",
   params: {
     ms: { type: "number", default: 2000, description: "Window length in ms (200-20000)." },
   },

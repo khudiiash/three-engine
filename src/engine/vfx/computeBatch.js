@@ -37,6 +37,14 @@ export function clothComputeBatch(engine) {
   if (batch) return batch;
   batch = engine.__clothComputeBatch = {
     kernels: [],
+    // ⚠ THE FLOCK'S SOLVER RUNS BEFORE ITS MEMBERS' SURFACE KERNELS. Members
+    // push during the frame's updates and the flock is ticked from preRender,
+    // which is later — so the solver goes in a HEAD list that is flushed first,
+    // or every member would draw last frame's particles.
+    head: [],
+    /** Run just before the submission — where the flock ticks, so its solver
+     *  is queued no matter which preRender listener registered first. */
+    beforeFlush: new Set(),
     /** Kernels in the last submission, and how many submissions it replaced. */
     lastKernels: 0,
     lastSources: 0,
@@ -45,9 +53,17 @@ export function clothComputeBatch(engine) {
       for (const kernel of kernels) this.kernels.push(kernel);
       this.sources++;
     },
+    pushFirst(kernels) {
+      for (const kernel of kernels) this.head.push(kernel);
+    },
   };
   engine.onPreRender?.(() => {
-    const { kernels } = batch;
+    for (const before of batch.beforeFlush) {
+      try { before(); } catch (error) { console.error("[cloth] flock tick failed", error); }
+    }
+    const { kernels, head } = batch;
+    if (head.length) kernels.unshift(...head);
+    head.length = 0;
     batch.lastKernels = kernels.length;
     batch.lastSources = batch.sources;
     batch.sources = 0;

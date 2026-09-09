@@ -162,12 +162,22 @@ export function mergeClothTopologies(members) {
  * same for all of them, because a flock has exactly one set. This is the
  * grouping key; anything that reaches a solver uniform belongs in it.
  */
+/**
+ * ⛔ QUANTISE MEASURED VALUES. `shellThickness` is MEASURED off the geometry,
+ * not authored, so nine Sponza curtains cut from two real shells produced nine
+ * different keys — 0.028830057 against 0.028830083 — and every cloth ended up
+ * alone in its own flock, which is exactly the state the flock exists to
+ * escape. Anything that comes off a mesh needs a tolerance; a tenth of a
+ * millimetre is far below what a cap on contact can express.
+ */
+const SHELL_STEP = 1e-4;
+
 export function flockKey(props = {}, topology = null) {
   return JSON.stringify([
     props.stiffness ?? null, props.bend ?? null, props.damping ?? null,
     props.gravity ?? null, props.wind ?? null, props.gust ?? null,
     props.gustFrequency ?? null, props.pinning ?? props.pin ?? null,
     props.friction ?? null, props.thickness ?? null, props.collisionRadius ?? null,
-    topology?.shellThickness ?? 0,
+    Math.round((topology?.shellThickness ?? 0) / SHELL_STEP),
   ]);
 }

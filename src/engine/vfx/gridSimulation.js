@@ -132,7 +132,7 @@ const SUBSTEP_PARTICLE_BUDGET = 6144;
  * uses the damped wave equation, not a volumetric liquid solver. All neighbor
  * reads are from a separate buffer: no cross-workgroup read/write races.
  * Largest compute graph binds four storage buffers, within portable WebGPU. */
-export function createGridSimulation(kind, props = {}, { colliderField = null, meshColliderField = null, colliderEntityId = null, material: sourceMaterial = null, sourceGeometry = null, anchorEngine = null, waterSlot = null, spectrum: givenSpectrum = null, seaQuality = null, worldScale = null, topology = null } = {}) {
+export function createGridSimulation(kind, props = {}, { colliderField = null, meshColliderField = null, colliderEntityId = null, material: sourceMaterial = null, sourceGeometry = null, anchorEngine = null, waterSlot = null, flock = null, solverFirst = false, spectrum: givenSpectrum = null, seaQuality = null, worldScale = null, topology = null } = {}) {
   if (kind === "cloth" && !sourceMaterial) throw new Error("Cloth requires the existing plane material.");
   const { resolution: n, width, height } = gridConfig(props);
   // ── THE SOLVER'S OWN GRID: A WINDOW IN METRES ─────────────────────────────
@@ -244,6 +244,24 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const clothRest = meshCloth ? instancedArray(meshCloth.rest, "vec4") : null;
   const clothSprings = meshCloth ? instancedArray(meshCloth.springs, "vec4") : null;
   const clothSimIndex = meshCloth ? instancedArray(meshCloth.simIndex, "float") : null;
+  // ⭐⭐⭐ A FLOCK MEMBER SOLVES NOTHING; IT READS THE SHARED PARTICLE SET.
+  //
+  // Ten curtains issued ten times the dispatches for the same work — 165 a
+  // frame, ~117 us each, 21.97 ms of a 30.3 ms frame, where the same editor
+  // runs at 120 fps with cloth off (`profile.frameCensus`, 2026-09-09). At
+  // 2300 particles a dispatch that is launch overhead, not arithmetic, so the
+  // cure is fewer and bigger: one solver over every cloth that shares a
+  // configuration (`clothFlock.js`).
+  //
+  // A member therefore keeps its own geometry, its own seams and its own
+  // surface kernel, and points that kernel at the flock's buffers offset by
+  // where its particles begin. Its own solver buffers are still allocated but
+  // never dispatched, so no pipeline is ever built for them: a TSL kernel is
+  // only compiled when it is first computed.
+  const solvePositions = flock?.positions ?? positions;
+  const solveSprings = flock?.springs ?? clothSprings;
+  const solveStride = flock ? flock.stride : (meshCloth?.stride ?? 1);
+  const solveBase = flock ? flock.base : 0;
   // ⭐ HOW FAR THIS RENDER VERTEX SITS OFF THE SIMULATED SURFACE, signed
   // along the normal. A shell is simulated as its MID-SURFACE — one particle
   // per front/back pair — and both faces are rebuilt from this. Null when the
@@ -1360,18 +1378,18 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // normals: median dot 1.000, and every one of the 1.9 % that disagree
       // sits on a welded rim position where the shell's two sides genuinely
       // oppose.
-      const particle = clothSimIndex.element(index).toInt();
-      const p = positions.element(particle).xyz.toVar();
-      const base = particle.mul(int(meshCloth.stride));
+      const particle = clothSimIndex.element(index).toInt().add(int(solveBase));
+      const p = solvePositions.element(particle).xyz.toVar();
+      const base = particle.mul(int(solveStride));
       const normal = vec3(0).toVar();
-      Loop({ start: 0, end: int(meshCloth.stride) }, ({ i }) => {
-        const spring = clothSprings.element(base.add(i));
+      Loop({ start: 0, end: int(solveStride) }, ({ i }) => {
+        const spring = solveSprings.element(base.add(i));
         If(spring.x.lessThan(0), () => { Break(); });
         // Both lanes guarded: `x < 0` is padding, `w < 0` is a boundary edge or
         // a dihedral spring, and neither closes a triangle around this vertex.
         If(spring.x.greaterThanEqual(0).and(spring.w.greaterThanEqual(0)), () => {
-          const a = positions.element(spring.x.toInt()).xyz.sub(p);
-          const b = positions.element(spring.w.toInt()).xyz.sub(p);
+          const a = solvePositions.element(spring.x.toInt()).xyz.sub(p);
+          const b = solvePositions.element(spring.w.toInt()).xyz.sub(p);
           normal.addAssign(a.cross(b));
         });
       });
@@ -1390,13 +1408,22 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // it immediately ("lighting on those also got broken") on a change that
       // every geometric test in the suite had passed, because not one of them
       // looks at a normal. The offset's SIGN is which side this vertex is on.
+      // ⚠ A FLOCK SOLVES IN WORLD SPACE, because its members have different
+      // entity transforms and one particle set can only have one space. The
+      // geometry this kernel writes is still the MEMBER's, so the vertex goes
+      // back through the member's own inverse — which `simulationInverse`
+      // already carries, refreshed from `mesh.matrixWorld` every tick. A cloth
+      // that is not in a flock simulates in its own local space and the matrix
+      // is the identity's business: skipped entirely.
+      const outward = flock ? simulationInverse.mul(vec4(unit, 0)).xyz.normalize() : unit;
+      const at = flock ? simulationInverse.mul(vec4(p, 1)).xyz.toVar() : p;
       if (clothOffset) {
         const shell = clothOffset.element(index);
-        normals.element(index).assign(unit.mul(select(shell.lessThan(0), float(-1), float(1))));
-        output.element(index).assign(p.add(unit.mul(shell)));
+        normals.element(index).assign(outward.mul(select(shell.lessThan(0), float(-1), float(1))));
+        output.element(index).assign(at.add(outward.mul(shell)));
       } else {
-        normals.element(index).assign(unit);
-        output.element(index).assign(p);
+        normals.element(index).assign(outward);
+        output.element(index).assign(at);
       }
       return;
     }
@@ -1917,10 +1944,11 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // ten cloths made that thirty wasted dispatches every frame. `pushSteps`
   // below adds it only when there is an anchor to enforce.
   const substepQueue = (queue) => {
+    if (flock) return;            // the flock solves; a member only draws
     queue.push(...steps);
     if (pinEntities && anchorCount.value > 0) queue.push(pinEntities);
   };
-  let initialized = false, accumulator = 0, elapsed = 0, lastStep = h;
+  let initialized = !!flock, accumulator = 0, elapsed = 0, lastStep = h;
   // The sea's settings and its CPU copy (for buoyancy), see `tick`.
   let lastProps = props, configuredDepth = 0, seaSample = null, seaReadbackPending = false, seaFrame = 0;
   const updateBounds = () => {
@@ -2072,7 +2100,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // sample ONE SEVENTH of a 7 174-particle cloth — bounds that looked healthy
   // while the rest of the sheet was free to be anywhere. An instrument that
   // silently measures a subset reports a fix that is not there.
-  const simulation = { mesh, skirtMesh, skirtMaterial, positions, count: particleCount, resolution: n, vertexCount: total, init, surface, steps, uniforms: u,waterSurfaceTexture,slotKernel,causticPass,
+  const simulation = { mesh, skirtMesh, skirtMaterial, positions, count: particleCount, resolution: n, vertexCount: total, init, surface, steps, uniforms: u,
+    /** What a FLOCK MEMBER binds its surface kernel to — see clothFlock.js. */
+    particles: meshCloth ? { positions, springs: clothSprings, stride: meshCloth.stride, count: particleCount } : null,waterSurfaceTexture,slotKernel,causticPass,
     spectrum, rippleTexture, flowTexture,
     /** The solver's grid and its window, in local units. */
     ripple: { resolution: w, cellX: sx, cellZ: sz, windowWidth: winW, windowHeight: winH, windowed },
@@ -2451,13 +2481,21 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         pendingFoam.length = 0;
         queue.push(foamField, rippleWrite);
       }
-      queue.push(surface);
+      // ⛔ A FLOCK HAS NO SURFACE OF ITS OWN. Its members draw; its own render
+      // side exists only because the solver's code path expects a geometry, and
+      // dispatching that one-vertex kernel asks the device for a bind group over
+      // empty buffers — "Binding size for [Buffer] is zero", which invalidates
+      // the whole command buffer and silently stops ALL cloth (a frame census
+      // then reads a beautiful 120 fps with nothing simulating at all).
+      if (!solverFirst) queue.push(surface);
       if (slotKernel) queue.push(...slotKernel.compute);
       // ⭐ ONE SUBMIT FOR EVERY CLOTH, NOT ONE EACH — see computeBatch.js. Water
       // keeps its own submission because its ordering against the caustic
       // render and `spectrum.afterCompute` is load-bearing.
       const batch = kind === "cloth" ? clothComputeBatch(anchorEngine) : null;
-      if (batch) batch.push(queue); else renderer.compute(queue);
+      if (!batch) renderer.compute(queue);
+      else if (solverFirst) batch.pushFirst(queue);   // a flock solves before its members draw
+      else batch.push(queue);
       // ── THE SEA, FOR THE CPU ──────────────────────────────────────────────
       //
       // Buoyancy floats on the sea the eye sees: the cascades that carry

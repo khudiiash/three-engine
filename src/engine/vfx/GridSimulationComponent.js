@@ -9,6 +9,7 @@ import { BackSide, FrontSide, Matrix4, Vector3 } from "three/webgpu";
 import { waterAutoResolution } from "./waterVolume.js";
 import { seaQuality } from "./waterSpectrum.js";
 import { analyseClothMesh, packClothTopology } from "./clothMeshTopology.js";
+import { clothFlocks } from "./clothFlockRuntime.js";
 
 const _cameraWorld = new Vector3(), _waterInverse = new Matrix4();
 const _reachCentre = new Vector3(), _reachScale = new Vector3();
@@ -339,7 +340,15 @@ export class GridSimulationComponent extends Component {
     const quality = this.entity.engine?.project?.settings?.build?.quality ?? this.entity.engine?.projectSettings?.build?.quality ?? "high";
     // The ripple window is a size in METRES: hand the solver the box's scale.
     const worldScale = this.constructor.type === "water" && plane ? this.worldScaleOf(plane) : null;
-    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, topology: plane?.topology ?? null, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality), worldScale });
+    // ⭐⭐⭐ JOIN THE FLOCK. Cloths that share a solver configuration are solved
+    // TOGETHER over one particle set, because the solver's cost is per DISPATCH
+    // and ten curtains issued ten times as many for the same work (see
+    // clothFlock.js). The first cloth to attach gets no handle — the flock has
+    // nothing to merge yet — so it builds its own solver and is re-attached
+    // onto the shared set at the next frame, once every member is known.
+    const flock = cloth ? clothFlocks(this.entity.engine)?.join(this) ?? null : null;
+    this.__inFlock = !!flock;
+    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, topology: plane?.topology ?? null, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality), worldScale, flock });
     this.simulation.mesh.userData.entityId = this.entity.id;
     this.entity.object3D.add(this.simulation.mesh);
     // The sea's spray sprites live in the LID's frame — a child of the lid
@@ -350,6 +359,21 @@ export class GridSimulationComponent extends Component {
     if (spray) { spray.userData.entityId = this.entity.id; this.simulation.mesh.add(spray); }
     this.syncAppearance();
     this.refreshWaterSlot();
+  }
+  /**
+   * The flock was (re)built, or gave up. Re-attach onto whatever the answer is,
+   * but only when it actually changed — a rebuild that leaves this cloth where
+   * it was must not tear its simulation down and lose its pose.
+   */
+  rejoinFlock(built, generation = 0) {
+    // ⛔ A REBUILD RE-BINDS EVEN A MEMBER THAT STAYED IN. The flock disposes the
+    // old particle set and mints a new one, and this cloth's surface kernel was
+    // built against the old buffers — comparing only "in a flock or not" left it
+    // pointing at freed memory, which fails the whole command buffer.
+    if (!!built === !!this.__inFlock && generation === this.__flockGeneration) return;
+    this.__flockGeneration = generation;
+    this.detachSimulation();
+    this.attachSimulation();
   }
   sourceMaterial(material) {
     if (this.constructor.type !== "water") return material;
@@ -512,6 +536,8 @@ export class GridSimulationComponent extends Component {
     return now - (this._gridWantedSince ?? now) > 500;
   }
   onDetach() {
+    // Leaving is what makes the remaining members rebuild without this one.
+    if (this.constructor.type === "cloth") this.entity?.engine?.__clothFlocks?.leave(this);
     this._unbindVfxAsset?.(); this._unbindVfxAsset = null;
     this.unsubscribeTick?.(); this.unsubscribeTick = null;
     this.unsubscribeMesh?.(); this.unsubscribeMesh = null;

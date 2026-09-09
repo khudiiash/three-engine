@@ -123,4 +123,8 @@ test('cloths only share a solver when every uniform the solver reads matches', (
   assert.notEqual(flockKey(a, { shellThickness: 0.02 }), flockKey({ ...a, bend: 0.5 }, { shellThickness: 0.02 }));
   assert.notEqual(flockKey(a, { shellThickness: 0.02 }), flockKey(a, { shellThickness: 0.03 }),
     'a different shell thickness is a different solver');
+  // ⛔ But a MEASURED thickness carries float noise: nine Sponza curtains cut
+  // from two shells produced nine keys, and every cloth flocked alone.
+  assert.equal(flockKey(a, { shellThickness: 0.028830057 }), flockKey(a, { shellThickness: 0.028830083 }),
+    'two curtains off the same shell must land in the same flock');
 });
