@@ -821,10 +821,35 @@ declare module "editor" {
     };
 
     /**
-     * Greybox level blockouts (the `level-design` module). `addPiece` takes
-     * the two points of a drag — the same gesture the viewport tools use — so
-     * a generated room is one call per wall rather than a page of trigonometry.
+     * Connected architectural forms, direct viewport gestures, freeform parts
+     * and optional generator recipes.
      */
+    architecture: {
+      createModel(options?: { model?: Record<string, unknown>; position?: number[]; rotation?: number[]; rotationY?: number; parentId?: string; name?: string; collision?: boolean; followTerrain?: boolean; terrainId?: string }): Promise<{ entityId: string }>;
+      setModel(entityId: string, model: Record<string, unknown>): Promise<{ entityId: string }>;
+      addForm(entityId: string | null, form: Record<string, unknown>): Promise<{ entityId: string; formId: string }>;
+      updateForm(entityId: string, formId: string, patch: Record<string, unknown>): Promise<{ entityId: string; formId: string }>;
+      removeForm(entityId: string, formId: string): Promise<{ entityId: string }>;
+      addPath(entityId: string, path: Record<string, unknown>): Promise<{ entityId: string; pathId: string }>;
+      updatePath(entityId: string, pathId: string, patch: Record<string, unknown>): Promise<{ entityId: string; pathId: string }>;
+      removePath(entityId: string, pathId: string): Promise<{ entityId: string; pathId: string }>;
+      addModelOpening(entityId: string, opening: Record<string, unknown>): Promise<{ entityId: string; openingId: string }>;
+      updateModelOpening(entityId: string, openingId: string, patch: Record<string, unknown>): Promise<{ entityId: string; openingId: string }>;
+      removeModelOpening(entityId: string, openingId: string): Promise<{ entityId: string; openingId: string }>;
+      sculpt(options?: { tool?: "build" | "round" | "wall" | "grow" | "reshape" | "path" | "window" | "door" | "paint" | "erase" | "none"; entityId?: string; height?: number; color?: string; roof?: "hip" | "flat" | "none" }): Promise<unknown>;
+      presets(): Promise<unknown>;
+      list(): Promise<unknown>;
+      preview(settings?: Record<string, unknown>, options?: { position?: number[]; rotationY?: number; rotation?: number[]; parentId?: string; name?: string }): Promise<unknown>;
+      create(settings?: Record<string, unknown>, options?: { position?: number[]; rotationY?: number; rotation?: number[]; parentId?: string; name?: string }): Promise<{ entityId: string; buildingCount: number; pieceCount: number; warnings: string[] }>;
+      rebuild(entityId: string, settings?: Record<string, unknown>): Promise<unknown>;
+      createAssembly(options?: { position?: number[]; rotationY?: number; rotation?: number[]; parentId?: string; name?: string }): Promise<{ entityId: string }>;
+      addPiece(options?: { shape?: string; position?: number[]; rotationY?: number; rotation?: number[]; size?: number[]; props?: Record<string, unknown>; parentId?: string; name?: string; collision?: boolean }): Promise<{ entityId: string }>;
+      duplicateAssembly(entityId: string, options?: { position?: number[]; name?: string }): Promise<{ entityId: string }>;
+      materials(entityId: string, materials: Record<string, string>): Promise<unknown>;
+      addColliders(entityId: string): Promise<{ entityId: string; added: number }>;
+      setTool(options?: Record<string, unknown>): Promise<unknown>;
+    };
+
     level: {
       list(): Promise<OpResult>;
       create(options?: LevelCreateOptions): Promise<OpResult>;

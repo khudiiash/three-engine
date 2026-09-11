@@ -431,3 +431,94 @@ function sceneNameFromPath(path) {
   const base = path.split(/[\\/]/).pop() ?? "Untitled";
   return base.replace(/\.(scene|json)$/i, "");
 }
+
+/** Case-insensitive path compare, for the project.json reference sweep. */
+const normPath = (p) => String(p ?? "").replaceAll("\\", "/").toLowerCase();
+
+/**
+ * A .scene asset moved on disk (renamed in Assets, or renamed from Scene
+ * Settings). Keeps ONE name across the editor by moving every record of the
+ * old one with the file:
+ * - the open scene's path, so the next Ctrl+S writes the renamed file instead
+ *   of quietly writing the old path back into existence as a duplicate scene;
+ * - the hierarchy/settings name, which is the file's stem by definition;
+ * - project.json's `mainScene`/`lastScene` references — open or not, a build
+ *   entry point left pointing at a renamed file is a build that lost its scene.
+ */
+export async function sceneAssetRetargeted(oldPath, newPath) {
+  if (!oldPath || !newPath || oldPath === newPath) return;
+  const root = projectRoot();
+  const relOld = root ? toProjectRelative(root, oldPath) : null;
+  const relNew = root ? toProjectRelative(root, newPath) : null;
+  if (relOld && relNew) {
+    const meta = useProjectStore.getState().projectMeta ?? {};
+    const moved = (ref) => ref && normPath(ref) === normPath(relOld);
+    const patch = {};
+    if (moved(meta.mainScene)) patch.mainScene = relNew;
+    // When the scene is open, rememberScene below rewrites lastScene; this
+    // branch covers a closed one that is still the boot fallback.
+    if (moved(meta.lastScene) && currentScenePath() !== oldPath) patch.lastScene = relNew;
+    if (Object.keys(patch).length) {
+      useProjectStore
+        .getState()
+        .updateMeta(patch)
+        .catch((err) => console.warn(`Couldn't move scene references in project.json: ${err}`));
+    }
+  }
+  if (currentScenePath() !== oldPath) return;
+  const engine = await ensureEngine();
+  const name = sceneNameFromPath(newPath);
+  engine.sceneName = name;
+  rememberScene(newPath); // open.path, the store's path, project.json lastScene
+  engine?.scenes?.reset?.({ path: open.path, name });
+  useSceneStore.getState().setSceneMeta(name, open.path);
+}
+
+/**
+ * The one writer of the scene's name. The name IS the file: renaming from
+ * Scene Settings renames `scenes/<name>.scene` on disk (and every reference
+ * to it, via sceneAssetRetargeted) rather than minting a second name the
+ * hierarchy, the Settings field and the Assets panel could disagree about.
+ * An unsaved scene has no file yet — its name simply becomes the file's name
+ * on first save, so there it is only stored.
+ */
+export async function renameScene(name) {
+  const trimmed = String(name ?? "").trim();
+  const engine = await ensureEngine();
+  if (!trimmed || trimmed === engine.sceneName) return false;
+  const oldPath = open.path;
+  if (!oldPath) {
+    engine.sceneName = trimmed;
+    useSceneStore.getState().setSceneMeta(trimmed, null);
+    return true;
+  }
+  const base = oldPath.split(/[\\/]/).pop() ?? oldPath;
+  const dir = oldPath.slice(0, oldPath.length - base.length);
+  const ext = /\.json$/i.test(base) ? ".json" : ".scene";
+  const newPath = `${dir}${trimmed}${ext}`;
+  const { invoke } = await import("@tauri-apps/api/core");
+  try {
+    await invoke("rename_path", { from: oldPath, to: newPath });
+    await invoke("rename_path", { from: `${oldPath}.meta`, to: `${newPath}.meta` }).catch(() => {});
+  } catch (err) {
+    console.error(`Couldn't rename the scene: ${err}`);
+    import("./toasts.js")
+      .then(({ pushToast }) =>
+        pushToast({
+          level: "error",
+          title: "Couldn't rename the scene",
+          detail: String(err?.message ?? err),
+          key: `scene-rename:${oldPath}`,
+        }),
+      )
+      .catch(() => {});
+    return false;
+  }
+  await sceneAssetRetargeted(oldPath, newPath);
+  await useProjectStore.getState().refresh();
+  // A tile in the Assets grid that was showing the old name follows the file.
+  const selection = useSelectionStore.getState();
+  if (selection.assetPaths.includes(oldPath)) selection.selectAsset(newPath);
+  console.log(`Scene renamed: ${sceneNameFromPath(newPath)}`);
+  return true;
+}

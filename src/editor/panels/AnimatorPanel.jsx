@@ -49,6 +49,7 @@ import { generateAnimationOnModel } from "../kimodoGenerate.js";
 import { addGeneratedAnimatorState } from "../kimodoIntegration.js";
 import { pushToast } from "../toasts.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * Node-graph editor for .anim animation-controller assets (Unity-style):
  * state nodes wired by transition edges, a parameters sidebar, per-transition
@@ -457,7 +458,7 @@ function ParametersSection({
       {playMode && drivenOptions.length > 1 && (
         <div className="field-row">
           <span className="field-label">Drives</span>
-          <select
+          <Select
             className="select-field animator-target-select"
             value={drivenComponent?.entity.id ?? ""}
             onChange={(e) => onPickDriven(e.target.value)}
@@ -468,7 +469,7 @@ function ParametersSection({
                 {name}
               </option>
             ))}
-          </select>
+          </Select>
         </div>
       )}
       {playMode && (
@@ -609,14 +610,14 @@ function ClipField({ value, clipNames, onChange, fieldKey }) {
     );
   }
   return (
-    <select className="select-field" value={value ?? ""} onChange={(e) => onChange(e.target.value)}>
+    <Select className="select-field" value={value ?? ""} onChange={(e) => onChange(e.target.value)}>
       <option value="">None</option>
       {clipNames.map((c) => (
         <option key={c} value={c}>
           {c}
         </option>
       ))}
-    </select>
+    </Select>
   );
 }
 
@@ -720,14 +721,14 @@ function BlendTreeEditor({ state, clipNames, parameters, onPatch, live }) {
     <div className="field-row">
       <span className="field-label">{label}</span>
       {numbers.length ? (
-        <select className="select-field" value={state[key] ?? ""} onChange={(e) => onPatch({ [key]: e.target.value })}>
+        <Select className="select-field" value={state[key] ?? ""} onChange={(e) => onPatch({ [key]: e.target.value })}>
           <option value="">None</option>
           {numbers.map((p) => (
             <option key={p.name} value={p.name}>
               {p.name}
             </option>
           ))}
-        </select>
+        </Select>
       ) : (
         <span className="field-hint" title="Add a number parameter first">—</span>
       )}
@@ -746,7 +747,7 @@ function BlendTreeEditor({ state, clipNames, parameters, onPatch, live }) {
       {is2d && (
         <div className="field-row">
           <span className="field-label">Metric</span>
-          <select
+          <Select
             className="select-field"
             value={state.blendMode ?? "cartesian"}
             onChange={(e) => onPatch({ blendMode: e.target.value })}
@@ -754,7 +755,7 @@ function BlendTreeEditor({ state, clipNames, parameters, onPatch, live }) {
           >
             <option value="cartesian">Cartesian</option>
             <option value="directional">Directional</option>
-          </select>
+          </Select>
         </div>
       )}
       <div className="field-row">
@@ -842,7 +843,7 @@ function StateSection({ node, clipNames, parameters, onPatch, onPreview, live })
       </div>
       <div className="field-row">
         <span className="field-label">Type</span>
-        <select
+        <Select
           className="select-field"
           value={kind}
           onChange={(e) => {
@@ -862,7 +863,7 @@ function StateSection({ node, clipNames, parameters, onPatch, onPreview, live })
               {k.label}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
       {kind === "clip" ? (
         <div className="field-row">
@@ -1056,7 +1057,7 @@ function LayersSection({ layers, active, onSelect, onChange, onAdd, onRemove, on
             </div>
             {i > 0 && (
               <div className="anim-layer-controls" onClick={(e) => e.stopPropagation()}>
-                <select
+                <Select
                   className="select-field"
                   value={layer.blend ?? "override"}
                   onChange={(e) => onChange(i, { blend: e.target.value })}
@@ -1064,7 +1065,7 @@ function LayersSection({ layers, active, onSelect, onChange, onAdd, onRemove, on
                 >
                   <option value="override">Override</option>
                   <option value="additive">Additive</option>
-                </select>
+                </Select>
                 <input
                   type="range"
                   min={0}
@@ -1101,7 +1102,7 @@ function TransitionSection({ edge, parameters, stateNames, onPatch }) {
     const type = parameters.find((p) => p.name === c.param)?.type ?? "number";
     return (
       <div className="field-row animator-cond-row" key={i}>
-        <select
+        <Select
           className="select-field"
           value={c.param}
           onChange={(e) => {
@@ -1119,10 +1120,10 @@ function TransitionSection({ edge, parameters, stateNames, onPatch }) {
               {p.name}
             </option>
           ))}
-        </select>
+        </Select>
         {type === "number" && (
           <>
-            <select
+            <Select
               className="select-field animator-op"
               value={c.op ?? ">"}
               onChange={(e) => patchCondition(i, { op: e.target.value })}
@@ -1132,7 +1133,7 @@ function TransitionSection({ edge, parameters, stateNames, onPatch }) {
                   {op}
                 </option>
               ))}
-            </select>
+            </Select>
             <input
               className="number-field"
               type="number"
@@ -1143,14 +1144,14 @@ function TransitionSection({ edge, parameters, stateNames, onPatch }) {
           </>
         )}
         {type === "boolean" && (
-          <select
+          <Select
             className="select-field"
             value={String(c.value ?? true)}
             onChange={(e) => patchCondition(i, { op: "==", value: e.target.value === "true" })}
           >
             <option value="true">true</option>
             <option value="false">false</option>
-          </select>
+          </Select>
         )}
         {type === "trigger" && (
           <span className="animator-trigger-hint" title="Fires this transition when the trigger is set from a script (setTrigger). Auto-consumed.">

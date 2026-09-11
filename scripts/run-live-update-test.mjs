@@ -110,7 +110,6 @@ const MUST_BE_VM_WIDE = [
   ["src/engine/audio/AudioAsset.js", "the decoded audio cache and its subscribers"],
   ["src/engine/cubemapAsset.js", "the cubemap cache"],
   ["src/engine/sprite/atlasAsset.js", "the atlas cache"],
-  ["src/engine/shaderGraph.js", "the shader-graph texture cache"],
   ["src/engine/tslGraph.js", "the TSL texture cache"],
   ["src/engine/editorBridge.js", "the editor API slot and the script menu registry"],
 ];

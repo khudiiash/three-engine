@@ -1,8 +1,12 @@
 /**
- * Builds the shader graph for a "ready to use" PBR .mat: texture nodes →
- * Principled BSDF → Material Output, exactly as a user would wire it by hand
- * in the Shader Graph panel (so it stays fully editable). Shared by the
- * Poly Haven importer and the GLB unpack pipeline.
+ * Builds the shader graph for a "ready to use" PBR .mat: texture nodes wired
+ * straight into the Material Output's channel sockets, exactly as a user would
+ * wire it by hand in the Shader Graph panel (so it stays fully editable).
+ * Shared by the Poly Haven importer and the GLB unpack pipeline.
+ *
+ * The socket names ARE three's material slots (`color` → `colorNode`,
+ * `roughness` → `roughnessNode`, …) — see `OUTPUT_SLOT_SPECS` in tslGraph.js,
+ * which is the table both this generator and the compiler answer to.
  *
  * `maps` holds asset paths per slot: diffuse, normal (GL convention),
  * roughness, ao, metalness, and `arm` — a packed R=AO / G=rough / B=metal
@@ -13,19 +17,16 @@
  * material's own aoMap points at the same image).
  */
 export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
-  const nodes = [{ id: "out", type: "output", props: {}, position: { x: 980, y: 200 } }];
   const edges = [];
-  const bsdf = {
-    id: "bsdf",
-    type: "principledBsdf",
-    // Prop keys must match what compileShaderGraph reads in tslGraph.js
-    // (NODE_TYPES.principledBsdf.inputs). The PBR builder used to write
-    // `color` here and `color` as the edge targetHandle, which was correct
-    // for the legacy shaderGraph.js runtime; the live runtime reads from
-    // tslGraph.js, which uses the same `color` / `specularColor` / `opacity`
-    // / `emissive` / `thickness` keys the panel shows in its BSDF node UI,
-    // so we keep that mapping here.
+  const output = {
+    id: "out",
+    type: "output",
+    position: { x: 980, y: 200 },
+    // Prop keys must match the Output socket keys `compileShaderGraph` reads
+    // (OUTPUT_SLOT_SPECS in tslGraph.js). A wired channel ignores the value
+    // here; an unwired one IS the material's constant for that slot.
     props: {
+      material: "physical",
       color: factors.color ?? "#ffffff",
       roughness: factors.roughness ?? 1,
       // ⚠ A texture set with NO metalness map is a DIELECTRIC. This defaulted
@@ -39,7 +40,6 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
       specularIntensity: factors.specularIntensity ?? 0.5,
       specularColor: factors.specularColor ?? "#ffffff",
       emissive: factors.emissive ?? "#000000",
-      emissiveStrength: factors.emissiveStrength ?? 1,
       opacity: factors.opacity ?? 1,
       anisotropy: factors.anisotropy,
       clearcoat: factors.clearcoat,
@@ -49,10 +49,8 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
       transmission: factors.transmission,
       thickness: factors.thickness,
     },
-    position: { x: 620, y: 80 },
   };
-  nodes.push(bsdf);
-  edges.push({ source: "bsdf", sourceHandle: "out", target: "out", targetHandle: "surface" });
+  const nodes = [output];
 
   let row = 0;
   const texNode = (slot, path) => {
@@ -61,7 +59,7 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
     return id;
   };
   const wire = (source, sourceHandle, targetHandle) =>
-    edges.push({ source, sourceHandle, target: "bsdf", targetHandle });
+    edges.push({ source, sourceHandle, target: "out", targetHandle });
 
   // glTF/Three scalar and color factors multiply their corresponding maps;
   // a texture does not replace the factor. Emit that multiply explicitly so
@@ -83,7 +81,7 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
   let diffuseId = null;
   if (maps.diffuse) {
     diffuseId = texNode("diffuse", maps.diffuse);
-    // Edge handle must match the principledBsdf input name in tslGraph.js.
+    // Edge handle must match the Output socket key in tslGraph.js.
     factoredWire("color", diffuseId, "out", "color", factors.color, "#ffffff", "color");
     if (factors.useDiffuseAlpha) {
       factoredWire("opacity", diffuseId, "a", "opacity", factors.opacity ?? 1);
@@ -121,7 +119,7 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
     const tex = texNode("normal", maps.normal);
     nodes.push({ id: "nmap", type: "normalMap", props: { scale: factors.normalScale ?? 1 }, position: { x: 400, y: 420 } });
     edges.push({ source: tex, sourceHandle: "out", target: "nmap", targetHandle: "color" });
-    edges.push({ source: "nmap", sourceHandle: "out", target: "bsdf", targetHandle: "normal" });
+    edges.push({ source: "nmap", sourceHandle: "out", target: "out", targetHandle: "normal" });
   }
   if (maps.emissive) {
     factoredWire("emissive", texNode("emissive", maps.emissive), "out", "emissive", factors.emissive, "#ffffff", "color");
@@ -136,5 +134,31 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
   if (maps.sheenRoughness) factoredWire("sheenRoughness", texNode("sheenRoughness", maps.sheenRoughness), "a", "sheenRoughness", factors.sheenRoughness ?? 1);
   if (maps.specularIntensity) factoredWire("specularIntensity", texNode("specularIntensity", maps.specularIntensity), "a", "specularIntensity", factors.specularIntensity ?? 1);
   if (maps.specularColor) factoredWire("specularColor", texNode("specularColor", maps.specularColor), "out", "specularColor", factors.specularColor, "#ffffff", "color");
+
+  // KHR_materials_emissive_strength. `emissiveNode` is assigned straight
+  // through by three (NodeMaterial applies `emissiveIntensity` to
+  // `material.emissive`, NOT to the node), so a strength other than 1 has to
+  // be an explicit multiply in the graph or the emission renders at 1x.
+  const emissiveStrength = factors.emissiveStrength ?? 1;
+  if (emissiveStrength !== 1) {
+    const feed = edges.find((e) => e.target === "out" && e.targetHandle === "emissive");
+    const strengthId = "factor_emissiveStrength";
+    const mulId = "mul_emissiveStrength";
+    nodes.push({ id: strengthId, type: "float", props: { value: emissiveStrength }, position: { x: 700, y: 560 } });
+    nodes.push({ id: mulId, type: "multiply", props: {}, position: { x: 820, y: 500 } });
+    if (feed) {
+      feed.target = mulId;
+      feed.targetHandle = "a";
+    } else {
+      // No emissive map: the constant colour becomes the multiply's operand,
+      // and the Output must stop carrying it or it would win back on unplug.
+      const colorId = "value_emissive";
+      nodes.push({ id: colorId, type: "color", props: { value: output.props.emissive }, position: { x: 700, y: 460 } });
+      edges.push({ source: colorId, sourceHandle: "out", target: mulId, targetHandle: "a" });
+      delete output.props.emissive;
+    }
+    edges.push({ source: strengthId, sourceHandle: "out", target: mulId, targetHandle: "b" });
+    edges.push({ source: mulId, sourceHandle: "out", target: "out", targetHandle: "emissive" });
+  }
   return { nodes, edges };
 }

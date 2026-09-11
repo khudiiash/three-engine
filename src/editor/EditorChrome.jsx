@@ -231,6 +231,29 @@ export function EditorChrome() {
         useProjectStore.getState().closeProject();
         return;
       }
+      // Rebindable viewport screenshot (Shift+Alt+S by default; Alt = Option
+      // on macOS). This sits WITH THE APPLICATION VERBS, above the keyScope
+      // gate below, because the capture is WYSIWYG of the whole presented
+      // frame — it means the same thing from the viewport, mid-word in the
+      // code editor, or with focus in an inspector field, and no panel has a
+      // meaning of its own for it. Dispatched from behind `keyScopeOwns` it
+      // was silently dead everywhere except a bare viewport: every denylist
+      // scope (code, texture, timeline, audio, graph, geometry) and every
+      // focused text field owns "everything unclaimed", and Shift+Alt+S is
+      // unclaimed — the key arrived and nothing happened, not even an error.
+      // It cannot ride keyScope's static passthrough lists instead: the chord
+      // is user-rebindable (a hardcoded list would only ever know the
+      // default), and its matching goes through keyTokenFromEvent's
+      // `event.code` fallback, which keyScope's key-spelled chords can't
+      // express. Dynamic import: the capture path pulls the renderer ops
+      // chunk, which nothing on the boot path needs until the chord fires.
+      if (chordMatches(e, getBinding("editor.screenshot"))) {
+        e.preventDefault();
+        import("./viewportScreenshot.js")
+          .then((m) => m.saveViewportScreenshot())
+          .catch((err) => console.error(`Screenshot failed: ${err}`));
+        return;
+      }
       // Scene editing from here down. Whichever context owns the keyboard —
       // the code editor, a text field, the geometry/texture/audio/timeline
       // panels, a node graph — gets these keys instead; `keyScope` resolves
@@ -263,16 +286,6 @@ export function EditorChrome() {
       // changed in Project Settings. Returns true on consume.
       if (dispatchVisibilityKeyAction(e)) {
         e.preventDefault();
-        return;
-      }
-      // Rebindable viewport screenshot (Shift+Alt+S by default; Alt = Option
-      // on macOS). Dynamic import: the capture path pulls the renderer ops
-      // chunk, which nothing on the boot path needs until the chord fires.
-      if (chordMatches(e, getBinding("editor.screenshot"))) {
-        e.preventDefault();
-        import("./viewportScreenshot.js")
-          .then((m) => m.saveViewportScreenshot())
-          .catch((err) => console.error(`Screenshot failed: ${err}`));
         return;
       }
       if (ctrl && e.key.toLowerCase() === "z") {

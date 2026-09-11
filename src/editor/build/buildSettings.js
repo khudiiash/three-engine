@@ -26,8 +26,11 @@ export const BUILD_DEFAULTS = {
   // Project-relative path of the scene the build boots into. Empty falls back
   // to the project's main scene, then to whatever is open in the editor.
   startScene: "",
-  // null = ship every .scene in the project (the right default until someone
-  // has a reason to trim). An array is an explicit allow-list of
+  // Which scenes ship. null (the default) = the start scene plus every scene
+  // the game can reach from it — one a shipped script, prefab or event names by
+  // path (`engine.loadScene("scenes/Level2.scene")`), discovered during the
+  // build the same way assets are; a `.scene` flagged Preload always ships.
+  // "all" = every .scene in the project. An array is an explicit allow-list of
   // project-relative paths.
   scenes: null,
   target: "web",
@@ -40,6 +43,11 @@ export const BUILD_DEFAULTS = {
   // a toggle that silently does nothing is worse than a disabled one.
   compressTextures: false,
   compressModels: false,
+  // Ship only the runtime chunks this game can reach — the player template is
+  // code-split, and a game without physics has no reason to carry Rapier. Off
+  // copies the whole template (the escape hatch if a trimmed build ever fails
+  // to load something). See build/runtimeFiles.js.
+  trimRuntime: true,
   // Boot/loading screen. Baked into index.html at export, not read from the
   // scene: the loading screen is on screen *before* scene.json is fetched, so
   // anything driven from the scene would flash the default colours first.
@@ -104,11 +112,15 @@ const samePath = (a, b) => !!a && !!b && normalizeRelPath(a).toLowerCase() === n
  * @param mainScene  project.json's `mainScene` (the editor's boot scene)
  * @param openScene  project-relative path of the scene open in the editor
  *
- * Returns `{ startScene, scenes, warnings }`. `scenes` always contains
+ * Returns `{ startScene, scenes, warnings, mode }`. `scenes` always contains
  * `startScene` first: a scene list that omits the scene the build boots into
  * produces a build that loads a black screen and logs a 404, which is a
  * miserable thing to debug an hour before a deadline. Trimming it back in is
  * cheaper than explaining it.
+ *
+ * `mode` is "reachable" (the default: `scenes` is the seed — the start scene —
+ * and the exporter adds every scene shipped content names, see
+ * `findSceneReferences`), "all", or "list" (an explicit allow-list).
  */
 export function resolveBuildScenes({ available = [], build = BUILD_DEFAULTS, mainScene = "", openScene = "" } = {}) {
   const warnings = [];
@@ -138,9 +150,10 @@ export function resolveBuildScenes({ available = [], build = BUILD_DEFAULTS, mai
     warnings.push(`No start scene configured — booting into "${startScene}".`);
   }
 
-  // Scene list: null means everything.
   let scenes;
+  let mode;
   if (Array.isArray(build?.scenes)) {
+    mode = "list";
     const wanted = build.scenes.map(normalizeRelPath).filter(Boolean);
     const missing = wanted.filter((p) => !exists(p));
     for (const p of missing) warnings.push(`Scene "${p}" is in the build list but no longer exists.`);
@@ -149,8 +162,13 @@ export function resolveBuildScenes({ available = [], build = BUILD_DEFAULTS, mai
       scenes.unshift(startScene);
       warnings.push(`Start scene "${startScene}" was not in the build list — added.`);
     }
-  } else {
+  } else if (build?.scenes === "all") {
+    mode = "all";
     scenes = [...all];
+  } else {
+    // The seed of the reachable set; the exporter grows it as it walks.
+    mode = "reachable";
+    scenes = [];
   }
 
   // Start scene first, then the rest in project order. Order is cosmetic in
@@ -160,11 +178,36 @@ export function resolveBuildScenes({ available = [], build = BUILD_DEFAULTS, mai
     ...scenes.filter((s) => !samePath(s, startScene)),
   ];
 
-  return { startScene, scenes, warnings };
+  return { startScene, scenes, warnings, mode };
+}
+
+/**
+ * Every project scene named in `text` — a scene's JSON, a prefab def, a
+ * script's source — as the project spells it. A game can only reach a scene
+ * by its path (`engine.loadScene("scenes/Level2.scene")`, an event action's
+ * `path`), so a quoted string ending in `.scene` is the whole evidence;
+ * absolute authoring paths under `root` count too. Order of first mention.
+ */
+export function findSceneReferences(text, { available = [], root = "" } = {}) {
+  const canonical = new Map(available.map((p) => [normalizeRelPath(p).toLowerCase(), normalizeRelPath(p)]));
+  const found = [];
+  const seen = new Set();
+  for (const match of String(text ?? "").matchAll(/(['"`])([^'"`\r\n]*\.scene)\1/gi)) {
+    // JSON and source both write a Windows backslash as two characters.
+    const raw = match[2].replaceAll("\\\\", "\\");
+    const rel = root ? toProjectRelative(root, raw) : normalizeRelPath(raw);
+    const key = normalizeRelPath(rel).toLowerCase();
+    const spelled = canonical.get(key);
+    if (!spelled || seen.has(key)) continue;
+    seen.add(key);
+    found.push(spelled);
+  }
+  return found;
 }
 
 /** Reads the shipped-scenes decision back out for display. */
 export function describeSceneSelection(build, availableCount) {
-  if (!Array.isArray(build?.scenes)) return `All ${availableCount} scene${availableCount === 1 ? "" : "s"}`;
-  return `${build.scenes.length} of ${availableCount} scenes`;
+  if (Array.isArray(build?.scenes)) return `${build.scenes.length} of ${availableCount} scenes`;
+  if (build?.scenes === "all") return `All ${availableCount} scene${availableCount === 1 ? "" : "s"}`;
+  return "The start scene + what it reaches";
 }

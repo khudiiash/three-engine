@@ -65,7 +65,11 @@ import { newScene } from "../sceneIO.js";
 import { createTerrainAssets } from "../terrainAssetSetup.js";
 import { getCursor3DPosition } from "../threeDCursor.js";
 import { ContextMenu as SharedContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
+import { PopoverMenu } from "../fields/PopoverMenu.jsx";
 import { askAiMenuItem, entitySelectionContext } from "../ai/askAi.js";
+import { Leaf } from "../icons/index.jsx";
+import { createFoliage } from "../foliageAuthoring.js";
+import { isFoliageSurface } from "../foliagePresets.js";
 
 const DROPPABLE_ASSET_EXTENSIONS = [...PREFAB_EXTENSIONS, ...MODEL_EXTENSIONS];
 
@@ -125,6 +129,12 @@ const TERRAIN_PRESET = {
   spec: { name: "Terrain", components: [{ type: "terrain", props: {} }] },
 };
 
+const FOLIAGE_PRESETS = [
+  { label: "Foliage Tree", Icon: Leaf, color: "#78b957", spec: { __foliageSpecies: "oak" } },
+  { label: "Foliage Grass", Icon: Leaf, color: "#78b957", spec: { __foliageSpecies: "grass" } },
+  { label: "Foliage Flowers", Icon: Leaf, color: "#d799cd", spec: { __foliageSpecies: "wildflowers" } },
+];
+
 // A blockout level and a playable character both come from optional modules,
 // so both are gated the same way Terrain is. They are *entities you place*
 // rather than components you bolt on, for the same reason Particles is: a
@@ -159,6 +169,7 @@ const CHARACTER_PRESET = {
 function modulePresets(flags = {}) {
   const presets = [];
   if (flags.terrain) presets.push(TERRAIN_PRESET);
+  if (flags.foliage) presets.push(...FOLIAGE_PRESETS);
   if (flags.level) presets.push(LEVEL_PRESET);
   if (flags.character) presets.push(CHARACTER_PRESET);
   return presets;
@@ -453,6 +464,8 @@ function EntityIcon({ components }) {
             // the same green the curve is drawn in, so the hierarchy row and
             // the thing in the viewport are recognisably one object.
             { Icon: Spline, color: "icon-path" }
+          : components.foliage
+          ? { Icon: Leaf, color: "icon-path" }
           : components.terrain
           ? { Icon: Mountain, color: "icon-model" }
           : components.mesh
@@ -1093,6 +1106,19 @@ function splitMenuItems(single) {
   ];
 }
 
+function foliageMenuItems(single) {
+  if (!single || !isFoliageSurface(engine.getEntity(single))) return [];
+  return [
+    { separator: true },
+    ...FOLIAGE_PRESETS.map((preset) => ({
+      label: `Scatter ${preset.spec.__foliageSpecies === "oak" ? "Trees" : preset.spec.__foliageSpecies === "grass" ? "Grass" : "Flowers"}`,
+      icon: Leaf,
+      action: () => createFoliage({ species: preset.spec.__foliageSpecies, surfaceId: single, parentId: single })
+        .catch((error) => console.error(`Could not create foliage: ${error.message}`)),
+    })),
+  ];
+}
+
 function prefabMenuItems(single) {
   if (!single) return [];
   const live = engine.getEntity(single);
@@ -1188,6 +1214,7 @@ function ContextMenu({
         },
         ...applyTransformMenuItems(single),
         ...splitMenuItems(single),
+        ...foliageMenuItems(single),
         ...prefabMenuItems(single),
         { separator: true },
         // Deliberately NOT restricted to a single row: "rename these twelve
@@ -1214,6 +1241,7 @@ export function HierarchyPanel() {
   // with the Modules panel without re-deriving three separate booleans.
   const moduleFlags = useMemo(() => ({
     terrain: moduleEnabled.includes("terrain"),
+    foliage: moduleEnabled.includes("foliage"),
     level: moduleEnabled.includes("level-design"),
     character: moduleEnabled.includes("character-controller"),
   }), [moduleEnabled]);
@@ -1240,6 +1268,7 @@ export function HierarchyPanel() {
   const cursorRef = useRef(null);
   const searchInputRef = useRef(null);
   const treeRef = useRef(null);
+  const addAnchorRef = useRef(null);
 
   // Assets dropped on empty tree space spawn at the scene root.
   const treeAssetDropRef = useAssetDrop({
@@ -1674,6 +1703,17 @@ export function HierarchyPanel() {
     setMenuOpen(false);
     const selected = useSelectionStore.getState().ids;
     const parentId = selected.length === 1 ? selected[0] : null;
+    if (spec.__foliageSpecies) {
+      try {
+        const surfaceId = isFoliageSurface(engine.getEntity(parentId)) ? parentId : "";
+        await createFoliage({ species: spec.__foliageSpecies, surfaceId, parentId, position: parentId ? undefined : getCursor3DPosition().toArray() });
+        if (parentId) setCollapsedIds((previous) => {
+          if (!previous.has(parentId)) return previous;
+          const next = new Set(previous); next.delete(parentId); return next;
+        });
+      } catch (error) { console.error(`Could not create foliage: ${error.message}`); }
+      return;
+    }
     let prepared = spec;
     const simulation = spec.components?.find((component) => ["particles", "cloth", "water", "vfx"].includes(component.type));
     if (simulation) {
@@ -1784,31 +1824,38 @@ export function HierarchyPanel() {
         </div>
       )}
       <div className="panel-toolbar hierarchy-toolbar">
-        <div className="dropdown-wrap hierarchy-add">
+        <div className="dropdown-wrap hierarchy-add" ref={addAnchorRef}>
           <button className="hierarchy-add-btn" title="Add" aria-label="Add" onClick={() => setMenuOpen((v) => !v)}>
             <Plus size={13} />
           </button>
           {menuOpen && (
-            <>
-              <div className="dropdown-overlay" onClick={() => setMenuOpen(false)} />
-              <div className="dropdown-menu component-menu">
-                <div className="dropdown-section-label">Scene</div>
-                <button key="New Scene" className="dropdown-item component-item" onClick={createScene}>
-                  <FileCode2 size={14} style={{ color: "#8ea0b5" }} className="component-item-icon" />
-                  <span className="component-item-label">New Scene</span>
-                </button>
-                <div className="dropdown-section-label">Entity</div>
-                {[...COMMON_PRESETS, ...modulePresets(moduleFlags)].map((p) => (
+            /* Portalled, like every other menu: the panel's `contain: paint`
+               clips an in-panel absolute menu at the panel edge, and this
+               trigger sits ON that edge — the menu opened as a ~40px sliver of
+               icons. `align="right"` opens it inward from the button's edge. */
+            <PopoverMenu
+              anchorRef={addAnchorRef}
+              className="component-menu"
+              align="right"
+              minWidth={232}
+              onClose={() => setMenuOpen(false)}
+            >
+              <div className="dropdown-section-label">Scene</div>
+              <button key="New Scene" className="dropdown-item component-item" onClick={createScene}>
+                <FileCode2 size={14} style={{ color: "#8ea0b5" }} className="component-item-icon" />
+                <span className="component-item-label">New Scene</span>
+              </button>
+              <div className="dropdown-section-label">Entity</div>
+              {[...COMMON_PRESETS, ...modulePresets(moduleFlags)].map((p) => (
+                <PresetItem key={p.label} preset={p} onPick={createEntity} />
+              ))}
+              <div className="dropdown-section-label">UI</div>
+              <PresetItem preset={UI_SCREEN_PRESET} onPick={createEntity} />
+              {isParentUiScreen(useSelectionStore.getState().ids[0] ?? null) &&
+                UI_ELEMENT_PRESETS.map((p) => (
                   <PresetItem key={p.label} preset={p} onPick={createEntity} />
                 ))}
-                <div className="dropdown-section-label">UI</div>
-                <PresetItem preset={UI_SCREEN_PRESET} onPick={createEntity} />
-                {isParentUiScreen(useSelectionStore.getState().ids[0] ?? null) &&
-                  UI_ELEMENT_PRESETS.map((p) => (
-                    <PresetItem key={p.label} preset={p} onPick={createEntity} />
-                  ))}
-              </div>
-            </>
+            </PopoverMenu>
           )}
         </div>
         <div className="hierarchy-search">

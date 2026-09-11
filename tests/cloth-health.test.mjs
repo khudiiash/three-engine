@@ -346,11 +346,10 @@ import {
   clothSubsteps, clothVelocityScale, CLOTH_REFERENCE_STEP, MAX_CLOTH_FRAME,
 } from "../src/engine/vfx/clothHealth.js";
 
-test("the OPT-IN real-time step simulates the whole frame, at every rate and budget", () => {
-  // ⚠ THIS IS NOT THE DEFAULT — see the h² test at the end of this file, which
-  // is why. `clothSubsteps` is the arithmetic behind `__clothRealtimeStep`, and
-  // it has to stay honest for whoever turns that on: simulated seconds per real
-  // second is 1.
+test("the real-time step simulates the whole frame, at every rate and budget", () => {
+  // ⭐ THIS IS THE DEFAULT AGAIN as of 2026-09-09 — see the fabric-length-cap
+  // tests at the end of this file, which are why. `clothSubsteps` is the
+  // arithmetic behind it: simulated seconds per real second is 1.
   for (const fps of [144, 120, 90, 60, 45, 38, 30, 24]) {
     for (const budget of [2, 3, 4, 6]) {
       const frame = 1 / fps;
@@ -467,12 +466,14 @@ test("a missing or malformed wind falls back to the default, not to NaN", () => 
 });
 
 /**
- * ⛔⛔ WHY THE FRAME IS NOT DIVIDED BETWEEN THE SUBSTEPS THE BUDGET ALLOWS.
+ * ⛔⛔ WHAT DIVIDING THE FRAME COSTS THE SOLVER — the h² this test measures.
  *
  * "Consume the whole frame" is the obvious fix for cloth that slows down when
- * the substep budget bites, and it is right about the CLOCK. It is wrong about
- * this SOLVER, and the test below is the reason the real-time step ships
- * OPT-IN (`__clothRealtimeStep`) rather than as the default.
+ * the substep budget bites, and it is right about the CLOCK. On 2026-09-08 it
+ * was wrong about this SOLVER, and this test is why it was demoted to opt-in
+ * for two hours. ⚠ READ THE PAIR AT THE BOTTOM OF THIS FILE BEFORE QUOTING IT:
+ * the arm below has NO long-range attachment, which is what the solver was
+ * when the verdict was reached and is not what it is now.
  *
  * Verlet's force term is `f·h²`, so a bigger step hands the constraint solver a
  * bigger violation to clean up each step. The cleanup is a FIXED eight Jacobi
@@ -494,8 +495,13 @@ test("a missing or malformed wind falls back to the default, not to NaN", () => 
  * A pinned chain under gravity, integrated exactly as `gridSimulation` does:
  * Verlet with `velocityScale`, then `passes` JACOBI distance relaxations. Runs
  * to steady state and returns how far it stretched past its rest length.
+ *
+ * ⚠ `lra` IS THE WHOLE ARGUMENT, so it is a parameter and not an assumption.
+ * At 0 this is the bare Jacobi solver the h² verdict was measured on; at 0.5
+ * it is the solver that actually ships, capping each particle's distance from
+ * its pin at the length of fabric between them, every pass. See `u.lraRelax`.
  */
-function hangingChainStretch({ step, passes = CLOTH_SOLVE_PASSES, damping = 0.99, links = 12, restLength = 0.2, gravity = 9.81, seconds = 400 }) {
+function hangingChainStretch({ step, passes = CLOTH_SOLVE_PASSES, lra = 0, damping = 0.99, links = 12, restLength = 0.2, gravity = 9.81, seconds = 400 }) {
   const n = links + 1;
   const y = Array.from({ length: n }, (_, i) => -i * restLength);
   const old = y.slice();
@@ -518,6 +524,11 @@ function hangingChainStretch({ step, passes = CLOTH_SOLVE_PASSES, damping = 0.99
         touched[i]++; touched[i + 1]++;
       }
       for (let i = 1; i < n; i++) if (touched[i]) y[i] += delta[i] / touched[i];
+      // The long-range attachment, mixed toward the cap rather than assigned.
+      if (lra > 0) for (let i = 1; i < n; i++) {
+        const far = Math.abs(y[0] - y[i]), reach = i * restLength * LRA_SLACK;
+        if (far > reach) y[i] += (far - reach) * Math.sign(y[0] - y[i]) * lra;
+      }
     }
   }
   return Math.abs(y[0] - y[n - 1]) / (links * restLength);
@@ -546,9 +557,9 @@ test("⛔⛔ A THREE-TIMES STEP IS RUBBER: residual stretch scales with h², not
 });
 
 test("⭐ the step a curtain actually gets, at the frame rates that matter", () => {
-  // The behaviour is not deleted, only moved behind `__clothRealtimeStep`. What
-  // it hands the solver is the whole argument, so it is written down: at 60 fps
-  // the division is free, and everything below that pays h².
+  // What the division hands the solver is the whole argument, so it is written
+  // down: at 60 fps it is free, and everything below that pays h² — bounded, at
+  // the bottom of this file, by the fabric-length cap.
   const stepAt = (fps) => clothSubsteps(1 / fps, 2, CLOTH_REFERENCE_STEP).step;
   assert.ok(Math.abs(stepAt(60) - CLOTH_REFERENCE_STEP) < 1e-9, "at 60 fps it lands exactly on the reference step");
   assert.ok(Math.abs(stepAt(30) - 1 / 60) < 1e-9, "at 30 fps the step doubles");
@@ -556,3 +567,215 @@ test("⭐ the step a curtain actually gets, at the frame rates that matter", () 
   assert.ok(Math.abs(stepAt(15) - 1 / 40) < 1e-9, `at 15 fps the clamp caps the step at 1/40, got ${stepAt(15)}`);
   assert.ok(Math.abs(stepAt(5) - 1 / 40) < 1e-9, "and no slower frame can push it past that");
 });
+
+/**
+ * ⭐⭐⭐ AND THE VERDICT ABOVE EXPIRED TWO HOURS AFTER IT WAS REACHED.
+ *
+ * The h² measurement is real and the test above still runs it — on a solver
+ * with NO long-range attachment, which is what the solver was at 17:51 on
+ * 2026-09-08. The fabric-length cap was armed at 20:10, and it is not a
+ * relaxation: it caps a particle's distance from its pin geometrically, in one
+ * pass, however many rings away that pin is. Nothing in it is a function of h.
+ *
+ * So the reason the frame may be divided among the substeps — and the reason
+ * `__clothRealtimeStep` is the DEFAULT rather than the opt-in — is this pair of
+ * tests, not an opinion. Flip `lra` back to 0 and the first one fails.
+ */
+import { LRA_SLACK } from "../src/engine/vfx/clothMeshTopology.js";
+/** `u.lraRelax`'s shipped default — see gridSimulation's solve pass. */
+const LRA_RELAX = 0.5;
+
+test("⭐⭐⭐ THE FABRIC-LENGTH CAP IS A CEILING: sag stops being a function of h", () => {
+  // ⚠ IT DOES NOT ZERO THE SAG, AND SAYING SO WOULD BE WRONG. `LRA_SLACK` lets
+  // a particle sit 2 % past its taut geodesic, so the cap CANNOT act until the
+  // chain has already sagged that far — which is precisely why it costs
+  // nothing at the reference step, where the sag is 1.005 % and the cap never
+  // fires. What it does is put a ceiling under h² instead of letting it run.
+  //
+  //   step    bare       capped        (measured 2026-09-09)
+  //   1/120     1.006 %    1.005 %     inside the slack, cap inert
+  //   1/60      4.024 %    1.698 %
+  //   1/40      9.053 %    1.782 %     the clamp's worst case
+  //   1/20     36.213 %    1.840 %
+  const ceiling = LRA_SLACK - 1;
+  const steps = [CLOTH_REFERENCE_STEP, 1 / 60, 1 / 40, 1 / 20];
+  const capped = steps.map((step) => hangingChainStretch({ step, lra: LRA_RELAX }) - 1);
+  const bare = steps.map((step) => hangingChainStretch({ step }) - 1);
+
+  for (const [i, value] of capped.entries())
+    assert.ok(value <= ceiling + 1e-3,
+      `step 1/${Math.round(1 / steps[i])} sagged ${(value * 100).toFixed(3)} %, past the ${(ceiling * 100).toFixed(1)} % slack the cap allows`);
+
+  // ⭐ THE MEASUREMENT. Across a four-times step the bare solver's sag grows by
+  // more than an order of magnitude; the capped one moves by under a percent.
+  const cappedSpread = Math.max(...capped) - Math.min(...capped);
+  const bareSpread = Math.max(...bare) - Math.min(...bare);
+  assert.ok(cappedSpread < 0.01, `capped sag should barely move with h, spread ${(cappedSpread * 100).toFixed(3)} %`);
+  assert.ok(bareSpread > 20 * cappedSpread,
+    `the control must still show the h² it was condemned for: bare spread ${(bareSpread * 100).toFixed(1)} % against capped ${(cappedSpread * 100).toFixed(3)} %`);
+});
+
+/**
+ * A pinned chain RELEASED FROM HORIZONTAL — the transient, which is the half of
+ * the report the steady-state sag cannot see. "Springs back soft" is a
+ * statement about the swing, not about where the cloth ends up.
+ */
+function swingPeak({ step, passes = CLOTH_SOLVE_PASSES, lra = 0, damping = 0.99, links = 12, restLength = 0.2, gravity = 9.81, seconds = 6 }) {
+  const n = links + 1;
+  const x = Array.from({ length: n }, (_, i) => i * restLength), y = new Array(n).fill(0);
+  const ox = x.slice(), oy = y.slice();
+  const scale = clothVelocityScale(step, step, damping, CLOTH_REFERENCE_STEP);
+  let worstSpring = 0, furthest = 0;
+  for (let s = 0, steps = Math.round(seconds / step); s < steps; s++) {
+    for (let i = 1; i < n; i++) {
+      const nx = x[i] + (x[i] - ox[i]) * scale, ny = y[i] + (y[i] - oy[i]) * scale - gravity * step * step;
+      ox[i] = x[i]; oy[i] = y[i]; x[i] = nx; y[i] = ny;
+    }
+    for (let p = 0; p < passes; p++) {
+      const dx = new Float64Array(n), dy = new Float64Array(n), touched = new Float64Array(n);
+      for (let i = 0; i < n - 1; i++) {
+        const vx = x[i] - x[i + 1], vy = y[i] - y[i + 1];
+        const d = Math.hypot(vx, vy) || 1e-9, e = (d - restLength) * 0.5 / d;
+        dx[i] -= vx * e; dy[i] -= vy * e; dx[i + 1] += vx * e; dy[i + 1] += vy * e;
+        touched[i]++; touched[i + 1]++;
+      }
+      for (let i = 1; i < n; i++) if (touched[i]) { x[i] += dx[i] / touched[i]; y[i] += dy[i] / touched[i]; }
+      if (lra > 0) for (let i = 1; i < n; i++) {
+        const ax = x[i] - x[0], ay = y[i] - y[0];
+        const far = Math.hypot(ax, ay), reach = i * restLength * LRA_SLACK;
+        if (far > reach) {
+          const k = reach / far;
+          x[i] += ((x[0] + ax * k) - x[i]) * lra; y[i] += ((y[0] + ay * k) - y[i]) * lra;
+        }
+      }
+      x[0] = 0; y[0] = 0;
+    }
+    for (let i = 0; i < n - 1; i++) worstSpring = Math.max(worstSpring, Math.hypot(x[i] - x[i + 1], y[i] - y[i + 1]) / restLength);
+    furthest = Math.max(furthest, Math.hypot(x[n - 1], y[n - 1]) / (links * restLength));
+  }
+  return { worstSpring, furthest };
+}
+
+test("⭐⭐ the TRANSIENT degrades linearly with the cap, quadratically without it", () => {
+  // Measured, 2026-09-09, peak over a 6 s swing:
+  //           LRA off                    LRA 0.5
+  //   1/120   1.034x spring 1.021x hem   1.021x  1.015x
+  //   1/60    1.129x        1.081x       1.041x  1.018x
+  //   1/40    1.277x        1.168x       1.089x  1.018x
+  const armed = [1 / 120, 1 / 60, 1 / 40].map((step) => swingPeak({ step, lra: LRA_RELAX }));
+  const bare = [1 / 120, 1 / 60, 1 / 40].map((step) => swingPeak({ step }));
+
+  // ⭐ THE HEM IS STEP-INVARIANT. This is the reading the user sees — how far
+  // the fabric reaches past where there is fabric — and the cap holds it flat.
+  for (const { furthest } of armed)
+    assert.ok(furthest < 1.03, `the hem should stay inside its own fabric length, reached ${furthest.toFixed(3)}x`);
+  assert.ok(Math.abs(armed[2].furthest - armed[0].furthest) < 0.01,
+    `the 3x step should reach no further than the reference one, ${armed[0].furthest.toFixed(3)} -> ${armed[2].furthest.toFixed(3)}`);
+
+  // The worst spring still grows with the step — the cap bounds distance from
+  // the PIN, not between neighbours — but linearly rather than as h², and it
+  // lands far under the tear threshold.
+  const armedExcess = armed[2].worstSpring - 1, bareExcess = bare[2].worstSpring - 1;
+  assert.ok(armed[2].worstSpring < STRETCH_LIMIT,
+    `the 3x step must stay well inside a tear, got ${armed[2].worstSpring.toFixed(3)}x against ${STRETCH_LIMIT}`);
+  assert.ok(armedExcess < bareExcess / 2,
+    `the cap should at least halve the transient stretch of a 3x step, ${(bareExcess * 100).toFixed(1)} % -> ${(armedExcess * 100).toFixed(1)} %`);
+});
+
+/**
+ * ⛔⛔ THE RECEIPT THAT WAS MISSING, AND WHY EVERY FIXTURE ABOVE COULD PASS
+ * WHILE THE LIVE CLOTH WAS WRONG.
+ *
+ * Every step-size fixture in this file uses a CONSTANT step. With a constant
+ * step `step / previousStep` is exactly 1, so the step-ratio correction is 1,
+ * so raising it to any power is still 1 — the bug is algebraically invisible to
+ * them. A real editor frame time never repeats: at 46 fps with GI rebuilds it
+ * swings by several times, and that is the first thing the user saw ("cloth is
+ * broken now", 2026-09-09) the moment the divided step shipped.
+ *
+ * ⭐ THE RULE: a fixture for a variable-step solver must VARY THE STEP.
+ */
+test("⛔ the step-ratio correction composes to exactly `ratio` over the frame", () => {
+  const damping = 1;   // isolate the ratio; damping is tested on its own above
+  for (const substeps of [1, 2, 3, 6]) {
+    for (const [step, previous] of [[1 / 60, 1 / 120], [1 / 120, 1 / 40], [1 / 90, 1 / 90]]) {
+      const per = clothVelocityScale(step, previous, damping, CLOTH_REFERENCE_STEP, substeps);
+      const composed = Math.pow(per / Math.pow(damping, step / CLOTH_REFERENCE_STEP), substeps);
+      assert.ok(Math.abs(composed - step / previous) < 1e-9,
+        `${substeps} substeps composed to ${composed.toFixed(6)}, not the ${(step / previous).toFixed(6)} the step change asks for`);
+    }
+  }
+});
+
+test("⛔ the OLD form over-corrects by exactly the substep count", () => {
+  // The control, so the regression cannot come back unnoticed: without the
+  // count, two substeps square the ratio.
+  const ratio = clothVelocityScale(1 / 60, 1 / 120, 1, CLOTH_REFERENCE_STEP);
+  assert.ok(Math.abs(ratio - 2) < 1e-9, `one application should be the raw ratio, got ${ratio}`);
+  assert.ok(Math.abs(ratio * ratio - 4) < 1e-9, "two applications of it are 4x, which is the bug");
+  assert.ok(Math.abs(clothVelocityScale(1 / 60, 1 / 120, 1, CLOTH_REFERENCE_STEP, 2) ** 2 - 2) < 1e-9,
+    "handed the count, two applications compose back to 2");
+});
+
+test("⭐⭐⭐ A JITTERING CLOCK MUST NOT SPEED THE CLOTH UP", () => {
+  // The same chain, the same seconds, driven by a frame clock that jitters the
+  // way a real editor's does — the variable every other fixture here is missing.
+  // Peak particle speed is the reading, because the STRETCH readings barely
+  // move (1.020 -> 1.058) while the cloth visibly flails: this is the same
+  // local-defect-under-a-global-statistic trap as the diagonal at the top.
+  const steady = jitterChainPeakSpeed({ jitter: 0 });
+  const jittered = jitterChainPeakSpeed({ jitter: 0.6 });
+  const bursty = jitterChainPeakSpeed({ jitter: 0.15, burst: 0.08 });
+  for (const [label, value] of [["+/-60 % jitter", jittered], ["8 % GI-rebuild stalls", bursty]])
+    assert.ok(value < steady * 1.25,
+      `${label} inflated peak speed to ${value.toFixed(2)} m/s against ${steady.toFixed(2)} steady — the clock is leaking energy into the cloth`);
+});
+
+/**
+ * The chain again, stepped by a jittering frame clock instead of a constant
+ * one. `substeps` mirrors the solver: one uniform for the whole frame, applied
+ * once per substep.
+ */
+function jitterChainPeakSpeed({ jitter = 0, burst = 0, fps = 46, seconds = 40, links = 12, rest = 0.2, damping = 0.99, gravity = 9.81, gust = 3.54, gustHz = 0.386, budget = 2, seed = 7 }) {
+  const n = links + 1;
+  const x = new Array(n).fill(0), y = Array.from({ length: n }, (_, i) => -i * rest);
+  const ox = x.slice(), oy = y.slice();
+  let rng = seed, lastStep = CLOTH_REFERENCE_STEP, t = 0, peak = 0;
+  const rand = () => (rng = (rng * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  while (t < seconds) {
+    const frame = burst > 0 && rand() < burst
+      ? Math.min(MAX_CLOTH_FRAME, (1 / fps) * (2 + rand() * 4))
+      : Math.max(1e-3, (1 / fps) * (1 + (rand() * 2 - 1) * jitter));
+    t += frame;
+    const { count, step } = clothSubsteps(frame, budget, CLOTH_REFERENCE_STEP);
+    if (count <= 0) continue;
+    const scale = clothVelocityScale(step, lastStep, damping, CLOTH_REFERENCE_STEP, count);
+    for (let s = 0; s < count; s++) {
+      const wind = Math.sin(t * gustHz * Math.PI * 2) * gust;
+      for (let i = 1; i < n; i++) {
+        const nx = x[i] + (x[i] - ox[i]) * scale + wind * step * step;
+        const ny = y[i] + (y[i] - oy[i]) * scale - gravity * step * step;
+        ox[i] = x[i]; oy[i] = y[i]; x[i] = nx; y[i] = ny;
+      }
+      for (let p = 0; p < CLOTH_SOLVE_PASSES; p++) {
+        const dx = new Float64Array(n), dy = new Float64Array(n), touched = new Float64Array(n);
+        for (let i = 0; i < n - 1; i++) {
+          const vx = x[i] - x[i + 1], vy = y[i] - y[i + 1];
+          const d = Math.hypot(vx, vy) || 1e-9, e = (d - rest) * 0.5 / d;
+          dx[i] -= vx * e; dy[i] -= vy * e; dx[i + 1] += vx * e; dy[i + 1] += vy * e;
+          touched[i]++; touched[i + 1]++;
+        }
+        for (let i = 1; i < n; i++) if (touched[i]) { x[i] += dx[i] / touched[i]; y[i] += dy[i] / touched[i]; }
+        for (let i = 1; i < n; i++) {
+          const ax = x[i] - x[0], ay = y[i] - y[0];
+          const far = Math.hypot(ax, ay), reach = i * rest * LRA_SLACK;
+          if (far > reach) { const k = reach / far; x[i] += ((x[0] + ax * k) - x[i]) * 0.5; y[i] += ((y[0] + ay * k) - y[i]) * 0.5; }
+        }
+        x[0] = 0; y[0] = 0;
+      }
+      lastStep = step;
+    }
+    for (let i = 1; i < n; i++) peak = Math.max(peak, Math.hypot(x[i] - ox[i], y[i] - oy[i]) / step);
+  }
+  return peak;
+}

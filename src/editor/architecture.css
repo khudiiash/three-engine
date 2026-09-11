@@ -1,0 +1,123 @@
+.architecture-settings details { padding: 10px 0; border-bottom: 1px solid color-mix(in srgb, var(--text) 8%, transparent); }
+.architecture-settings summary { color: var(--text-dim); font-size: 11px; cursor: pointer; padding: 3px 0; user-select: none; }
+.architecture-settings details[open] > summary { color: var(--text); margin-bottom: 11px; }
+.architecture-field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 12px; }
+.architecture-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 11px; min-width: 0; color: var(--text-dim); font-size: 10px; }
+.architecture-input { width: 100%; min-width: 0; background: color-mix(in srgb, var(--text) 4%, transparent); color: var(--text); border: 1px solid color-mix(in srgb, var(--text) 12%, transparent); border-radius: 4px; font: inherit; font-size: 11px; padding: 7px 8px; outline: none; }
+.architecture-field .tx-select { min-height: 29px; width: 100%; font-size: 11px; }
+.architecture-input:focus { border-color: var(--accent); }
+.architecture-toggle { display: flex; align-items: center; gap: 8px; color: var(--text-dim); font-size: 11px; margin: 9px 0 12px; cursor: pointer; }
+.architecture-toggle input { accent-color: var(--accent); margin: 0; }
+.architecture-hint { font-size: 10px; line-height: 1.6; color: var(--text-dim); margin: 8px 0 12px; }
+.architecture-materials { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 10px; }
+.architecture-polygon { margin: 0 0 12px; color: var(--text-dim); font-size: 10px; }
+.architecture-polygon textarea { display: block; margin-top: 6px; resize: vertical; line-height: 1.5; font-family: monospace; }
+.architecture-plan { border: 1px solid color-mix(in srgb, var(--text) 12%, transparent); border-radius: 7px; overflow: hidden; transition: opacity 120ms; }
+.architecture-plan.pending svg { opacity: .45; }
+.architecture-plan-heading { display: flex; justify-content: space-between; gap: 5px; padding: 11px 12px; color: var(--text-dim); font-size: 9px; letter-spacing: .045em; }
+.architecture-plan svg { display: block; width: 100%; height: 185px; padding: 12px; background-image: linear-gradient(color-mix(in srgb, var(--text) 4%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in srgb, var(--text) 4%, transparent) 1px, transparent 1px); background-size: 20px 20px; }
+.architecture-plan path { fill: color-mix(in srgb, var(--accent) 10%, transparent); stroke: color-mix(in srgb, var(--accent) 75%, transparent); stroke-width: 1.2; }
+.architecture-plan-stats { display: flex; gap: 10px; justify-content: space-between; padding: 11px; border-top: 1px solid color-mix(in srgb, var(--text) 9%, transparent); }
+.architecture-plan-stats span { display: flex; flex-direction: column; gap: 5px; color: var(--text-dim); font-size: 9px; }
+.architecture-plan-stats strong { font-size: 11px; color: var(--text); font-weight: 550; }
+.architecture-notices, .architecture-plan > .architecture-error { font-size: 10px; line-height: 1.5; padding: 0 11px; color: var(--warn); }
+.architecture-vector { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.architecture-error { color: var(--danger); font-size: 11px; line-height: 1.5; }
+.architecture-result { border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); padding: 11px; border-radius: 6px; margin-top: 12px; font-size: 11px; line-height: 1.5; }
+.architecture-result strong { font-weight: 500; }
+.architecture-result p { color: var(--warn); font-size: 10px; }
+.architecture-result .toolbar-btn { margin-top: 8px; }
+.architecture-primary { display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: var(--accent); color: var(--on-accent); border: 0; border-radius: 5px; padding: 8px 13px; font: inherit; font-size: 11px; font-weight: 550; cursor: pointer; white-space: nowrap; }
+.architecture-primary:disabled { opacity: .45; cursor: default; }
+.architecture-section { padding: 4px 0 8px; min-width: 0; }
+.architecture-section .architecture-plan { margin-bottom: 10px; }
+.architecture-section .architecture-plan svg { height: 120px; }
+.architecture-section-actions { display: flex; flex-wrap: wrap; gap: 7px; padding: 12px 0 4px; }
+.architecture-section-actions > button { flex: 1; }
+.architecture-section .architecture-settings { font-size: 11px; }
+.architecture-tool-button { gap: 5px; }
+.viewport-toolbar .toolbar-btn.architecture-tool-button.active { background: var(--bg-2); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+.architecture-opening { padding: 10px 0; border-bottom: 1px solid color-mix(in srgb, var(--text) 10%, transparent); }
+.architecture-opening summary { margin-bottom: 10px; font-size: 11px; color: var(--text-dim); cursor: pointer; }
+
+/* The canvas remains the workspace. Only the shelf and its optional flyout capture input. */
+.architecture-workspace { position: absolute; inset: 0; z-index: 12; pointer-events: none; container-type: size; --arch-stone: #d2cab7; --arch-roof: #8fa89a; --arch-window: #475751; }
+.architecture-shelf, .architecture-flyout { pointer-events: auto; color: var(--text); background: color-mix(in srgb, var(--bg-2, #202426) 96%, transparent); border: 1px solid color-mix(in srgb, var(--text) 15%, transparent); box-shadow: 0 6px 28px #0005, inset 0 1px #ffffff06; }
+.architecture-shelf { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); width: min(680px, calc(100% - 24px)); border-radius: 12px; padding: 6px 8px 5px; }
+.architecture-shelf button, .architecture-flyout button { font-family: inherit; cursor: pointer; }
+.architecture-workspace button:focus-visible, .architecture-section button:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.architecture-shelf-header { display: flex; align-items: center; gap: 12px; height: 25px; padding: 0 2px 3px; }
+.architecture-shelf-brand { display: flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 550; color: var(--text-dim); margin-right: 2px; }
+.architecture-shelf-brand svg { color: var(--accent); }
+.architecture-mode-switch { display: flex; align-items: center; gap: 2px; }
+.architecture-mode-switch button { display: flex; align-items: center; justify-content: center; gap: 5px; height: 24px; padding: 0 10px; border: 0; border-radius: 5px; background: transparent; color: var(--text-dim); font-size: 10px; }
+.architecture-mode-switch button[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
+.architecture-shelf-actions { display: flex; align-items: center; gap: 2px; margin-left: auto; }
+.architecture-mini-button { display: inline-flex; justify-content: center; align-items: center; width: 25px; height: 25px; padding: 0; color: var(--text-dim); background: transparent; border: 0; border-radius: 5px; }
+.architecture-mini-button:hover, .architecture-mini-button.active { background: color-mix(in srgb, var(--text) 8%, transparent); color: var(--text); }
+.architecture-tool-strip { display: flex; gap: 4px; overflow-x: auto; padding: 4px 0; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--text) 15%, transparent) transparent; }
+.architecture-tool-tile { display: flex; flex: 1 0 52px; align-items: center; justify-content: center; flex-direction: column; gap: 3px; height: 46px; min-width: 0; border: 1px solid transparent; border-radius: 7px; background: color-mix(in srgb, var(--text) 3%, transparent); color: var(--text-dim); padding: 3px; transition: background .1s, border-color .1s, color .1s; }
+.architecture-tool-tile span { font-size: 9px; white-space: nowrap; }
+.architecture-tool-tile:hover { background: color-mix(in srgb, var(--text) 8%, transparent); color: var(--text); }
+.architecture-tool-tile.active { border-color: color-mix(in srgb, var(--accent) 48%, transparent); background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent); }
+.architecture-stamp-tile { gap: 0; flex-basis: 57px; }
+.architecture-stamp-icon { display: block; height: 30px; width: 48px; flex-shrink: 0; }
+.architecture-context-bar { display: flex; align-items: center; gap: 10px; min-height: 29px; overflow-x: auto; scrollbar-width: thin; }
+.architecture-context-field { display: flex; align-items: center; gap: 4px; min-width: 0; flex-shrink: 0; color: var(--text-dim); font-size: 9px; }
+.architecture-context-field > span { white-space: nowrap; }
+.architecture-context-field .architecture-input { width: 46px; height: 23px; padding: 3px 4px; font-size: 10px; text-align: center; border-color: transparent; background: color-mix(in srgb, var(--text) 5%, transparent); font-variant-numeric: tabular-nums; }
+.architecture-context-field .architecture-input:hover { border-color: color-mix(in srgb, var(--text) 15%, transparent); }
+.architecture-context-field .architecture-input:focus { border-color: var(--accent); }
+.architecture-context-field input::-webkit-inner-spin-button { appearance: none; }
+.architecture-context-label { font-size: 10px; color: var(--text-dim); min-width: 70px; }
+.architecture-rotate-button { display: flex; align-items: center; justify-content: center; gap: 5px; min-width: 51px; height: 23px; padding: 3px 6px; color: var(--text-dim); background: color-mix(in srgb, var(--text) 5%, transparent); border: 0; border-radius: 4px; font-size: 10px; }
+.architecture-swatches { display: flex; gap: 5px; align-items: center; margin-left: auto; padding: 0 3px; }
+.architecture-swatches button { border: 2px solid transparent; outline: 1px solid transparent; border-radius: 50%; background: var(--swatch); background-clip: padding-box; width: 17px; height: 17px; padding: 0; flex-shrink: 0; }
+.architecture-swatches button[aria-pressed="true"] { outline-color: var(--swatch); border-color: var(--bg-2); }
+.architecture-shelf-footer { position: absolute; bottom: calc(100% + 5px); left: 6px; right: 6px; pointer-events: none; display: flex; justify-content: space-between; align-items: center; gap: 12px; height: 17px; font-size: 9px; color: var(--text); text-shadow: 0 1px 3px #000; opacity: .85; padding: 1px 2px 0; }
+.architecture-shelf-footer span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.architecture-shelf-footer span:last-child { flex-shrink: 0; }
+.architecture-shelf-error { position: absolute; bottom: calc(100% + 26px); left: 0; max-width: 100%; padding: 9px 12px; background: var(--bg-2); border: 1px solid var(--danger); border-radius: 7px; color: var(--danger); font-size: 11px; line-height: 1.5; }
+.architecture-shelf-warning { border-color: color-mix(in srgb, var(--warn) 45%, transparent); color: var(--warn); max-height: 64px; overflow-y: auto; }
+.architecture-roof-choices { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
+.architecture-roof-choices > span { margin-right: 4px; font-size: 9px; color: var(--text-dim); }
+.architecture-roof-choices button, .architecture-new-composition { height: 23px; padding: 0 7px; font-size: 9px; color: var(--text-dim); background: transparent; border: 1px solid transparent; border-radius: 4px; }
+.architecture-roof-choices button[aria-pressed="true"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.architecture-new-composition { border-color: color-mix(in srgb, var(--text) 12%, transparent); }
+.architecture-sculpt-context { justify-content: space-between; }
+.architecture-model-stats { display: flex; gap: 14px; margin: 12px 0; color: var(--text-dim); font-size: 10px; }
+.architecture-model-stats strong { color: var(--text); margin-right: 3px; }
+.architecture-flyout { position: absolute; left: max(12px, calc(50% - 340px)); bottom: 171px; width: min(264px, calc(100% - 24px)); max-height: min(440px, calc(100% - 205px)); display: flex; flex-direction: column; border-radius: 10px; overflow: hidden; }
+.architecture-flyout > header { display: flex; align-items: center; justify-content: space-between; padding: 8px 9px 8px 14px; flex-shrink: 0; border-bottom: 1px solid color-mix(in srgb, var(--text) 10%, transparent); }
+.architecture-flyout > header strong { font-size: 11px; font-weight: 550; }
+.architecture-flyout-body { padding: 12px 14px; overflow-y: auto; scrollbar-width: thin; }
+.architecture-flyout .architecture-field-grid { column-gap: 8px; }
+.architecture-flyout .architecture-input { padding: 5px 7px; }
+.architecture-flyout .architecture-primary { width: 100%; margin-top: 8px; }
+.architecture-selection-controls { padding: 7px 3px; min-height: 70px; }
+.architecture-context-title { display: flex; align-items: center; gap: 6px; font-size: 11px; margin-bottom: 8px; }
+.architecture-context-title strong { font-weight: 550; }
+.architecture-context-row { display: flex; align-items: center; gap: 8px; overflow-x: auto; padding-bottom: 3px; }
+.architecture-context-row .toolbar-btn { font-size: 10px; flex-shrink: 0; }
+.architecture-context-row .architecture-context-field { flex-direction: row; margin: 0; }
+.architecture-context-empty, .architecture-context-hint { font-size: 10px; line-height: 1.5; color: var(--text-dim); }
+.architecture-context-hint { margin-top: 5px; }
+@container (max-width: 570px) {
+  .architecture-shelf-brand { display: none; }
+  .architecture-context-bar { gap: 8px; }
+  .architecture-shelf-footer span:last-child { display: none; }
+  .architecture-swatches { margin-left: 4px; }
+}
+@container (max-width: 860px) {
+  /* Keep the orientation gizmo clickable beside the shelf on narrow docks. */
+  .architecture-shelf { width: min(680px, calc(100% - 112px)); left: calc(50% - 40px); }
+}
+@container (max-width: 450px) {
+  .architecture-shelf-header { gap: 4px; }
+  .architecture-mode-switch button { padding: 0 6px; }
+  .architecture-mode-switch svg { display: none; }
+  .architecture-shelf-actions button[aria-label="Architecture undo"], .architecture-shelf-actions button[aria-label="Architecture redo"] { display: none; }
+}
+@container (max-height: 400px) {
+  .architecture-flyout { bottom: 162px; max-height: calc(100% - 200px); }
+}

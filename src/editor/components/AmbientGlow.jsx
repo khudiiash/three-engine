@@ -22,8 +22,9 @@ import {
  *
  * WHEN IT SAMPLES is the other half. On a slow timer it looked like lag —
  * the light arrived in visible steps behind the camera. Sampling every frame
- * regardless would spend a whole scene encode per frame on a decoration. So
- * it samples when the picture CAN have changed and idles when it cannot:
+ * regardless would spend a frame copy and a readback per frame on a
+ * decoration. So it samples when the picture CAN have changed and idles when
+ * it cannot:
  *
  *   · every frame the readback can keep up with while the camera moves —
  *     which is where the stepping showed and where the eye is looking
@@ -202,7 +203,9 @@ export function AmbientGlow() {
       inFlight = true;
       try {
         const height = sampleHeightFor(rect.width / rect.height);
-        const pixels = await sampleViewportColour(engine.renderer, engine.scene, camera, height);
+        // The sample is the NEXT presented frame, copied on the GPU (see
+        // ambientGlow.js) — the scene is never rendered a second time.
+        const pixels = await sampleViewportColour(engine, camera, height);
         if (stopped || !pixels) return;
         lastSample = now;
         place(rect);

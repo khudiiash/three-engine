@@ -43,6 +43,7 @@ import {
   SCRIPT_EXTENSIONS,
   HDRI_EXTENSIONS,
 } from "../assetLoader.js";
+import { sceneAssetRetargeted } from "../sceneIO.js";
 import { assetActions } from "../assetActions.js";
 import { CodeEditor } from "../components/CodeEditor.jsx";
 import { AudioScrubber } from "../components/AudioScrubber.jsx";
@@ -78,6 +79,7 @@ import { useModulesStore } from "../modules.js";
 import { prefabRegistry, resolvePrefab, isPrefabDef } from "../../engine/index.js";
 import { throttlePreviewFrame, stopPreviewRenderer } from "../previewLoop.js";
 
+import { Select } from "../fields/Select.jsx";
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 const stemOf = (name) => name.replace(/\.[^.]+$/, "");
 
@@ -228,6 +230,10 @@ async function renameAsset(path, newStem, { isDir = false } = {}) {
       // …and move what pointed at the old name: open tabs, the shared Monaco
       // model, and every entity whose Scripts component named this file.
       await retargetScriptPath(path, newPath);
+      // A renamed .scene takes the editor's scene record with it — the open
+      // path and project.json's references — so the next save writes the
+      // renamed file instead of recreating the old one.
+      await sceneAssetRetargeted(path, newPath);
     }
     await useProjectStore.getState().refresh();
     useSelectionStore.getState().selectAsset(newPath);
@@ -358,11 +364,11 @@ function TextureSettings({ path }) {
   };
 
   const wrapSelect = (key) => (
-    <select className="select-field" value={meta[key]} onChange={(e) => patch({ [key]: e.target.value })}>
+    <Select className="select-field" value={meta[key]} onChange={(e) => patch({ [key]: e.target.value })}>
       <option value="repeat">Repeat</option>
       <option value="clamp">Clamp</option>
       <option value="mirror">Mirror</option>
-    </select>
+    </Select>
   );
 
   const toggleBasis = async (enabled) => {
@@ -388,10 +394,10 @@ function TextureSettings({ path }) {
       <div className="section-header">Import Settings</div>
       <div className="field-row">
         <span className="field-label">Filtering</span>
-        <select className="select-field" value={meta.filter} onChange={(e) => patch({ filter: e.target.value })}>
+        <Select className="select-field" value={meta.filter} onChange={(e) => patch({ filter: e.target.value })}>
           <option value="linear">Linear</option>
           <option value="nearest">Nearest (pixel art)</option>
-        </select>
+        </Select>
       </div>
       <div className="field-row">
         <span className="field-label">Wrap U</span>
@@ -474,10 +480,10 @@ function MultiTextureSettings({ paths }) {
   const select = (key, options) => {
     const same = allSame((meta) => meta[key]);
     return (
-      <select className="select-field" value={same ? metas[0].meta[key] : ""} onChange={(event) => patch(() => ({ [key]: event.target.value }))}>
+      <Select className="select-field" value={same ? metas[0].meta[key] : ""} onChange={(event) => patch(() => ({ [key]: event.target.value }))}>
         {!same && <option value="">— Mixed —</option>}
         {options.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
-      </select>
+      </Select>
     );
   };
   const mixedCheckbox = (key, read = (meta) => meta[key]) => {
@@ -1222,17 +1228,17 @@ function MaterialSummary({ path }) {
         <div className="section-header">Pipeline</div>
         <div className="field-row">
           <span className="field-label">Cull Mode</span>
-          <select className="select-field" value={pipeline.cullMode} onChange={(event) => patchPipeline({ cullMode: event.target.value })}>
+          <Select className="select-field" value={pipeline.cullMode} onChange={(event) => patchPipeline({ cullMode: event.target.value })}>
             <option value="back">Back Faces</option>
             <option value="front">Front Faces</option>
             <option value="none">None (Double-Sided)</option>
-          </select>
+          </Select>
         </div>
         {toggle("depthTest", "Depth Test")}
         {toggle("depthWrite", "Depth Write")}
         <div className="field-row">
           <span className="field-label">Depth Function</span>
-          <select className="select-field" value={pipeline.depthFunc} disabled={!pipeline.depthTest} onChange={(event) => patchPipeline({ depthFunc: event.target.value })}>
+          <Select className="select-field" value={pipeline.depthFunc} disabled={!pipeline.depthTest} onChange={(event) => patchPipeline({ depthFunc: event.target.value })}>
             <option value="less-equal">Less or Equal</option>
             <option value="less">Less</option>
             <option value="equal">Equal</option>
@@ -1241,19 +1247,19 @@ function MaterialSummary({ path }) {
             <option value="not-equal">Not Equal</option>
             <option value="always">Always</option>
             <option value="never">Never</option>
-          </select>
+          </Select>
         </div>
         {toggle("colorWrite", "Color Write")}
         {toggle("transparent", "Transparent")}
         <div className="field-row">
           <span className="field-label">Blend Mode</span>
-          <select className="select-field" value={pipeline.blendMode} onChange={(event) => patchPipeline({ blendMode: event.target.value })}>
+          <Select className="select-field" value={pipeline.blendMode} onChange={(event) => patchPipeline({ blendMode: event.target.value })}>
             <option value="normal">Normal</option>
             <option value="additive">Additive</option>
             <option value="subtractive">Subtractive</option>
             <option value="multiply">Multiply</option>
             <option value="none">Disabled</option>
-          </select>
+          </Select>
         </div>
         {number("alphaTest", "Alpha Clip", { min: 0, max: 1, step: 0.01 })}
         {toggle("alphaHash", "Alpha Hash", "Stochastic alpha testing for dithered cutouts")}
@@ -1573,10 +1579,14 @@ function AssetSettingsSection({ paths }) {
       </div>
       <div className="asset-hint">
         {mode === "exclude"
-          ? "Stays in the project; never ships in a build."
-          : mode === "preload"
-            ? "Loaded up front — ready the moment the game starts."
-            : "Loaded on demand, the first time the scene needs it."}
+          ? "Stays in the project; never ships in a build, even when a scene references it."
+          : paths.every((path) => /\.prefab$/i.test(path))
+            ? mode === "preload"
+              ? "Always ships, even when no built scene spawns it — for a prefab only ever named at runtime."
+              : "Ships when a built scene, prefab or script can reach it; left out of the build otherwise."
+            : mode === "preload"
+              ? "Loaded up front — ready the moment the game starts."
+              : "Loaded on demand, the first time the scene needs it. Ships only if a built scene reaches it."}
       </div>
     </div>
   );

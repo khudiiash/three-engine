@@ -1,0 +1,67 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Foliage wind study</title>
+<style>html,body{margin:0;background:#b9ccd0;font:14px system-ui}canvas{display:block;width:100vw;height:100vh}nav{position:fixed;top:16px;left:16px;display:flex;gap:10px;align-items:center;background:#182e25e8;color:#fff;padding:10px 14px;border-radius:8px}select,button{font:inherit;padding:5px 8px}#status{position:fixed;bottom:14px;left:16px;color:#fff;background:#182e25dc;padding:8px 12px;border-radius:5px}</style></head>
+<body><canvas id="view"></canvas><nav><strong>Wind study</strong><select id="species"><option value="grass">Grass</option><option value="wildflowers">Flowers</option><option value="oak">Oak</option><option value="birch">Birch</option><option value="pine">Pine</option></select><select id="weather"><option value="gusty">Passing gusts</option><option value="steady">Steady breeze</option><option value="strong">Strong wind</option><option value="calm">Calm</option></select><button id="turn">Turn wind 90°</button></nav><div id="status">Preparing foliage…</div>
+<script type="module">
+try {
+  globalThis.__engineLimitsCap={maxStorageBuffersPerShaderStage:8};
+  const {Engine,THREE,registerBuiltInComponents}=await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const {enableEngineModule}=await import('/src/engine/modules.js');
+  const {FOLIAGE_SPECIES}=await import('/src/modules/foliage/foliageGeometry.js');
+  registerBuiltInComponents();
+  const engine=new Engine();engine.setSize(innerWidth,innerHeight);await engine.init(document.querySelector('canvas'));
+  if(!engine.renderer.backend.isWebGPUBackend)throw new Error('WebGPU is required');
+  await enableEngineModule(engine,'foliage');
+  engine.scene.background=new THREE.Color('#bdced0');
+  engine.scene.add(new THREE.HemisphereLight('#eaf5ff','#746444',2));
+  const sun=new THREE.DirectionalLight('#fff2db',3.5);sun.position.set(-7,12,8);engine.scene.add(sun);
+  sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);
+  Object.assign(sun.shadow.camera,{left:-16,right:16,top:16,bottom:-16,near:.1,far:60});sun.shadow.normalBias=.025;
+  engine.renderer.shadowMap.enabled=true;
+  const ground=engine.createEntity({id:'wind-study-ground',name:'Meadow'});
+  ground.setTransform({rotation:[-Math.PI/2,0,0],scale:[18,18,1]});ground.addComponent('mesh',{geometry:'plane'});
+  await Promise.resolve();
+  const floor=ground.getComponent('mesh').mesh;
+  floor.material=new THREE.MeshStandardNodeMaterial({color:'#6c7850',roughness:1});floor.receiveShadow=true;
+  const camera=new THREE.PerspectiveCamera(46,innerWidth/innerHeight,.03,200);engine.camera=camera;engine.scene.add(camera);
+  const layers=new Map();
+  for(const species of ['grass','wildflowers','oak','birch','pine']){
+    const meadow=['grass','wildflowers'].includes(species);
+    const entity=engine.createEntity({name:species});
+    const component=entity.addComponent('foliage',{...FOLIAGE_SPECIES[species],species,seed:42,
+      distribution:meadow?'scatter':'single',surface:meadow?ground.id:'',density:species==='grass'?12:3.5,
+      minSpacing:meadow ? .1 : 0,maxInstances:5000,minScale:.85,maxScale:1.15,
+      wind:true,interaction:false,lodNear:40,lodFar:65,maxDistance:100});
+    layers.set(species,component);
+  }
+  let selected='grass',weather='gusty',heading=0;
+  const status=()=>{const c=layers.get(selected);document.querySelector('#status').textContent=`${c.stats.instances.toLocaleString()} plants · Scene wind: ${weather} · ${c.stats.drawCalls} foliage draws`;};
+  const setWeather=(value='gusty')=>{
+    weather=value;const force=weather==='calm'?0:weather==='strong'?10:2;
+    engine.settings.wind={vector:[Math.cos(heading)*force,0,Math.sin(heading)*force],gust:weather==='strong'?10:weather==='gusty'?4:0,gustFrequency:1};
+    document.querySelector('#weather').value=weather;
+    status();
+  };
+  const show=(species='grass',value=weather)=>{
+    selected=species;const meadow=['grass','wildflowers'].includes(species),h=FOLIAGE_SPECIES[species].height;
+    for(const [name,c]of layers)c.entity.setVisibleInEditor(name===species);
+    if(meadow){camera.position.set(8,2.5,10);camera.lookAt(0,.35,0);}
+    else{camera.position.set(h*.86,h*.6,h*1.45);camera.lookAt(0,h*.49,0);}
+    camera.updateMatrixWorld(true);setWeather(value);document.querySelector('#species').value=species;
+  };
+  document.querySelector('#species').onchange=e=>show(e.target.value);
+  document.querySelector('#weather').onchange=e=>setWeather(e.target.value);
+  document.querySelector('#turn').onclick=()=>{heading+=Math.PI/2;setWeather(weather);};
+  addEventListener('resize',()=>{engine.setSize(innerWidth,innerHeight);camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();});
+  camera.position.set(16,12,22);camera.lookAt(0,2,0);camera.updateMatrixWorld(true);
+  setWeather();engine.start();
+  const deadline=performance.now()+90000;
+  while([...layers.values()].some(c=>!c.stats.impostorReady||(c.entity.visibleInEditor!==false&&c._foliageWarmup?.pending>0))&&performance.now()<deadline)await new Promise(r=>setTimeout(r,100));
+  if([...layers.values()].some(c=>!c.stats.impostorReady))throw new Error('Atlas preparation timed out');
+  show();
+  setInterval(status,500);status();
+  globalThis.__FOLIAGE_WIND_PREVIEW__={engine,layers,show,setWeather};
+  globalThis.__FOLIAGE_WIND_PREVIEW_READY__=true;
+}catch(error){console.error(error);document.querySelector('#status').textContent=error.message;globalThis.__FOLIAGE_WIND_PREVIEW_ERROR__=error.stack??String(error);}
+</script></body></html>

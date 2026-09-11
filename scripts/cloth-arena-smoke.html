@@ -1,0 +1,122 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"></head><body><script type="module">
+// THE CLOTH ARENA ON A REAL DEVICE.
+//
+// Two cloths — a plane and an imported-style mesh (a subdivided plane handed
+// over as a geometry asset) — plus a box collider entity, ticked for a couple
+// of seconds through the component's own tick and the arena's preRender, on
+// a device limited to the PORTABLE eight storage buffers per stage. Positions
+// are read back from the arena and judged: finite, moved, pinned row held,
+// nothing inside the box, the mesh cloth's render attribute written.
+import * as THREE from 'three/webgpu';
+import { Entity } from '/src/engine/Entity.js';
+import { ClothComponent } from '/src/engine/components/ClothComponent.js';
+import { ColliderComponent } from '/src/modules/physics-rapier/ColliderComponent.js';
+import { CLOTH_STEP } from '/src/engine/vfx/clothArenaPack.js';
+const check = (ok, message) => { if (!ok) throw new Error(message); console.log('CLOTH-ARENA:', message); };
+try {
+  const adapter = await navigator.gpu.requestAdapter(), device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } }), errors = [];
+  device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation:', e.error.message); });
+  const renderer = new THREE.WebGPURenderer({ device }); await renderer.init(); renderer.setSize(128, 128); document.body.append(renderer.domElement);
+  const updates = new Set(), preRenders = new Set();
+  const engine = {
+    renderer, entities: new Map(), deltaTime: 1 / 60, playing: false, settings: { wind: { vector: [0, 0, 1], gust: 0, gustFrequency: 1 } },
+    onUpdate: (fn) => { updates.add(fn); return () => updates.delete(fn); },
+    onPreRender: (fn) => { preRenders.add(fn); return () => preRenders.delete(fn); },
+    on: () => () => {}, emit: () => {},
+  };
+  const material = new THREE.MeshStandardNodeMaterial({ side: THREE.DoubleSide });
+  // A deliberately tiny first allocation, so joining these two cloths forces
+  // the arena through a stride rebuild AND a capacity rebuild — the path a
+  // real scene's curtains take at boot.
+  globalThis.__clothArenaInitial = { capacity: 256, stride: 8 };
+  globalThis.__clothArenaLog = true;
+  // A plane cloth.
+  const planeEntity = new Entity(engine, { id: 'plane', name: 'Plane' }); engine.entities.set(planeEntity.id, planeEntity);
+  planeEntity.object3D.position.set(0, 2, 0);
+  const planeMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material); planeEntity.object3D.add(planeMesh);
+  planeEntity.components.set('mesh', { mesh: planeMesh, props: { geometry: 'plane' }, enabled: true });
+  const planeCloth = new ClothComponent({ resolution: 24, pinning: 'top', gravity: 9.81, sceneCollision: true, collisionRadius: .03, windSource: 'scene' });
+  planeCloth.entity = planeEntity; planeEntity.components.set('cloth', planeCloth); planeCloth.onAttach();
+  // The live boot's shape: kernels run BEFORE the next cloth arrives and
+  // forces a rebuild, and a cloth detaches and re-attaches (a placeholder box
+  // swapped for the real geometry) while the arena is already dispatching.
+  const updates0 = [...updates], preRenders0 = [...preRenders];
+  const earlyFrame = () => { for (const fn of updates0) fn(); for (const fn of preRenders0) fn(); };
+  for (let i = 0; i < 5; i++) earlyFrame();
+  planeCloth.onDetach(); planeCloth.onAttach();
+  for (let i = 0; i < 3; i++) { for (const fn of updates) fn(); for (const fn of preRenders) fn(); }
+  // A "mesh" cloth: a subdivided plane presented as a geometry asset, laid
+  // FLAT (local y -> world -z) a metre up and unpinned, so it falls onto the slab.
+  const meshEntity = new Entity(engine, { id: 'curtain', name: 'Curtain' }); engine.entities.set(meshEntity.id, meshEntity);
+  meshEntity.object3D.position.set(3, 1, 0); meshEntity.object3D.rotation.x = -Math.PI / 2;
+  const curtainGeometry = new THREE.PlaneGeometry(1.5, 2, 20, 28);
+  const curtainMesh = new THREE.Mesh(curtainGeometry, material); meshEntity.object3D.add(curtainMesh);
+  meshEntity.components.set('mesh', { mesh: curtainMesh, props: { geometry: 'box', geometryAsset: 'curtain.geom' }, enabled: true });
+  const meshCloth = new ClothComponent({ pinning: 'none', gravity: 9.81, sceneCollision: true, collisionRadius: .03 });
+  meshCloth.entity = meshEntity; meshEntity.components.set('cloth', meshCloth); meshCloth.onAttach();
+  // A box collider under both, and a concave one (a thin slab) under the curtain.
+  const boxEntity = new Entity(engine, { id: 'box', name: 'Box' }); engine.entities.set(boxEntity.id, boxEntity);
+  boxEntity.object3D.position.set(0, .3, 0);
+  const box = new ColliderComponent({ shape: 'box', size: [1, .6, 1] }); box.entity = boxEntity; boxEntity.components.set('collider', box);
+  const slabEntity = new Entity(engine, { id: 'slab', name: 'Slab' }); engine.entities.set(slabEntity.id, slabEntity);
+  slabEntity.object3D.position.set(3, .2, 0);
+  const slabMesh = new THREE.Mesh(new THREE.BoxGeometry(3, .1, 3), material); slabMesh.userData.entityId = slabEntity.id; slabEntity.object3D.add(slabMesh);
+  const slab = new ColliderComponent({ shape: 'concave' }); slab.entity = slabEntity; slabEntity.components.set('collider', slab);
+
+  check(planeCloth.simulation?.arena && meshCloth.simulation?.arena, 'both cloths joined the arena');
+  const arena = planeCloth.simulation.arena;
+  check(arena.members.size === 2, `two members (${arena.members.size})`);
+  check(arena.rebuilds >= 2 && arena.capacity >= 1024 && arena.stride >= 12, `the arena rebuilt itself on the way (${arena.rebuilds} rebuilds, capacity ${arena.capacity}, stride ${arena.stride})`);
+  await device.queue.onSubmittedWorkDone();
+  check(!errors.length, `no GPU errors across the rebuilds and the re-attach (${errors.length})`);
+  check(meshCloth.simulation.member.base !== planeCloth.simulation.member.base, 'members occupy different ranges');
+  const frame = () => { for (const fn of updates) fn(); for (const fn of preRenders) fn(); };
+  const readback = async (sim) => {
+    await device.queue.onSubmittedWorkDone();
+    const raw = new Float32Array(await renderer.getArrayBufferAsync(sim.solved.positions.value));
+    return raw.subarray(sim.solved.base * 4, (sim.solved.base + sim.solved.count) * 4);
+  };
+  frame();
+  check(arena.stats.steps === 6, `six steps at 60 fps (${arena.stats.steps})`);
+  check(arena.stats.dispatches === 6 + 2, `six steps plus two surfaces in one submission (${arena.stats.dispatches})`);
+  for (let i = 0; i < 150; i++) frame();
+  const planeData = await readback(planeCloth.simulation), meshData = await readback(meshCloth.simulation);
+  check([...planeData, ...meshData].every(Number.isFinite), 'every position is finite');
+  const rest = planeCloth.simulation.member.topology.rest;
+  let moved = 0, worstBox = 0;
+  for (let v = 0; v < planeCloth.simulation.count; v++) {
+    const d = Math.hypot(planeData[v * 4] - rest[v * 4], planeData[v * 4 + 1] - rest[v * 4 + 1], planeData[v * 4 + 2] - rest[v * 4 + 2]);
+    moved = Math.max(moved, d);
+    // World: the plane's local (x, y) plus the entity's (0, 2, 0); the box spans y 0..0.6, x/z ±0.5.
+    const wx = planeData[v * 4], wy = planeData[v * 4 + 1] + 2, wz = planeData[v * 4 + 2];
+    if (Math.abs(wx) < .5 && Math.abs(wz) < .5 && wy < .6 - .03 + 1e-3) worstBox = Math.max(worstBox, .6 - wy);
+  }
+  check(moved > .05, `the plane cloth moved (${moved.toFixed(3)} m)`);
+  check(worstBox === 0, `no plane particle inside the box (worst ${worstBox.toFixed(4)} m)`);
+  for (let ix = 0; ix < 24; ix++) check(Math.abs(planeData[ix * 4 + 1] - rest[ix * 4 + 1]) < 1e-5, ix === 0 ? 'the pinned row held' : 'pinned');
+  const status = arena.describe(meshCloth.simulation.member);
+  check(status.member.grid && status.member.grid.triangles === 12, `the curtain's grid holds the slab's 12 triangles (${JSON.stringify(status.member.grid)})`);
+  let curtainMoved = 0, lowest = Infinity;
+  const curtainRest = meshCloth.simulation.member.topology.rest;
+  for (let v = 0; v < meshCloth.simulation.count; v++) {
+    curtainMoved = Math.max(curtainMoved, Math.hypot(meshData[v * 4] - curtainRest[v * 4], meshData[v * 4 + 1] - curtainRest[v * 4 + 1], meshData[v * 4 + 2] - curtainRest[v * 4 + 2]));
+    lowest = Math.min(lowest, meshData[v * 4 + 2] + 1);   // world y = local z + 1 under the rotation
+  }
+  check(curtainMoved > .05, `the curtain moved (${curtainMoved.toFixed(3)} m)`);
+  check(lowest >= .25 + .03 - 2e-3 && lowest < .25 + .03 + .05, `the sheet fell 0.7 m and rests on the slab (lowest world y ${lowest.toFixed(4)}, slab top 0.25)`);
+  const written = new Float32Array(await renderer.getArrayBufferAsync(meshCloth.simulation.geometry.getAttribute('position')));
+  check(written.length >= meshCloth.simulation.vertexCount * 3 && Math.abs(written[1] - meshData[1]) < 1e-6, 'the render attribute carries the solved positions');
+  // Leaving: the other cloth keeps solving in the same arena.
+  meshCloth.onDetach();
+  check(arena.members.size === 1, 'the curtain left the arena');
+  const before = (await readback(planeCloth.simulation)).slice();
+  for (let i = 0; i < 30; i++) frame();
+  const after = await readback(planeCloth.simulation);
+  let still = 0; for (let v = 0; v < after.length; v++) still = Math.max(still, Math.abs(after[v] - before[v]));
+  check(still > 1e-6, 'the plane cloth kept simulating after its neighbour left');
+  await device.queue.onSubmittedWorkDone();
+  check(!errors.length, 'portable eight-storage device has no GPU errors');
+  planeCloth.onDetach();
+  console.log('CLOTH-ARENA PASS'); globalThis.__VFX_SMOKE_RESULT__ = { pass: true, stepHz: 1 / CLOTH_STEP };
+} catch (error) { console.error(error.stack); globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: String(error.stack) }; }
+</script></body></html>

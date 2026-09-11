@@ -287,3 +287,76 @@ test("the ASYNC pipeline calls are charged for their synchronous half only", asy
   assert.ok(row, "and it is named in the offender table, so a report says WHICH pipeline");
   assert.equal(row.count, 1);
 });
+
+test("a spanless block names the synchronous pipelines the GPU process was handed before it", () => {
+  // THE 21.5-SECOND BLOCK OF 2026-09-09 read `(unattributed) 21528`, `gpu:
+  // null`: no engine span, no GPU call inside it. It followed ten synchronous
+  // `createRenderPipeline` calls of a 70 kB program, each of which returned
+  // at once and parked the GPU process's command thread for its compile — so
+  // the page's main thread blocked, later, in a task of its own. The ledger
+  // now keeps those creations past their task window and charges a block
+  // that nothing marked with them.
+  reset();
+  const module = {};
+  const device = {
+    createShaderModule(d) { return module; },
+    createRenderPipeline(d) { return { d }; },
+  };
+  installGpuCallLedger(device);
+  device.createShaderModule({ label: "fragment_Foliage", code: "x".repeat(70_000) });
+  for (let i = 0; i < 3; i++) {
+    device.createRenderPipeline({ label: "renderPipeline_Foliage · living surface_226", fragment: { module }, vertex: { module } });
+  }
+  // The task in which those calls ran: attributed to the calls themselves.
+  const t0 = performance.now();
+  freeze.recordTask(t0 - 5, 60);
+  // Later, a block with nothing in it.
+  busy(2);
+  const at = performance.now();
+  const task = freeze.recordTask(at, 400);
+  assert.ok(task.gpuLoad, "the block carries what the GPU process had been handed");
+  assert.equal(task.gpuLoad.syncRecent.count, 3);
+  assert.ok(task.gpuLoad.syncRecent.kB >= 136, `sized by the shader text, got ${task.gpuLoad.syncRecent.kB} kB`);
+  assert.match(task.gpuLoad.syncRecent.names[0], /Foliage · living surface.*x3/);
+  const report = freeze.read();
+  assert.equal(report.stalls.waitingBlocks, 1);
+  assert.equal(report.stalls.waitingOnGpuMs, 400);
+
+  // Cleared, the history goes with it: the next block is not blamed on a
+  // compile from before the A/B began.
+  freeze.clear();
+  const later = freeze.recordTask(performance.now(), 300);
+  assert.equal(later.gpuLoad, undefined);
+});
+
+test("a block with an engine span in it is not charged to the GPU process", () => {
+  reset();
+  const device = { createRenderPipeline(d) { return { d }; } };
+  installGpuCallLedger(device);
+  device.createRenderPipeline({ label: "renderPipeline_x" });
+  const from = performance.now();
+  const token = freeze.begin("scene:instantiate");
+  busy(30);
+  freeze.end(token);
+  const task = freeze.recordTask(from, performance.now() - from);
+  assert.equal(task.gpuLoad, undefined, "the block has an owner; the compile is not it");
+});
+
+test("the shader text handed to the device is canonical, and the report scores it", () => {
+  reset();
+  const seen = [];
+  const device = { createShaderModule(d) { seen.push(d.code); return {}; } };
+  installGpuCallLedger(device);
+  device.createShaderModule({ label: "compute_k", code: "var<storage> NodeBuffer_55143 : array<u32>; fn main() { let a = NodeBuffer_55143[0]; }" });
+  assert.equal(seen[0], "var<storage> NodeBuffer_0 : array<u32>; fn main() { let a = NodeBuffer_0[0]; }");
+  const wgsl = freeze.read().wgsl;
+  assert.ok(wgsl && wgsl.modules >= 1);
+  assert.ok(wgsl.renamed >= 1);
+  globalThis.__wgslCanonical = false;
+  try {
+    device.createShaderModule({ label: "compute_raw", code: "var<storage> NodeBuffer_9 : array<u32>;" });
+    assert.equal(seen[1], "var<storage> NodeBuffer_9 : array<u32>;", "the hatch sends three's text through");
+  } finally {
+    delete globalThis.__wgslCanonical;
+  }
+});

@@ -94,7 +94,7 @@ export class ParticleComponent extends Component {
   static label = "Particles";
   static defaults = { asset: "", graph: null };
   // The node editor (Window → Particles) is the real UI; nothing to inspect here.
-  static schema = [{ key: "asset", label: "Particle graph", type: "asset", exts: ["vfx"] }];
+  static schema = [{ key: "asset", label: "Particle graph", type: "asset", exts: ["vfx"] }, { key: "runInEditor", label: "Run In Editor", type: "boolean" }];
 
   get effectiveGraph() {
     return this._vfxAssetGraph ?? this.props.graph ?? (this.props.startColor !== undefined ? legacyPropsToGraph(this.props) : DEFAULT_PARTICLE_GRAPH);
@@ -133,6 +133,8 @@ export class ParticleComponent extends Component {
       // editor). See Engine.suspendSimulation: advancing the rest of the
       // scene while the user is inside one mesh is pure interference.
       if (this.entity.engine.simulationSuspended === true) return;
+      // "Run In Editor" (default off): freeze the particle sim while editing.
+      if (!this.shouldAnimate) return;
       this.#tick();
     });
   }

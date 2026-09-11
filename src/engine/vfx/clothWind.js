@@ -24,6 +24,25 @@
 /** The solver's own defaults, so "scene" never means "no wind at all". */
 export const SCENE_WIND_DEFAULTS = { vector: [0, 0, 2], gust: 0, gustFrequency: 1 };
 
+/**
+ * ⭐ THE SCENE'S WIND, AND WHO IS ALLOWED TO SPEAK FOR IT.
+ *
+ * `engine.settings.wind` is the AUTHORED wind — one field in Scene Settings,
+ * saved with the scene. `engine.windOverride` is a LIVE wind installed by a
+ * system that owns the weather (the `atmosphere` module), and while one is
+ * installed it wins.
+ *
+ * ⚠ AND IT IS A SEPARATE FIELD ON PURPOSE. The obvious implementation is for
+ * the weather to write `engine.settings.wind` directly — but `serialize.js`
+ * saves `structuredClone(engine.settings)`, so whatever gust happened to be
+ * blowing when the user pressed Save would be written into the scene file as
+ * its authored wind. The override is read here, by everything that asks what
+ * the wind is doing, and it never touches what the scene remembers.
+ */
+export function sceneWind(engine) {
+  return engine?.windOverride ?? engine?.settings?.wind ?? null;
+}
+
 const finite = (value, fallback, min, max) =>
   Number.isFinite(Number(value)) ? Math.min(max, Math.max(min, Number(value))) : fallback;
 

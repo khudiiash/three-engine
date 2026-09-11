@@ -8,9 +8,11 @@ import {
   isMaterialRenderable,
   subscribeMaterial,
 } from "../materialAsset.js";
-import { acquireGeometryAsset, disposeOrReleaseGeometry } from "../geometryAsset.js";
+import { acquireGeometryAsset, acquirePrimitiveGeometry, disposeOrReleaseGeometry } from "../geometryAsset.js";
 import { applyCastShadow } from "../shadowMerge.js";
 
+// Factories, not instances: each primitive is built ONCE, on first use, by
+// `primitiveGeometry` below, and then shared by every mesh that shows it.
 const geometryFactories = {
   box: () => new THREE.BoxGeometry(1, 1, 1),
   sphere: () => new THREE.SphereGeometry(0.5, 32, 16),
@@ -23,6 +25,19 @@ const geometryFactories = {
   cone: () => new THREE.ConeGeometry(0.5, 1, 32),
   torus: () => new THREE.TorusGeometry(0.4, 0.15, 16, 48),
 };
+
+/**
+ * The SHARED instance of the primitive `kind` names (an unknown name falls back
+ * to the box, as the schema's select does). Every mesh showing the same
+ * primitive renders the same BufferGeometry — that is what lets
+ * `engine/batching.js` instance them, and it is the same deal a `.geom` gets
+ * from `acquireGeometryAsset`. So it is borrowed, not owned: hand it back
+ * through `#releaseGeometry`, never `dispose()` it.
+ */
+function primitiveGeometry(kind) {
+  const name = geometryFactories[kind] ? kind : "box";
+  return acquirePrimitiveGeometry(name, geometryFactories[name]);
+}
 
 /**
  * Geometry + a material asset reference. All surface properties live in the
@@ -186,8 +201,7 @@ export class MeshComponent extends Component {
   }
 
   onAttach() {
-    const makeGeometry = geometryFactories[this.props.geometry] ?? geometryFactories.box;
-    this.mesh = new THREE.Mesh(makeGeometry(), getDefaultMaterial());
+    this.mesh = new THREE.Mesh(primitiveGeometry(this.props.geometry), getDefaultMaterial());
     this.mesh.userData.entityId = this.entity.id;
     applyCastShadow(this.mesh, !!this.props.castShadow, this.entity.engine);
     this.mesh.receiveShadow = !!this.props.receiveShadow;
@@ -221,11 +235,11 @@ export class MeshComponent extends Component {
   }
 
   /**
-   * Drops this mesh's claim on `geometry`. Geometry loaded from a `.geom` is a
-   * SHARED instance (see geometryAsset.js) that other meshes may still be
-   * rendering, so it must be refcount-released rather than disposed outright;
-   * anything else (a primitive we built, an evaluated modifier result) is ours
-   * alone and is disposed.
+   * Drops this mesh's claim on `geometry`. Geometry loaded from a `.geom` AND
+   * every built-in primitive are SHARED instances (see geometryAsset.js) that
+   * other meshes may still be rendering, so they are refcount-released rather
+   * than disposed outright; anything else (an evaluated modifier result, an
+   * Edit Mode result) is ours alone and is disposed.
    */
   /**
    * Write `visible` from this component's own authored state — UNLESS a
@@ -381,7 +395,7 @@ export class MeshComponent extends Component {
       this._geometryAssetLoading = false;
       console.warn(`Mesh "${this.entity?.name ?? this.entity?.id}" uses a volume .mat — snapping geometry to box for correct raymarch bounds.`);
       this.#releaseGeometry(this.mesh.geometry);
-      this.mesh.geometry = new THREE.BoxGeometry(1, 1, 1);
+      this.mesh.geometry = primitiveGeometry("box");
       this.props.geometry = "box";
       this.props.geometryAsset = "";
     }
@@ -436,8 +450,7 @@ export class MeshComponent extends Component {
         this._geometryAssetLoading = false;
         this.#settleAssetWaiters();
         this.#releaseGeometry(this.mesh.geometry);
-        const makeGeometry = geometryFactories[this.props.geometry] ?? geometryFactories.box;
-        this.mesh.geometry = makeGeometry();
+        this.mesh.geometry = primitiveGeometry(this.props.geometry);
       }
     } else if (key === "material") {
       this.sharedGeneration = (this.sharedGeneration ?? 0) + 1;

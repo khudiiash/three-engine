@@ -1,0 +1,47 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Impostor lighting continuity</title></head><body><canvas id="view"></canvas><script type="module">
+import * as THREE from 'three/webgpu';
+import {bakeImpostorAtlas} from '/src/engine/lod/impostorBake.js';
+import {createImpostorGeometry,createImpostorMaterial} from '/src/engine/lod/impostorMaterial.js';
+import {createFoliagePrototype} from '/src/modules/foliage/foliageGeometry.js';
+import {createFoliageSurfaceMaterial} from '/src/modules/foliage/foliageMaterial.js';
+const assert=(value,message)=>{if(!value)throw new Error(message);};
+try {
+  const renderer=new THREE.WebGPURenderer({canvas:document.querySelector('#view'),antialias:false});
+  await renderer.init();renderer.setSize(256,256);renderer.toneMapping=THREE.NoToneMapping;
+  assert(renderer.backend.isWebGPUBackend,'real WebGPU required');
+  const errors=[];renderer.backend.device.addEventListener('uncapturederror',event=>errors.push(event.error.message));
+  const target=new THREE.RenderTarget(256,256,{type:THREE.FloatType});target.texture.colorSpace=THREE.LinearSRGBColorSpace;
+  const scene=new THREE.Scene(),camera=new THREE.OrthographicCamera(-1,1,1,-1,.01,20);
+  const ambient=new THREE.AmbientLight(0xffffff,1),sun=new THREE.DirectionalLight(0xffffff,Math.PI);scene.add(ambient,sun,sun.target);
+  renderer.setClearColor(0,0);
+  const capture=async()=>{renderer.setRenderTarget(target);await renderer.compileAsync(scene,camera);renderer.render(scene,camera);const pixels=await renderer.readRenderTargetPixelsAsync(target,0,0,256,256);renderer.setRenderTarget(null);let count=0,rgb=[0,0,0];for(let i=0;i<pixels.length;i+=4)if(pixels[i+3]>.99){count++;for(let c=0;c<3;c++)rgb[c]+=pixels[i+c];}return {count,rgb:rgb.map(v=>v/Math.max(1,count))};};
+  const results=[];
+  for(const kind of ['card','grass','grass-runtime']){
+    const props={species:'grass',seed:42,height:.65,width:.65,...(kind==='grass-runtime'?{leafColor:'#4d6a29'}:{})};
+    const geometry=kind==='card'?new THREE.PlaneGeometry(1,1):createFoliagePrototype(props,1);
+    const material=kind==='card'?new THREE.MeshStandardNodeMaterial({color:new THREE.Color().setRGB(.22,.65,.09),roughness:1,metalness:0,side:THREE.DoubleSide}):createFoliageSurfaceMaterial(props);
+    const source=new THREE.Mesh(geometry,material);scene.add(source);
+    const atlas=await bakeImpostorAtlas(renderer,source,kind==='grass-runtime'?{frames:4,tile:64,hemisphere:true}:{frames:5,tile:96,hemisphere:false});
+    const farGeometry=createImpostorGeometry(1),attrs=farGeometry.attributes;
+    attrs.aCenter.setXYZ(0,...atlas.center.toArray());attrs.aSize.setX(0,atlas.radius*2);attrs.aAxisX.setXYZ(0,1,0,0);attrs.aAxisY.setXYZ(0,0,1,0);farGeometry.instanceCount=1;
+    const far=new THREE.Mesh(farGeometry,createImpostorMaterial(atlas,{alphaTest:.35,roughness:1}));far.frustumCulled=false;scene.add(far);
+    const extent=atlas.radius*1.12;camera.left=-extent;camera.right=extent;camera.top=extent;camera.bottom=-extent;camera.updateProjectionMatrix();
+    for(const side of [1,-1])for(const light of ['ambient','directional']){
+      camera.position.copy(atlas.center).add(new THREE.Vector3(0,kind==='grass-runtime'?.75:0,side*4));camera.lookAt(atlas.center);
+      ambient.intensity=light==='ambient'?(kind==='grass-runtime'?.2:1):0;sun.intensity=light==='directional'?Math.PI:0;sun.position.copy(camera.position);sun.target.position.copy(atlas.center);
+      source.visible=true;far.visible=false;const near=await capture();source.visible=false;far.visible=true;const distant=await capture();
+      results.push({kind,side,light,near,distant,ratio:distant.rgb.map((v,i)=>v/Math.max(near.rgb[i],1e-8))});
+    }
+    scene.remove(source,far);geometry.dispose();material.dispose();farGeometry.dispose();far.material.dispose();atlas.dispose();
+  }
+  console.log('IMPOSTOR LIGHTING MEASURE',JSON.stringify(results));
+  const checks=[];
+  for(const row of results){
+    const tolerance=row.kind==='card'?.025:row.kind==='grass'?.07:.2;
+    checks.push(row.near.count>20&&row.distant.count>20&&row.ratio.every(value=>value>1-tolerance&&value<1+tolerance));
+  }
+  assert(checks.every(Boolean),'near/far absolute linear RGB differs beyond the capture approximation');
+  assert(!errors.length,errors.join('\n'));
+  globalThis.__IMPOSTOR_LIGHTING_RESULT__={pass:true,results,errors};
+}catch(error){console.error(error.stack??error);globalThis.__IMPOSTOR_LIGHTING_RESULT__={pass:false,error:String(error.stack??error)};}
+</script></body></html>

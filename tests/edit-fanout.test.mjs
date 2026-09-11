@@ -172,15 +172,16 @@ test("the real components' structural keys are the ones the listeners need", asy
   const engine = makeEngine();
   const entity = engine.createEntity({ name: "Probe" });
 
-  // A light's intensity/colour write in place; its `kind`/`castShadow`/csm
-  // shape replace the THREE.Light (LightComponent.onPropChanged).
+  // A light's intensity/colour write in place, and since 2026-09-10 so does
+  // `castShadow` (LightComponent.#castShadowInPlace keeps the THREE.Light);
+  // its `kind`/`shadowMode`/csm shape still replace the THREE.Light.
   const LightComponent = getComponentClass("light");
   const light = new LightComponent();
   light.entity = entity;
-  for (const key of ["intensity", "color", "shadowBias", "shadowCamSize", "csmSplitLambda"]) {
+  for (const key of ["intensity", "color", "shadowBias", "shadowCamSize", "csmSplitLambda", "castShadow"]) {
     assert.equal(light.isStructuralProp(key), false, `light.${key} must not be structural`);
   }
-  for (const key of ["kind", "castShadow", "shadowMode", "csm"]) {
+  for (const key of ["kind", "shadowMode", "csm"]) {
     assert.equal(light.isStructuralProp(key), true, `light.${key} must be structural`);
   }
 

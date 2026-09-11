@@ -1,0 +1,216 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Foliage WebGPU verification</title>
+<style>html,body{margin:0;background:#19231f;color:#edf3e9;font:14px system-ui}canvas{display:block;width:960px;height:600px}#status{padding:10px}</style></head>
+<body><canvas id="view"></canvas><div id="status">Foliage: checking real GPU rendering…</div><script type="module">
+const assert = (ok, message) => { if (!ok) throw new Error(message); };
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const until = async (check, label, timeout = 30000) => {
+  const deadline = performance.now() + timeout;
+  while (!check() && performance.now() < deadline) await delay(100);
+  assert(check(), label);
+};
+const difference = (a, b) => { let pixels = 0, energy = 0; for (let i = 0; i < a.length; i += 4) {
+  const d = Math.abs(a[i] - b[i]) + Math.abs(a[i+1] - b[i+1]) + Math.abs(a[i+2] - b[i+2]);
+  if (d > 3) pixels++; energy += d;
+} return { pixels, energy }; };
+try {
+  globalThis.__editorKeepRendering = true;
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  globalThis.__giSrcProbes = true;
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const { enableEngineModule, disableEngineModule } = await import('/src/engine/modules.js');
+  const { FOLIAGE_SPECIES } = await import('/src/modules/foliage/foliageGeometry.js');
+  registerBuiltInComponents();
+  const engine = new Engine(); globalThis.__FOLIAGE_ENGINE__ = engine;
+  engine.setSize(640, 400); await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer, errors = [];
+  assert(renderer.backend.isWebGPUBackend, 'real WebGPU required');
+  assert(renderer.backend.device.limits.maxStorageBuffersPerShaderStage === 8, 'portable eight-buffer device');
+  renderer.backend.device.addEventListener('uncapturederror', event => { errors.push(event.error.message); console.error('WebGPU validation', event.error.message); });
+  for (const id of ['foliage', 'terrain', 'physics-rapier']) await enableEngineModule(engine, id);
+  engine.scene.background = new THREE.Color('#8ca5aa');
+  const camera = new THREE.PerspectiveCamera(48, 1.6, .1, 1000);
+  camera.position.set(17, 11, 21); camera.lookAt(0, 2, 0); engine.camera = camera; engine.scene.add(camera);
+  const ambient = new THREE.AmbientLight('#d5e7ff', 1.2); engine.scene.add(ambient);
+  const sun = new THREE.DirectionalLight('#fff2d9', 3); sun.position.set(-4, 9, 6); engine.scene.add(sun);
+  const terrainEntity = engine.createEntity({ name: 'Foliage ground' });
+  const terrain = terrainEntity.addComponent('terrain', { size: 24, resolution: 8, splatResolution: 16 });
+  const plants = [];
+  for (const [i, species] of ['oak', 'pine', 'birch', 'grass', 'wildflowers'].entries()) {
+    const entity = engine.createEntity({ name: species });
+    entity.object3D.position.set(-7 + i * 3.5, 0, i > 2 ? 4 : 0);
+    plants.push(entity.addComponent('foliage', { ...FOLIAGE_SPECIES[species], species, seed: 42,
+      distribution: 'single', wind: false, interaction: false, lodNear: 45, lodFar: 80, maxDistance: 250 }));
+  }
+  const patchEntity = engine.createEntity({ name: 'Anchored grass patch' });
+  const patch = patchEntity.addComponent('foliage', { ...FOLIAGE_SPECIES.grass, species: 'grass', distribution: 'scatter',
+    surface: terrainEntity.id, density: 1.5, maxInstances: 900, seed: 22, minSpacing: .2,
+    wind: false, interaction: false, chunkSize: 12, lodNear: 45, lodFar: 80, maxDistance: 250 });
+  engine.start();
+  await until(() => plants.every(p => p.stats?.instances === 1) && patch.stats?.instances > 500, 'procedural plants and terrain scatter build');
+  assert(patch.stats.drawCalls < 12, `scatter batches plants: ${JSON.stringify(patch.stats)}`);
+  const near = { ...patch.stats };
+  console.log('FOLIAGE near', JSON.stringify(near));
+  await until(() => [...plants, patch].every(p => p.stats.impostorReady), 'prototype atlas baking completes', 60000);
+  const target = new THREE.RenderTarget(640, 400);
+  target.texture.internalFormat = navigator.gpu.getPreferredCanvasFormat();
+  renderer.initRenderTarget(target);
+  const settleWarmup = async () => {
+    if (engine.loopActive === false) return;
+    await until(() => [...plants,patch].every(component => !(component._foliageWarmup?.pending > 0)), 'foliage async material warmup settles before manual render targets', 60000);
+  };
+  const settleIrradiance = async (gi, label) => {
+    const deadline = performance.now() + 30000;
+    let nonzero = 0, samples = 0;
+    while (performance.now() < deadline) {
+      await settleWarmup();
+      const texture = gi.state?.light?.giIrradianceNode?.value;
+      if (texture) {
+        const values = await renderer.backend.copyTextureToBuffer(texture, 0, 0, texture.image.width, texture.image.height);
+        nonzero = values.reduce((n,v,i)=>n+(i%4!==3&&v!==0?1:0),0); samples++;
+        if (nonzero > 20) { console.log('FOLIAGE field readiness', JSON.stringify({label,samples,nonzero,frame:gi._frame})); return; }
+      }
+      await delay(200);
+    }
+    assert(false, `${label} requires positive irradiance; ${samples} readbacks, ${nonzero} nonzero channels`);
+  };
+  const capture = async () => {
+    await settleWarmup();
+    engine.stop();
+    renderer.setRenderTarget(target); renderer.render(engine.scene, camera);
+    const pixels = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 640, 400);
+    renderer.setRenderTarget(null); return pixels;
+  };
+  const captureIrradianceContribution = async gi => {
+    // Keep the compiled light graph identical in both captures. Removing and
+    // adding lights recompiles every material and can defer the first draw.
+    const node = gi.state.light.giIrradianceNode, original = node.value;
+    const black = new THREE.DataTexture(new Uint16Array(original.image.width * original.image.height * 4), original.image.width, original.image.height, THREE.RGBAFormat, THREE.HalfFloatType);
+    black.minFilter = original.minFilter; black.magFilter = original.magFilter; black.needsUpdate = true;
+    try {
+      renderer.setRenderTarget(target); await renderer.compileAsync(engine.scene, camera);
+      node.value = black; await capture(); const off = await capture();
+      node.value = original; await capture(); const on = await capture();
+      return { difference: difference(off,on), offSum: off.reduce((a,b)=>a+b,0), onSum: on.reduce((a,b)=>a+b,0) };
+    } finally { node.value = original; black.dispose(); renderer.setRenderTarget(null); }
+  };
+  const still = await capture();
+  patch.setProp('wind', true); patch.setProp('windStrength', .9); engine.start(); await delay(650);
+  const wind = difference(still, await capture());
+  assert(wind.pixels > 20, `wind changes rendered foliage pixels: ${JSON.stringify(wind)}`);
+  patch.setProp('wind', false); engine.start(); await delay(200); const noActor = await capture();
+  const actor = engine.createEntity({ name: 'Foliage interaction actor' }); actor.object3D.position.set(1, .5, 5);
+  actor.addComponent('collider', { shape: 'sphere', radius: 2.5, autoFit: false, autoCenter: false });
+  patch.setProp('interaction', true); patch.setProp('interactionRadius', 2); patch.setProp('interactionStrength', .9);
+  engine.start(); await delay(800); const interaction = difference(noActor, await capture());
+  assert(interaction.pixels > 10, `collider bends actual foliage: ${JSON.stringify(interaction)}`);
+  patch.setProp('interaction', false);
+  camera.position.set(0, 20, 120); camera.lookAt(0, 2, 0); engine.start();
+  await until(() => patch.stats?.impostorReady && patch.stats?.impostorChunks === patch.stats?.chunks, 'all grass cells reach the distant camera LOD', 60000);
+  const far = { ...patch.stats }; await capture();
+  assert(far.triangles < near.triangles / 5, `impostors reduce geometry: near ${near.triangles}, far ${far.triangles}`);
+  camera.position.set(0, 20, 500); engine.start(); await delay(300);
+  assert(patch.stats.drawCalls === 0, 'beyond-range foliage draws nothing');
+  camera.position.set(17, 11, 21); camera.lookAt(0, 2, 0);
+  // Opaque foliage participates in the existing deferred GI receiver path.
+  await enableEngineModule(engine, 'gi');
+  ambient.removeFromParent();
+  engine.scene.background = new THREE.Color('#ffffff'); engine.scene.environmentIntensity = 2;
+  const bounceWall = new THREE.Mesh(new THREE.BoxGeometry(24, 10, .3), new THREE.MeshStandardNodeMaterial({ color: '#ddd6bf', roughness: 1 }));
+  bounceWall.position.set(0, 5, -9); engine.scene.add(bounceWall);
+  const emitter = new THREE.Mesh(new THREE.BoxGeometry(10, .2, 4), new THREE.MeshStandardNodeMaterial({ color: '#fff2d5', emissive: '#fff2d5', emissiveIntensity: 6 }));
+  emitter.position.set(0, 6, 1); engine.scene.add(emitter);
+  engine.createEntity({ name: 'Foliage GI' }).addComponent('global-illumination', { bounce: .25, ao: 0, reflections: 0 });
+  await until(() => engine.modules.get('gi')?.system?._fieldReadyOnce && !engine.renderSuspended, 'GI field settles', 70000);
+  await until(() => engine.modules.get('gi')?.system?._firstGatherLogged && !engine.modules.get('gi')?.system?._compileWaveActive, 'GI diffuse gather dispatches', 70000);
+  const gi = engine.modules.get('gi').system;
+  await delay(2000); await settleIrradiance(gi, 'near GI'); engine.stop();
+  assert(gi.state?.light, 'active GI light exists');
+  const irrTexture = gi.state.light.giIrradianceNode.value;
+  const irrPixels = await renderer.backend.copyTextureToBuffer(irrTexture, 0, 0, irrTexture.image.width, irrTexture.image.height);
+  console.log('FOLIAGE irradiance diagnostic', JSON.stringify({ nonzero: irrPixels.reduce((n, v, i) => n + (i % 4 !== 3 && v !== 0 ? 1 : 0), 0), max: irrPixels.reduce((n,v)=>Math.max(n,v),0), type: irrPixels.constructor.name, count: irrPixels.length, intensity: gi.state.light.intensityUniform.value, frame:gi._frame, gather:gi._firstGatherLogged,wave:gi._compileWaveActive,dispatches:gi._giDispatchedLastFrame }));
+  console.log('FOLIAGE control diagnostic', JSON.stringify(await captureIrradianceContribution(gi)));
+  terrain.mesh.visible = false; bounceWall.visible = false; emitter.visible = false;
+  // The deferred texture already contains its intensity multiplier. Zero only
+  // that uniform's sampled texture, preserving source gbuffer, direct lighting
+  // and shader identities; restore the positive field for the second capture.
+  const nearContribution = await captureIrradianceContribution(gi);
+  const giReception = nearContribution.difference;
+  console.log('FOLIAGE GI diagnostic', JSON.stringify({ giReception, ...nearContribution, light: gi.state.light.type, patch: patch.stats }));
+  assert(giReception.pixels > 20, `GI lights foliage with source ground hidden: ${JSON.stringify(giReception)}`);
+  assert(nearContribution.onSum > nearContribution.offSum, 'positive near irradiance brightens the same visible plants');
+  // Resolve the SAME camera with only the actual distant representation in
+  // front of it. Sources participate in transport, then disappear for A/B.
+  terrain.mesh.visible = true; bounceWall.visible = true; emitter.visible = true;
+  for (const component of [...plants, patch]) { component.setProp('lodNear', 0); component.setProp('lodFar', 1); }
+  engine.start();
+  const farStart = gi._frame;
+  await until(() => [...plants, patch].every(component => component.stats.impostorChunks === component.stats.chunks) && gi._frame > farStart + 30 && !gi._compileWaveActive, 'impostor GI resolve settles', 60000);
+  await settleIrradiance(gi, 'far GI'); engine.stop(); terrain.mesh.visible = false; bounceWall.visible = false; emitter.visible = false;
+  const farContribution = await captureIrradianceContribution(gi);
+  const farGiReception = farContribution.difference;
+  console.log('FOLIAGE far GI diagnostic', JSON.stringify({ farGiReception, ...farContribution, patch: patch.stats, warmup: [...plants,patch].map(component=>component._foliageWarmup?.pending) }));
+  assert(farGiReception.pixels > 20, `GI lights baked impostors: ${JSON.stringify(farGiReception)}`);
+  assert(farContribution.onSum > farContribution.offSum, 'positive far irradiance brightens the same visible plants');
+  // A gbuffer that fills an impostor's transparent rectangle makes invisible
+  // walls in the lighting. Compare actual valid texels against the unmasked
+  // override, and verify sampled normals vary across the baked plant surface.
+  const { createGiGBuffer, renderGiGBuffer } = await import('/src/modules/gi/giScreen.js');
+  const testGbuffer = createGiGBuffer(320, 200);
+  for (const component of plants) component.root.visible = false;
+  renderGiGBuffer(renderer, engine.scene, camera, testGbuffer);
+  const maskedPositions = await renderer.backend.copyTextureToBuffer(testGbuffer.position, 0, 0, 320, 200);
+  const maskedNormals = await renderer.backend.copyTextureToBuffer(testGbuffer.normal, 0, 0, 320, 200);
+  const activeImpostors = [patch.renderMeshes[2]];
+  const hooks = activeImpostors.map(mesh => mesh.onBeforeRender);
+  for (const mesh of activeImpostors) mesh.onBeforeRender = () => {};
+  // The test deliberately changes the graph of a material already rendered
+  // against these same objects. Three's RenderObject keys need a version bump
+  // to observe that test-only edit; normal runtime graph identities are stable.
+  testGbuffer.material.needsUpdate = true;
+  renderGiGBuffer(renderer, engine.scene, camera, testGbuffer);
+  const unmaskedPositions = await renderer.backend.copyTextureToBuffer(testGbuffer.position, 0, 0, 320, 200);
+  for (let i = 0; i < activeImpostors.length; i++) activeImpostors[i].onBeforeRender = hooks[i];
+  const coverage = values => values.reduce((n, value, i) => n + (i % 4 === 3 && value > .5 ? 1 : 0), 0);
+  const normalValues = new Set();
+  for (let i = 0; i < maskedPositions.length; i += 4) if (maskedPositions[i + 3] > .5) normalValues.add(`${maskedNormals[i]},${maskedNormals[i+1]},${maskedNormals[i+2]}`);
+  const impostorGbuffer = { maskedPixels: coverage(maskedPositions), unmaskedPixels: coverage(unmaskedPositions), distinctNormals: normalValues.size };
+  assert(impostorGbuffer.maskedPixels > 20 && impostorGbuffer.maskedPixels < impostorGbuffer.unmaskedPixels * .8, `impostor gbuffer preserves alpha silhouette: ${JSON.stringify(impostorGbuffer)}`);
+  assert(impostorGbuffer.distinctNormals > 20, `impostor gbuffer uses baked normals: ${JSON.stringify(impostorGbuffer)}`);
+  const { checkFoliageImpostorMain } = await import('/scripts/lib/foliageGpuChecks.js');
+  const impostorMain = await checkFoliageImpostorMain(renderer, patch.renderMeshes[2], camera);
+  testGbuffer.dispose();
+  for (const component of [...plants, patch]) { component.root.visible = true; component.setProp('lodNear', 45); component.setProp('lodFar', 80); }
+  await disableEngineModule(engine, 'gi');
+  const { runFoliageGpuChecks } = await import('/scripts/lib/foliageGpuChecks.js');
+  const surfaceAndWind = await runFoliageGpuChecks(renderer);
+  bounceWall.removeFromParent(); emitter.removeFromParent();
+  bounceWall.geometry.dispose(); bounceWall.material.dispose(); emitter.geometry.dispose(); emitter.material.dispose();
+  terrain.mesh.visible = true; engine.scene.add(ambient);
+  const constructionStart = performance.now();
+  patch.setProp('minSpacing', 0); patch.setProp('density', 120); patch.setProp('maxInstances', 60000);
+  engine.start(); await until(() => patch.stats.instances === 60000, '60,000 plant scale fixture builds', 30000);
+  engine.stop();
+  const largeArea = { ...patch.stats, constructionMs: Math.round(performance.now() - constructionStart) };
+  const updateStart = performance.now();
+  for (let i = 0; i < 120; i++) patch.update();
+  largeArea.meanUpdateMs = (performance.now() - updateStart) / 120;
+  assert(largeArea.drawCalls < 100, `large scatter remains batched: ${JSON.stringify(largeArea)}`);
+  const oldAutoReset = renderer.info.autoReset; renderer.info.autoReset = false; renderer.info.reset();
+  await capture();
+  largeArea.renderedDrawCalls = renderer.info.render.drawCalls;
+  largeArea.renderedTriangles = renderer.info.render.triangles;
+  renderer.info.autoReset = oldAutoReset;
+  patch.setProp('maxInstances', 900); patch.setProp('density', 1.5);
+  engine.start(); await until(() => patch.stats.instances < 1000, 'restore preview patch'); engine.stop();
+  await renderer.backend.device.queue.onSubmittedWorkDone(); assert(!errors.length, errors.join('\n'));
+  renderer.setRenderTarget(null); renderer.render(engine.scene, camera); target.dispose();
+  const result = { pass: true, storageLimit: 8, near, far, wind, interaction, giReception, farGiReception, impostorGbuffer, impostorMain, surfaceAndWind, largeArea };
+  document.querySelector('#status').textContent = `Foliage passed · ${near.instances} plants · ${near.drawCalls} near draws · ${far.triangles} distant triangles · WebGPU portable 8`;
+  globalThis.__FOLIAGE_SMOKE_RESULT__ = result;
+  console.log('FOLIAGE-SMOKE PASS', JSON.stringify(result));
+} catch (error) {
+  console.error('FOLIAGE-SMOKE FAIL', error.stack ?? error);
+  globalThis.__FOLIAGE_SMOKE_RESULT__ = { pass: false, error: String(error.stack ?? error) };
+}
+</script></body></html>

@@ -39,11 +39,14 @@ const { getComponentTypes } = await import("../src/engine/components/registry.js
 const { physicsRapierModule } = await import("../src/modules/physics-rapier/index.js");
 const { navigationModule } = await import("../src/modules/navigation/index.js");
 const { terrainModule } = await import("../src/modules/terrain/index.js");
+const { foliageModule } = await import("../src/modules/foliage/index.js");
+const { atmosphereModule } = await import("../src/modules/atmosphere/index.js");
 const { postprocessingModule } = await import("../src/modules/postprocessing/index.js");
 const { polyhavenModule } = await import("../src/modules/polyhaven/index.js");
 const { ambientcgModule } = await import("../src/modules/ambientcg/index.js");
 const { giModule } = await import("../src/modules/gi/index.js");
 const { levelDesignModule } = await import("../src/modules/level-design/index.js");
+const { architectureModule } = await import("../src/modules/architecture/index.js");
 
 registerBuiltInComponents();
 // Module components register only when their module is enabled, so pull their
@@ -51,10 +54,13 @@ registerBuiltInComponents();
 // types appear in `ComponentMap` have to be listed here — a missing one reads
 // as "you typo'd the key", which is the failure this test exists to catch.
 const registered = new Set([
+  ...architectureModule.components.map(cls => cls.type),
   ...getComponentTypes(),
   ...physicsRapierModule.components.map((c) => c.type),
   ...navigationModule.components.map((c) => c.type),
   ...terrainModule.components.map((c) => c.type),
+  ...foliageModule.components.map((c) => c.type),
+  ...atmosphereModule.components.map((c) => c.type),
   ...postprocessingModule.components.map((c) => c.type),
   ...polyhavenModule.components.map((c) => c.type),
   ...ambientcgModule.components.map((c) => c.type),
@@ -63,6 +69,27 @@ const registered = new Set([
 ]);
 
 const source = readFileSync(DTS, "utf8");
+
+check("Foliage exposes Scene Wind responses and retains deprecated local wind fields", () => {
+  const props = source.match(/export interface FoliageComponent extends ComponentBase<\{([\s\S]*?)\}>/)?.[1];
+  assert.ok(props, "missing Foliage component property declaration");
+  const defaults = foliageModule.components.find((component) => component.type === "foliage").defaults;
+  for (const key of ["windStrength", "windGustStrength", "windScale", "windTurbulence", "windSpeed", "windDirection"]) {
+    assert.equal(typeof defaults[key], "number", `${key} must remain a numeric runtime property`);
+    assert.match(props, new RegExp(`\\b${key}: number;`), `${key} missing from Foliage script properties`);
+  }
+  for (const key of ["windSpeed", "windDirection"]) {
+    assert.match(props, new RegExp(`/\\*\\* @deprecated Ignored:[^*]*Scene Wind[^*]*\\*/\\s*${key}:`), `${key} must explain Scene Wind inheritance`);
+  }
+});
+
+check("SceneSettings exposes global wind and its legacy scalar vector", () => {
+  const wind = source.match(/export interface SceneSettings\s*\{[\s\S]*?\bwind:\s*\{([\s\S]*?)\};/)?.[1];
+  assert.ok(wind, "missing SceneSettings.wind declaration");
+  assert.match(wind, /vector:\s*\[number, number, number\]\s*\|\s*number;/);
+  assert.match(wind, /\bgust: number;/);
+  assert.match(wind, /\bgustFrequency: number;/);
+});
 
 console.log("script types — ComponentMap");
 

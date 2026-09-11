@@ -2,6 +2,9 @@ import { RigidbodyComponent } from "./RigidbodyComponent.js";
 import { ColliderComponent } from "./ColliderComponent.js";
 import { CharacterControllerComponent } from "./CharacterControllerComponent.js";
 import { JointComponent } from "./JointComponent.js";
+import { DestructibleComponent } from "./DestructibleComponent.js";
+import { ChainComponent } from "./ChainComponent.js";
+import { RagdollComponent } from "./RagdollComponent.js";
 import { PhysicsSystem } from "./PhysicsSystem.js";
 import { collisionSimplifierReady } from "./collisionGeometry.js";
 import { setPhysicsLayerConfig } from "./layerConfig.js";
@@ -39,13 +42,24 @@ export const physicsRapierModule = {
   name: "Rapier Physics",
   version: "1.0.0",
   category: "Physics",
-  tags: ["physics", "rapier", "wasm", "3d", "rigidbody", "collider"],
+  tags: ["physics", "rapier", "wasm", "3d", "rigidbody", "collider", "destruction", "ragdoll", "chain"],
   description:
     "Rigid-body physics powered by Rapier: Rigidbody, Collider, Character " +
-    "Controller and Joint components, collision layers with a project-wide " +
-    "matrix, background-cooked automatic mesh collision, fixed-step simulation " +
-    "in play mode, collision/trigger script hooks, and ray/shape/overlap queries.",
-  components: [RigidbodyComponent, ColliderComponent, CharacterControllerComponent, JointComponent],
+    "Controller and Joint components, Destructible (Voronoi fracture on impact " +
+    "or on an event), Chain (jointed children or instancer instances) and " +
+    "Ragdoll (a body per bone, built from the skeleton itself), collision " +
+    "layers with a project-wide matrix, background-cooked automatic mesh " +
+    "collision, fixed-step simulation in play mode, collision/trigger/contact " +
+    "force script hooks, and ray/shape/overlap queries.",
+  components: [
+    RigidbodyComponent,
+    ColliderComponent,
+    CharacterControllerComponent,
+    JointComponent,
+    DestructibleComponent,
+    ChainComponent,
+    RagdollComponent,
+  ],
 
   setup(engine) {
     // Layer names have to be readable by component schemas (the Inspector's

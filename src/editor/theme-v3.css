@@ -14,15 +14,18 @@
 
 /* ---------- 0 · tokens ---------- */
 :root {
-  --bg-0: #111;
-  --bg-1: #111;
+  /* These are SURFACES: something has to be painted here. `transparent` lets
+   * the window's own ground through, and nothing paints that — so every panel,
+   * node and field went white. Opaque values only. */
+  --bg-0: transparent;
+  --bg-1: transparent;
   --bg-2: #111;
-  --bg-3: #111;
-  --inset: #111;
-  --fill-1: #111; 
-  --fill-2: #111;
+  --bg-3: transparent;
+  --inset: transparent;
+  --fill-1: #111;
+  --fill-2: #111`;
   --border: #111;
-  --border-strong: #111;
+  --border-strong: transparent;
   --text: #e6eeeb;
   --text-dim: #8b9a97;
   --text-faint: #5e6c69;
@@ -2242,7 +2245,7 @@ input.number-field,
   cursor: move;
 }
 .stats-overlay.perf-hud button,
-.stats-overlay.perf-hud select {
+.stats-overlay.perf-hud .tx-select {
   cursor: pointer;
 }
 .stats-overlay.perf-hud.dragging {
@@ -2710,6 +2713,44 @@ input.number-field,
 .shader-node-row[data-wired] .shader-port-label {
   color: var(--text);
 }
+
+/* Section headings on a node with enough sockets to need them — the Material
+ * Output, which carries one per three.js material slot. Drawn as a rule with
+ * the section name on it, above the row that opens the section, so Clearcoat /
+ * Sheen / Iridescence / Transmission read as groups rather than a long list. */
+.shader-node-row[data-section]::before {
+  content: attr(data-section);
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: -9px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+  pointer-events: none;
+}
+.shader-node-row[data-section] {
+  margin-top: 16px;
+}
+
+/* A slot the Output's current material class does not read. Kept mounted (and
+ * so kept wired — React Flow deletes edges whose handle unmounts) but shown as
+ * inert, because nothing on screen is reading it. */
+.shader-node-row.inactive {
+  opacity: 0.4;
+}
+.shader-node-row.inactive .shader-port-label {
+  color: var(--text-dim);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
 /* Ports: filled dots in the socket's colour, sitting on the card's edge. */
 .react-flow__handle.shader-handle {
   width: 9px;
@@ -2909,15 +2950,196 @@ input.number-field,
 .perf-note { padding: 6px 2px; font-size: 11px; color: var(--text-faint); }
 @container (min-width: 620px) { .perf-groups { grid-template-columns: 1fr 1fr; } }
 
+/* ---------- Keybindings: the whole catalog, in collapsed groups -----------
+   The page used to be five editable rows — the five chords that happen to be
+   rebindable — which is not what anyone opens a Keybindings page for. It now
+   lists every shortcut the editor answers to (keyCatalog.js), so the fixed
+   ones need a read-only spelling that still reads as a KEY: keycaps. The
+   rebindable rows keep their capture field, and the difference between "you
+   can change this" and "this is how it is" is exactly the difference between
+   a field and a cap — no extra badge required. */
+.keybindings-table {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 2px;
+}
+.key-filter {
+  width: 100%;
+  margin-bottom: 6px;
+}
+.key-group {
+  border-radius: 6px;
+}
+.key-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+.key-group-head:hover {
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--text);
+}
+.key-group.open .key-group-head {
+  color: var(--text);
+}
+.key-group-caret {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  transition: transform 0.12s ease;
+}
+.key-group.open .key-group-caret {
+  transform: rotate(90deg);
+}
+.key-group-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* The count, and a dot when the group holds something you can rebind. */
+.key-group-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.key-group-count i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.key-group-body {
+  padding: 2px 6px 8px 21px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* Action names are sentences ("Toggle all unselected (editor)") and the control
+   is one chord, so this is the one place the columns invert: the label takes
+   the room and the chord is pinned right. */
+.keybindings-table .settings-row {
+  grid-template-columns: minmax(0, 1fr) 168px;
+  min-height: 22px;
+}
+.keybindings-table .settings-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 4px;
+}
+/* A row with a condition on it carries one dot; the condition is its title. */
+.keybinding-note {
+  display: inline-block;
+  width: 3px;
+  height: 3px;
+  margin-left: 5px;
+  vertical-align: 3px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.keybinding-fixed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  justify-content: flex-end;
+  width: 100%;
+}
+.keycaps {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.keycaps kbd {
+  display: inline-block;
+  min-width: 17px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.075);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 10.5px;
+  line-height: 1.5;
+  text-align: center;
+  white-space: nowrap;
+}
+.keycap-unbound {
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+.keybinding-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.settings-control > .keybinding-cell {
+  flex: 1;
+  min-width: 0;
+}
+.settings-control .keybinding-input {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  font-size: 10.5px;
+}
+.keybinding-input {
+  cursor: pointer;
+}
+.keybinding-input.capturing {
+  border-color: var(--accent);
+}
+
 /* ---------- AI panel: a conversation, not a log ----------------------------
-   Three rows that never move: an anchor bar, a scrolling transcript, and a
-   composer pinned to the bottom. `.inspector-panel` owns `overflow-y: auto`
-   on ITSELF and is not a flex container, so the panel root has to opt back
-   out of that or the composer scrolls away with the transcript and the log's
-   own scrollbar never appears (the exact bug the old .ai-lines had). The
-   `min-height: 0` on the log is load-bearing for the same reason: a flex
-   child refuses to shrink below its content without it. */
+   Four rows that never move: an anchor bar, a scrolling transcript, and a
+   composer card pinned to the bottom. `.inspector-panel` owns `overflow-y:
+   auto` on ITSELF and is not a flex container, so the panel root has to opt
+   back out of that or the composer scrolls away with the transcript and the
+   log's own scrollbar never appears (the exact bug the old .ai-lines had).
+   The `min-height: 0` on the log is load-bearing for the same reason: a flex
+   child refuses to shrink below its content without it.
+
+   THE MATERIAL (2026-09-09). The global tokens are all `transparent` in this
+   theme — one flat black ground, no borders — and a chat rendered in nothing
+   at all is what the panel looked like: the question, the answer and the box
+   you type in were three runs of text at the same weight on the same void.
+   So this section carries FOUR LOCAL TOKENS, white at very low alpha. They
+   are overlays, not colours: they read on whatever ground the theme happens
+   to have, they survive the user re-tinting `--bg-*`, and they say what a
+   border used to say with a fill instead — which is this theme's own rule.
+   Everything else is rhythm: one measure (`--ai-measure`) so lines do not
+   run the full width of an undocked panel, generous leading, and real
+   markdown shape (see ai/markdown.jsx — before it, an answer arrived with
+   its asterisks and backticks showing). */
 .inspector-panel.ai-panel {
+  container-type: inline-size;
+  --ai-surface: rgba(255, 255, 255, 0.035);
+  --ai-surface-2: rgba(255, 255, 255, 0.065);
+  --ai-line: rgba(255, 255, 255, 0.1);
+  --ai-code: rgba(255, 255, 255, 0.055);
+  /* Prose is READ, not scanned. `--text` (#e6eeeb) is the near-white the rest
+     of the editor uses for a VALUE — a number you glance at once — and a
+     paragraph of it on this ground glares. Body sits back; only the words the
+     author emphasised come forward, which is what bold is for. */
+  --ai-text: rgba(230, 238, 235, 0.74);
+  --ai-text-strong: rgba(230, 238, 235, 0.93);
+  --ai-measure: 680px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -2925,73 +3147,458 @@ input.number-field,
   gap: 0;
 }
 
+/* ---- the anchor bar ---- */
 .ai-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-1);
-  min-height: 30px;
+  gap: 4px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--hairline);
+  min-height: 32px;
 }
 .ai-bar-btn {
   display: grid;
   place-items: center;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   flex: 0 0 auto;
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
+  border: 0;
+  border-radius: 6px;
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 .ai-bar-btn:hover:not(:disabled) {
-  border-color: var(--border-strong);
   color: var(--text);
-  background: var(--fill-1);
+  background: var(--ai-surface-2);
 }
 .ai-bar-btn:disabled {
-  opacity: 0.4;
+  opacity: 0.35;
   cursor: default;
-}
-.ai-bar-select {
-  height: 22px;
-  padding: 0 4px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
-  background: var(--inset);
-  color: var(--text-dim);
-  font-family: inherit;
-  font-size: 10.5px;
-  cursor: pointer;
-}
-.ai-bar-select:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
 }
 .ai-bar-sub {
   margin-left: auto;
-  font-size: 10.5px;
+  padding-right: 2px;
+  font-size: 10px;
   color: var(--text-faint);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Model / Effort. Both default to the word "Default", so each keeps its
+   caption — two identical dropdowns are two mysteries. */
+.ai-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 2px 4px 2px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+.ai-pick:hover {
+  background: var(--ai-surface);
+}
+.ai-pick > span {
+  font-size: 8.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.ai-pick .tx-select {
+  height: 20px;
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.ai-pick:hover .tx-select {
+  color: var(--text);
+}
+.ai-pick .tx-select:focus {
+  outline: none;
+}
 
-/* Context chips: what the next message is about. `kind` is the quiet half —
-   you mostly need to know WHICH thing, and only occasionally what sort. */
+/* ---- the transcript ---- */
+.ai-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 14px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  user-select: text;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+}
+/* One measure, centred: a chat panel undocked to half the screen must not
+   set 30-word lines. */
+.ai-log > * {
+  width: 100%;
+  max-width: var(--ai-measure);
+  align-self: center;
+}
+
+/* Your own words sit right and boxed; the assistant's run full width and
+   unboxed. Two bubble styles would make a narrow docked panel feel like a
+   phone; asymmetry costs nothing and reads instantly. */
+.ai-msg.user {
+  display: flex;
+  justify-content: flex-end;
+}
+.ai-bubble {
+  max-width: 88%;
+  padding: 8px 11px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--ai-surface-2);
+  color: var(--ai-text);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* The chips recorded on a past question, inside its own bubble. */
+.ai-bubble-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.ai-msg.assistant {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+.ai-thinking {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.ai-thinking i {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: ai-dot 1.1s ease-in-out infinite;
+}
+.ai-thinking i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.ai-thinking i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes ai-dot {
+  0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-2px); }
+}
+.ai-note {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--live);
+}
+
+/* The footer: cost on the left of nothing, actions on hover. A running total
+   of tokens and dollars is worth having and not worth reading, so it stays at
+   the smallest legible size and the copy button only appears under the
+   pointer — a button per turn, always lit, would out-shout the answer. */
+.ai-msg-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  min-height: 18px;
+}
+.ai-msg-meta {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.ai-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background-color 0.12s ease, color 0.12s ease;
+}
+.ai-msg:hover .ai-copy,
+.ai-copy:focus-visible {
+  opacity: 1;
+}
+.ai-copy:hover {
+  background: var(--ai-surface-2);
+  color: var(--text);
+}
+
+/* ---- rendered markdown: the assistant's actual voice ---- */
+.ai-answer {
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--ai-text);
+  word-break: break-word;
+  /* theme.css still sets `pre-wrap` here from when the answer was one raw
+     text node. It is rendered markdown now — the paragraphs carry their own
+     breaks and the source whitespace must not survive. */
+  white-space: normal;
+}
+.md > *:first-child {
+  margin-top: 0;
+}
+.md > *:last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0 0 10px;
+}
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  margin: 16px 0 6px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--ai-text-strong);
+}
+.md h3 { font-size: 13.5px; }
+.md h4 { font-size: 12.5px; }
+.md h5,
+.md h6 { font-size: 12px; color: var(--text-dim); }
+.md strong {
+  font-weight: 650;
+  color: var(--ai-text-strong);
+}
+.md em {
+  font-style: italic;
+}
+.md s {
+  color: var(--text-faint);
+}
+.md a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.25);
+  cursor: pointer;
+}
+.md a:hover {
+  border-bottom-color: currentColor;
+}
+.md ul,
+.md ol {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+.md li {
+  margin: 3px 0;
+}
+.md li::marker {
+  color: var(--text-faint);
+}
+.md ul ul,
+.md ol ol,
+.md ul ol,
+.md ol ul {
+  margin: 3px 0 0;
+}
+.md hr {
+  margin: 14px 0;
+  border: 0;
+  border-top: 1px solid var(--ai-line);
+}
+.md-quote {
+  margin: 0 0 10px;
+  padding: 2px 0 2px 10px;
+  border-left: 2px solid var(--ai-line);
+  color: var(--text-dim);
+}
+/* Inline code carries a path, a prop name or an id — the things you copy by
+   eye. A fill and a mono face, no border: at 12 px a hairline box around six
+   characters is just visual grit. */
+.md code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--ai-code);
+  font-family: "Cascadia Mono", Consolas, "SF Mono", monospace;
+  font-size: 0.9em;
+  color: rgba(217, 231, 226, 0.82);
+  word-break: break-word;
+}
+.md-code {
+  margin: 0 0 10px;
+  border-radius: 8px;
+  background: var(--ai-code);
+  overflow: hidden;
+}
+.md-code-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px 3px 10px;
+  border-bottom: 1px solid var(--hairline);
+}
+.md-code-lang {
+  flex: 1;
+  min-width: 0;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.md-code-copy {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.md-code-copy:hover {
+  background: var(--ai-surface-2);
+  color: var(--text);
+}
+.md-code pre {
+  margin: 0;
+  padding: 9px 10px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.md-code code {
+  padding: 0;
+  background: none;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--ai-text);
+  white-space: pre;
+  word-break: normal;
+}
+.md-table {
+  width: 100%;
+  margin: 0 0 10px;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+.md-table th,
+.md-table td {
+  padding: 4px 8px 4px 0;
+  text-align: left;
+  vertical-align: top;
+}
+.md-table th {
+  border-bottom: 1px solid var(--ai-line);
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.md-table tbody tr + tr td {
+  border-top: 1px solid var(--hairline);
+}
+/* A caret on the last line while the answer is still arriving: the one cue
+   that says "there is more coming" without moving anything. */
+.ai-answer.streaming > *:last-child::after {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 0.95em;
+  margin-left: 2px;
+  vertical-align: -1px;
+  background: var(--accent);
+  opacity: 0.7;
+  animation: ai-caret 1s steps(2, start) infinite;
+}
+@keyframes ai-caret {
+  50% { opacity: 0; }
+}
+
+/* ---- the tool trail: progress while it runs, a footnote afterwards ---- */
+.ai-trail {
+  margin-bottom: 8px;
+}
+.ai-trail-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px 2px 3px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--ai-surface);
+  color: var(--text-faint);
+  font-size: 10.5px;
+  cursor: pointer;
+  transition: color 0.12s ease, background-color 0.12s ease;
+}
+.ai-trail-head:hover {
+  color: var(--text-dim);
+  background: var(--ai-surface-2);
+}
+.ai-trail.live .ai-trail-head {
+  color: var(--accent);
+}
+.ai-trail-caret {
+  transition: transform 0.12s ease;
+}
+.ai-trail.open .ai-trail-caret {
+  transform: rotate(90deg);
+}
+.ai-trail-body {
+  margin-top: 5px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: var(--ai-code);
+  font-family: "Cascadia Mono", Consolas, "SF Mono", monospace;
+  font-size: 10.5px;
+  max-height: 260px;
+  overflow: auto;
+  scrollbar-width: thin;
+}
+.ai-line {
+  padding: 1px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+.ai-line.tool_call {
+  color: var(--accent);
+}
+.ai-line.tool_result,
+.ai-line.raw {
+  color: var(--text-faint);
+}
+.ai-line.error {
+  color: var(--danger);
+  font-family: inherit;
+  font-size: 11.5px;
+}
+
+/* ---- context chips: what the next message is about ---- */
 .ai-chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   max-width: 190px;
-  padding: 2px 3px 2px 6px;
-  border: 1px solid var(--accent-ring);
-  border-radius: var(--r-1);
-  background: var(--accent-soft);
+  padding: 2px 3px 2px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--ai-surface-2);
   font-size: 10.5px;
-  line-height: 1.5;
+  line-height: 1.6;
 }
 .ai-chip-kind {
   color: var(--text-faint);
@@ -3000,7 +3607,7 @@ input.number-field,
   letter-spacing: 0.06em;
 }
 .ai-chip-label {
-  color: var(--text);
+  color: var(--ai-text-strong);
   font-weight: 600;
   overflow: hidden;
   white-space: nowrap;
@@ -3009,45 +3616,167 @@ input.number-field,
 .ai-chip-x {
   display: grid;
   place-items: center;
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
   border: 0;
-  border-radius: 3px;
+  border-radius: 4px;
   background: transparent;
   color: var(--text-faint);
   cursor: pointer;
 }
 .ai-chip-x:hover {
-  background: var(--fill-2);
+  background: rgba(255, 255, 255, 0.12);
   color: var(--text);
 }
 
-/* The chip row above the composer, where attachments are added and removed. */
-.ai-attach-row {
+/* ---- the empty thread ---- */
+.ai-empty {
+  margin: auto;
+  max-width: 300px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.ai-empty svg {
+  color: var(--accent);
+  opacity: 0.85;
+  margin-bottom: 10px;
+}
+.ai-empty p {
+  margin: 0 0 8px;
+}
+.ai-empty-lead {
+  color: var(--text);
+  font-size: 13px;
+}
+.ai-empty-sub {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.ai-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 14px;
+}
+.ai-suggestion {
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--ai-surface);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+.ai-suggestion:hover {
+  background: var(--ai-surface-2);
+  color: var(--text);
+}
+
+/* ---- the composer: one card, not three bars ---- */
+.ai-dock {
+  padding: 6px 14px 12px;
+}
+.ai-composer {
+  max-width: var(--ai-measure);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 8px 6px;
+  border: 1px solid var(--ai-line);
+  border-radius: 12px;
+  background: var(--ai-surface);
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+.ai-composer:focus-within {
+  border-color: rgba(255, 255, 255, 0.24);
+  background: rgba(255, 255, 255, 0.05);
+}
+.ai-composer-chips {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
   gap: 4px;
-  padding: 6px 8px 0;
-  background: var(--bg-1);
+  padding: 0 2px 2px;
 }
-.ai-attach-btn {
+.ai-input {
+  min-width: 0;
+  max-height: 180px;
+  resize: none;
+  padding: 2px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.ai-input:focus {
+  outline: none;
+}
+.ai-input::placeholder {
+  color: var(--text-faint);
+}
+.ai-composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.ai-composer-gap {
+  flex: 1;
+}
+.ai-tool-btn {
   display: inline-grid;
   place-items: center;
-  height: 20px;
-  min-width: 20px;
-  padding: 0 5px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-1);
+  height: 24px;
+  min-width: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
   background: transparent;
-  color: var(--text-dim);
-  font-size: 10.5px;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 11px;
   cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
-.ai-attach-btn:hover {
-  border-color: var(--border-strong);
+.ai-tool-btn.wide {
+  padding: 0 8px;
+}
+.ai-tool-btn:hover {
+  background: var(--ai-surface-2);
   color: var(--text);
-  background: var(--fill-1);
+}
+.ai-send {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+  cursor: pointer;
+  transition: opacity 0.12s ease, background-color 0.12s ease;
+}
+.ai-send:hover:not(:disabled) {
+  opacity: 0.85;
+}
+.ai-send:disabled {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.3);
+  cursor: default;
+}
+.ai-send.stop {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
 }
 
 /* Drop feedback. `entity-drop-hover` is entityDrag.js's fixed class name;
@@ -3058,7 +3787,7 @@ input.number-field,
   outline-offset: -1px;
 }
 
-/* Past chats. */
+/* ---- past chats ---- */
 .ai-history-row {
   display: flex;
   align-items: center;
@@ -3107,184 +3836,12 @@ input.number-field,
   color: var(--danger);
 }
 
-/* The chips recorded on a past question, inside its own bubble. */
-.ai-bubble-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 3px;
-  margin-bottom: 5px;
-}
-
-.ai-log {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 10px 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  user-select: text;
-}
-
-.ai-empty {
-  margin: auto;
-  max-width: 260px;
-  text-align: center;
-  color: var(--text-dim);
-  font-size: 11.5px;
-  line-height: 1.5;
-}
-.ai-empty svg {
-  color: var(--accent);
-  margin-bottom: 6px;
-}
-.ai-empty p {
-  margin: 0 0 6px;
-}
-.ai-empty-sub {
-  color: var(--text-faint);
-  font-size: 10.5px;
-}
-
-/* Your own words sit right and boxed; the assistant's run full width and
-   unboxed. Two bubble styles would make a narrow docked panel feel like a
-   phone; asymmetry costs nothing and reads instantly. */
-.ai-msg.user {
-  display: flex;
-  justify-content: flex-end;
-}
-.ai-bubble {
-  max-width: 85%;
-  padding: 6px 9px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-card);
-  background: var(--bg-2);
-  font-size: 12px;
-  line-height: 1.45;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.ai-answer {
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--text);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.ai-thinking {
-  font-size: 11.5px;
-  color: var(--text-dim);
-}
-.ai-note {
-  margin-top: 6px;
-  font-size: 11px;
-  color: var(--live);
-}
-.ai-msg-meta {
-  margin-top: 5px;
-  font-size: 10px;
-  color: var(--text-faint);
-}
-
-/* The tool trail: progress while it runs, a folded footnote afterwards. */
-.ai-trail {
-  margin-bottom: 6px;
-  border-left: 1px solid var(--border);
-  padding-left: 8px;
-}
-.ai-trail-head {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--text-faint);
-  font-size: 10.5px;
-  cursor: pointer;
-}
-.ai-trail.live .ai-trail-head {
-  color: var(--accent);
-}
-.ai-trail-caret {
-  transition: transform 0.12s ease;
-}
-.ai-trail.open .ai-trail-caret {
-  transform: rotate(90deg);
-}
-.ai-trail-body {
-  margin-top: 3px;
-  font-family: "Cascadia Mono", Consolas, "SF Mono", monospace;
-  font-size: 10.5px;
-}
-.ai-line {
-  padding: 1px 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--text);
-}
-.ai-line.tool_call {
-  color: var(--accent);
-}
-.ai-line.tool_result,
-.ai-line.raw {
-  color: var(--text-faint);
-}
-.ai-line.error {
-  color: var(--danger);
-  font-family: inherit;
-  font-size: 11.5px;
-}
-
-.ai-composer {
-  display: flex;
-  align-items: flex-end;
-  gap: 6px;
-  padding: 8px;
-  border-top: 1px solid var(--border);
-  background: var(--bg-1);
-}
-.ai-input {
-  flex: 1;
-  min-width: 0;
-  resize: none;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-input);
-  background: var(--inset);
-  color: var(--text);
-  font-family: inherit;
-  font-size: 12px;
-  line-height: 1.4;
-}
-.ai-input:focus {
-  outline: none;
-  border-color: var(--accent-ring);
-}
-.ai-input::placeholder {
-  color: var(--text-faint);
-}
-.ai-send {
-  display: grid;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  flex: 0 0 auto;
-  border: 1px solid transparent;
-  border-radius: var(--r-input);
-  background: var(--accent);
-  color: var(--on-accent);
-  cursor: pointer;
-}
-.ai-send:disabled {
-  background: var(--fill-2);
-  color: var(--text-faint);
-  cursor: default;
-}
-.ai-send.stop {
-  background: transparent;
-  border-color: var(--border-strong);
-  color: var(--danger);
+/* A narrow dock gets the same conversation with less furniture around it. */
+@container (max-width: 340px) {
+  .ai-log { padding: 12px 10px 6px; gap: 16px; }
+  .ai-dock { padding: 4px 10px 10px; }
+  .ai-bar-sub { display: none; }
+  .ai-pick > span { display: none; }
 }
 
 /* =====================================================================
@@ -3518,7 +4075,7 @@ input.number-field,
 /* The value is the bright half of the pair — that contrast is the row. */
 .settings-control,
 .settings-control input,
-.settings-control select,
+.settings-control .tx-select,
 .field-row .number-field,
 .field-row .text-field,
 .field-row .select-field {

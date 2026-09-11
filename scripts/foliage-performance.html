@@ -1,0 +1,124 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Foliage frame performance</title>
+<style>html,body{margin:0;background:#202329}canvas{display:block}#status{position:fixed;left:12px;top:12px;color:white;font:13px system-ui}</style></head>
+<body><canvas id="view"></canvas><div id="status">Preparing the captured foliage scene…</div><script type="module">
+try {
+  const query = new URLSearchParams(location.search);
+  if(query.has('gi'))globalThis.__giSrcProbes=true;
+  const config = await (await fetch('/scripts/foliage-performance-fixture.json')).json();
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const { enableEngineModule } = await import('/src/engine/modules.js');
+  const currentRuntime = await import('/src/modules/foliage/FoliageComponent.js');
+  const { freeze } = await import('/src/engine/freezeLedger.js');
+  const { FoliageComponent } = query.get('arm') === 'legacy' ? await import('/artifacts/foliage/FoliageComponent-legacy.js') : currentRuntime;
+  registerBuiltInComponents();
+  const engine = new Engine(); globalThis.__FOLIAGE_PERFORMANCE_ENGINE__ = engine;
+  engine.applySettings(config.settings); engine.setSize(config.width, config.height);
+  await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer;
+  if (!renderer.backend.isWebGPUBackend) throw new Error('Real WebGPU required');
+  const errors = [];
+  renderer.backend.device.addEventListener('uncapturederror', event => { errors.push(event.error.message); console.error('WebGPU validation', event.error.message); });
+  for (const id of ['foliage','terrain']) await enableEngineModule(engine,id);
+  const camera = new THREE.PerspectiveCamera(config.camera.fov, config.width / config.height, .1, 1000);
+  const origin = new THREE.Vector3().fromArray(config.camera.position), target = new THREE.Vector3().fromArray(config.camera.target);
+  camera.position.copy(origin); camera.lookAt(target); engine.camera = camera; engine.scene.add(camera);
+  const light = engine.createEntity({name:'Directional Light'});
+  light.rotation.set(-.9599310885968813,.6108652381980153,0);
+  light.addComponent('light',{kind:'directional',intensity:2,castShadow:true,shadowMapType:'PCFSoftShadowMap',shadowMapWidth:2048,shadowMapHeight:2048,shadowCamSize:20,shadowCamFar:100,shadowNormalBias:.02});
+  const box = engine.createEntity({name:'Box'}); box.position.y=.5; box.addComponent('mesh',{geometry:'box'});
+  const ground = engine.createEntity({name:'Terrain'});
+  ground.addComponent('terrain',{size:50,resolution:128,splatResolution:256,castShadow:false,receiveShadow:true});
+  const layers = config.foliage.map(description => {
+    const entity=engine.createEntity({name:description.name}); entity.setParent(ground);
+    return entity.addComponent(new FoliageComponent({...description.props,surface:ground.id}));
+  });
+  const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  const until=async(check,label,timeout=120000)=>{const end=performance.now()+timeout;while(!check()&&performance.now()<end)await delay(100);if(!check())throw new Error(label);};
+  engine.start();
+  await until(()=>layers.every(c=>c.stats.impostorReady),'Atlas preparation timed out');
+  if(query.has('gi')) {
+    engine.applySettings({wind:{...config.settings.wind,gust:4}});
+    await enableEngineModule(engine,'gi');
+    engine.createEntity({name:'GI benchmark optional arm'}).addComponent('global-illumination',{bounce:.25,ao:0,reflections:0});
+    await until(()=>engine.modules.get('gi')?.system?._firstGatherLogged&&!engine.modules.get('gi')?.system?._compileWaveActive&&!engine.renderSuspended,'GI preparation timed out');
+  }
+  await delay(2500);
+  const uploadCheck = query.has('uploads') ? (await import('/scripts/lib/foliageUploadCheck.js')).trackFoliageUploads(renderer, layers) : null;
+  const quantile=(values,p)=>values[Math.min(values.length-1,Math.floor(values.length*p))]??0;
+  const measure=async(label,seconds,moving)=>{
+    uploadCheck?.reset();
+    const frames=[],draws=[],triangles=[],poses=new Set();
+    freeze.clear();
+    const warmupStart=layers.map(c=>({species:c.props.species,...c._foliageWarmup}));
+    const start=performance.now(); let previous=start;
+    const startRender=renderer.info.render.calls;
+    const gi=engine.modules.get('gi')?.system,startGi=gi?._frame??0;
+    engine.stats.beginSpikeWatch({seconds,thresholdMs:8.34,keep:15});
+    const off=engine.onPostRender(()=>{
+      const now=performance.now(); frames.push(now-previous); previous=now;
+      const readout=engine.stats.readout;
+      draws.push(readout.drawCalls);triangles.push(readout.triangles);
+      poses.add(camera.matrixWorld.elements.map(v=>v.toFixed(2)).join(','));
+    });
+    await new Promise(resolve=>{
+      const step=()=>{
+        const elapsed=(performance.now()-start)/1000;
+        if(elapsed>=seconds)return resolve();
+        if(moving){const a=elapsed/seconds*Math.PI*2,dx=origin.x-target.x,dz=origin.z-target.z;camera.position.set(target.x+dx*Math.cos(a)-dz*Math.sin(a),origin.y,target.z+dx*Math.sin(a)+dz*Math.cos(a));camera.lookAt(target);}
+        requestAnimationFrame(step);
+      }; requestAnimationFrame(step);
+    });
+    off();engine.stats.endPhaseCapture();
+    const elapsed=(performance.now()-start)/1000,stats=structuredClone(engine.stats.sample()),spikes=engine.stats.readSpikeWatch();
+    const giTexture=gi?.state?.light?.giIrradianceNode?.value;
+    let irradianceNonzero=null;
+    if(giTexture){const values=await renderer.backend.copyTextureToBuffer(giTexture,0,0,giTexture.image.width,giTexture.image.height);irradianceNonzero=values.reduce((n,v,i)=>n+(i%4!==3&&v!==0?1:0),0);}
+    frames.sort((a,b)=>a-b);
+    return {label,uploads:uploadCheck?.read(),seconds:elapsed,presentedFrames:frames.length,presentedFps:frames.length/elapsed,frameMeanMs:elapsed*1000/frames.length,frameP50Ms:quantile(frames,.5),frameP95Ms:quantile(frames,.95),frameMaxMs:frames.at(-1),framesOverBudget:frames.filter(ms=>ms>1000/120).length,renderCalls:renderer.info.render.calls-startRender,renderedCameraPoses:poses.size,cpu:engine.stats.readPhaseCapture(),gpu:spikes.gpuFrames,spikes:{...spikes,gpuFrames:undefined},freezes:freeze.read({limit:12,sinceMs:start-freeze.boot.t0}),warmupStart,warmupEnd:layers.map(c=>({species:c.props.species,...c._foliageWarmup})),gi:gi?{frames:gi._frame-startGi,gather:!!gi._firstGatherLogged,activeLight:gi.state?.light?.parent===engine.scene,irradianceNonzero,dispatches:gi._giDispatchedLastFrame}:null,drawCalls:{min:Math.min(...draws),max:Math.max(...draws)},triangles:{min:Math.min(...triangles),max:Math.max(...triangles)},layers:layers.map(c=>({species:c.props.species,...c.stats})),sample:stats};
+  };
+  const results=[];
+  if(query.has('contribution')) {
+    results.push(await measure('full foliage 360 degree sweep',8,true));
+    const meshes=layers.flatMap(c=>c.renderMeshes).filter(Boolean),masks=meshes.map(m=>m.layers.mask);
+    for(const mesh of meshes)mesh.layers.mask=0;
+    camera.position.copy(origin);camera.lookAt(target);await delay(500);
+    results.push(await measure('all foliage hidden 360 degree sweep',8,true));
+    for(let i=0;i<meshes.length;i++)meshes[i].layers.mask=masks[i];
+    const hooks=meshes.map(mesh=>({before:mesh.onBeforeRender,after:mesh.onAfterRender}));
+    for(let i=0;i<meshes.length;i++){
+      const mesh=meshes[i],hook=hooks[i];let count=null;
+      mesh.onBeforeRender=function(...args){if(args[1].overrideMaterial?.name.startsWith('GI gbuffer')){count=mesh.isInstancedMesh?mesh.count:mesh.geometry.instanceCount;if(mesh.isInstancedMesh)mesh.count=0;else mesh.geometry.instanceCount=0;}hook.before.apply(this,args);};
+      mesh.onAfterRender=function(...args){hook.after.apply(this,args);if(count!==null){if(mesh.isInstancedMesh)mesh.count=count;else mesh.geometry.instanceCount=count;count=null;}};
+    }
+    camera.position.copy(origin);camera.lookAt(target);await delay(500);
+    results.push(await measure('foliage excluded from gbuffer 360 degree sweep',8,true));
+    for(let i=0;i<meshes.length;i++){meshes[i].onBeforeRender=hooks[i].before;meshes[i].onAfterRender=hooks[i].after;}
+  } else {
+    results.push(await measure('first 360 degree sweep',6,true));
+    camera.position.copy(origin);camera.lookAt(target);await delay(500);
+    results.push(await measure('warm stationary',3,false));
+    results.push(await measure('warm 360 degree sweep',8,true));
+  }
+  if(query.has('shadowCompare')) {
+    // Test-only ablation. Keep every authored plant and all scene/GI settings;
+    // restore the original flags and measure again to expose order/cadence noise.
+    const meshes=layers.flatMap(c=>c.renderMeshes).filter(Boolean),casts=meshes.map(m=>m.castShadow);
+    for(const mesh of meshes)mesh.castShadow=false;
+    camera.position.copy(origin);camera.lookAt(target);await delay(500);
+    results.push(await measure('foliage shadows disabled diagnostic 360 degree sweep',8,true));
+    for(let i=0;i<meshes.length;i++)meshes[i].castShadow=casts[i];
+    camera.position.copy(origin);camera.lookAt(target);await delay(500);
+    results.push(await measure('restored foliage shadows 360 degree sweep',8,true));
+  }
+  camera.position.copy(origin);camera.lookAt(target);await delay(300);engine.stop();renderer.render(engine.scene,camera);
+  const device=renderer.backend.device;
+  const adapter=device.adapterInfo;
+  const report={arm:query.get('arm')??'current',gi:query.has('gi'),width:config.width,height:config.height,dpr:devicePixelRatio,adapter:adapter?{vendor:adapter.vendor,architecture:adapter.architecture,device:adapter.device,description:adapter.description}:null,limits:{storageBuffers:device.limits.maxStorageBuffersPerShaderStage},settings:structuredClone(engine.settings),method:'Presented frames counted after the actual engine render; full 360 degree camera sweep; uncapped isolated Chromium; GPU values are timestamp queries. This reproduces the captured foliage layer properties, not the running editor shell.',prototypeTriangles:layers.map(c=>({species:c.props.species,levels:c.geometries.map(g=>g.index.count/3)})),results,errors};
+  if(results.some(r=>r.label.includes('sweep')&&r.renderedCameraPoses<50))throw new Error('Orbit failed to change the rendered camera');
+  if(query.has('gi')&&results.some(r=>!r.gi?.activeLight||!r.gi.gather||r.gi.frames<20||!(r.gi.irradianceNonzero>20)))throw new Error('GI benchmark did not run an active field with nonzero irradiance');
+  globalThis.__FOLIAGE_PERFORMANCE_RESULT__=report;
+  document.querySelector('#status').textContent=`${report.arm}: ${results.at(-1).presentedFps.toFixed(1)} FPS warm orbit`;
+}catch(error){console.error(error);globalThis.__FOLIAGE_PERFORMANCE_ERROR__=error.stack??String(error);}
+</script></body></html>

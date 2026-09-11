@@ -12,6 +12,7 @@ import { usePanelVisible } from "../usePanelVisible.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { revealAssetInPanel } from "../assetReveal.js";
 
+import { Select } from "../fields/Select.jsx";
 /** How many families render at once. More is slower to paint and no more useful. */
 const PAGE = 48;
 
@@ -197,21 +198,21 @@ export function FontLibraryPanel({ api }) {
             onChange={(event) => setQuery(event.target.value)}
           />
         </div>
-        <select className="select-field" value={category} onChange={(event) => setCategory(event.target.value)}>
+        <Select className="select-field" value={category} onChange={(event) => setCategory(event.target.value)}>
           <option value="all">All categories</option>
           {categories.map((name) => (
             <option key={name} value={name}>
               {name}
             </option>
           ))}
-        </select>
-        <select className="select-field" value={sort} onChange={(event) => setSort(event.target.value)}>
+        </Select>
+        <Select className="select-field" value={sort} onChange={(event) => setSort(event.target.value)}>
           {SORTS.map((option) => (
             <option key={option.id} value={option.id}>
               {option.label}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
       <div className="font-library-bar">
         <input

@@ -37,6 +37,29 @@ defineOp({
     // component — see `engulfingColliderNotes`. Two implementations of one
     // diagnostic is two things to get out of step.
     result.engulfedBy = c.engulfedBy ?? [];
+    // ⭐ WHAT THIS CLOTH'S OWN COLLISION TREE HOLDS, against the shared one.
+    // Cheap-and-broken looks exactly like cheap-and-working (see the flock), so
+    // the per-cloth collider view has to be able to prove it kept the triangles
+    // it needs rather than merely being fast.
+    if (c.meshColliderView && c.meshColliderView !== c.meshColliderField) {
+      result.localColliders = {
+        triangles: c.meshColliderView.triangleCount ?? null,
+        sharedTriangles: c.meshColliderField?.triangleCount ?? null,
+      };
+    }
+    // ⭐ THE ARENA (clothArena.js): every cloth in one particle set, one fused
+    // kernel per 1/360 s step, contact against this cloth's own triangle grid.
+    // `steps` and `dispatches` are the whole scene's last frame; `member.grid`
+    // is what THIS cloth collides with, against the shared triangle count.
+    if (sim?.arena) {
+      result.solver = "arena";
+      result.arena = sim.arena.describe(sim.member);
+      result.localColliders = {
+        triangles: sim.member.grid?.triangles ?? 0,
+        sharedTriangles: c.meshColliderField?.triangleCount ?? null,
+        gridCells: sim.member.grid?.cells ?? 0,
+      };
+    } else if (sim) result.solver = "legacy";
     if (readPositions) result.live = await readClothPositions(c, sim);
     return result;
   },
@@ -279,10 +302,36 @@ function motionOf(g) {
 
 async function readClothPositions(component, simulation) {
   const renderer = engine.renderer, analysis = component.clothAnalysis;
-  if (!simulation?.positions?.value) return { error: "this cloth has no GPU simulation yet" };
+  // ⛔⛔ READ THE BUFFER THAT IS DISPATCHED, NOT THE ONE THIS CLOTH OWNS.
+  //
+  // Two ways `simulation.positions` is never uploaded to the GPU, and both
+  // threw `Cannot read properties of undefined (reading 'size')` from inside
+  // three rather than saying anything useful:
+  //
+  //   · a FLOCK MEMBER does not solve at all — the flock's shared buffer does,
+  //     and this cloth's particles start at `solved.base` inside it;
+  //   · an OFF-CAMERA cloth never ticks (the frustum gate), so `init` has never
+  //     been dispatched and there is no buffer to read.
+  //
+  // A blind instrument is worse than a missing one: this op is what decides
+  // whether a cloth is healthy, and for a whole session it could not answer.
+  const solved = simulation?.solved ?? null;
+  const attribute = solved?.positions?.value ?? simulation?.positions?.value ?? null;
+  if (!attribute) return { error: "this cloth has no GPU simulation yet" };
   if (!renderer?.getArrayBufferAsync) return { error: "the renderer cannot read buffers back" };
-  const data = new Float32Array(await renderer.getArrayBufferAsync(simulation.positions.value));
-  const count = Math.min(simulation.count ?? 0, data.length >> 2);
+  let raw;
+  try {
+    raw = new Float32Array(await renderer.getArrayBufferAsync(attribute));
+  } catch (error) {
+    return { error: `the solver buffer has never been dispatched, so there is nothing to read (${error.message}). An off-screen cloth does not tick — bring it into view, or check whether its flock is solving.` };
+  }
+  const base = solved?.base ?? 0;
+  if (base < 0) return { error: "this cloth has no place in the arena (over the cloth limit?) — see `arena.member.error`" };
+  const want = Math.min(solved?.count ?? simulation.count ?? 0, Math.max(0, (raw.length >> 2) - base));
+  // Sliced to THIS cloth's particles, so every index below still lines up with
+  // `analysis.island` / `analysis.rest`, which are per-member.
+  const data = base > 0 || want * 4 < raw.length ? raw.subarray(base * 4, (base + want) * 4) : raw;
+  const count = want;
   if (!count) return { error: "the simulation buffer is empty" };
 
   // ⭐⭐⭐ "FIGHTING THEMSELVES" IS A STATEMENT ABOUT MOTION, AND EVERY

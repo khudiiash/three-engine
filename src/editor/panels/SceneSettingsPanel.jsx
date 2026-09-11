@@ -5,6 +5,7 @@ import { engine, ensureEngine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetSceneSettingsCommand } from "../commands/settingsCommands.js";
 import { useSceneStore } from "../store/sceneStore.js";
+import { renameScene } from "../sceneIO.js";
 import { MSAA_SAMPLES, SHADOW_TYPES, SCENE_SETTINGS_DEFAULTS } from "../../engine/sceneSettings.js";
 import { ENVIRONMENT_EXTENSIONS, CUBEMAP_EXTENSIONS } from "../assetLoader.js";
 import { AssetField } from "../fields/AssetField.jsx";
@@ -16,6 +17,7 @@ import { openPanel } from "../EditorShell.jsx";
 import { Row, Toggle, Note, Section } from "./settingsUi.jsx";
 import { SCENE_WIND_DEFAULTS } from "../../engine/vfx/clothWind.js";
 
+import { Select } from "../fields/Select.jsx";
 const TONE_MAPPING_OPTIONS = [
   ["neutral", "Neutral (Khronos)"],
   ["aces", "ACES Filmic"],
@@ -173,6 +175,37 @@ function LegacyEnvironmentNote({ entity }) {
 }
 
 /**
+ * The scene's one name, editable. Commits on blur/Enter — renaming the file
+ * per keystroke is not a thing anyone wants — and snaps back to the store's
+ * name when the rename is refused (a file with that name already exists, say).
+ * `renameScene` renames scenes/<name>.scene on disk, so this field, the
+ * hierarchy label and the Assets entry are one name, not three.
+ */
+function SceneNameField({ name }) {
+  const [text, setText] = useState(name);
+  useEffect(() => setText(name), [name]);
+  const commit = () => {
+    const trimmed = text.trim();
+    if (!trimmed || trimmed === name) return setText(name);
+    renameScene(trimmed).catch((err) => console.error(`Couldn't rename the scene: ${err}`));
+  };
+  return (
+    <input
+      className="text-field"
+      type="text"
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        if (e.key === "Escape") setText(name);
+      }}
+      spellCheck={false}
+    />
+  );
+}
+
+/**
  * Per-scene environment settings (saved inside the .scene file, undoable).
  * Every change is one command on the bus, applied live to the engine.
  *
@@ -181,6 +214,7 @@ function LegacyEnvironmentNote({ entity }) {
  */
 export function SceneSettingsPanel() {
   const sceneName = useSceneStore((s) => s.sceneName);
+  const scenePath = useSceneStore((s) => s.scenePath);
   const [settings, setSettings] = useState(null);
   const legacyEnv = useLegacyEnvironmentEntity();
 
@@ -245,10 +279,21 @@ export function SceneSettingsPanel() {
   return (
     <div className="inspector-panel settings-panel scene-settings-panel">
       <div className="panel-toolbar">
-        <span className="asset-path" title={sceneName}>
-          {sceneName}
+        <span className="asset-path" title={scenePath ?? "Not saved yet — the name becomes the file name on first save"}>
+          {/* The name has its own editable row now; the toolbar says where the
+              scene lives, which is the fact the field cannot show. */}
+          {scenePath ?? `${sceneName} (not saved)`}
         </span>
       </div>
+
+      <Section id="scene.name" title="Scene">
+        <Row
+          label="Name"
+          hint="The scene's one name — this field, the hierarchy label and the .scene file in Assets are the same thing. Renaming here renames the file on disk."
+        >
+          <SceneNameField name={sceneName} />
+        </Row>
+      </Section>
 
       <Section id="scene.environment" title="Environment">
         <Row label="Background" hint="Shows wherever the sky is off. With no sky asset set, it is also the color GI lights the scene with.">
@@ -356,7 +401,7 @@ export function SceneSettingsPanel() {
 
       <Section id="scene.fog" title="Fog">
         <Row label="Type">
-          <select
+          <Select
             className="select-field"
             value={settings.fog.type}
             onChange={(e) => commitFog({ type: e.target.value })}
@@ -364,7 +409,7 @@ export function SceneSettingsPanel() {
             <option value="none">None</option>
             <option value="linear">Linear</option>
             <option value="exp2">Exponential²</option>
-          </select>
+          </Select>
         </Row>
         {settings.fog.type !== "none" && (
           <Row label="Color">
@@ -447,7 +492,7 @@ export function SceneSettingsPanel() {
 
       <Section id="scene.rendering" title="Rendering">
         <Row label="Tone mapping">
-          <select
+          <Select
             className="select-field"
             value={settings.toneMapping}
             onChange={(e) => commit({ toneMapping: e.target.value }, "Change tone mapping")}
@@ -457,7 +502,7 @@ export function SceneSettingsPanel() {
                 {label}
               </option>
             ))}
-          </select>
+          </Select>
         </Row>
         <Row label="Exposure">
           <NumberInput
@@ -477,7 +522,7 @@ export function SceneSettingsPanel() {
             second, competing shadow switch. Nested under the one that gates
             them, greyed out when it is off, they read as what they are. */}
         <Row label="Map type" sub disabled={!shadowsOn}>
-          <select
+          <Select
             className="select-field"
             value={shadow.type}
             onChange={(e) => commitShadow({ type: e.target.value }, "Change shadow type")}
@@ -487,7 +532,7 @@ export function SceneSettingsPanel() {
                 {label}
               </option>
             ))}
-          </select>
+          </Select>
         </Row>
         <Row
           label="Auto update"
@@ -527,7 +572,7 @@ export function SceneSettingsPanel() {
           />
         </Row>
         <Row label="Render scale" hint="Render below the canvas size and upscale.">
-          <select
+          <Select
             className="select-field"
             value={String(perf.renderScale ?? 1)}
             onChange={(e) =>
@@ -541,7 +586,7 @@ export function SceneSettingsPanel() {
             <option value="0.5">50%</option>
             <option value="0.33">33%</option>
             <option value="0.25">25%</option>
-          </select>
+          </Select>
         </Row>
         <Row label="Dynamic res" hint="Move the render scale automatically to hold the target FPS.">
           <Toggle
@@ -550,7 +595,7 @@ export function SceneSettingsPanel() {
           />
         </Row>
         <Row label="Target FPS" sub disabled={perf.dynamicResolution !== true}>
-          <select
+          <Select
             className="select-field"
             value={String(perf.targetFps ?? 60)}
             onChange={(e) =>
@@ -561,7 +606,7 @@ export function SceneSettingsPanel() {
             <option value="60">60</option>
             <option value="90">90</option>
             <option value="120">120</option>
-          </select>
+          </Select>
         </Row>
         <Row label="Volume quality" hint="Ray-march step size for volumetric materials. Lower is faster.">
           <NumberInput
@@ -592,7 +637,7 @@ export function SceneSettingsPanel() {
           />
         </Row>
         <Row label="MSAA samples" sub disabled={renderer.antialias === false}>
-          <select
+          <Select
             className="select-field"
             value={renderer.antialias === false ? 1 : (renderer.samples ?? 4)}
             onChange={(e) =>
@@ -604,7 +649,7 @@ export function SceneSettingsPanel() {
                 {n}×
               </option>
             ))}
-          </select>
+          </Select>
         </Row>
         <Row label="Transparent canvas" hint="Let the page behind the canvas show through.">
           <Toggle

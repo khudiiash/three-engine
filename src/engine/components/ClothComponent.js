@@ -28,5 +28,6 @@ export class ClothComponent extends GridSimulationComponent {
         return { ...field, showIf: (props) => !props.asset && props.windSource === "custom" };
       }
       return { ...field, showIf: (props) => !props.asset };
-    });
+    })
+    .concat([{ key: "runInEditor", label: "Run In Editor", type: "boolean" }]);
 }

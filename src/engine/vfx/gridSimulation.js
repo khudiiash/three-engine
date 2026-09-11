@@ -1,7 +1,7 @@
 import * as THREE from "three/webgpu";
 import { CLOTH_SOLVE_PASSES, clothSolveSplit, clothSubsteps, clothVelocityScale } from "./clothHealth.js";
 import { clothComputeBatch } from "./computeBatch.js";
-import { resolveClothWind } from "./clothWind.js";
+import { resolveClothWind, sceneWind } from "./clothWind.js";
 import { Fn, If, Break, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, texture, ivec2 } from "three/tsl";
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
 import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt, seaFoldNode } from "./waterSpectrum.js";
@@ -1161,6 +1161,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // from its surface while a grid edge crosses it. Propagate the side of the
   // pinned boundary through a Jacobi snapshot; no thread reads another thread's
   // newly corrected positions. Contact can therefore untangle the existing pose.
+  // How many incident springs each vertex sweeps contact along. See the
+  // contact-cost note by `steps` below; `__clothContactEdges` overrides it.
+  const meshContactEdges = Math.max(1, Math.min(8, Number(globalThis.__clothContactEdges) || MESH_CONTACT_EDGES));
   const collideEdges = kind === "cloth" && meshColliderField ? Fn(() => {
     const point = simulationWorld.mul(vec4(positions.element(index).xyz, 1)).xyz.toVar();
     If(pinned().not(), () => {
@@ -1193,7 +1196,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
           // excludes them (they carry SPRING_THICKNESS = -2) while still
           // admitting a boundary edge, whose successor is -1.
           If(spring.x.greaterThanEqual(0).and(spring.z.lessThan(.5)).and(spring.w.greaterThan(-1.5))
-            .and(used.lessThan(int(MESH_CONTACT_EDGES))), () => {
+            .and(used.lessThan(int(meshContactEdges))), () => {
             used.addAssign(int(1));
             const anchor = simulationWorld.mul(vec4(positions.element(spring.x.toInt()).xyz, 1)).xyz.toVar();
             projectClothMeshContact({ field: meshColliderField, skip: u.meshCollisionSkip, point, old: anchor, velocity, radius: contactRadius, friction: u.friction });
@@ -1958,8 +1961,32 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const steps = kind === "cloth"
     ? [integrate, ...Array.from({ length: split }, (_, i) => (i % 2 === 0 ? solveA : solveB)), commit]
     : [integrate, commit, momentum];
-  if (collide) steps.push(collide);
-  if (collideEdges) steps.push(collideEdges, commit, collideEdges, commit, collide);
+  // ⭐ MEASUREMENT ARM. Six of a mesh cloth's sixteen dispatches per substep are
+  // contact, and this solver is DISPATCH-bound — so before building a runtime
+  // gate that skips them for a curtain nothing is touching, price the ceiling:
+  // `__clothNoContact = true` drops the whole chain. The cloth falls through
+  // the world with it on; it is an arm, not a setting.
+  const noContact = globalThis.__clothNoContact === true;
+  // ⭐⭐⭐ CONTACT IS 92 % OF CLOTH, MEASURED. `profile.frameCensus` on the
+  // user's Sponza, ten curtains, same camera: 25.93 ms with contact, 2.07 ms
+  // with `__clothNoContact` — the solver itself is two milliseconds and
+  // everything else is contact. So the cost lever is how many BVH TRAVERSALS
+  // each particle runs, and there are two of them:
+  //
+  //   passes  `collideEdges` runs TWICE a substep (`__clothContactPasses`)
+  //   edges   each sweeps up to MESH_CONTACT_EDGES springs (`__clothContactEdges`)
+  //
+  // Six traversals per particle per substep at the defaults. Both are quality
+  // trades — edge sweeps are what stop a curtain cutting through an open
+  // collider between its vertices — so they are dials to be MEASURED against
+  // the look, not lowered on principle.
+  const contactPasses = Math.max(1, Math.min(2, Number(globalThis.__clothContactPasses) || 2));
+  if (collide && !noContact) steps.push(collide);
+  if (collideEdges && !noContact) {
+    steps.push(collideEdges, commit);
+    if (contactPasses > 1) steps.push(collideEdges, commit);
+    steps.push(collide);
+  }
   // The tail starts from `positions` (what `collide` last wrote), so it leads
   // with solveB; an even count returns it to `positions`.
   if (kind === "cloth") steps.push(...Array.from({ length: CLOTH_SOLVE_PASSES - split }, (_, i) => (i % 2 === 0 ? solveB : solveA)));
@@ -1975,7 +2002,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     queue.push(...steps);
     if (pinEntities && anchorCount.value > 0) queue.push(pinEntities);
   };
-  let initialized = !!flock, accumulator = 0, elapsed = 0, lastStep = h;
+  // `elapsed` is the wall clock (the sea's phase, the culling excursion);
+  // `simulated` is how much of it the solver actually integrated. They are the
+  // same number except across a clamped hitch — see `u.simTime` in `tick`.
+  let initialized = !!flock, accumulator = 0, elapsed = 0, simulated = 0, lastStep = h;
   // The sea's settings and its CPU copy (for buoyancy), see `tick`.
   let lastProps = props, configuredDepth = 0, seaSample = null, seaReadbackPending = false, seaFrame = 0;
   const updateBounds = () => {
@@ -2129,7 +2159,17 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // silently measures a subset reports a fix that is not there.
   const simulation = { mesh, skirtMesh, skirtMaterial, positions, count: particleCount, resolution: n, vertexCount: total, init, surface, steps, uniforms: u,
     /** What a FLOCK MEMBER binds its surface kernel to — see clothFlock.js. */
-    particles: meshCloth ? { positions, springs: clothSprings, stride: meshCloth.stride, count: particleCount } : null,waterSurfaceTexture,slotKernel,causticPass,
+    particles: meshCloth ? { positions, springs: clothSprings, stride: meshCloth.stride, count: particleCount } : null,
+    /**
+     * ⭐ THE BUFFER THAT IS ACTUALLY DISPATCHED, and where this cloth begins in
+     * it. `positions` above is this cloth's OWN buffer, and a flock member never
+     * dispatches it — so reading that back throws inside three (the GPU buffer
+     * was never created), which is exactly how `vfx.cloth.status readPositions`
+     * came to report `Cannot read properties of undefined (reading 'size')`.
+     * ⚠ A FLOCK SOLVES IN WORLD SPACE, so these are world coordinates when
+     * `flocked` is true and local when it is not.
+     */
+    solved: { positions: solvePositions, base: solveBase, count: particleCount, flocked: !!flock },waterSurfaceTexture,slotKernel,causticPass,
     spectrum, rippleTexture, flowTexture,
     /** The solver's grid and its window, in local units. */
     ripple: { resolution: w, cellX: sx, cellZ: sz, windowWidth: winW, windowHeight: winH, windowed },
@@ -2256,7 +2296,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       pendingSplash.push([x,z,Math.max(2*Math.max(sx,sz),radius),speed,count,segment?x1:null,segment?z1:null,nx,nz]);
       return true;
     },
-    restart() { initialized = false; accumulator = 0; elapsed = 0; u.simTime.value = 0; pendingImpulses.length=0; pendingFoam.length=0; pendingSplash.length=0; spectrum?.restart(); updateBounds(); },
+    restart() { initialized = false; accumulator = 0; elapsed = 0; simulated = 0; u.simTime.value = 0; pendingImpulses.length=0; pendingFoam.length=0; pendingSplash.length=0; spectrum?.restart(); updateBounds(); },
     tick(renderer, dt) {
       if (!renderer?.isWebGPURenderer) return;
       const queue = [];
@@ -2383,7 +2423,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // dragging the scene's wind moves every curtain that inherits it at
         // once, and a flock (which built its solver from one member's props)
         // still tracks it.
-        const wind = resolveClothWind(lastProps, anchorEngine?.settings?.wind);
+        const wind = resolveClothWind(lastProps, sceneWind(anchorEngine));
         if (wind.inherited) {
           u.wind.value.set(wind.vector[0], wind.vector[1], wind.vector[2]);
           u.gust.value = wind.gust;
@@ -2421,34 +2461,52 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       const maxSubsteps = kind === "cloth"
         ? Math.max(2, Math.min(6, Math.floor(budget / Math.max(particleCount, 1))))
         : 6;
-      // ⛔⛔ **THE REAL-TIME STEP IS OPT-IN, AND THE FIXED STEP IS THE DEFAULT.**
-      // Dividing the frame between the substeps the budget allows is right for
-      // the CLOCK and wrong for this SOLVER, and the second beats the first.
+      // ⭐⭐⭐ **THE FRAME IS DIVIDED AMONG THE SUBSTEPS, AND THE LONG-RANGE
+      // ATTACHMENT IS WHAT MAKES THAT SAFE.**
       //
-      // A mesh curtain in Sponza is far past the 6 144-particle budget, so it
-      // gets `maxSubsteps` = 2 — always. At 60 fps that division lands exactly
-      // on 1/120 and costs nothing, which is why this looked fine. Below 60 it
-      // does not: at 30 fps hEff is 1/60, and from 20 fps down the frame is
-      // clamped first so hEff stops at 1/40 — THREE times the reference step,
-      // NINE times the force term.
+      // A cloth must not change speed with the frame rate, and with a fixed
+      // step it did. A mesh curtain in Sponza is far past the 6 144-particle
+      // budget, so it gets `maxSubsteps` = 2 — always — and two steps of
+      // h = 1/120 is 1/60 s of simulation per frame however long the frame
+      // took. Simulated seconds per real second is therefore `min(1, fps/60)`:
+      // 1.00x at 120 and at 60, 0.67x at 40, 0.50x at 30, 0.33x at 20. The
+      // cloth never ran FAST; everything under 60 fps ran in slow motion, and
+      // walking from a 30 fps editor into a 100 fps play mode doubled its
+      // speed ("i suspect it is frame rate dependant, moving too fast with
+      // higher fps", user, 2026-09-09).
       //
-      // The relaxation that has to clean that up is a fixed EIGHT Jacobi
-      // passes, and Jacobi removes a fixed FRACTION of a violation per pass,
-      // never a fixed distance. So the residual stretch scales with h², and a
-      // hanging chain measures it doing exactly that (`cloth-health`, the
-      // rubber test): 1.006 % at 1/120, 4.024 % at 1/60, 9.053 % at 1/40. On a
-      // 2.3 m curtain that is 2 cm of sag at 120 Hz and 21 cm at 20 fps.
+      // ⛔ THIS WAS DEMOTED TO OPT-IN ON 09-08 AND THE PREMISE HAS SINCE
+      // EXPIRED. Dividing the frame grows h, Verlet's force term is `f·h²`,
+      // and the cleanup is a FIXED eight Jacobi passes — Jacobi removes a
+      // fixed FRACTION of a violation per pass, never a fixed distance — so
+      // residual stretch scaled with h²: 1.006 / 4.024 / 9.053 % at 1/120,
+      // 1/60, 1/40. That was measured at 17:51 on 09-08. **The long-range
+      // fabric-length cap (`u.lraRelax`, see the solve pass) was armed at
+      // 20:10 — two hours later.** It caps distance-from-pin geometrically, in
+      // ONE pass however far the pin is, so it does not care about h at all.
       //
-      // That is not an abstraction, it is the report. "cloth started moving
-      // unnatural, like gravity is super strong or it is made of rubber"
-      // (user, 2026-09-08) — sagging too far AND springing back soft are the
-      // same 9x number seen twice, and nothing else in the solver does both.
+      // The same chain fixture with the LRA the solver actually ships, peak
+      // over a release from horizontal:
       //
-      // Making it step-size-invariant needs the pass count to rise with h, or
-      // an implicit solve. Until then, honest slow motion under load is the
-      // better failure: the cloth lags real time on a slow frame and looks
-      // like cloth. `__clothRealtimeStep = true` restores the division.
-      if (kind === "cloth" && globalThis.__clothRealtimeStep === true) {
+      //             LRA off (what the h² test measures)   LRA 0.5 (ships)
+      //   step      worst spring    furthest hem          worst spring  hem
+      //   1/120     1.034x          1.021x                1.021x        1.015x
+      //   1/60      1.129x          1.081x                1.041x        1.018x
+      //   1/40      1.277x          1.168x                1.089x        1.018x
+      //
+      // ⚠ THE CAP IS A CEILING, NOT A SPRING, and it matters to say so: it
+      // allows 2 % of slack past the taut geodesic (`LRA_SLACK`), so it cannot
+      // act until the cloth has sagged that far, and at the reference step —
+      // 1.005 % — it never fires at all. What it does is stop h² running:
+      // steady-state sag goes 1.006 / 4.024 / 9.053 / 36.213 % bare at
+      // 1/120, 1/60, 1/40, 1/20 and 1.005 / 1.698 / 1.782 / 1.840 % capped.
+      // The hem is step-invariant, and the worst spring degrades linearly
+      // rather than quadratically — 1.089 against a `STRETCH_LIMIT` of 1.5,
+      // where healthy cloth has been measured spiking to 2.54. That is the
+      // whole reason the division is safe now and was not then.
+      // `__clothRealtimeStep = false` restores the fixed step; `cloth-health`
+      // keeps both arms, so flipping this back needs the tests to say so.
+      if (kind === "cloth" && globalThis.__clothRealtimeStep !== false) {
         // ⭐ CONSUME THE WHOLE FRAME. However many substeps the budget allows,
         // they divide the frame's real time between them — so the cloth runs
         // at 1x at every frame rate instead of slowing down when the budget
@@ -2457,19 +2515,33 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         const { count: n, step: hEff } = clothSubsteps(accumulator, maxSubsteps, h);
         accumulator = 0;
         if (n > 0) {
-          velocityScale.value = clothVelocityScale(hEff, lastStep, u.damping.value, h);
+          // ⛔ `n` IS NOT OPTIONAL. Every one of these substeps re-applies this
+          // uniform, so the step-ratio correction has to be handed the count it
+          // will be raised to. See `clothVelocityScale`.
+          velocityScale.value = clothVelocityScale(hEff, lastStep, u.damping.value, h, n);
           stepSq.value = hEff * hEff;
           lastStep = hEff;
+          simulated += n * hEff;
           for (let i = 0; i < n; i++) substepQueue(queue);
         }
+        // ⚠ THE GUST RUNS ON THE FABRIC'S CLOCK, NOT THE WALL'S. `simTime`
+        // drives the wind's gust phase inside the solve kernel, and it was
+        // `elapsed` — real seconds — while the cloth advanced at `fps/60`. A
+        // curtain at 30 fps was therefore blown by a gust oscillating at twice
+        // its own rate. It is only ever the clamped hitch that separates the
+        // two now, but a clamped hitch is exactly when it would show.
+        u.simTime.value = simulated;
       } else {
         stepSq.value = h * h;
         velocityScale.value = u.damping.value;
         lastStep = h;
-        for (let i = 0; accumulator + 1e-9 >= h && i < maxSubsteps; i++, accumulator -= h) substepQueue(queue);
+        let n = 0;
+        for (let i = 0; accumulator + 1e-9 >= h && i < maxSubsteps; i++, accumulator -= h) { substepQueue(queue); n++; }
         // A cloth too big to keep up must not hoard time it will never spend,
         // or the next frame starts already owing six substeps again.
         if (accumulator > h * maxSubsteps) accumulator = h * maxSubsteps;
+        simulated += n * h;
+        if (kind === "cloth") u.simTime.value = simulated;
       }
       // The authoritative pass still runs on a zero-delta frame so a gizmo drag
       // moves its attachment immediately — but only when an anchor exists.

@@ -12,6 +12,7 @@ import {
   subscribeMaterial,
 } from "../../engine/materialAsset.js";
 import { getGltfLoader } from "../../engine/gltfLoader.js";
+import { freeze } from "../../engine/freezeLedger.js";
 
 export const MAX_TERRAIN_LAYERS = 4;
 export const SCULPT_TOOLS = ["raise", "lower", "smooth", "flatten", "sharpen", "contrast", "pinch", "erode", "noise"];
@@ -256,6 +257,72 @@ function valueNoise(x, y, seed) {
 }
 
 /**
+ * Vertex normals for one rectangle of heightfield grid vertices — rows
+ * `rMin..rMax`, columns `cMin..cMax`, inclusive — written in place into `out`
+ * (a normal attribute's array; vertex (r, c) is array index `r * (res + 1) + c`).
+ * O(rectangle), so a brush dab can refresh only the vertices it moved plus the
+ * one-vertex ring whose normals read into them.
+ *
+ * This is EXACTLY what `BufferGeometry.computeVertexNormals()` produces for a
+ * `PlaneGeometry(size, size, res, res).rotateX(-PI / 2)`: the unnormalised
+ * (area-weighted) sum of the six triangles around a vertex, then normalised.
+ * ⛔ It is NOT the central difference `(-dh/dx, 1, -dh/dz)` — that agrees only
+ * to first order, and on the coarse, bumpy grid a freshly sculpted terrain is
+ * the two shade visibly differently (a dab would then "pop" at pointerup when
+ * the full pass replaced them). PlaneGeometry splits every cell along the
+ * (r+1, c)–(r, c+1) diagonal, so two of the six triangles reach the NE and SW
+ * diagonal neighbours; edge and corner vertices sum the triangles that exist.
+ * Pinned against three's own result in tests/terrain-sculpt.test.mjs.
+ *
+ * Layout (see #buildGeometry): row r → local z = -half + r·step, column c →
+ * local x = -half + c·step, y = height.
+ */
+export function heightfieldNormals(heights, res, step, out, rMin = 0, rMax = res, cMin = 0, cMax = res) {
+  const cols = res + 1;
+  rMin = Math.max(0, rMin);
+  rMax = Math.min(res, rMax);
+  cMin = Math.max(0, cMin);
+  cMax = Math.min(res, cMax);
+  for (let r = rMin; r <= rMax; r++) {
+    const row = r * cols;
+    for (let c = cMin; c <= cMax; c++) {
+      const i = row + c;
+      const h0 = heights[i];
+      let nx = 0, ny = 0, nz = 0;
+      // Each block is one cell's triangles touching this vertex, as three
+      // accumulates them: (C - B) × (A - B) per face, with the common factor
+      // `step` divided out (every face contributes `step` to y).
+      if (r < res && c < res) {
+        // face (P, S, E)
+        const hS = heights[i + cols], hE = heights[i + 1];
+        nx -= hE - h0; ny += step; nz -= hS - h0;
+      }
+      if (r > 0 && c < res) {
+        // faces (N, P, NE) and (P, E, NE)
+        const hN = heights[i - cols], hNE = heights[i - cols + 1], hE = heights[i + 1];
+        nx -= hNE - hN; ny += step; nz -= h0 - hN;
+        nx -= hE - h0; ny += step; nz += hNE - hE;
+      }
+      if (r > 0 && c > 0) {
+        // face (W, P, N)
+        const hW = heights[i - 1], hN = heights[i - cols];
+        nx -= h0 - hW; ny += step; nz += hN - h0;
+      }
+      if (r < res && c > 0) {
+        // faces (W, SW, P) and (SW, S, P)
+        const hW = heights[i - 1], hSW = heights[i + cols - 1], hS = heights[i + cols];
+        nx -= h0 - hW; ny += step; nz -= hSW - hW;
+        nx -= hS - hSW; ny += step; nz += h0 - hS;
+      }
+      const len = Math.hypot(nx, ny, nz) || 1;
+      out[i * 3] = nx / len;
+      out[i * 3 + 1] = ny / len;
+      out[i * 3 + 2] = nz / len;
+    }
+  }
+}
+
+/**
  * Heightmap-displaced ground plane with up to 4 splatmap-blended texture
  * layers. Geometry, heights, and the splatmap are all CPU-owned so brush
  * strokes can mutate live buffers directly for immediate visual feedback;
@@ -339,6 +406,8 @@ export class TerrainComponent extends Component {
   onDetach() {
     if (!this.mesh) return;
     this.generation = (this.generation ?? 0) + 1;
+    this._committedHeights = null;
+    this._brushScratch = null;
     if (this.meshComponent?.mesh === this.mesh) {
       this.mesh.geometry = this.previousMeshGeometry;
       this.mesh.material = this.previousMeshMaterial;
@@ -378,13 +447,23 @@ export class TerrainComponent extends Component {
 
   onPropChanged(key) {
     if (key === "heights") {
-      this.heightsArray = decodeFloat32(this.props.heights, (this.resolution + 1) ** 2);
+      if (this._committedHeights != null && this.props.heights === this._committedHeights) {
+        // The stroke's own SetTerrainHeightsCommand echoing the string
+        // `commitHeights()` just encoded from the live buffer: the geometry
+        // already IS this state, so the decode and the second full pass
+        // (normals, bounds, every scatter layer) would only repeat the commit.
+        this._committedHeights = null;
+        return;
+      }
+      this._committedHeights = null;
+      this.heightsArray = decodeFloat32(this.props.heights, (this._gridResolution + 1) ** 2);
       this.#applyHeightsToGeometry();
+      this.#announceSurfaceChange("committed");
       return;
     }
     if (key === "splatmap") {
-      const decoded = decodeUint8(this.props.splatmap, this.splatResolution * this.splatResolution * 4);
-      this.splatData = decoded ?? makeDefaultSplat(this.splatResolution);
+      const decoded = decodeUint8(this.props.splatmap, this._splatResolution * this._splatResolution * 4);
+      this.splatData = decoded ?? makeDefaultSplat(this._splatResolution);
       this.splatTexture.image.data.set(this.splatData);
       this.splatTexture.needsUpdate = true;
       return;
@@ -422,7 +501,9 @@ export class TerrainComponent extends Component {
   // ---------------------------------------------------------------------------
 
   #buildGeometry() {
-    const resolution = (this.resolution = Math.max(2, Math.floor(this.props.resolution ?? 128)));
+    // Component mirrors authored props through setters. Runtime dimensions
+    // must use separate names: assigning this.resolution re-enters onAttach.
+    const resolution = (this._gridResolution = Math.max(2, Math.floor(this.props.resolution ?? 128)));
     const size = this.props.size ?? 50;
     this.geometry = new THREE.PlaneGeometry(size, size, resolution, resolution);
     this.geometry.rotateX(-Math.PI / 2);
@@ -430,19 +511,144 @@ export class TerrainComponent extends Component {
     this.#applyHeightsToGeometry();
   }
 
+  /**
+   * The full, from-scratch apply — load, undo/redo, a resolution change.
+   * O(terrain): every vertex, `computeVertexNormals()` over every triangle, the
+   * bounding sphere, every scatter layer. A brush dab must NOT come through
+   * here (it did, dozens of times a second, and a 512 grid is ~525k triangles
+   * per dab — "terrain sculpting is freezing"); dabs take #applyHeightsRect
+   * and this tail runs once per stroke from commitHeights().
+   */
   #applyHeightsToGeometry() {
     const pos = this.geometry.getAttribute("position");
     const n = Math.min(pos.count, this.heightsArray.length);
     for (let i = 0; i < n; i++) pos.setY(i, this.heightsArray[i]);
+    // This is a whole-buffer upload: an empty range list means "everything",
+    // and ranges left by dabs that never reached a frame would otherwise turn
+    // it into a partial one.
+    pos.clearUpdateRanges();
+    this.geometry.getAttribute("normal")?.clearUpdateRanges();
     pos.needsUpdate = true;
     this.geometry.computeVertexNormals();
-    this.geometry.computeBoundingSphere();
-    for (let i = 0; i < (this.scatterLayersData?.length ?? 0); i++) this.#refreshScatterLayer(i);
+    this.#finishHeightsGeometry();
   }
 
-  /** Encode the live heights buffer back into `props` (call once per stroke). */
+  /** The O(terrain) tail shared by a full apply and a stroke commit. */
+  #finishHeightsGeometry() {
+    this.geometry.boundingBox = null;
+    this.geometry.computeBoundingSphere();
+    const span = freeze.begin("terrain:scatter");
+    try {
+      for (let i = 0; i < (this.scatterLayersData?.length ?? 0); i++) this.#refreshScatterLayer(i);
+    } finally {
+      freeze.end(span);
+    }
+  }
+
+  /**
+   * The per-dab path: writes `heightsArray` into the geometry for grid rows
+   * rMin..rMax × columns cMin..cMax only, recomputes the normals of that
+   * rectangle plus the one-vertex ring whose normals read into it (exactly —
+   * see heightfieldNormals), grows the bounding sphere to cover the moved
+   * vertices, and marks just the touched rows for upload. O(brush area).
+   * Everything that is O(terrain) — the exact bounding sphere, the scatter
+   * layers' re-seat — waits for commitHeights().
+   *
+   * The upload ranges are honoured by both backends: WebGPU
+   * (WebGPUAttributeUtils.updateAttribute — one `queue.writeBuffer` per range,
+   * then `clearUpdateRanges()`) and WebGL (`bufferSubData` per range). A row is
+   * contiguous in the attribute, so the range is whole rows: one range per
+   * attribute per dab rather than one per row.
+   */
+  #applyHeightsRect(rMin, rMax, cMin, cMax) {
+    const res = this._gridResolution;
+    const cols = res + 1;
+    rMin = Math.max(0, rMin);
+    rMax = Math.min(res, rMax);
+    cMin = Math.max(0, cMin);
+    cMax = Math.min(res, cMax);
+    if (rMin > rMax || cMin > cMax) return;
+    const size = this.props.size ?? 50;
+    const half = size / 2;
+    const step = size / res;
+    const heights = this.heightsArray;
+    const pos = this.geometry.getAttribute("position");
+    const nrm = this.geometry.getAttribute("normal");
+    const posArr = pos.array;
+    // Mid-stroke the sphere only ever grows (a tall peak at the edge must not
+    // frustum-cull the whole terrain); the commit recomputes it exactly.
+    const sphere = this.geometry.boundingSphere;
+    const sx = sphere?.center.x ?? 0, sy = sphere?.center.y ?? 0, sz = sphere?.center.z ?? 0;
+    let r2 = sphere ? sphere.radius * sphere.radius : 0;
+    for (let r = rMin; r <= rMax; r++) {
+      const z = -half + r * step;
+      for (let c = cMin; c <= cMax; c++) {
+        const i = r * cols + c;
+        const y = heights[i];
+        posArr[i * 3 + 1] = y;
+        const x = -half + c * step;
+        const d2 = (x - sx) ** 2 + (y - sy) ** 2 + (z - sz) ** 2;
+        if (d2 > r2) r2 = d2;
+      }
+    }
+    if (sphere) sphere.radius = Math.sqrt(r2);
+    const nr0 = Math.max(0, rMin - 1), nr1 = Math.min(res, rMax + 1);
+    const nc0 = Math.max(0, cMin - 1), nc1 = Math.min(res, cMax + 1);
+    heightfieldNormals(heights, res, step, nrm.array, nr0, nr1, nc0, nc1);
+    pos.addUpdateRange(rMin * cols * 3, (rMax - rMin + 1) * cols * 3);
+    pos.needsUpdate = true;
+    nrm.addUpdateRange(nr0 * cols * 3, (nr1 - nr0 + 1) * cols * 3);
+    nrm.needsUpdate = true;
+    this.geometry.boundingBox = null;
+    const rect = { rMin, rMax, cMin, cMax };
+    const previous = this._surfaceDirtyRect;
+    this._surfaceDirtyRect = previous ? { rMin: Math.min(previous.rMin, rMin), rMax: Math.max(previous.rMax, rMax), cMin: Math.min(previous.cMin, cMin), cMax: Math.max(previous.cMax, cMax) } : rect;
+    this.#announceSurfaceChange("preview", rect);
+  }
+
+  /**
+   * End of a sculpt stroke: finishes the O(terrain) work the dabs deferred —
+   * a full pass over positions and normals (the same analytic normals the dabs
+   * wrote, over the whole grid, so the end state is exactly what a from-scratch
+   * apply gives), the exact bounding sphere, every scatter layer's re-seat —
+   * then encodes the live heights buffer into `props.heights`. Once per stroke,
+   * never per dab.
+   *
+   * The editor follows this with SetTerrainHeightsCommand, whose `do()` is
+   * `setProp("heights", <this same string>)`; onPropChanged recognises the
+   * string this commit produced and skips the decode and a second full pass.
+   * Undo/redo carry a different string and take the full path.
+   */
   commitHeights() {
-    this.props.heights = encodeFloat32(this.heightsArray);
+    const span = freeze.begin("terrain:stroke-commit");
+    try {
+      if (this.geometry) {
+        const res = this._gridResolution;
+        const pos = this.geometry.getAttribute("position");
+        const nrm = this.geometry.getAttribute("normal");
+        const n = Math.min(pos.count, this.heightsArray.length);
+        for (let i = 0; i < n; i++) pos.setY(i, this.heightsArray[i]);
+        heightfieldNormals(this.heightsArray, res, (this.props.size ?? 50) / res, nrm.array);
+        pos.clearUpdateRanges();
+        pos.needsUpdate = true;
+        nrm.clearUpdateRanges();
+        nrm.needsUpdate = true;
+        this.#finishHeightsGeometry();
+      }
+      this.props.heights = encodeFloat32(this.heightsArray);
+      this._committedHeights = this.props.heights;
+      this.#announceSurfaceChange("committed", this._surfaceDirtyRect ?? null);
+      this._surfaceDirtyRect = null;
+    } finally {
+      freeze.end(span);
+    }
+  }
+
+  /** Dedicated light notification: live dabs must not wake every generic
+   * geometry consumer, recook physics or rebuild GI and foliage. */
+  #announceSurfaceChange(phase, rect = null) {
+    this._surfaceRevision = (this._surfaceRevision ?? 0) + 1;
+    this.entity.engine?.emit?.("terrain-surface-changed", { entityId: this.entity.id, component: this, phase, rect, revision: this._surfaceRevision });
   }
 
   /**
@@ -453,11 +659,11 @@ export class TerrainComponent extends Component {
    */
   heightAtLocal(x, z) {
     const half = (this.props.size ?? 50) / 2;
-    const cols = this.resolution + 1;
-    const fc = THREE.MathUtils.clamp(((x + half) / (half * 2)) * this.resolution, 0, this.resolution);
-    const fr = THREE.MathUtils.clamp(((z + half) / (half * 2)) * this.resolution, 0, this.resolution);
+    const cols = this._gridResolution + 1;
+    const fc = THREE.MathUtils.clamp(((x + half) / (half * 2)) * this._gridResolution, 0, this._gridResolution);
+    const fr = THREE.MathUtils.clamp(((z + half) / (half * 2)) * this._gridResolution, 0, this._gridResolution);
     const c0 = Math.floor(fc), r0 = Math.floor(fr);
-    const c1 = Math.min(c0 + 1, this.resolution), r1 = Math.min(r0 + 1, this.resolution);
+    const c1 = Math.min(c0 + 1, this._gridResolution), r1 = Math.min(r0 + 1, this._gridResolution);
     const tc = fc - c0, tr = fr - r0;
     const h00 = this.heightsArray[r0 * cols + c0];
     const h10 = this.heightsArray[r0 * cols + c1];
@@ -472,7 +678,7 @@ export class TerrainComponent extends Component {
 
   /** Surface normal sampled from the live heightfield in entity-local space. */
   normalAtLocal(x, z) {
-    const step = (this.props.size ?? 50) / this.resolution;
+    const step = (this.props.size ?? 50) / this._gridResolution;
     const dx = this.heightAtLocal(x + step, z) - this.heightAtLocal(x - step, z);
     const dz = this.heightAtLocal(x, z + step) - this.heightAtLocal(x, z - step);
     return new THREE.Vector3(-dx, step * 2, -dz).normalize();
@@ -486,7 +692,7 @@ export class TerrainComponent extends Component {
     if (dist > radius) return current;
     const exp = THREE.MathUtils.lerp(0.4, 4, hardness);
     const amount = strength * Math.pow(1 - dist / radius, exp);
-    const step = (this.props.size ?? 50) / this.resolution;
+    const step = (this.props.size ?? 50) / this._gridResolution;
     const neighbor = () => {
       let sum = 0;
       for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
@@ -517,7 +723,7 @@ export class TerrainComponent extends Component {
   // ---------------------------------------------------------------------------
 
   #buildSplatmap() {
-    const resolution = (this.splatResolution = Math.max(2, Math.floor(this.props.splatResolution ?? 256)));
+    const resolution = (this._splatResolution = Math.max(2, Math.floor(this.props.splatResolution ?? 256)));
     const decoded = decodeUint8(this.props.splatmap, resolution * resolution * 4);
     this.splatData = decoded ?? makeDefaultSplat(resolution);
     this.splatTexture = new THREE.DataTexture(this.splatData, resolution, resolution, THREE.RGBAFormat);
@@ -1133,22 +1339,50 @@ export class TerrainComponent extends Component {
    */
   applyHeightBrush(local, opts) {
     if (!this.geometry) return;
+    const span = freeze.begin("terrain:brush");
+    try {
+      this.#sculpt(local, opts);
+    } finally {
+      freeze.end(span);
+    }
+  }
+
+  /**
+   * Rows `rMin - 1 .. rMax + 1` of the live heights, copied into a reusable
+   * scratch buffer sized like `heightsArray`. The neighbour-reading tools
+   * read one vertex around the dab's box and nothing further, so that is all
+   * a snapshot needs to hold — `heights.slice()` was an O(terrain) 1 MB copy
+   * per dab on a 512 grid. The scratch is allocated once per resolution.
+   */
+  #brushSnapshot(rMin, rMax) {
+    const heights = this.heightsArray;
+    let scratch = this._brushScratch;
+    if (!scratch || scratch.length !== heights.length) scratch = this._brushScratch = new Float32Array(heights.length);
+    const cols = this._gridResolution + 1;
+    const from = Math.max(0, rMin - 1) * cols;
+    const to = Math.min(this._gridResolution, rMax + 1) * cols + cols;
+    scratch.set(heights.subarray(from, to), from);
+    return scratch;
+  }
+
+  #sculpt(local, opts) {
     const { tool, radius, strength, hardness = 0.5, falloff = null, flattenHeight = 0, seed = 0 } = opts;
-    const cols = this.resolution + 1;
+    const cols = this._gridResolution + 1;
     const heights = this.heightsArray;
     const half = (this.props.size ?? 50) / 2;
-    const step = (half * 2) / this.resolution;
+    const step = (half * 2) / this._gridResolution;
+
+    // Only touch vertices inside the brush's bounding box.
+    const cMin = Math.max(0, Math.floor((local.x - radius + half) / step));
+    const cMax = Math.min(this._gridResolution, Math.ceil((local.x + radius + half) / step));
+    const rMin = Math.max(0, Math.floor((local.z - radius + half) / step));
+    const rMax = Math.min(this._gridResolution, Math.ceil((local.z + radius + half) / step));
+    if (rMin > rMax || cMin > cMax) return; // the brush is off the grid
 
     // Neighbor-reading tools work off a snapshot so one pass isn't biased by
     // its own in-progress writes.
     const needsSnapshot = tool === "smooth" || tool === "sharpen" || tool === "erode" || tool === "pinch" || tool === "contrast";
-    const src = needsSnapshot ? heights.slice() : heights;
-
-    // Only touch vertices inside the brush's bounding box.
-    const cMin = Math.max(0, Math.floor((local.x - radius + half) / step));
-    const cMax = Math.min(this.resolution, Math.ceil((local.x + radius + half) / step));
-    const rMin = Math.max(0, Math.floor((local.z - radius + half) / step));
-    const rMax = Math.min(this.resolution, Math.ceil((local.z + radius + half) / step));
+    const src = needsSnapshot ? this.#brushSnapshot(rMin, rMax) : heights;
 
     for (let r = rMin; r <= rMax; r++) {
       for (let c = cMin; c <= cMax; c++) {
@@ -1172,17 +1406,17 @@ export class TerrainComponent extends Component {
             heights[idx] += (flattenHeight - heights[idx]) * Math.min(1, amt);
             break;
           case "smooth": {
-            const avg = neighborAvg(src, cols, r, c, this.resolution);
+            const avg = neighborAvg(src, cols, r, c, this._gridResolution);
             heights[idx] = src[idx] + (avg - src[idx]) * Math.min(1, amt);
             break;
           }
           case "sharpen": {
-            const avg = neighborAvg(src, cols, r, c, this.resolution);
+            const avg = neighborAvg(src, cols, r, c, this._gridResolution);
             heights[idx] = src[idx] + (src[idx] - avg) * amt;
             break;
           }
           case "erode": {
-            const mn = neighborMin(src, cols, r, c, this.resolution);
+            const mn = neighborMin(src, cols, r, c, this._gridResolution);
             heights[idx] = src[idx] + (mn - src[idx]) * Math.min(1, amt);
             break;
           }
@@ -1199,14 +1433,14 @@ export class TerrainComponent extends Component {
           case "contrast":
             // Push away from the local average: the inverse of smooth, and the
             // heightfield equivalent of the mesh sculptor's Crease.
-            heights[idx] = src[idx] + (src[idx] - neighborAvg(src, cols, r, c, this.resolution)) * amt * 2;
+            heights[idx] = src[idx] + (src[idx] - neighborAvg(src, cols, r, c, this._gridResolution)) * amt * 2;
             break;
           default:
             break;
         }
       }
     }
-    this.#applyHeightsToGeometry();
+    this.#applyHeightsRect(rMin, rMax, cMin, cMax);
   }
 
   // ---------------------------------------------------------------------------
@@ -1228,7 +1462,7 @@ export class TerrainComponent extends Component {
     const { layerIndex, radius, strength, hardness = 0.5, falloff = null, erase = false } = opts;
     const layer = THREE.MathUtils.clamp(layerIndex | 0, 0, 3);
     const half = (this.props.size ?? 50) / 2;
-    const res = this.splatResolution;
+    const res = this._splatResolution;
 
     // Texel <-> world mapping matches the material's uv() sampling:
     //   world x = -half + u*size,  world z =  half - v*size   (see PlaneGeometry

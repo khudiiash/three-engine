@@ -17,6 +17,7 @@ import {
 import { AssetPreview } from "../components/AssetPreview.jsx";
 import { loadArchivePreview } from "../previewSources.js";
 
+import { Select } from "../fields/Select.jsx";
 const formatMb = (bytes) => `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 
 /**
@@ -134,7 +135,7 @@ export function FabPanel() {
         <button className="toolbar-btn icon-only" type="submit" title="Search">
           <Search size={13} />
         </button>
-        <select
+        <Select
           className="ph-category"
           value={filters.listingType}
           onChange={(event) => setFilter({ listingType: event.target.value })}
@@ -142,8 +143,8 @@ export function FabPanel() {
           {LISTING_TYPES.map((value) => (
             <option key={value.id} value={value.id}>{value.label}</option>
           ))}
-        </select>
-        <select
+        </Select>
+        <Select
           className="ph-category"
           value={filters.format}
           onChange={(event) => setFilter({ format: event.target.value })}
@@ -153,7 +154,7 @@ export function FabPanel() {
           {IMPORT_FORMATS.map((value) => (
             <option key={value.id} value={value.id}>{value.label}</option>
           ))}
-        </select>
+        </Select>
         <label className="pp-animated" title="Creative Commons Attribution — free for any use, credit required">
           <input
             type="checkbox"

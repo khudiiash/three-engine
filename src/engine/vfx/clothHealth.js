@@ -237,13 +237,32 @@ export function clothSubsteps(frameSeconds, maxSubsteps, referenceStep = CLOTH_R
 /**
  * What to multiply Verlet's stored velocity by.
  *
- * ⚠ TWO CORRECTIONS IN ONE NUMBER. Verlet keeps velocity as a DISPLACEMENT
- * over the previous step, so a change of step size has to be rescaled by the
- * ratio or it reads as an impulse. And damping is authored per REFERENCE step,
- * so it has to be re-exponentiated for the step actually taken — otherwise a
- * cloth simulated in fewer, larger steps is less damped per second and rings.
+ * ⚠ TWO CORRECTIONS IN ONE NUMBER, AND THEY DO NOT COMPOSE THE SAME WAY.
+ * Verlet keeps velocity as a DISPLACEMENT over the previous step, so a change
+ * of step size has to be rescaled by the ratio or it reads as an impulse. And
+ * damping is authored per REFERENCE step, so it has to be re-exponentiated for
+ * the step actually taken — otherwise a cloth simulated in fewer, larger steps
+ * is less damped per second and rings.
+ *
+ * ⛔⛔ **DAMPING IS PER SUBSTEP; THE RATIO IS PER FRAME.** `integrate` runs
+ * once per substep and multiplies by this number every time, but all the
+ * substeps of one frame share a single uniform — so a ratio meant to be
+ * applied ONCE was applied `substeps` times, i.e. raised to that power. Under
+ * a steady frame rate the ratio is exactly 1 and the bug is invisible, which
+ * is why a constant-step fixture could not see it and the live editor could:
+ * "cloth is broken now" (user, 2026-09-09), on the first frame rate that
+ * jittered. Peak particle speed, 12-link chain, against the fixed step:
+ *
+ *   clock                       ratio^n (was)   ratio^(1/n)^n (now)
+ *   46 fps, +/-15 % jitter          1.4x              1.2x
+ *   46 fps, 8 % GI-rebuild stalls   2.9x              1.4x
+ *
+ * ⚠ AND DELETING THE RATIO IS WORSE, NOT BETTER (3.7x on that burst clock) —
+ * this is a composition error, not a bad correction. The n-th root is what
+ * makes `substeps` applications compose to exactly `ratio`.
  */
-export function clothVelocityScale(step, previousStep, damping, referenceStep = CLOTH_REFERENCE_STEP) {
+export function clothVelocityScale(step, previousStep, damping, referenceStep = CLOTH_REFERENCE_STEP, substeps = 1) {
   const ratio = previousStep > 1e-9 ? step / previousStep : 1;
-  return ratio * Math.pow(Math.min(Math.max(damping, 0), 1), step / referenceStep);
+  const perSubstep = Math.pow(ratio, 1 / Math.max(1, Math.floor(substeps) || 1));
+  return perSubstep * Math.pow(Math.min(Math.max(damping, 0), 1), step / referenceStep);
 }

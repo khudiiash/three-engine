@@ -230,6 +230,29 @@ export function classifyDynamicShape(mesh) {
   if (tag === "bvh") return asMesh();
   if (tag === "obb") return { type: "obb", center, halfExtents };
 
+  // ── AN ASSET CAN DECLARE ITS OWN CLOSED FORM ────────────────────────────
+  //
+  // Everything below switches on `geometry.type`, which only a three.js
+  // primitive carries — a `.geom` asset loads as a bare BufferGeometry, so a
+  // 350-ball pool authored against a SHARED sphere asset (the only way
+  // engine/batching.js will instance it, see MeshComponent's per-entity
+  // `geometryFactories`) classified as 350 BVH-mesh movers at ~320 triangles
+  // each. That is unaffordable per ray, and it is also wrong: the thing IS a
+  // sphere, and a sphere costs ~10 ALU exactly.
+  //
+  // `geometryAsset.js` has always carried `meta.giRayProxy` onto
+  // `geometry.userData` and NOTHING has ever read it. This is that reader:
+  // a `.geom.meta` of `{ "giRayProxy": { "type": "sphere", "radius": 0.5 } }`
+  // says "trace me as this closed form", in the geometry's own local units.
+  const proxy = geometry.userData?.giRayProxy;
+  if (proxy?.type === "sphere" && Number.isFinite(proxy.radius)) {
+    return { type: "sphere", center, halfExtents, params: [proxy.radius, 0, 0] };
+  }
+  if (proxy?.type === "capsule" && Number.isFinite(proxy.radius)) {
+    return { type: "capsule", center, halfExtents, params: [proxy.radius, (proxy.height ?? 0) / 2, 0] };
+  }
+  if (proxy?.type === "obb") return { type: "obb", center, halfExtents };
+
   const p = geometry.parameters;
   switch (geometry.type) {
     case "BoxGeometry":
@@ -1697,7 +1720,20 @@ export const OBJ_SLOT_STRIDE = 8;
  * allocator, staged uploads) and the TSL/WGSL trace closures.
  */
 export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjects, isPromotedEmitter = null }) {
-  const MAX = Math.min(64, Math.max(4, maxObjects ?? (Number(globalThis.__giMaxDynamicObjects) || DEFAULT_MAX_OBJECTS)));
+  // ── THE CEILING WAS 64, AND ITS STATED REASON DOES NOT BIND ─────────────
+  //
+  // "f32-exact card ids" (see writeSurface): the packed value is
+  // objectIndex*8 + cardSlot, so MAX = 64 maxes it at 509 — and f32 is exact
+  // to 2^24. 512 objects pack to 4095, which is exact by four orders of
+  // magnitude. The real cost of a big set is the PER-RAY LOOP (one swept-AABB
+  // reject per mover), which is why the tier defaults stay small; a scene that
+  // seats more pays more, and one that seats 16 pays exactly what it paid.
+  //
+  // Raised for the ball pool (2026-09-10): 350 moving spheres could not all be
+  // exact movers, so a ball that lost the race kept its STATIC triangles at the
+  // authored pose (shadow frozen in place) while one that won was masked OUT of
+  // the static BVH (shadow gone). Both symptoms are the cap.
+  const MAX = Math.min(512, Math.max(4, maxObjects ?? (Number(globalThis.__giMaxDynamicObjects) || DEFAULT_MAX_OBJECTS)));
   const HEADER_WORDS = dynHeaderWords(MAX);
   const enabled = capacityWords >= HEADER_WORDS;
   const poolWords = Math.max(0, capacityWords - HEADER_WORDS);
@@ -1906,7 +1942,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
    * near-misses fade shadow verdicts continuously — the same band-limit
    * contract the voxel marchers follow (WIDTH only, never admission).
    */
-  const traceDynBody = (o, d, t0, t1, penK, penW, exclP, meshes, objId) => {
+  const traceDynBody = (o, d, t0, t1, penK, penW, exclP, meshes, objId, exclN = null) => {
     const rw = (rel) => bits.element(uint(baseWord).add(rel));
     const rf = (rel) => uintBitsToFloat(rw(rel));
     const count = rf(uint(0)).toInt().min(int(MAX)).toVar();
@@ -1972,7 +2008,29 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         // the joint skin, which is exactly the right admission there.
         const excluded = exclP != null
           ? (() => {
-              const exL = c0.mul(exclP.x).add(c1.mul(exclP.y)).add(c2.mul(exclP.z)).add(c3);
+              const exL = c0.mul(exclP.x).add(c1.mul(exclP.y)).add(c2.mul(exclP.z)).add(c3).toVar();
+              // EXACT ADOPTEES ARE NOT FAT (2026-09-11). The signed slack
+              // below — 15 % of the radius, 6 cm on a 0.4 m ball — exists for
+              // bone capsules whose skin sits inside the shell. On an EXACT
+              // sphere it excluded the ball from every receiver within 6 cm
+              // of its surface: the floor under it and the neighbour it rests
+              // on. Those receivers' shadow rays then passed straight through
+              // the one sphere that should have blocked them, which lit a
+              // ring around every contact — the "white dashed halo" along
+              // the lower silhouettes of the ball pool, surviving every bias
+              // and upsample change because the trace itself said "lit".
+              // With the receiver's NORMAL supplied, a sphere is excluded
+              // only when the receiver FACES OUT OF IT (n · (P − C) > 0.5):
+              // a receiver on the sphere's own surface, or skin inside a
+              // joint sphere. A floor point under a ball faces INTO it and
+              // keeps the ball as its occluder. Callers without a normal
+              // (transport rays, RTAO) keep the old distance-only test.
+              const nL = exclN != null
+                ? c0.mul(exclN.x).add(c1.mul(exclN.y)).add(c2.mul(exclN.z)).toVar()
+                : null;
+              const facesOut = nL != null
+                ? exL.dot(nL).div(exL.length().max(1e-6).mul(nL.length().max(1e-6))).greaterThan(0.5)
+                : null;
               const qe = exL.abs().sub(he);
               const de = qe.max(vec3(0)).length().add(qe.x.max(qe.y.max(qe.z)).min(0));
               const deSphere = exL.length().sub(prm.x);
@@ -1992,7 +2050,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
               // signed and |d| agree.
               const boxTest = type.lessThan(1.5)
                 .and(de.mul(scale).lessThan(0.03));
-              const sphereTest = type.greaterThan(2.5).and(type.lessThan(3.5))
+              const sphereTest = (facesOut != null
+                ? type.greaterThan(2.5).and(type.lessThan(3.5)).and(facesOut)
+                : type.greaterThan(2.5).and(type.lessThan(3.5)))
                 .and(deSphere.mul(scale).lessThan(slackW));
               const capsuleTest = type.greaterThan(3.5).and(type.lessThan(4.5))
                 .and(deCapsule.mul(scale).lessThan(slackW));
@@ -2670,12 +2730,15 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       const pw = pen && opts.penWidth != null;
       const meshes = opts.meshes !== false && poolCapacity > 0;
       const excl = opts.excludePoint != null;
+      // The receiver NORMAL beside the exclude point (see the sphere test in
+      // traceDynBody): only meaningful with a point, and its own variant.
+      const exclN = excl && opts.excludeNormal != null;
       // `objId` returns the winning object's index in the pen slot. Mutually
       // exclusive with penumbra by construction — they share the slot, and no
       // consumer wants both (penumbra is a shadow-ray term; the index is for
       // shading a transport-ray hit).
       const objId = opts.objId === true && !pen;
-      const key = `${pen ? 1 : 0}${pw ? 1 : 0}${meshes ? 1 : 0}${excl ? 1 : 0}${objId ? 1 : 0}`;
+      const key = `${pen ? 1 : 0}${pw ? 1 : 0}${meshes ? 1 : 0}${excl ? 1 : 0}${objId ? 1 : 0}${exclN ? 1 : 0}`;
       let fn = set._traceVariants.get(key);
       if (fn === undefined) {
         fn = sharedFn({
@@ -2689,6 +2752,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
             ...(pen ? [{ name: "penK", type: "float" }] : []),
             ...(pw ? [{ name: "penW", type: "float" }] : []),
             ...(excl ? [{ name: "excl", type: "vec3" }] : []),
+            ...(exclN ? [{ name: "excln", type: "vec3" }] : []),
           ],
           // Trailing-optional positional mapping, same idiom as the hybrid
           // marcher: each optional input occupies the next free seat.
@@ -2698,7 +2762,8 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
             const penK = pen ? params[seat++] : null;
             const penW = pw ? params[seat++] : null;
             const exclP = excl ? params[seat++] : null;
-            return traceDynBody(o, d, t0, t1, penK, penW, exclP, meshes, objId);
+            const exclNv = exclN ? params[seat++] : null;
+            return traceDynBody(o, d, t0, t1, penK, penW, exclP, meshes, objId, exclNv);
           },
         });
         set._traceVariants.set(key, fn);
@@ -2707,6 +2772,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       if (pen) args.push(float(opts.penumbraK));
       if (pw) args.push(float(opts.penWidth));
       if (excl) args.push(vec3(opts.excludePoint));
+      if (exclN) args.push(vec3(opts.excludeNormal));
       const packed = fn(...args).toVar();
       // §11.15: x is 0 miss / 1 hit from outside / 2 hit from INSIDE the
       // mover. `hit` stays the 0/1 every consumer tests; `inside` is the
@@ -2923,6 +2989,7 @@ export function composeFieldDynamics(field, dyn) {
       penWidth: wantPen && opts.penWidth != null ? opts.penWidth : null,
       meshes: opts.dynamics !== "obb",
       excludePoint: opts.excludePoint ?? null,
+      excludeNormal: opts.excludeNormal ?? null,
       objId: wantObj,
     });
     const better = dr.hit.greaterThan(0.5)

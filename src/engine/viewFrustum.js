@@ -226,6 +226,12 @@ function collectSimulationMeshes(entity, meshes) {
     const mesh = entity.getComponent?.(type)?.simulation?.mesh;
     if (mesh) meshes.push(mesh);
   }
+  // One full-detail bound per chunk covers every distance representation.
+  // The authored entity has no MeshComponent; omitting these makes framing and
+  // view-only gates treat an entire foliage field as an empty transform.
+  for (const chunk of entity.getComponent?.("foliage")?.chunks ?? []) {
+    if (chunk.meshes?.[0]) meshes.push(chunk.meshes[0]);
+  }
 }
 
 /**

@@ -79,7 +79,29 @@ try {
     if (process.env.FULL) console.log(JSON.stringify(tools, null, 2));
     else console.log(tools.map((t) => t.name).sort().join("\n"));
   } else {
-    const res = await withTimeout(client.callTool({ name: toolArg, arguments: args }), toolArg);
+    // ── THE ATTACH RACE, CLOSED ────────────────────────────────────────────
+    //
+    // `client.connect()` resolves on the MCP handshake, but the server it just
+    // spawned dials the broker AFTER that — so the FIRST call reliably answers
+    // "needs the engine editor to be running", and the banner two lines later
+    // says `editor connected`. Every caller has had to know this and retry by
+    // hand; a session driving a measurement loop through here loses roughly
+    // every other call to it, which is how a working bridge reads as a broken
+    // one.
+    //
+    // Retried on the EXACT refusal text rather than on any error: a real "no
+    // editor is running" answers the same way, so the bound is what separates
+    // them — after ~12 s of retries the editor genuinely is not there, and the
+    // op fails with the message it always did.
+    const ATTACHING = /needs the engine editor to be running/i;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms).unref());
+    let res;
+    for (let attempt = 0; ; attempt++) {
+      res = await withTimeout(client.callTool({ name: toolArg, arguments: args }), toolArg);
+      const first = (res?.content ?? []).find((c) => c.type === "text")?.text ?? "";
+      if (!ATTACHING.test(first) || attempt >= 8) break;
+      await sleep(250 + attempt * 250);
+    }
     const content = res?.content ?? [];
     const text = content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
     if (res?.isError) fail(text || `${toolArg} reported an error with no message`);

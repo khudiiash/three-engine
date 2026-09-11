@@ -93,13 +93,17 @@ function Widget({ spec, value, onChange }) {
 }
 
 function GraphNodeInner({ id, data, selected }) {
-  const def = data.describe(data.nodeType);
+  const props = data.props ?? {};
+  const wired = data.connectedHandles;
+  // A registry may vary a node's sockets with its own params — the shader
+  // Material Output shows the slots its material class actually reads. It
+  // needs both the params and the live wiring to decide (see `outputInputs`),
+  // so hand it the node rather than only the type.
+  const def = data.describe(data.nodeType, { props, connectedHandles: wired });
   const updateNodeInternals = useUpdateNodeInternals();
 
-  const props = data.props ?? {};
   const collapsed = !!props.__collapsed;
   const thumb = !!props.__thumb;
-  const wired = data.connectedHandles;
   const inputs = def?.inputs ?? [];
   const outputs = def?.outputs ?? [];
   const params = def?.params ?? [];
@@ -117,7 +121,7 @@ function GraphNodeInner({ id, data, selected }) {
   useEffect(() => {
     const raf = requestAnimationFrame(() => updateNodeInternals(id));
     return () => cancelAnimationFrame(raf);
-  }, [id, thumb, collapsed, updateNodeInternals]);
+  }, [id, thumb, collapsed, inputs.length, updateNodeInternals]);
 
   if (!def) return null;
 
@@ -236,12 +240,22 @@ function GraphNodeInner({ id, data, selected }) {
             outputPorts
           )}
 
-          {inputs.map((spec) => {
+          {inputs.map((spec, index) => {
             const isWired = wired?.has(spec.key) ?? false;
             const propKey = spec.propKey ?? spec.key;
             const automatic = spec.autoLabel && props[propKey] == null;
+            // Section headings for a node with enough sockets to need them
+            // (the shader Material Output). Emitted when the section changes,
+            // never for the first row of a node that only has one section.
+            const sect = spec.sect && spec.sect !== inputs[index - 1]?.sect ? spec.sect : null;
             return (
-              <div className="shader-node-row" key={spec.key} data-wired={isWired || undefined}>
+              <div
+                className={`shader-node-row${spec.inactive ? " inactive" : ""}`}
+                key={spec.key}
+                data-wired={isWired || undefined}
+                data-section={sect || undefined}
+                title={spec.inactive ? `${spec.key} is not read by this material class` : undefined}
+              >
                 <Handle
                   type="target"
                   position={Position.Left}

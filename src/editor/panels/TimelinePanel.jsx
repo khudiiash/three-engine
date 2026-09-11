@@ -45,6 +45,7 @@ import {
 import { defaultValueFor, evaluateKeys, isSteppedType } from "../../engine/timeline/curve.js";
 import { TimelineRuntime } from "../../engine/timeline/TimelineRuntime.js";
 import { ownsKeyboard } from "../keyScope.js";
+import { Select } from "../fields/Select.jsx";
 import {
   animatableProperties,
   readProperty,
@@ -335,32 +336,32 @@ function AddTrackPopover({ onAdd, onClose }) {
     <div className="timeline-add-popover" onPointerDown={(e) => e.stopPropagation()}>
       <label className="timeline-add-row">
         <span>Kind</span>
-        <select className="select-field" value={kind} onChange={(e) => setKind(e.target.value)}>
+        <Select className="select-field" value={kind} onChange={(e) => setKind(e.target.value)}>
           {TRACK_KINDS.map((k) => (
             <option key={k} value={k}>
               {KIND_LABELS[k]}
             </option>
           ))}
-        </select>
+        </Select>
       </label>
       {kind !== "camera" && (
         <label className="timeline-add-row">
           <span>Target</span>
-          <select className="select-field" value={target} onChange={(e) => setTarget(e.target.value)}>
+          <Select className="select-field" value={target} onChange={(e) => setTarget(e.target.value)}>
             <option value="">— the director's entity —</option>
             {entityList.map((e) => (
               <option key={e.id} value={e.id}>
                 {e.name}
               </option>
             ))}
-          </select>
+          </Select>
         </label>
       )}
       {kind === "property" && (
         <>
           <label className="timeline-add-row">
             <span>Component</span>
-            <select
+            <Select
               className="select-field"
               value={component}
               onChange={(e) => setComponent(e.target.value)}
@@ -370,11 +371,11 @@ function AddTrackPopover({ onAdd, onClose }) {
                   {type === "" ? "Transform" : type}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
           <label className="timeline-add-row">
             <span>Property</span>
-            <select
+            <Select
               className="select-field"
               value={property}
               onChange={(e) => setProperty(e.target.value)}
@@ -384,7 +385,7 @@ function AddTrackPopover({ onAdd, onClose }) {
                   {p.label}
                 </option>
               ))}
-            </select>
+            </Select>
           </label>
         </>
       )}
@@ -490,7 +491,7 @@ function ItemInspector({ track, item, entities, onPatch, onDelete }) {
       rows.push(
         <label key="interp" className="timeline-insp-row">
           <span>Interp</span>
-          <select
+          <Select
             className="select-field"
             value={item.interp}
             onChange={(e) => patch({ interp: e.target.value })}
@@ -505,7 +506,7 @@ function ItemInspector({ track, item, entities, onPatch, onDelete }) {
                 {i}
               </option>
             ))}
-          </select>
+          </Select>
         </label>,
       );
       if (item.interp === "bezier" && track.valueType === "number") {
@@ -596,7 +597,7 @@ function ItemInspector({ track, item, entities, onPatch, onDelete }) {
     rows.push(
       <label key="vcam" className="timeline-insp-row">
         <span>Shot</span>
-        <select
+        <Select
           className="select-field"
           value={item.vcam ?? ""}
           onChange={(e) => patch({ vcam: e.target.value })}
@@ -609,7 +610,7 @@ function ItemInspector({ track, item, entities, onPatch, onDelete }) {
                 {e.name}
               </option>
             ))}
-        </select>
+        </Select>
       </label>,
       <label key="blend" className="timeline-insp-row">
         <span>Blend (s)</span>

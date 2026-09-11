@@ -13,7 +13,7 @@ export class VfxComponent extends Component {
   static tags = ["effects", "timeline", "animation"];
   static resetOnStop = true;
   static defaults = { timeline: null, playOnStart: true, speed: 1 };
-  static schema = [{ key: "playOnStart", label: "Play on start", type: "boolean" }, { key: "speed", label: "Playback speed", type: "number", min: 0, max: 10, step: .1 }];
+  static schema = [{ key: "playOnStart", label: "Play on start", type: "boolean" }, { key: "speed", label: "Playback speed", type: "number", min: 0, max: 10, step: .1 }, { key: "runInEditor", label: "Run In Editor", type: "boolean" }];
 
   onAttach() {
     this.time = 0; this.state = "stopped";
@@ -22,6 +22,9 @@ export class VfxComponent extends Component {
       // Held while a modal editor mode owns the viewport (the geometry
       // editor). See Engine.suspendSimulation.
       if (this.entity.engine.simulationSuspended === true) return;
+      // "Run In Editor" (default off): freeze VFX playback while editing —
+      // billboards still face the camera, but the timeline does not advance.
+      if (!this.shouldAnimate) { this.alignBillboards(); return; }
       const ownerVisible = this.ownerVisible();
       if (ownerVisible !== this._ownerVisible) { this._ownerVisible = ownerVisible; this.evaluate(this.time); }
       if (!this.enabled || !ownerVisible || this.state !== "playing") { this.alignBillboards(); return; }

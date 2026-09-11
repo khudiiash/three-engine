@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Save, X, RotateCcw, Crosshair, FolderOpen } from "../icons/index.jsx";
+import { useEffect, useMemo, useState } from "react";
+import { Save, X, RotateCcw, Crosshair, ChevronRight, FolderOpen } from "../icons/index.jsx";
 import { AssetField } from "../fields/AssetField.jsx";
 import { Row, Toggle, Note, Section } from "./settingsUi.jsx";
 import { useProjectStore, basename } from "../store/projectStore.js";
@@ -8,6 +8,7 @@ import { applyAccent, DEFAULT_ACCENT } from "../accent.js";
 import { NumberField } from "../fields/NumberField.jsx";
 import { currentScenePath } from "../sceneIO.js";
 import { KEY_BINDING_ACTIONS, describeBinding, keyTokenFromEvent } from "../keybindings.js";
+import { KEY_CATALOG, chordsOf, formatChord } from "../keyCatalog.js";
 import { AMBIENT_GLOW_DEFAULTS, setAmbientGlowLook } from "../ambientGlowLook.js";
 import { setLayerVisible, subscribeLayers } from "../panels/ViewportPanel.jsx";
 import {
@@ -150,20 +151,142 @@ function KeybindingInput({ value, defaultChord, onChange }) {
   );
 }
 
+/** A chord, drawn as keycaps. `Ctrl+Shift+S` becomes three keys, not a string. */
+function Chord({ chord }) {
+  const text = formatChord(chord);
+  if (text === "Unbound") return <span className="keycap-unbound">Unbound</span>;
+  // On macOS `formatChord` already returns one glyph run (⇧⌥S) — the way a Mac
+  // menu writes it — so there is nothing left to split.
+  const parts = text.includes("+") ? text.split("+") : [text];
+  return (
+    <span className="keycaps">
+      {parts.map((part, i) => (
+        <kbd key={i}>{part}</kbd>
+      ))}
+    </span>
+  );
+}
+
+/**
+ * One shortcut. Rebindable rows get the capture field; the rest are read-only
+ * keycaps.
+ *
+ * Showing the fixed ones is the point of the page. Five editable rows told you
+ * nothing about the seventy chords the editor actually answers to, so "what
+ * does Shift+D do" and "is Ctrl+J free" had no answer anywhere in the product.
+ */
+function KeyRow({ item, keybindings, onChange }) {
+  const def = item.action ? KEY_BINDING_ACTIONS[item.action] : null;
+  const label = item.label ?? def?.label ?? item.action;
+  return (
+    <div className="settings-row keybinding-row" title={item.note ?? item.action ?? undefined}>
+      <span className="settings-label">
+        {label}
+        {item.note && <i className="keybinding-note" aria-hidden="true" />}
+      </span>
+      <div className="settings-control">
+        {def ? (
+          <KeybindingInput
+            value={keybindings[item.action] ?? ""}
+            defaultChord={def.default}
+            onChange={(chord) => onChange({ ...keybindings, [item.action]: chord })}
+          />
+        ) : (
+          <span className="keybinding-fixed">
+            {chordsOf(item).map((chord, i) => (
+              <Chord key={i} chord={chord} />
+            ))}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One collapsed subgroup. Closed by default and remembered per group, because
+ * the whole catalog open at once is a wall — you come here for one context
+ * (the geometry editor, the level tool) and want that one open.
+ */
+function KeyGroup({ group, keybindings, onChange, query }) {
+  const storageKey = `settingsSection.keys.${group.id}`;
+  const [open, setOpen] = useState(() => {
+    try {
+      return localStorage.getItem(storageKey) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const rebindable = group.items.filter((i) => i.action).length;
+
+  const items = useMemo(() => {
+    if (!query) return group.items;
+    const q = query.toLowerCase();
+    return group.items.filter((item) => {
+      const label = (item.label ?? KEY_BINDING_ACTIONS[item.action]?.label ?? "").toLowerCase();
+      const chords = item.action
+        ? [KEY_BINDING_ACTIONS[item.action]?.default ?? ""]
+        : chordsOf(item);
+      return label.includes(q) || chords.some((c) => String(c).toLowerCase().includes(q));
+    });
+  }, [group.items, query]);
+
+  // A search that matched here opens the group: hiding the hit behind a
+  // closed header is the one thing a filter must never do.
+  const expanded = open || (query && items.length > 0);
+  if (query && items.length === 0) return null;
+
+  return (
+    <div className={`key-group${expanded ? " open" : ""}`}>
+      <button
+        className="key-group-head"
+        title={group.hint ?? undefined}
+        onClick={() => {
+          setOpen((was) => {
+            try {
+              localStorage.setItem(storageKey, was ? "0" : "1");
+            } catch {
+              // Private mode — it still opens, it just won't be remembered.
+            }
+            return !was;
+          });
+        }}
+      >
+        <ChevronRight size={11} className="key-group-caret" />
+        <span className="key-group-title">{group.label}</span>
+        <span className="key-group-count">
+          {items.length}
+          {rebindable > 0 && <i title={`${rebindable} rebindable`} />}
+        </span>
+      </button>
+      {expanded && (
+        <div className="key-group-body">
+          {items.map((item, i) => (
+            <KeyRow key={item.action ?? `${item.label}-${i}`} item={item} keybindings={keybindings} onChange={onChange} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function KeybindingsTable({ keybindings, onChange }) {
+  const [query, setQuery] = useState("");
   return (
     <div className="keybindings-table">
-      {Object.entries(KEY_BINDING_ACTIONS).map(([actionId, def]) => (
-        <div key={actionId} className="settings-row keybinding-row" title={actionId}>
-          <span className="settings-label">{def.label}</span>
-          <div className="settings-control">
-            <KeybindingInput
-              value={keybindings[actionId] ?? ""}
-              defaultChord={def.default}
-              onChange={(chord) => onChange({ ...keybindings, [actionId]: chord })}
-            />
-          </div>
-        </div>
+      <input
+        className="text-field key-filter"
+        type="text"
+        value={query}
+        placeholder="Filter by action or key…"
+        onChange={(e) => setQuery(e.target.value)}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Escape") setQuery("");
+        }}
+      />
+      {KEY_CATALOG.map((group) => (
+        <KeyGroup key={group.id} group={group} keybindings={keybindings} onChange={onChange} query={query.trim()} />
       ))}
     </div>
   );

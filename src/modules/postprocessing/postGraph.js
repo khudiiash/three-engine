@@ -46,6 +46,26 @@ import * as TSL from "three/tsl";
 const num = (key, label, def, extra = {}) => ({ kind: "hot", key, label, type: "number", default: def, ...extra });
 const sel = (key, label, def, options) => ({ kind: "struct", key, label, type: "select", default: def, options });
 const bool = (key, label, def) => ({ kind: "struct", key, label, type: "boolean", default: def });
+// Hex string ("#rrggbb"), the panel's <input type="color"> value. Hot: the
+// builders that use one hold a THREE.Color inside a uniform and `setStyle` it,
+// which converts sRGB → the working color space on the way in.
+const colr = (key, label, def) => ({ kind: "hot", key, label, type: "color", default: def });
+
+/**
+ * "#rrggbb" → linear-sRGB triple.
+ *
+ * Post-process math runs in the WORKING color space (linear); the panel's
+ * color input hands us a display-space hex. Feeding the raw bytes through
+ * would wash every tint out toward white. Done by hand rather than with
+ * `THREE.Color` because this module deliberately imports only `three/tsl`.
+ */
+function hexToLinearRGB(hex) {
+  const parsed = /^#?([0-9a-f]{6})$/i.exec(String(hex ?? ""));
+  if (!parsed) return [1, 1, 1];
+  const n = parseInt(parsed[1], 16);
+  const toLinear = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  return [toLinear(((n >> 16) & 255) / 255), toLinear(((n >> 8) & 255) / 255), toLinear((n & 255) / 255)];
+}
 
 // Per-effect resolution scale. Structural (not hot) because it resizes the
 // addon's offscreen render target — a real pipeline change, not a uniform.
@@ -709,6 +729,114 @@ export const PP_NODE_TYPES = {
       num("denoise", "Denoise", 0.0, { min: 0, max: 1, step: 0.01 }),
     ],
   },
+
+  // --- Atmosphere ---------------------------------------------------------
+  //
+  // Raymarched height fog (three's `webgpu_postprocessing_fog`). Ours, not an
+  // addon: `./volumetricFog.js`, lazy-loaded through the same path so a graph
+  // without fog never downloads it or generates its noise field.
+  //
+  // Two outputs: `out` is the composited scene, `fog` is the raw [0,1] factor
+  // for anyone who wants to grade it themselves (e.g. tint the fog by height
+  // with a Mix node instead of using the flat colour).
+  volumetricFog: {
+    label: "Volumetric Fog",
+    category: "effect",
+    inputs: [
+      { key: "color", kind: "vec4" },
+      { key: "depth", kind: "float" },
+    ],
+    outputs: [
+      { key: "out", kind: "vec4" },
+      { key: "fog", kind: "float" },
+    ],
+    params: [
+      // The march is the expensive part and its output is low-frequency, so
+      // it runs offscreen at this scale and is upsampled with the denoiser
+      // below. Full res is available but rarely worth it.
+      resScale("0.5"),
+      sel("denoiser", "Denoiser", "JBU", ["JBU", "Gaussian", "Off"]),
+      // Edge length of the 3D noise field. Cost is CPU-side and one-off (it
+      // is generated in a worker, cached per size for the session): roughly
+      // 0.18 s / 0.45 s / 2.1 s. 96 buys finer wisps, nothing else.
+      sel("noiseSize", "Noise Detail", "64", ["48", "64", "96"]),
+      colr("color", "Fog Color", "#ffffff"),
+      num("intensity", "Intensity", 1, { min: 0, max: 1, step: 0.01 }),
+      // --- Lighting. The fog integrates single scattering from the scene's
+      // sun, which is what makes it react to the light at all; with no light
+      // in the scene only `ambient` contributes and it behaves like the flat
+      // fog of three's example.
+      num("ambient", "Ambient", 1, { min: 0, max: 2, step: 0.01 }),
+      num("sunScatter", "Sun Scatter", 1.6, { min: 0, max: 8, step: 0.05 }),
+      // Henyey-Greenstein g: 0 scatters evenly, positive peaks the glow in the
+      // sun's own travel direction (looking into the sun), negative back at it.
+      num("anisotropy", "Anisotropy", 0.6, { min: -0.9, max: 0.9, step: 0.01 }),
+      // Structural: a shadow lookup per march step is a different shader, and
+      // it is what turns lit fog into visible SHAFTS.
+      bool("sunShadows", "Sun Shafts", true),
+      num("steps", "Steps", 16, { min: 4, max: 32, step: 1 }),
+      num("density", "Density", 1.05, { min: 0, max: 3, step: 0.05 }),
+      // The slab the ray marches through, in WORLD metres. `groundLevel` is
+      // the floor of the fog — the example hard-codes its own ground at -1;
+      // here it is a knob because our scenes put the floor wherever they like.
+      num("groundLevel", "Ground Level", 0, { min: -100, max: 100, step: 0.1 }),
+      num("height", "Height", 3.5, { min: 0.2, max: 50, step: 0.1 }),
+      num("heightFalloff", "Height Falloff", 1.2, { min: 0.2, max: 4, step: 0.1 }),
+      num("cloudScale", "Cloud Scale", 0.019, { min: 0.001, max: 0.15, step: 0.001 }),
+      num("cloudThreshold", "Cloud Threshold", 0.66, { min: 0, max: 0.8, step: 0.02 }),
+      num("cloudSpeed", "Cloud Speed", 0.04, { min: 0, max: 0.2, step: 0.005 }),
+      num("maxRayDist", "Max Ray Distance", 70, { min: 10, max: 200, step: 1 }),
+      // Linear distance fog that takes over past the march, so the volume
+      // does not end in a wall at `maxRayDist`.
+      num("rangeFogNear", "Range Fog Near", 62.5, { min: 0, max: 500, step: 0.5 }),
+      num("rangeFogFar", "Range Fog Far", 100, { min: 5, max: 1000, step: 0.5 }),
+      // JBU only.
+      num("spatialSigma", "Spatial Sigma", 1.2, { min: 0.5, max: 3, step: 0.1 }),
+      num("depthSensitivity", "Depth Sensitivity", 30, { min: 1, max: 100, step: 1 }),
+      // Gaussian only.
+      num("blurRadius", "Blur Radius", 0.5, { min: 0, max: 1, step: 0.01 }),
+    ],
+  },
+
+  lensflare: {
+    label: "Lens Flare",
+    category: "effect",
+    // `lensflare(bloomTexture, params)` — three's pseudo lens flare (Chapman
+    // 2013): it mirrors BRIGHT SPOTS through the screen centre, so its input
+    // is the scene's BLOOM, not the scene. Wire Input → Bloom → Lens Flare,
+    // then Add the flare back onto the beauty (three's own example composites
+    // `scene + bloom + flare`); feeding it raw scene colour ghosts everything.
+    inputs: [{ key: "color", kind: "vec4" }],
+    outputs: [{ key: "out", kind: "vec4" }],
+    params: [
+      colr("ghostTint", "Ghost Tint", "#ffffff"),
+      num("threshold", "Threshold", 0.5, { min: 0, max: 1, step: 0.01 }),
+      num("ghostSamples", "Ghosts", 4, { min: 1, max: 16, step: 1 }),
+      num("ghostSpacing", "Spacing", 0.25, { min: 0, max: 0.3, step: 0.005 }),
+      num("ghostAttenuationFactor", "Attenuation", 25, { min: 10, max: 50, step: 0.5 }),
+      // Structural: it sizes the addon's own render target.
+      sel("downSampleRatio", "Downsample", "4", ["1", "2", "4", "8"]),
+    ],
+  },
+
+  radialBlur: {
+    label: "Radial Blur",
+    category: "effect",
+    // `radialBlur(input, { center, weight, decay, count, exposure })` —
+    // streaks radiating from a screen-space point. Cheap fake light shafts;
+    // unlike God Rays it knows nothing about depth, so it blurs foreground
+    // objects along with everything else.
+    inputs: [{ key: "color", kind: "vec4" }],
+    outputs: [{ key: "out", kind: "vec4" }],
+    params: [
+      num("centerX", "Center X", 0.5, { min: 0, max: 1, step: 0.01 }),
+      num("centerY", "Center Y", 0.5, { min: 0, max: 1, step: 0.01 }),
+      num("weight", "Weight", 0.9, { min: 0, max: 1, step: 0.01 }),
+      num("decay", "Decay", 0.95, { min: 0, max: 1, step: 0.01 }),
+      num("count", "Samples", 32, { min: 16, max: 64, step: 1 }),
+      num("exposure", "Exposure", 5, { min: 1, max: 10, step: 0.1 }),
+    ],
+  },
 };
 
 /** Categories drive both the palette group headers and the panel header order. */
@@ -803,6 +931,12 @@ const _addonLoaders = {
   bilateralBlur: () => import("three/addons/tsl/display/BilateralBlurNode.js"),
   motionBlur: () => import("three/addons/tsl/display/MotionBlur.js"),
   fsr1: () => import("three/addons/tsl/display/FSR1Node.js"),
+  lensflare: () => import("three/addons/tsl/display/LensflareNode.js"),
+  radialBlur: () => import("three/addons/tsl/display/radialBlur.js"),
+  // Ours, not three's — but it earns the same treatment: it pulls in a 3D
+  // texture, a worker and an RTT pass, and a graph without a fog node should
+  // pay for none of that.
+  volumetricFog: () => import("./volumetricFog.js"),
 };
 
 /** Named export each addon module exposes. */
@@ -832,6 +966,9 @@ const _addonExportNames = {
   bilateralBlur: "bilateralBlur",
   motionBlur: "motionBlur",
   fsr1: "fsr1",
+  lensflare: "lensflare",
+  radialBlur: "radialBlur",
+  volumetricFog: "volumetricFog",
 };
 
 /**
@@ -863,6 +1000,12 @@ const _nodeTypeAddonKeys = {
   bilateralBlur: ["bilateralBlur"],
   motionBlur: ["motionBlur"],
   fsr1: ["fsr1"],
+  lensflare: ["lensflare"],
+  radialBlur: ["radialBlur"],
+  // The fog's "Gaussian" denoiser reuses three's blur addon, so the graph has
+  // to fetch it whenever a fog node is reachable — the mode is a hot-swappable
+  // dropdown and waiting for an import mid-drag would blank the effect.
+  volumetricFog: ["volumetricFog", "gaussianBlur"],
 };
 
 /** Cap concurrent dynamic imports so Chrome does not abort the fetch storm. */
@@ -1014,6 +1157,9 @@ export async function loadAddonsForGraph(graph) {
     bilateralBlur: null,
     motionBlur: null,
     fsr1: null,
+    lensflare: null,
+    radialBlur: null,
+    volumetricFog: null,
   };
   const keys = [...collectPostAddonKeys(graph)];
   if (!keys.length) return empty;
@@ -1100,6 +1246,15 @@ export function loadMotionBlur() {
 }
 export function loadFSR1() {
   return lazyLoad("fsr1", "fsr1");
+}
+export function loadLensflare() {
+  return lazyLoad("lensflare", "lensflare");
+}
+export function loadRadialBlur() {
+  return lazyLoad("radialBlur", "radialBlur");
+}
+export function loadVolumetricFog() {
+  return lazyLoad("volumetricFog", "volumetricFog");
 }
 
 // ---------------------------------------------------------------------------
@@ -2018,6 +2173,108 @@ function buildNode(type, props, ins, ctx) {
       return node;
     }
 
+    // --- Atmosphere ---------------------------------------------------------
+    case "volumetricFog": {
+      const color = ins.get("color") ?? ctx.beautyNode ?? TSL.vec4(0);
+      // The fog needs a SAMPLABLE depth, not a float: both the march (one tap
+      // per pixel) and the JBU guide (25 taps at shifted uvs) sample it. The
+      // Input node's `depth` socket is the scene pass's depth TextureNode, so
+      // the wired case is fine; this guards the user who wires a computed
+      // float in there, which would otherwise throw
+      // "depthNode.sample is not a function" at TSL build time and take the
+      // whole chain down (the shape of the God Rays bug — see post-godrays).
+      const depth = ins.get("depth") ?? ctx.depthNode ?? null;
+      const fn = ctx.volumetricFog;
+      if (typeof fn !== "function") {
+        console.warn("Volumetric Fog: module not loaded — emitting color passthrough");
+        return { out: color, fog: TSL.float(0) };
+      }
+      if (typeof depth?.sample !== "function") {
+        console.warn("Volumetric Fog: needs the Input node's Depth socket (a depth texture) — passthrough");
+        return { out: color, fog: TSL.float(0) };
+      }
+      const built = fn({
+        colorNode: color,
+        depthNode: depth,
+        camera: ctx.camera,
+        params: P,
+        // The component resolves this the same way god rays do (a
+        // shadow-mapped light if there is one, otherwise any sun for colour
+        // and direction). Null is fine: the fog falls back to ambient-only.
+        light: ctx.volumetricFogLight ?? null,
+        gaussianBlur: ctx.gaussianBlur,
+      });
+      ctx.registerHot?.(built.setParams);
+      // Cloud drift is accumulated, not read off TSL's global clock — see the
+      // module header. Without this tick the fog is a still image.
+      ctx.registerTick?.(built.tick);
+      // The march lives in an RTT node that nothing else references once the
+      // JBU has sampled it; the keepalive set is what stops it being collected
+      // while the pipeline still renders it.
+      if (ctx.temps?.add) for (const pass of built.passes ?? []) ctx.temps.add(pass);
+      return { out: built.color, fog: built.fog };
+    }
+
+    case "lensflare": {
+      const bloomNode = ins.get("color") ?? TSL.vec4(0);
+      const fn = ctx.lensflare;
+      if (typeof fn !== "function") return bloomNode;
+      // Every param is a UniformNode we own, so the panel's sliders write
+      // straight into the live shader (the addon reads whatever node it was
+      // handed; it never re-reads a JS number).
+      const ghostTint = TSL.uniform(TSL.vec3(...hexToLinearRGB(P.ghostTint)));
+      const threshold = TSL.uniform(P.threshold);
+      const ghostSamples = TSL.uniform(P.ghostSamples);
+      const ghostSpacing = TSL.uniform(P.ghostSpacing);
+      const ghostAttenuationFactor = TSL.uniform(P.ghostAttenuationFactor);
+      const node = fn(bloomNode, {
+        ghostTint,
+        threshold,
+        ghostSamples,
+        ghostSpacing,
+        ghostAttenuationFactor,
+        // Structural — it sizes the addon's render target, so it is read once.
+        downSampleRatio: Math.max(1, parseInt(P.downSampleRatio, 10) || 4),
+      });
+      const applyHot = (Q) => {
+        const [r, g, b] = hexToLinearRGB(Q.ghostTint);
+        ghostTint.value.set(r, g, b);
+        threshold.value = Q.threshold;
+        ghostSamples.value = Q.ghostSamples;
+        ghostSpacing.value = Q.ghostSpacing;
+        ghostAttenuationFactor.value = Q.ghostAttenuationFactor;
+      };
+      ctx.registerHot?.(applyHot);
+      if (ctx.temps?.add) ctx.temps.add(node);
+      // LensflareNode is a TempNode that renders into its own target; the
+      // samplable result is the texture node it hands out, and referencing it
+      // is what drives the pass (same contract as God Rays).
+      return typeof node.getTextureNode === "function" ? node.getTextureNode() : node;
+    }
+
+    case "radialBlur": {
+      const color = ins.get("color") ?? TSL.vec4(0);
+      const fn = ctx.radialBlur;
+      if (typeof fn !== "function") return color;
+      const center = TSL.uniform(TSL.vec2(P.centerX, P.centerY));
+      const weight = TSL.uniform(P.weight);
+      const decay = TSL.uniform(P.decay);
+      // `count` is the loop bound AND a divisor. Keep it an int uniform, the
+      // way three's own example does — a float there generates a loop whose
+      // comparison mixes types.
+      const count = TSL.uniform(TSL.int(P.count));
+      const exposure = TSL.uniform(P.exposure);
+      const applyHot = (Q) => {
+        center.value.set(Q.centerX, Q.centerY);
+        weight.value = Q.weight;
+        decay.value = Q.decay;
+        count.value = Math.round(Q.count);
+        exposure.value = Q.exposure;
+      };
+      ctx.registerHot?.(applyHot);
+      return fn(color, { center, weight, decay, count, exposure });
+    }
+
     default:
       console.warn(`Post-process node type "${type}" is not implemented`);
       return TSL.vec4(0, 0, 0, 1);
@@ -2109,11 +2366,20 @@ export function compilePostGraph(graph, ctx) {
   // tonemap families, DoF, sharpen…) don't register, and keep needing the
   // signature rebuild they already get.
   const hotAppliers = new Map(); // nodeId -> (props) => void
+  // Effects that ANIMATE need a clock, and TSL's global `time` is the wrong
+  // one for two reasons: multiplying it by a speed uniform teleports the
+  // animation whenever the speed changes, and it keeps running while the game
+  // is paused. A builder that needs one registers a `tick(dtSeconds)` here and
+  // the component calls it once per rendered frame with the engine's delta.
+  const tickers = [];
   let buildingNodeId = null;
   const buildCtx = {
     ...ctx,
     registerHot(apply) {
       if (buildingNodeId != null) hotAppliers.set(buildingNodeId, apply);
+    },
+    registerTick(tick) {
+      if (typeof tick === "function") tickers.push(tick);
     },
   };
   const updateParams = (nextGraph) => {
@@ -2225,12 +2491,15 @@ export function compilePostGraph(graph, ctx) {
       signature: "__passthrough__",
       updateParams,
       effects: [],
+      tickers,
     };
   }
   return {
     output: result,
     signature: postGraphSignature(graph),
     updateParams,
+    // Called once per rendered frame by the component — see `registerTick`.
+    tickers,
     // Consumed only by `profile.renderPasses` (see collectEffects above).
     effects,
   };

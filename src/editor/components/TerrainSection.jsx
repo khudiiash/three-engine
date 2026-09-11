@@ -10,6 +10,8 @@ import { engine } from "../engineInstance.js";
 import { ensureTerrainAssets } from "../terrainAssetSetup.js";
 import { SCULPT_TOOLS, MAX_TERRAIN_LAYERS, makeTerrainLayer, makeTerrainScatterLayer } from "../../modules/terrain/TerrainComponent.js";
 import { FALLOFF_CURVES } from "../brush.js";
+import { Select } from "../fields/Select.jsx";
+import { FoliageSurfaceSection } from "./FoliageSection.jsx";
 import {
   armTerrainBrush,
   armTerrainScatterSourcePick,
@@ -178,15 +180,15 @@ function ScatterPlacement({ layer, entityId, layerIndex, onChange }) {
       {open && (
         <div className="terrain-placement">
           <PropRow label="Align">
-            <select className="select-field" value={align} onChange={(e) => onChange({ align: e.target.value })}>
+            <Select className="select-field" value={align} onChange={(e) => onChange({ align: e.target.value })}>
               <option value="surface">Terrain normal</option>
               <option value="axis">Fixed axis</option>
               <option value="source">Copy source rotation</option>
-            </select>
+            </Select>
           </PropRow>
           {align !== "source" && (
             <PropRow label="Up Axis">
-              <select
+              <Select
                 className="select-field"
                 value={layer.alignAxis ?? "+y"}
                 onChange={(e) => onChange({ alignAxis: e.target.value })}
@@ -194,7 +196,7 @@ function ScatterPlacement({ layer, entityId, layerIndex, onChange }) {
                 {["+x", "-x", "+y", "-y", "+z", "-z"].map((axis) => (
                   <option key={axis} value={axis}>{axis.toUpperCase()}</option>
                 ))}
-              </select>
+              </Select>
             </PropRow>
           )}
           {align === "surface" && (
@@ -403,7 +405,7 @@ export function TerrainSection({ entityId, props }) {
 
       {mode === "sculpt" && (
         <PropRow label="Tool">
-          <select
+          <Select
             className="select-field"
             value={settings.tool}
             title={TOOL_HINTS[settings.tool]}
@@ -412,7 +414,7 @@ export function TerrainSection({ entityId, props }) {
             {SCULPT_TOOLS.map((t) => (
               <option key={t} value={t}>{t}</option>
             ))}
-          </select>
+          </Select>
         </PropRow>
       )}
 
@@ -428,7 +430,7 @@ export function TerrainSection({ entityId, props }) {
             <NumberInput value={settings.hardness} min={0} max={1} step={0.05} onCommit={(v) => setTerrainBrushSetting("hardness", v)} />
           </PropRow>
           <PropRow label="Falloff">
-            <select
+            <Select
               value={settings.falloff ?? ""}
               title="Shared with the mesh sculptor. Hardness keeps the original terrain curve."
               onChange={(e) => setTerrainBrushSetting("falloff", e.target.value || null)}
@@ -437,7 +439,7 @@ export function TerrainSection({ entityId, props }) {
               {FALLOFF_CURVES.map((curve) => (
                 <option key={curve.id} value={curve.id}>{curve.label}</option>
               ))}
-            </select>
+            </Select>
           </PropRow>
         </>
       )}
@@ -452,6 +454,8 @@ export function TerrainSection({ entityId, props }) {
           </PropRow>
         </>
       )}
+
+      <FoliageSurfaceSection entityId={entityId} terrain />
 
       <div className="inspector-subheader">
         Scatter Layers
@@ -496,10 +500,10 @@ export function TerrainSection({ entityId, props }) {
           </div>
           <div onClick={(e) => e.stopPropagation()}>
             <PropRow label="Source">
-              <select className="select-field" value={layer.sourceType ?? "asset"} onChange={(e) => updateScatterLayer(i, { sourceType: e.target.value })}>
+              <Select className="select-field" value={layer.sourceType ?? "asset"} onChange={(e) => updateScatterLayer(i, { sourceType: e.target.value })}>
                 <option value="asset">GLB asset</option>
                 <option value="entity">Scene entity</option>
-              </select>
+              </Select>
             </PropRow>
             {(layer.sourceType ?? "asset") === "asset" ? (
               <PropRow label="Model">

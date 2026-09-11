@@ -35,21 +35,25 @@ import { freeze } from "./freezeLedger.js";
 // editor graph's `/@fs/…` form). globalThis-keyed, same as the editor's
 // vmSingleton pattern (which engine code must not import).
 const definitions = (globalThis.__engineModuleDefinitions ??= new Map());
+const aliases = (globalThis.__engineModuleAliases ??= new Map());
+
+export function resolveModuleId(id) { return aliases.get(id) ?? id; }
 
 export function registerModuleDefinition(def) {
   if (!def?.id) throw new Error("Module definition needs an `id`");
   definitions.set(def.id, def);
+  for (const alias of def.aliases ?? []) aliases.set(alias, def.id);
 }
 
 export function getModuleDefinition(id) {
-  return definitions.get(id);
+  return definitions.get(resolveModuleId(id));
 }
 
 export function getModuleDefinitions() {
   // Surface `category` / `tags` with safe defaults so the Modules panel
   // doesn't have to defensive-check every definition (third-party modules
   // registered before these fields were introduced still work).
-  return [...definitions.values()].map((d) => ({
+  return [...definitions.values()].filter(d => !aliases.has(d.id)).map((d) => ({
     ...d,
     category: d.category ?? "Other",
     tags: d.tags ?? [],
@@ -64,6 +68,7 @@ const MODULE_MARK_MS = 30;
 
 /** Registers the module's components and runs its setup on this engine. */
 export async function enableEngineModule(engine, id) {
+  id = resolveModuleId(id);
   if (engine.modules.has(id)) return engine.modules.get(id);
   const def = definitions.get(id);
   if (!def) throw new Error(`Unknown module "${id}"`);
@@ -103,6 +108,7 @@ export async function enableEngineModule(engine, id) {
 
 /** Tears down the module's runtime and unregisters its components. */
 export async function disableEngineModule(engine, id) {
+  id = resolveModuleId(id);
   const handle = engine.modules.get(id);
   if (!handle) return;
   engine.modules.delete(id);
@@ -114,6 +120,7 @@ export async function disableEngineModule(engine, id) {
 
 /** Makes the engine's enabled set exactly `ids` (order-preserving enable). */
 export async function applyEngineModules(engine, ids = []) {
+  ids = [...new Set(ids.map(resolveModuleId))];
   const want = new Set(ids.filter((id) => definitions.has(id)));
   for (const id of [...engine.modules.keys()]) {
     if (!want.has(id)) await disableEngineModule(engine, id);

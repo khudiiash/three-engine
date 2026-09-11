@@ -4,6 +4,8 @@ import { commandBus } from "./commands/CommandBus.js";
 import { BatchCommand, CreateEntityCommand, DeleteEntityCommand } from "./commands/entityCommands.js";
 import { AddComponentCommand, SetComponentPropCommand } from "./commands/componentCommands.js";
 import { getComponentClass } from "../engine/components/registry.js";
+import { createArchitecturePiece } from "./architectureBuild.js";
+import { getArchitectureDrawContext, setArchitectureDrawParent } from "./architectureTool.js";
 import {
   BLOCKOUT_COLORS,
   BLOCKOUT_DEFAULT_SIZE,
@@ -196,6 +198,18 @@ export function createPiece({
   name = null,
 } = {}) {
   const settings = getLevelToolSettings();
+  const architecture = getArchitectureDrawContext();
+  if (architecture) {
+    const result = createArchitecturePiece({
+      shape, position, rotationY, size,
+      props: { ...props, ...(architecture.material ? { material: architecture.material } : {}), ...(architecture.role ? { role: architecture.role } : {}), ...(architecture.color ? { color: architecture.color } : {}) },
+      parentId: architecture.parentId,
+      collision: collision ?? settings.collision, name, createAssembly: !architecture.parentId,
+    });
+    if (result.assemblyId) setArchitectureDrawParent(result.assemblyId);
+    if (select) import("./store/selectionStore.js").then(({ useSelectionStore }) => useSelectionStore.getState().select(result.entityId)).catch(() => {});
+    return result.entityId;
+  }
   const elevation = position?.[1] ?? 0;
   // ONE gesture, ONE Ctrl+Z. The first piece drawn in an empty scene also
   // creates a Level and a storey; without this the user undoes their wall and
@@ -270,7 +284,8 @@ export function levelOf(entity) {
  * off the end of the wall it belongs to.
  */
 export function addOpening(entityId, { offset = 0, kind = "door", width, height, sill } = {}) {
-  const piece = engine.getEntity(entityId)?.getComponent?.("blockout");
+  const entity = engine.getEntity(entityId);
+  const piece = entity?.getComponent?.("architecturepiece") ?? entity?.getComponent?.("blockout");
   if (!piece || piece.props.shape !== "wall") return -1;
   const preset = OPENING_PRESETS[kind] ?? OPENING_PRESETS.door;
   const opening = makeOpening({
@@ -281,18 +296,19 @@ export function addOpening(entityId, { offset = 0, kind = "door", width, height,
   const half = (piece.props.size?.[0] ?? 1) / 2;
   opening.offset = THREE.MathUtils.clamp(offset, -half + opening.width / 2, half - opening.width / 2);
   const next = [...(piece.props.openings ?? []), opening];
-  commandBus.execute(new SetComponentPropCommand(entityId, "blockout", "openings", next, `Add ${kind}`));
+  commandBus.execute(new SetComponentPropCommand(entityId, piece.type, "openings", next, `Add ${kind}`));
   return next.length - 1;
 }
 
 /** Removes the opening at `index` from a wall. */
 export function removeOpening(entityId, index) {
-  const piece = engine.getEntity(entityId)?.getComponent?.("blockout");
+  const entity = engine.getEntity(entityId);
+  const piece = entity?.getComponent?.("architecturepiece") ?? entity?.getComponent?.("blockout");
   if (!piece) return false;
   const openings = [...(piece.props.openings ?? [])];
   if (index < 0 || index >= openings.length) return false;
   openings.splice(index, 1);
-  commandBus.execute(new SetComponentPropCommand(entityId, "blockout", "openings", openings, "Remove opening"));
+  commandBus.execute(new SetComponentPropCommand(entityId, piece.type, "openings", openings, "Remove opening"));
   return true;
 }
 

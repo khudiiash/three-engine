@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Check, ChevronDown } from "../icons/index.jsx";
+import { ChevronDown } from "../icons/index.jsx";
 import { PopoverMenu } from "./PopoverMenu.jsx";
 
 /**
@@ -59,7 +59,7 @@ export function SelectField({
             <button
               key={item.value}
               type="button"
-              className={`dropdown-item ${item.value === value ? "selected" : ""}`}
+              className={`dropdown-item ${item.value === value ? "checked selected" : ""}`}
               title={item.hint}
               onClick={() => {
                 setOpen(false);
@@ -67,7 +67,6 @@ export function SelectField({
               }}
             >
               <span className={`menu-item-label ${capitalize ? "cap" : ""}`}>{item.label}</span>
-              {item.value === value && <Check size={12} className="tx-select-tick" />}
             </button>
           ))}
         </PopoverMenu>

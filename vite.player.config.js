@@ -17,6 +17,10 @@ export default defineConfig({
     // folder the exporter fills with game content, so a texture can never
     // land on a bundle chunk's name.
     assetsDir: "_engine",
+    // `.vite/manifest.json`: which chunk each source file became and what it
+    // imports (statically and dynamically). The exporter walks it to ship only
+    // the runtime chunks a game can actually reach — see build/runtimeFiles.js.
+    manifest: true,
     rollupOptions: { input: "player.html" },
     chunkSizeWarningLimit: 2500,
   },

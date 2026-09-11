@@ -14,6 +14,7 @@ import { rewriteComponentAssets } from "../src/editor/build/assetRefs.js";
 import {
   BUILD_DEFAULTS,
   resolveBuildScenes,
+  findSceneReferences,
   resolvePagesProject,
   sanitizePagesProject,
   normalizeRelPath,
@@ -35,6 +36,7 @@ import {
 } from "../src/editor/build/desktopScaffold.js";
 import { QUALITY_PRESETS, applyQualityCeiling } from "../src/engine/sceneSettings.js";
 import { sanitizeFileName } from "../src/editor/exportGame.js";
+import { selectRuntimeFiles, scriptImportSpecifiers } from "../src/editor/build/runtimeFiles.js";
 
 let pass = 0;
 let fail = 0;
@@ -112,8 +114,25 @@ console.log("\nScene selection");
 
   let plan = resolveBuildScenes({ available, build: BUILD_DEFAULTS, mainScene: "scenes/Menu.scene" });
   eq("no explicit start scene falls back to the project's main scene", plan.startScene, "scenes/Menu.scene");
-  eq("ships every scene by default", plan.scenes.length, 3);
+  eq("by default only the start scene is planned — the rest is discovered during the build", plan.scenes, ["scenes/Menu.scene"]);
+  eq("and the plan says so", plan.mode, "reachable");
+
+  plan = resolveBuildScenes({ available, build: { ...BUILD_DEFAULTS, scenes: "all" }, mainScene: "scenes/Menu.scene" });
+  eq('"all" ships every scene', plan.scenes.length, 3);
   eq("the start scene is listed first", plan.scenes[0], "scenes/Menu.scene");
+  eq("in all mode", plan.mode, "all");
+
+  const refs = findSceneReferences(
+    'engine.loadScene("scenes/Level2.scene"); a("C:/proj/scenes/Menu.scene"); b(\'scenes/Missing.scene\'); c("notes.scene.txt")',
+    { available, root: "C:/proj" },
+  );
+  eq("scene paths named in text resolve to the project's spelling", refs, ["scenes/Level2.scene", "scenes/Menu.scene"]);
+  eq(
+    "JSON with escaped Windows backslashes and odd case works too",
+    findSceneReferences(JSON.stringify({ path: "SCENES\\level1.scene", again: "scenes/Level1.scene" }), { available }),
+    ["scenes/Level1.scene"],
+  );
+  eq("nothing named, nothing found", findSceneReferences("export default class X {}", { available }), []);
 
   plan = resolveBuildScenes({
     available,
@@ -144,6 +163,7 @@ console.log("\nScene selection");
     build: { ...BUILD_DEFAULTS, startScene: "scenes/Level2.scene", scenes: ["scenes/Menu.scene"] },
   });
   check("a start scene left out of the list is added back", plan.scenes.includes("scenes/Level2.scene"), plan.scenes.join(","));
+  eq("an explicit list is list mode", plan.mode, "list");
   check("and warns", plan.warnings.some((w) => w.includes("not in the build list")), plan.warnings.join(" | "));
 
   plan = resolveBuildScenes({
@@ -572,6 +592,160 @@ console.log("\nComponent asset rewriting");
     { file: "scene.json", path: "C:/proj/materials/Leaked.mat" },
   ]);
   eq("a clean build reports nothing", findLeakedAbsolutePaths([["a.js", "'assets/x.png'"]], "C:/proj"), []);
+}
+
+// --- Runtime trimming ----------------------------------------------------------
+// The player template is code-split; a game ships only the chunks it can
+// reach. Every rule errs towards shipping, so the checks below pin BOTH
+// directions: what a bare game must not carry, and what an enabled feature must.
+console.log("\nRuntime files");
+{
+  const manifest = {
+    "player.html": {
+      file: "_engine/player-A.js",
+      isEntry: true,
+      assets: ["_engine/draco_decoder-B.wasm"],
+      dynamicImports: [
+        "node_modules/@dimforge/rapier3d-compat/rapier.mjs",
+        "src/modules/gi/GISystem.js",
+        "node_modules/three/examples/jsm/loaders/EXRLoader.js",
+        "node_modules/three/examples/jsm/loaders/KTX2Loader.js",
+        "src/engine/scriptRuntime/tslRuntime.js",
+        "src/engine/scriptRuntime/runtime.js",
+        "src/player/liveUpdate.js",
+        "node_modules/three/examples/jsm/tsl/display/BloomNode.js",
+        "src/vendor/mystery.js",
+      ],
+    },
+    "node_modules/@dimforge/rapier3d-compat/rapier.mjs": { file: "_engine/rapier-C.js", isDynamicEntry: true },
+    "src/modules/gi/GISystem.js": {
+      file: "_engine/GISystem-D.js",
+      isDynamicEntry: true,
+      imports: ["player.html"],
+      dynamicImports: ["node_modules/meshoptimizer/index.js"],
+    },
+    "node_modules/meshoptimizer/index.js": { file: "_engine/index-E.js" },
+    "node_modules/three/examples/jsm/loaders/EXRLoader.js": { file: "_engine/EXRLoader-F.js" },
+    "node_modules/three/examples/jsm/loaders/KTX2Loader.js": {
+      file: "_engine/KTX2Loader-G.js",
+      assets: ["_engine/basis_transcoder-H.wasm"],
+    },
+    "src/engine/scriptRuntime/tslRuntime.js": { file: "_engine/tslRuntime-I.js" },
+    "src/engine/scriptRuntime/runtime.js": { file: "_engine/runtime-J.js" },
+    "src/player/liveUpdate.js": { file: "_engine/liveUpdate-K.js" },
+    "node_modules/three/examples/jsm/tsl/display/BloomNode.js": { file: "_engine/BloomNode-L.js" },
+    "src/vendor/mystery.js": { file: "_engine/mystery-M.js" },
+  };
+  const templateFiles = [
+    ["index.html", 10], [".vite/manifest.json", 10], ["app-icon.png", 10], ["tauri.svg", 10],
+    ["_engine/player-A.js", 1000], ["_engine/rapier-C.js", 2000], ["_engine/GISystem-D.js", 700],
+    ["_engine/index-E.js", 80], ["_engine/EXRLoader-F.js", 30], ["_engine/KTX2Loader-G.js", 60],
+    ["_engine/basis_transcoder-H.wasm", 500], ["_engine/draco_decoder-B.wasm", 280],
+    ["_engine/tslRuntime-I.js", 20], ["_engine/runtime-J.js", 20], ["_engine/liveUpdate-K.js", 20],
+    ["_engine/BloomNode-L.js", 15], ["_engine/mystery-M.js", 5],
+    ["_engine/bvhBlasWorker-N.js", 130], ["_engine/cloudNoiseWorker-O.js", 10], ["_engine/unknownWorker-P.js", 7],
+    ["basis/basis_transcoder.wasm", 500], ["draco/draco_decoder.wasm", 280],
+  ];
+  const has = (r, rel) => r.files.includes(rel);
+
+  const bare = selectRuntimeFiles({ manifest, templateFiles, modules: [] });
+  check("the entry chunk always ships", has(bare, "_engine/player-A.js"));
+  check("the engine script proxy always ships", has(bare, "_engine/runtime-J.js"));
+  check("no physics module → no Rapier", !has(bare, "_engine/rapier-C.js"));
+  check("no GI module → no GI system", !has(bare, "_engine/GISystem-D.js"));
+  check("…nor what only it reaches", !has(bare, "_engine/index-E.js"));
+  check("…nor its worker", !has(bare, "_engine/bvhBlasWorker-N.js"));
+  check("no post-processing → no addon, no cloud worker", !has(bare, "_engine/BloomNode-L.js") && !has(bare, "_engine/cloudNoiseWorker-O.js"));
+  check("no .exr shipped → no EXR loader", !has(bare, "_engine/EXRLoader-F.js"));
+  check(
+    "no basis → no KTX2 loader, transcoder or public copy",
+    !has(bare, "_engine/KTX2Loader-G.js") && !has(bare, "_engine/basis_transcoder-H.wasm") && !has(bare, "basis/basis_transcoder.wasm"),
+  );
+  check("no draco → no decoder", !has(bare, "_engine/draco_decoder-B.wasm") && !has(bare, "draco/draco_decoder.wasm"));
+  check("no script imports three/tsl → no TSL proxy", !has(bare, "_engine/tslRuntime-I.js"));
+  check("not a live preview → no live-update client", !has(bare, "_engine/liveUpdate-K.js"));
+  check(
+    "the manifest, index.html and the editor's public leftovers never ship",
+    ![".vite/manifest.json", "index.html", "app-icon.png", "tauri.svg"].some((rel) => has(bare, rel)),
+  );
+  check("an unrecognised lazy chunk ships (err towards working)", has(bare, "_engine/mystery-M.js"));
+  check("an unrecognised worker ships too", has(bare, "_engine/unknownWorker-P.js"));
+  eq(
+    "skipped bytes are summed",
+    bare.skippedBytes,
+    templateFiles.filter(([rel]) => !bare.files.includes(rel)).reduce((n, [, s]) => n + s, 0),
+  );
+  check("trimming is reported", bare.trimmed === true);
+
+  const full = selectRuntimeFiles({
+    manifest,
+    templateFiles,
+    modules: ["physics-rapier", "gi", "postprocessing", "basis", "draco"],
+    assetExtensions: ["exr"],
+    scriptImports: ["three/tsl"],
+    livePreview: true,
+  });
+  check("physics on → Rapier ships", has(full, "_engine/rapier-C.js"));
+  check(
+    "GI on → the GI system, meshoptimizer and the BVH worker ship",
+    has(full, "_engine/GISystem-D.js") && has(full, "_engine/index-E.js") && has(full, "_engine/bvhBlasWorker-N.js"),
+  );
+  check("post-processing on → the addon and the cloud worker ship", has(full, "_engine/BloomNode-L.js") && has(full, "_engine/cloudNoiseWorker-O.js"));
+  check("an .exr shipped → the EXR loader ships", has(full, "_engine/EXRLoader-F.js"));
+  check(
+    "basis on → KTX2 loader, transcoder and public copy",
+    has(full, "_engine/KTX2Loader-G.js") && has(full, "_engine/basis_transcoder-H.wasm") && has(full, "basis/basis_transcoder.wasm"),
+  );
+  check("draco on → the decoder ships", has(full, "_engine/draco_decoder-B.wasm") && has(full, "draco/draco_decoder.wasm"));
+  check("a script importing three/tsl → the TSL proxy ships", has(full, "_engine/tslRuntime-I.js"));
+  check("a live preview → the live-update client ships", has(full, "_engine/liveUpdate-K.js"));
+  check("the leftovers still never ship", !has(full, "tauri.svg") && !has(full, ".vite/manifest.json"));
+
+  const viaModel = selectRuntimeFiles({ manifest, templateFiles, modules: [], dracoModels: true });
+  check(
+    "a Draco-compressed model needs the decoder even with the module off",
+    has(viaModel, "_engine/draco_decoder-B.wasm") && has(viaModel, "draco/draco_decoder.wasm"),
+  );
+  const viaCompress = selectRuntimeFiles({ manifest, templateFiles, modules: [], compressTextures: true });
+  check("build-time texture compression needs the transcoder", has(viaCompress, "basis/basis_transcoder.wasm"));
+  const viaBasisFile = selectRuntimeFiles({ manifest, templateFiles, modules: [], assetExtensions: ["basis"] });
+  check("a shipped .basis needs the KTX2 loader", has(viaBasisFile, "_engine/KTX2Loader-G.js"));
+  const viaHdr = selectRuntimeFiles({
+    manifest: {
+      ...manifest,
+      "player.html": { ...manifest["player.html"], dynamicImports: ["node_modules/three/examples/jsm/loaders/RGBELoader.js"] },
+      "node_modules/three/examples/jsm/loaders/RGBELoader.js": { file: "_engine/RGBELoader-R.js", imports: ["node_modules/three/examples/jsm/loaders/HDRLoader.js"] },
+      "node_modules/three/examples/jsm/loaders/HDRLoader.js": { file: "_engine/HDRLoader-S.js" },
+    },
+    templateFiles: [["_engine/RGBELoader-R.js", 1], ["_engine/HDRLoader-S.js", 1]],
+    modules: [],
+    assetExtensions: ["hdr"],
+  });
+  check("an .hdr sky → both HDR loaders (static import followed)", has(viaHdr, "_engine/RGBELoader-R.js") && has(viaHdr, "_engine/HDRLoader-S.js"));
+
+  const moduleChunk = selectRuntimeFiles({
+    manifest: {
+      ...manifest,
+      "player.html": { ...manifest["player.html"], dynamicImports: ["src/modules/architecture/Big.js"] },
+      "src/modules/architecture/Big.js": { file: "_engine/Big-Q.js" },
+    },
+    templateFiles: [["_engine/Big-Q.js", 1], ["_engine/player-A.js", 1]],
+    modules: ["architecture"],
+  });
+  check("a module's own chunk ships when the module is enabled", has(moduleChunk, "_engine/Big-Q.js"));
+
+  const noManifest = selectRuntimeFiles({ manifest: null, templateFiles, modules: [] });
+  check(
+    "without a manifest everything but the never-ship files is copied",
+    noManifest.trimmed === false && has(noManifest, "_engine/rapier-C.js") && !has(noManifest, ".vite/manifest.json"),
+  );
+
+  const specs = scriptImportSpecifiers([
+    "import { Component } from \"engine\";\nimport * as THREE from 'three';\nconst tsl = await import(\"three/tsl\");",
+    null,
+    "export default class X {}",
+  ]);
+  eq("bare specifiers are found by shape", [...specs].sort(), ["engine", "three", "three/tsl"]);
 }
 
 console.log(`\nBUILD-TEST ${fail ? "FAIL" : "PASS"} — ${pass}/${pass + fail} checks`);

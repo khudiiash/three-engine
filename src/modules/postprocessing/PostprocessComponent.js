@@ -177,6 +177,22 @@ function findGodraysLight(engine) {
       return light;
     }
   }
+  // ⭐ THE SUN MAY NOT BE AN ENTITY'S LIGHT AT ALL. The `atmosphere` module
+  // creates and owns a directional light when a scene has none of its own, and
+  // that light has no LightComponent — so the loop above cannot see it and god
+  // rays silently had nothing to shine from in exactly the scenes most likely
+  // to want them. It is tagged for this.
+  if (!skippedGi) {
+    let owned = null;
+    engine?.scene?.traverse?.((object) => {
+      if (owned || object.userData?.atmosphereOwned !== true) return;
+      if (object.isDirectionalLight && object.castShadow && object.visible !== false
+        && object.shadow?.map?.depthTexture && object.userData?.giShadowMode !== "gi") {
+        owned = object;
+      }
+    });
+    if (owned) return owned;
+  }
   if (skippedGi && !findGodraysLight._warned) {
     findGodraysLight._warned = true;
     console.info(
@@ -186,6 +202,27 @@ function findGodraysLight(engine) {
     );
   }
   return null;
+}
+
+/**
+ * The sun the volumetric fog lights itself with, shadow map or not.
+ *
+ * Fog needs a light for two different things and only one of them needs a map:
+ * COLOUR and DIRECTION drive the scattering phase (the glow toward the sun),
+ * while the shadow map is what turns that glow into shafts. `findGodraysLight`
+ * refuses a map-less light because god rays are a shadow-map effect by
+ * construction; fog degrades gracefully instead, so a scene lit by a plain
+ * unshadowed sun still gets fog that reacts to it.
+ */
+function findFogSun(engine) {
+  let best = null;
+  for (const entity of engine?.entities?.values?.() ?? []) {
+    const light = entity.getComponent?.("light")?.light;
+    if (!light || light.visible === false) continue;
+    if (!light.isDirectionalLight && !light.isSpotLight) continue;
+    if (!best || (light.intensity ?? 0) > (best.intensity ?? 0)) best = light;
+  }
+  return best;
 }
 
 /**
@@ -481,7 +518,13 @@ export class PostprocessComponent extends Component {
    */
   #resolveGodraysLight(engine, graph) {
     const direct = findGodraysLight(engine);
-    const wanted = (graph?.nodes ?? []).some((n) => n.type === "godrays");
+    // Volumetric fog marches the same map for its light shafts, so it wants
+    // the GI-fallback map on exactly the same terms god rays do — but only
+    // when its "Sun Shafts" toggle is on, because rendering an extra shadow
+    // map for an effect that will not sample it is pure cost.
+    const wanted = (graph?.nodes ?? []).some(
+      (n) => n.type === "godrays" || (n.type === "volumetricFog" && n.props?.sunShadows !== false),
+    );
     if (direct || !wanted) {
       this.#releaseGodraysShadow();
       return direct;
@@ -698,6 +741,23 @@ export class PostprocessComponent extends Component {
       this.postprocessLayers.disable(EDITOR_LAYER);
       this.postprocessLayers.disable(PHYSICS_DEBUG_LAYER);
     }
+    // Animated effects advance on the ENGINE's clock, not on TSL's global
+    // `time`: an effect whose speed is a uniform must not jump when that
+    // uniform changes, and a paused game must not keep drifting its fog.
+    // `engine.deltaTime` is already zero while paused, so the play-mode branch
+    // freezes on its own; edit mode uses the unscaled clock so the viewport
+    // keeps animating with no scene playing.
+    const tickers = this.compiled?.tickers;
+    if (tickers?.length) {
+      const dt = (engine?.playing ? engine.deltaTime : engine?.unscaledDeltaTime) ?? 0;
+      for (const tick of tickers) {
+        try {
+          tick(dt);
+        } catch (err) {
+          console.warn(`PostprocessComponent: effect tick failed: ${err?.message ?? err}`);
+        }
+      }
+    }
     this.pipeline.outputNode = this.outputNode;
     this.pipeline.render();
   }
@@ -850,6 +910,9 @@ export class PostprocessComponent extends Component {
       bilateralBlur,
       motionBlur,
       fsr1,
+      lensflare,
+      radialBlur,
+      volumetricFog,
     } = await loadAddonsForGraph(graph);
     if (myGen !== this.generation) return;
 
@@ -1063,6 +1126,33 @@ export class PostprocessComponent extends Component {
           // rendering every frame" is otherwise unanswerable from outside.
           globalThis.__ppOverlayTicks = (globalThis.__ppOverlayTicks ?? 0) + 1;
           const seedQuad = this._overlaySeedQuad;
+          // ⭐ THE SAME LIGHTS FLIP AS THE SELECTION OUTLINE (selectionOutline.js,
+          // 2026-09-10). This pass narrows camera.layers to the overlay set, and
+          // three's render-list finish() then sets the SCENE-SHARED lights node
+          // from the camera-visible lights — no scene light sits on an overlay
+          // layer, so the node is EMPTIED, and every material's dynamic cache key
+          // folds `lightsNode.getCacheKey()` (an unlit `Background.material`
+          // included). The node going full→empty→full each frame re-mints the
+          // sky material ~every frame — its pipeline is never ready, which is the
+          // "sky flickers / everything rebuilds with post on" report. Verified
+          // live: post ON storms `Background.material` ~350-680 builds/s; post ON
+          // with this pass off (showInEditor:false) = 0. ⚠ GI ON HID IT (GI
+          // installs a black scene.environmentNode, §12.64), so it bit only the
+          // GI-off scenes. Fix: widen every scene light onto the overlay mask so
+          // the narrowed render still gathers them → the node never flips. The
+          // pass is unlit helpers, so a collected-but-unused light changes
+          // nothing it draws; the mask is restored in the finally.
+          // `__ppOverlayKeepLights = false` reverts.
+          const overlayMask = overlayLayers.mask;
+          const widenedLights = [];
+          if (globalThis.__ppOverlayKeepLights !== false) {
+            scene.traverse((obj) => {
+              if (obj.isLight && (obj.layers.mask & overlayMask) !== overlayMask) {
+                widenedLights.push([obj, obj.layers.mask]);
+                obj.layers.mask |= overlayMask;
+              }
+            });
+          }
           try {
             // Only THIS pass may see its own seed quad — see the quad's
             // construction for the cross-camera depth poisoning this prevents.
@@ -1070,6 +1160,7 @@ export class PostprocessComponent extends Component {
             originalUpdateBefore(frame);
           } finally {
             if (seedQuad) seedQuad.visible = false;
+            for (const [light, mask] of widenedLights) light.layers.mask = mask;
             scene.background = bg;
             clearColor.setRGB(r, g, b);
             renderer.setClearColor(clearColor, alpha);
@@ -1161,7 +1252,16 @@ export class PostprocessComponent extends Component {
       // rays but found no light (the map-less boot-time light — see render()'s
       // watcher) arms the watch-and-rebuild.
       const godraysLight = this.#resolveGodraysLight(engine, graph);
-      this._godraysAwaitingLight = !godraysLight && (graph?.nodes ?? []).some((n) => n.type === "godrays");
+      const fogNodes = (graph?.nodes ?? []).filter((n) => n.type === "volumetricFog");
+      const volumetricFogLight = fogNodes.length ? godraysLight ?? findFogSun(engine) : null;
+      // The same boot-order race god rays hit: a light's shadow map is only
+      // rendered after the first frame, so a pipeline built at load time can
+      // compile fog with no shafts and never notice the map arriving. Arm the
+      // watcher when either effect is still waiting for a real map.
+      const wantsShafts = fogNodes.some((n) => n.props?.sunShadows !== false);
+      this._godraysAwaitingLight =
+        (!godraysLight && (graph?.nodes ?? []).some((n) => n.type === "godrays")) ||
+        (wantsShafts && !volumetricFogLight?.shadow?.map?.depthTexture);
       const compiled = compilePostGraph(graph, {
         camera: this.renderCamera,
         beautyNode,
@@ -1206,6 +1306,10 @@ export class PostprocessComponent extends Component {
         // Other
         motionBlur,
         fsr1,
+        lensflare,
+        radialBlur,
+        volumetricFog,
+        volumetricFogLight,
         // Keepalive set for off-screen temp passes (SSGI, bloom, etc.)
         temps: this.keepaliveTemps,
       });

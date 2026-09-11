@@ -1538,3 +1538,120 @@ The disappearance is cured, but the 20-27 ms rebuild per selection remains and
 is pure waste. Merging is not the writer (it is inactive on this scene) and
 `loadMaterialAsset` is cached and does not re-apply. The next step is a setter
 trap on those three slots, not more reading.
+
+### 2026-09-10 — ⭐⭐⭐ THE 21.5-SECOND BLOCK WAS THE GPU PROCESS, AND EVERY SYNC PIPELINE IS ONE OF THEM
+
+User: *"our editor, and especially GI component, take enormous time to boot,
+huge freezes. Even when I simply enable shadow map on the light, it freezes
+again. Terrain sculpting is freezing … main thread hanging all the time after
+any changes made."*
+
+**The receipt that named it.** The user's own Foliage scene, the live ledger:
+`blocked 36 087 ms in 72 tasks, worst 21 528 ms` — and the worst one read
+`(unattributed) 21528`, `gpu: null`: no engine span, no wrapped GPU call
+inside it. Two more of the same shape on the next boot (14 731 ms, 6 016 ms,
+5 367 ms). What the same session's `syncPipelines` table showed beside them:
+`renderPipeline_Foliage · living surface_226` ×10, `ShadowMaterial_238` ×14,
+`Background.material_179` ×9 — **without** the `[async]` suffix. Those are
+the RE-MINTS, and the 2026-09-07 rule made them synchronous on purpose ("defer
+a first compile, never a re-mint", to stop meshes vanishing). A sync
+`createRenderPipeline` returns at once, but the GPU process executes it in
+order on its command thread, so a 70 kB foliage program parks that thread for
+its compile and the page's main thread blocks — later, in a task of its own —
+the next time the WebGPU wire needs the GPU process to catch up.
+`asyncRenderPipelines.js`'s own header had described this mechanism on
+2026-09-02; the 09-07 rule re-introduced it for exactly the class of edit the
+user was making (a light's `castShadow` = a `lights` wave = every material
+re-minted = ten sync compiles).
+
+**Shipped (all gated, all hatched):**
+
+| unit | change | receipt / hatch |
+|---|---|---|
+| **2.1** the stand-in | `asyncRenderPipelines.js`: a re-mint is deferred AND the object keeps drawing what it drew. three re-mints in two shapes: SAME render object + new pipeline from the same programs (a render-state change) → `renderObject.pipeline` stays on the previous pipeline (same programs = same bind group layout; the 09-07 "bind groups are rebuilt for the new layout" objection is true only of the other shape); NEW render object (a cache-key change — `lights`, `environment`, `fog`, `shadowMap`, a material slot) → the disposed predecessor is PARKED (chain entry removed so `get` can create the replacement, the three resource deletes deferred) and `Pipelines.isReady` draws it — `_geometries`/`_nodes`/`_bindings.updateForRender` + `backend.draw`, deliberately NOT `updateBefore` (a `ShadowNode` re-renders its map there) — until the replacement lands; dropped if a bound texture/storage buffer is gone (the old light's disposed shadow map), on material/geometry dispose, or after a 30 s TTL; a chain of re-mints hands the parked object down | `test:async-pipelines` 23 checks (fakes reproduce `getForRender`'s release-then-create and `RenderObjects.get`'s dispose-then-recreate). `__asyncRenderPipelinesStandIn = false` → the 09-07 rule; `__asyncRenderPipelinesRemint = true` → the 09-02 rule |
+| **2.2** the build budget | the main render builds at most `BUILD_BUDGET_MS` (8) of node graphs per frame (`_renderObjectDirect` wrapper: an object whose graph is not built and not in `nodeBuilderCache` waits, its parked predecessor holding the picture); at least one build per frame so a wave never stalls; a one-shot pass (outside `active`) is never budgeted | a nine-material `lights` wave: one 362 ms block → frames of one build each (`Foliage · living surface` 12 builds / 409 ms spread, no block over 60 ms). `__asyncRenderPipelinesBuildBudgetMs` (0 disables) |
+| **0.x** the ledger names the stall | `freezeLedger.js`: sync pipeline creations are kept 90 s past their task (`syncCompileLog`), async ones counted in flight; a block that is ≥ 50 % unattributed carries `gpuLoad` — `[GPU process busy? 12 sync pipeline(s) / 56kB WGSL in the last 1s: mipmap-rgba16float-2d-array, renderPipeline_Background.material_136, …; 8 async / 362kB still compiling]`; `profile.freezes.stalls` splits the session's unattributed ms into `waitingOnGpuMs` / `unmarkedMs`. Spans on `queue.submit/writeBuffer/writeTexture`, `createBindGroup/Buffer/Texture`; bytes written per block (`writeBytes`, honouring three's `dataOffset/size`); `installRenderSpans`: `render:scene→canvas` / `render:scene→ShadowMap:2048x2048` / `render:createBindings` / `render:updateTexture` / `render:geometry` / `render:updateBefore` | `test:freeze-ledger` 17 checks. The next spanless block reads as a cause, not a mystery |
+| **3.6** byte-stable WGSL | `wgslStable.js`: three names unnamed storage buffers `NodeBuffer_<node.id>` — a process-wide counter — so the same graph produced different text every boot and Chromium's compiled-shader disk cache (keyed on the text) compiled the 80 s GI kernels from scratch each boot (`[gi] SLOWEST PIPELINE: #126 [bvhHitShade] took 80.3s … binds NodeBuffer_55143,…`). Renamed to per-module ordinals at `createShaderModule` (bindings are by `@group/@binding` index; three never reflects a name); `WgslRegistry` scores each boot against the previous one in localStorage — `profile.freezes.wgsl` + `profile.wgsl` (dump a module to diff two boots) | `test:wgsl-stable` 5 checks. Foliage scene, boot 2 vs boot 1: **79 of 84 modules byte-identical, 12 rescued by the rename**; boot 3: 84/100, 15 rescued. `__wgslCanonical = false` |
+| **1.x** light in place | `LightComponent`: `castShadow` no longer `onDetach()` + `#buildLight()` (a new `light.id`, a second re-mint wave, a disposed and reallocated shadow map, and a `hierarchy-changed` fan-out to ~20 scene walkers). `#castShadowInPlace` keeps the light/camera/target/GI contract; `castShadow` left `STRUCTURAL_PROPS`; the rare swap fallback emits `hierarchy-changed` itself. `shadowMapType`/`shadowMode`/`csm*` keep the swap — three has no hash bit for them | `test:light-inplace` 11, `test:edit-fanout`. `__lightCastShadowInPlace = false` |
+| **(found)** the ambient glow's second context | `ambientGlow.js` rendered the WHOLE SCENE into a 32×21 target 2.5×/s — a second `RenderContext`, so every material carried a second graph and every wave re-minted twice, the second half SYNC (outside `active`). Now `frameCopy.js`: `copyTextureToTexture` from the swapchain in a post-render hook (waits for a PRESENTED frame — `getCurrentTexture()` on an undrawn tick hands out black) + one 4×4-tap quad into the sample target | `test:editor-prefs` (ambient-glow-sample 9). `__ambientGlowFrameCopy = false`. The `renderContext (… → rt:32x20)` cause rows are gone |
+| **(found)** the scene thumbnail's third context | `sceneThumbs.captureSceneThumb` rendered the scene into 320×200 on every save (autosave 10 s, throttled 20 s) — `material key: renderContext (… → rt:320x200#8)` ×400 ms waves plus sync 70 kB compiles, twice a minute while editing. Now the same frame copy, centre-cropped | same test file; falls back to the render when no frame is presented within 1.5 s |
+| **(found)** terrain sculpt was O(terrain) per dab | `TerrainComponent.applyHeightBrush` re-set every vertex, `computeVertexNormals()` over the whole grid, `computeBoundingSphere()`, a full upload and a re-seat of EVERY scatter layer on every pointermove. Now `#applyHeightsRect`: the box only, exact analytic six-triangle normals for box+1 ring, conservative sphere growth, `addUpdateRange` rows; the O(terrain) tail once in `commitHeights()`; spans `terrain:brush` / `terrain:stroke-commit` / `terrain:scatter`; `terrain.sculpt` (MCP) drives a stroke | `test:terrain-sculpt` 5. On the user's 128-res terrain: 12 dabs **2.9 ms**, commit **5.9 ms**, one 91 ms reaction block (`frame:preRender` — foliage re-layout) |
+
+**Receipts, user's Foliage scene, live editor:**
+
+| | before (09-09 code) | after |
+|---|---|---|
+| boot, main thread blocked | **19 838 ms in 16 tasks, worst 14 731** | **3 549-5 400 ms in 24-29 tasks, worst 725-939** |
+| a light `castShadow` off+on cycle | 5 blocks / **1 322 ms**, worst 366 (loop half asleep) · 13 / 2 943 ms, worst 475 (stand-ins only) | **9 blocks / 764 ms, worst 198**, no node-build block over 60 ms |
+| `(unattributed)` blocks with a cause | none | every one ≥ 50 % unattributed names the sync pipelines / async in flight / bytes written before it |
+| shader modules byte-stable across boots | unknown (never measured) | **79 / 84 → 84 / 100** |
+| a sculpt stroke (12 dabs + commit) | O(terrain) × 12, un-measurable (no op) | 2.9 + 5.9 ms |
+
+**What the receipts say is LEFT (next session, in order):**
+1. **The remaining spanless stalls are small first-compiles and big writes.**
+   `stalls.waitingOnGpuMs` 700-1 700 ms per boot in 8-13 blocks of 50-200 ms,
+   each naming sub-16 kB sync pipelines (`LineBasicMaterial`, `MeshBasicMaterial`,
+   `frameCopy:downsample`, `mipmap-rgba16float-2d-array`, `ShadowMaterial_209`
+   at 15 kB — just under the gate) plus 7 async in flight, and `writeBytes` of
+   10-100 MB per block (texture/instance uploads). Two levers: (a) the size
+   gate is a trade of absence for a stall — with parking, a first compile
+   OUTSIDE `active` in a REPEATING context (the shadow pass, GI's prepass)
+   could go async too, but "repeating" needs a whitelist (a bake target must
+   never defer); (b) chunk large `writeTexture`/`writeBuffer` uploads.
+2. **`module:setup foliage` 437-497 ms** and a 231 ms `first compile x7` block
+   from the foliage warmup's `compileAsync` (builds all of a mesh's programs in
+   one task; not on the budgeted `_renderObjectDirect` path) — the foliage
+   module's own, and it is another session's WIP.
+3. **The GI reflection BVH resync** (`#maybeResyncBvhScene` → `buildBvhScene`
+   → `packGeometryBlas`'s `MeshBVH`, synchronous, 200 ms-2 s) after any
+   geometry edit — in flight as a worker prewarm (see below).
+4. **The 80 s GI kernel compiles themselves** on a GI-heavy scene: the disk
+   cache now has a stable key to hit; the first boot after any kernel-text
+   change still pays. Unit 3.1 (capacities as uniforms) is what makes the text
+   stable across SCENES, not just boots.
+5. Unit 4.4 (`#rebuild` as a yielding state machine) is untouched: a rebuild
+   is still ~2.3 s of blocks (kernel TSL builds ~100 ms each, `screenGraphs`,
+   `bvhScene`).
+
+⚠ **Measurement traps met today:** `profile.frameStats` reports `fps 0 /
+loop stopped` whenever the frame pacer has idled the viewport — the edit's
+frames still ran (blocks were recorded) — so an fps of 0 during an A/B is not
+evidence the edit did nothing. The first `writeBytes` read `10 GB` in a 60 ms
+task because three hands the WHOLE attribute array to `writeBuffer` and bounds
+the write with `dataOffset`/`size` (elements); the count honours them now, and
+carries `writes`/`largestWrite` so a real 100 MB upload and a thousand small
+ones read differently. And `profile.freezes {clear:true}` returns the ledger
+BEFORE clearing — a batch that clears and edits in one round trip can lose the
+edit's blocks; clear first, act next.
+
+### 2026-09-10 — ⭐⭐⭐ THE GI RECEIPT: SPONZA LIT IN 18 s, NOT 93 s — the disk cache serves the kernels now
+
+Two consecutive boots of the user's Sponza scene through the live editor,
+same machine, nothing changed between them but the reload:
+
+| | first boot after the rename (cold: every kernel's text had just changed) | second boot |
+|---|---|---|
+| `[gi] compile wave: materials warmed` | **93 216 ms** to the first field pass | **17 662 ms** (field first pass at 18 181 ms) |
+| `[gi] SLOWEST PIPELINE` | `bvhHitShade` **80.3 s** (272 kB) | `resolve` **14.4 s** (52 kB); 250 s summed over 134 pipelines |
+| `profile.freezes.wgsl` | 291 modules, 145 renamed; 89 canonical hits (the Foliage boot before it had no GI kernels) | 212 modules, **193 canonical hits, 63 raw hits — 130 rescued by the rename** |
+| still unstable | — | 8 `fragment` modules of 17-75 kB (GI-injected MeshPhysical fragments: their text still moves between boots — dump two boots with `profile.wgsl` and diff; the next stability unit) |
+
+The 09-09 memory had this scene lighting at 73 s and called the 80 s
+`bvhHitShade` compile the wall; the wall was the cache never being asked
+the same question twice. What is left on a GI scene is the REBUILD block
+itself — `[freeze] 2997 ms — gi:kernel build src:glossy gather 422,
+gi:rebuild/staticBvhBuild(SAH) 305, src:shade + bounce [J] 193,
+src:merge#7 191 …` — one synchronous `#rebuild` plus the first frame's
+kernel graph builds in the same task: unit 4.4, untouched, now the largest
+single block on any GI scene.
+
+**Also shipped in this entry (agent, gated):** the GI reflection BVH's
+per-geometry `MeshBVH` pack is keyed on content revision (it served a STALE
+BVH after an in-place edit — terrain sculpting — before) and is built in a
+thin in-repo worker (`src/modules/gi/bvh/bvhBlasWorker.js`; three-mesh-bvh's
+own `GenerateMeshBVHWorker` transfers the live geometry's arrays away for the
+build, so it cannot be used on a drawing mesh); `#maybeResyncBvhScene` waits
+for the prewarm before its synchronous `#syncBvhScene`. `test:gi-bvh-worker`
+6 checks, the cache test verified to fail against the identity-only cache;
+`__giBvhWorker=false` / `__giBvhPrewarm=false`. ⚠ Not yet observed live on a
+sculpt of a GI-enabled terrain (the user's Foliage terrain has GI disabled).

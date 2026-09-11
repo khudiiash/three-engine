@@ -27,6 +27,7 @@ import { AudioEffectDialog } from "./AudioEffectDialog.jsx";
 import { usePanelVisible } from "../usePanelVisible.js";
 import { ownsKeyboard } from "../keyScope.js";
 
+import { Select } from "../fields/Select.jsx";
 const HEAD_WIDTH = 168;
 const LANE_HEIGHT = 76;
 
@@ -843,7 +844,7 @@ export function AudioEditorPanel({ api } = {}) {
 
         <div className="aud-addtrack">
           <Plus size={12} />
-          <select
+          <Select
             value=""
             disabled={busy}
             onChange={(e) => { if (e.target.value) addTrackFromFile(e.target.value); e.target.value = ""; }}
@@ -852,7 +853,7 @@ export function AudioEditorPanel({ api } = {}) {
             {files.map((f) => (
               <option key={f.path} value={f.path}>{f.name}</option>
             ))}
-          </select>
+          </Select>
           <Layers size={11} className="aud-hint" title="Tracks layer like an impact: thud, crack, tail" />
         </div>
       </div>

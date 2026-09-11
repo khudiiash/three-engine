@@ -14,6 +14,7 @@ import {
 import { STORE_SORTS, browseStore, openStoreItem, searchStore } from "../itchioStore.js";
 import { CREDENTIAL_CHANGED_EVENT } from "../credentialEvents.js";
 
+import { Select } from "../fields/Select.jsx";
 const openModulesPanel = () => import("../EditorShell.jsx").then((m) => m.openPanel("modules"));
 
 const TABS = [
@@ -625,7 +626,7 @@ function PublishTab() {
                   </button>
                 </>
               ) : (
-                <select
+                <Select
                   className="text-field itchio-step-select"
                   value={selectedId}
                   onChange={(e) => setSelectedId(e.target.value)}
@@ -634,7 +635,7 @@ function PublishTab() {
                   {games.map((g) => (
                     <option key={g.id} value={g.id}>{g.title}</option>
                   ))}
-                </select>
+                </Select>
               )}
             </div>
           </li>

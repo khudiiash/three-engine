@@ -268,7 +268,14 @@ export class BatchSystem {
       const at = i * 16;
       let same = true;
       for (let e = 0; e < 16; e++) {
-        if (cache[at + e] !== elements[e]) {
+        // The cache is Float32 and three's matrix elements are Float64, so
+        // compare at the cache's precision. A raw `!==` read every value
+        // float32 cannot hold exactly as motion — which re-uploaded EVERY
+        // batch EVERY frame, and, because GI hashes `instanceMatrix.version`
+        // into its g-buffer key, kept the depth prepass re-rendering the whole
+        // scene on a parked camera (measured: 357 → 645 draws on the ball pool
+        // with zero fps gained from batching).
+        if (cache[at + e] !== Math.fround(elements[e])) {
           same = false;
           break;
         }

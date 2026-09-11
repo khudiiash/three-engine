@@ -1,5 +1,5 @@
 import * as THREE from "three/webgpu";
-import { faceDirection, normalWorld, vec4 } from "three/tsl";
+import { float, normalWorld, texture, vec4 } from "three/tsl";
 import { frameBasis, frameDirection } from "./octahedral.js";
 import { readRenderTargetImage } from "../renderTargetImage.js";
 
@@ -33,8 +33,10 @@ import { readRenderTargetImage } from "../renderTargetImage.js";
  * To capture something close to albedo out of arbitrary materials (which may be
  * shader graphs — there is no `material.color` to read), the bake renders the
  * object in its own scene lit by a single white ambient light and nothing else.
- * A diffuse surface under uniform ambient returns its own colour, which is the
- * definition we want; a metal or a mirror returns something darker, which is
+ * Three's ambient light supplies irradiance; Lambert diffuse divides that by
+ * PI. A unit neutral bake therefore needs PI irradiance to return albedo,
+ * rather than baking another 1/PI darkening into the final lit surface. A
+ * metal or a mirror returns something darker, which is
  * the accepted cost of not owning every material's shading model. Tone mapping
  * is switched off for the same reason — a tone-mapped bake would be tone-mapped
  * a second time when the impostor is drawn.
@@ -61,7 +63,7 @@ export const IMPOSTOR_BAKE_DEFAULTS = {
   tile: 128,
   /** Upper hemisphere only — right for anything standing on the ground. */
   hemisphere: true,
-  /** Brightness of the neutral ambient the albedo is captured under. */
+  /** Neutral albedo gain; 1 supplies PI irradiance to cancel Lambert's 1/PI. */
   ambient: 1,
 };
 
@@ -135,8 +137,8 @@ function boundsOf(root) {
   return { center, radius: radius > 0 ? radius : 1e-3 };
 }
 
-/** The override material for the normal pass. One pipeline for the whole bake. */
-function createNormalMaterial() {
+/** One normal pass material per source surface, with the same visible pixels. */
+function createNormalMaterial(source) {
   const material = new THREE.MeshBasicNodeMaterial();
   material.name = "Impostor normal";
   // Same trap the GI gbuffer hit: MeshBasicNodeMaterial ships with
@@ -147,8 +149,25 @@ function createNormalMaterial() {
   // Foliage is modelled as single-sided cards seen from both sides; rendering
   // the normal pass front-side-only would leave holes exactly where the albedo
   // pass has coverage, and a hole in a normal atlas is a black leaf.
-  material.side = THREE.DoubleSide;
-  material.colorNode = vec4(normalWorld.mul(faceDirection).mul(0.5).add(0.5), 1);
+  material.side = source.side ?? THREE.DoubleSide;
+  material.positionNode = source.positionNode ?? null;
+  material.opacity = source.opacity ?? 1;
+  material.opacityNode = source.opacityNode ?? null;
+  material.alphaMap = source.alphaMap ?? null;
+  material.alphaTest = source.alphaTest ?? 0;
+  material.alphaTestNode = source.alphaTestNode ?? null;
+  material.maskNode = source.maskNode ?? null;
+  material.normalNode = source.normalNode ?? null;
+  material.normalMap = source.normalMap ?? null;
+  material.normalMapType = source.normalMapType ?? THREE.TangentSpaceNormalMap;
+  material.normalScale = source.normalScale?.clone() ?? new THREE.Vector2(1, 1);
+  // MeshBasic's own setupNormal ignores normalNode and normalMap.
+  material.setupNormal = THREE.NodeMaterial.prototype.setupNormal;
+  const colorAlpha = source.colorNode ? vec4(source.colorNode).a : source.map ? texture(source.map).a : float(1);
+  // normalWorld already includes Three's DoubleSide back-face correction.
+  // Undoing it would point the rear view's normals away from its visible face:
+  // the same grass card would be lit nearby and completely black as an impostor.
+  material.colorNode = vec4(normalWorld.mul(0.5).add(0.5), colorAlpha);
   return material;
 }
 
@@ -243,6 +262,29 @@ async function readAtlas(renderer, target, size, tile) {
   return out;
 }
 
+/** Linear filtering must interpolate surface RGB, not the black clear colour.
+ * Keep coverage unchanged, but extend colour/encoded normals into the one-texel
+ * transparent border each bilinear footprint can touch. Work within each tile
+ * so unrelated views never leak into one another. This is especially visible on
+ * grass, where nearly every texel belongs to a thin blade's silhouette edge. */
+function padAtlasEdges(data, size, tile) {
+  const source = data.slice();
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const at = (y * size + x) * 4;
+    if (source[at + 3]) continue;
+    const tileX = Math.floor(x / tile) * tile, tileY = Math.floor(y / tile) * tile;
+    let red = 0, green = 0, blue = 0, weight = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const px = x + dx, py = y + dy;
+      if (px < tileX || px >= tileX + tile || py < tileY || py >= tileY + tile) continue;
+      const neighbor = (py * size + px) * 4, alpha = source[neighbor + 3];
+      if (!alpha) continue;
+      red += source[neighbor] * alpha; green += source[neighbor + 1] * alpha; blue += source[neighbor + 2] * alpha; weight += alpha;
+    }
+    if (weight) { data[at] = Math.round(red / weight); data[at + 1] = Math.round(green / weight); data[at + 2] = Math.round(blue / weight); }
+  }
+}
+
 function makeAtlasTexture(data, size, colorSpace) {
   const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
   texture.colorSpace = colorSpace;
@@ -284,7 +326,7 @@ export async function bakeImpostorAtlas(renderer, source, options = {}) {
   scene.add(root);
   // The whole lighting environment of the bake: one white ambient, so what
   // comes out is (approximately) albedo rather than a frozen lighting solution.
-  scene.add(new THREE.AmbientLight(0xffffff, settings.ambient));
+  scene.add(new THREE.AmbientLight(0xffffff, Math.PI * settings.ambient));
 
   const target = new THREE.RenderTarget(size, size, {
     depthBuffer: true,
@@ -304,7 +346,12 @@ export async function bakeImpostorAtlas(renderer, source, options = {}) {
   });
   normalTarget.texture.colorSpace = THREE.NoColorSpace;
 
-  const normalMaterial = createNormalMaterial();
+  const normalMaterials = new Map();
+  const normalFor = sourceMaterial => {
+    let material = normalMaterials.get(sourceMaterial);
+    if (!material) { material = createNormalMaterial(sourceMaterial); normalMaterials.set(sourceMaterial, material); }
+    return material;
+  };
   const previousTarget = renderer.getRenderTarget();
   const previousToneMapping = renderer.toneMapping;
   const previousClear = new THREE.Color();
@@ -315,13 +362,21 @@ export async function bakeImpostorAtlas(renderer, source, options = {}) {
     renderer.toneMapping = THREE.NoToneMapping;
     const tileArgs = { frames, tile, hemisphere, center: bounds.center, radius: bounds.radius };
     renderTiles(renderer, scene, target, tileArgs);
-    scene.overrideMaterial = normalMaterial;
+    // A blind scene override loses alpha/normal nodes. The bake root is a
+    // private clone, so replace its materials for this second pass without
+    // mutating the source or relying on callbacks Object3D.clone drops.
+    root.traverse(object => {
+      if (!object.isMesh || !object.material) return;
+      object.material = Array.isArray(object.material) ? object.material.map(normalFor) : normalFor(object.material);
+    });
     renderTiles(renderer, scene, normalTarget, tileArgs);
     scene.overrideMaterial = null;
     renderer.setRenderTarget(previousTarget);
 
     const albedoData = await readAtlas(renderer, target, size, tile);
     const normalData = await readAtlas(renderer, normalTarget, size, tile);
+    padAtlasEdges(albedoData, size, tile);
+    padAtlasEdges(normalData, size, tile);
 
     return {
       albedo: makeAtlasTexture(albedoData, size, THREE.SRGBColorSpace),
@@ -344,7 +399,7 @@ export async function bakeImpostorAtlas(renderer, source, options = {}) {
     renderer.toneMapping = previousToneMapping;
     renderer.setClearColor(previousClear, previousClearAlpha);
     scene.overrideMaterial = null;
-    normalMaterial.dispose();
+    for (const material of normalMaterials.values()) material.dispose();
     target.dispose();
     normalTarget.dispose();
     // The clone shares geometry and materials with the source — disposing

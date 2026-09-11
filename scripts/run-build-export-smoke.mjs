@@ -60,8 +60,50 @@ const stoneTex = write("textures/stone/color.png", PNG);
 const woodMat = write("materials/wood/Surface.mat", JSON.stringify({ name: "Wood", map: woodTex, color: "#ffffff" }));
 const stoneMat = write("materials/stone/Surface.mat", JSON.stringify({ name: "Stone", map: stoneTex, color: "#888888" }));
 write("art/logo.png", PNG);
-write("scripts/Player.ts", "export default class Player { onUpdate() {} }\n");
+// The script names the next level by path — what makes Level2 reachable when
+// the scene list is left on its default.
+write(
+  "scripts/Player.ts",
+  "export default class Player { onUpdate() {} next() { return this.entity.engine.loadScene(\"scenes/Level2.scene\"); } }\n",
+);
 const playerScript = `${ROOT}/scripts/Player.ts`;
+
+// A material flagged Exclude, referenced by the start scene: neither it nor the
+// texture only it references may ship — exclusion is decided before the
+// document is read, not after its children were already claimed.
+const wipTex = write("textures/wip/color.png", PNG);
+const wipMat = write("materials/wip/Wip.mat", JSON.stringify({ name: "Wip", map: wipTex }));
+write("materials/wip/Wip.mat.meta", JSON.stringify({ build: { exclude: true } }));
+
+// Prefabs: one the start scene instances, one nothing reaches, one pinned with
+// Preload. Each carries its own material and texture, so what ships tells
+// which prefabs were embedded.
+const prefabFixture = (guid, name, folder) => {
+  const tex = write(`textures/${folder}/color.png`, PNG);
+  const mat = write(`materials/${folder}/${name}.mat`, JSON.stringify({ name, map: tex }));
+  const path = write(
+    `prefabs/${name}.prefab`,
+    JSON.stringify({
+      prefab: 1,
+      guid,
+      name,
+      root: {
+        fid: `f_${guid}`,
+        name,
+        position: [0, 0, 0],
+        rotation: [0, 0, 0],
+        scale: [1, 1, 1],
+        components: [{ type: "mesh", props: { geometry: "box", material: mat } }],
+        children: [],
+      },
+    }),
+  );
+  return { guid, name, tex, mat, path };
+};
+const usedPrefab = prefabFixture("p_used", "Prop", "prop");
+const unusedPrefab = prefabFixture("p_unused", "Crate", "crate");
+const pinnedPrefab = prefabFixture("p_pinned", "Pinned", "pinned");
+write("prefabs/Pinned.prefab.meta", JSON.stringify({ build: { preload: true } }));
 
 const entity = (id, name, components = []) => ({
   id,
@@ -82,6 +124,16 @@ write(
       entity("stone", "Stone Box", [{ type: "mesh", props: { geometry: "box", material: stoneMat } }]),
       entity("player", "Player", [{ type: "script", props: { scripts: [{ path: playerScript }] } }]),
       entity("cam", "Camera", [{ type: "camera", props: {} }]),
+      entity("wip", "WIP Box", [{ type: "mesh", props: { geometry: "box", material: wipMat } }]),
+      {
+        id: "prop1",
+        name: "Prop",
+        prefab: { guid: usedPrefab.guid, path: usedPrefab.path },
+        position: [2, 0, 0],
+        rotation: [0, 0, 0],
+        scale: [1, 1, 1],
+        overrides: [],
+      },
     ],
   }),
 );
@@ -140,6 +192,15 @@ await installTauriShim(page, {
       return null;
     },
     read_player_template: ({ rel }) => fs.readFileSync(path.join("dist-player", rel), "utf8"),
+    list_player_template: () => {
+      const walk = (dir, prefix) =>
+        fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+          entry.isDirectory()
+            ? walk(path.join(dir, entry.name), `${prefix}${entry.name}/`)
+            : [[`${prefix}${entry.name}`, fs.statSync(path.join(dir, entry.name)).size]],
+        );
+      return walk("dist-player", "");
+    },
     write_binary_file: ({ path: p, contents }) => {
       binaryWrites.push([p, contents?.length ?? 0]);
       return null;
@@ -226,7 +287,8 @@ try {
   // where both materials point at the same file.
   const fileBody = (predicate) => files.find(([rel]) => predicate(rel))?.[1];
   const matBodies = files.filter(([rel]) => rel.endsWith(".mat")).map(([rel, body]) => [rel, JSON.parse(body)]);
-  check("both materials ship", matBodies.length === 2, matBodies.map(([rel]) => rel).join(", "));
+  const shipsMaterial = (name) => matBodies.some(([, def]) => def.name === name);
+  check("both materials ship", shipsMaterial("Wood") && shipsMaterial("Stone"), matBodies.map(([rel]) => rel).join(", "));
   const wood = matBodies.find(([, def]) => def.name === "Wood")?.[1];
   const stone = matBodies.find(([, def]) => def.name === "Stone")?.[1];
   check("the wood material still points at the wood texture", wood?.map === woodDest, `${wood?.map} (want ${woodDest})`);
@@ -241,6 +303,7 @@ try {
   // nobody can find.
   const scene = JSON.parse(manifest.sceneJson);
   const matRefs = scene.entities
+    .filter((e) => e.id === "wood" || e.id === "stone")
     .flatMap((e) => e.components ?? [])
     .filter((c) => c.type === "mesh")
     .map((c) => c.props.material);
@@ -250,6 +313,60 @@ try {
     matRefs.every((ref) => files.some(([rel]) => rel === ref)),
     matRefs.join(", "),
   );
+
+  // --- Only what the build can reach ships -----------------------------------
+  // An Exclude flag keeps the material AND the texture only it references out;
+  // the scene still names it (a 404 at runtime, which the report warns about).
+  check("an excluded material does not ship", !shipsMaterial("Wip"), "");
+  check("…nor the texture only it referenced", destOf(wipTex) === null, String(destOf(wipTex)));
+  check("the exclusion is reported", (report.excluded ?? []).length === 1, JSON.stringify(report.excluded));
+  check(
+    "and warned about",
+    (report.warnings ?? []).some((w) => /Excluded from the build/.test(w)),
+    (report.warnings ?? []).join(" | "),
+  );
+  // Prefabs: the instanced one and the pinned one are embedded with their
+  // assets; the one nothing reaches is left out along with its material and texture.
+  const prefabGuids = (scene.prefabs ?? []).map((d) => d.guid).sort();
+  check(
+    "the instanced and the pinned prefab ship, the unreachable one does not",
+    JSON.stringify(prefabGuids) === JSON.stringify(["p_pinned", "p_used"]),
+    prefabGuids.join(", "),
+  );
+  check(
+    "a shipped prefab carries a project-relative path, not the authoring path",
+    (scene.prefabs ?? []).every((d) => d.path && !/^([A-Za-z]:|\/)/.test(d.path)),
+    (scene.prefabs ?? []).map((d) => d.path).join(", "),
+  );
+  check("the instanced prefab's material and texture ship", shipsMaterial("Prop") && destOf(usedPrefab.tex) !== null, "");
+  check("the pinned prefab's material and texture ship", shipsMaterial("Pinned") && destOf(pinnedPrefab.tex) !== null, "");
+  check("the unreachable prefab's material does not ship", !shipsMaterial("Crate"), "");
+  check("…nor its texture", destOf(unusedPrefab.tex) === null, String(destOf(unusedPrefab.tex)));
+  check("the instance link has no authoring path", !scene.entities.find((e) => e.id === "prop1")?.prefab?.path, "");
+  check("the report counts prefabs", report.prefabCount === 2 && report.prefabsSkipped === 1, `${report.prefabCount}/${report.prefabsSkipped}`);
+
+  // --- The runtime is trimmed to what the game can reach ------------------------
+  const templateFiles = manifest.templateFiles;
+  check("the exporter hands over a runtime allow-list", Array.isArray(templateFiles), String(templateFiles));
+  check("and asks for leftovers to be pruned", manifest.prune === true, String(manifest.prune));
+  const enabledModules = scene.modules ?? [];
+  check("the entry chunk is in it", (templateFiles ?? []).some((f) => /^_engine\/player-.*\.js$/.test(f)), "");
+  check(
+    "Rapier ships exactly when physics is enabled",
+    (templateFiles ?? []).some((f) => /rapier/i.test(f)) === enabledModules.includes("physics-rapier"),
+    `modules: ${enabledModules.join(", ") || "none"}`,
+  );
+  check(
+    "the GI system ships exactly when GI is enabled",
+    (templateFiles ?? []).some((f) => /GISystem/.test(f)) === enabledModules.includes("gi"),
+    "",
+  );
+  check(
+    "the manifest and the editor's public leftovers are not in the build",
+    !(templateFiles ?? []).some((f) => /^\.vite\/|^tauri\.svg$|^app-icon\.png$/.test(f)),
+    (templateFiles ?? []).filter((f) => /^\.vite\/|^tauri\.svg$|^app-icon\.png$/.test(f)).join(", "),
+  );
+  check("the report says the runtime was trimmed", report.runtime?.trimmed === true && report.runtime.skipped > 0, JSON.stringify(report.runtime));
 
   // Scripts: transpiled, renamed, and referenced by the new name.
   const scriptRef = scene.entities.flatMap((e) => e.components ?? []).find((c) => c.type === "script")?.props.scripts[0].path;
@@ -286,16 +403,16 @@ try {
   // --- The other two targets -------------------------------------------------
   // Same game, different delivery. Both take branches the web target never
   // touches, and a throw in either is invisible until someone picks it.
-  const runTargetExport = async (target, outDir) => {
+  const runExportWith = async (buildPatch, outDir) => {
     manifest = null;
     zipCalls.length = 0;
     await page.evaluate(
-      async ({ target: t, outDir: dir }) => {
+      async ({ buildPatch: p, outDir: dir }) => {
         globalThis.__build = { done: false };
         const { useProjectStore } = await globalThis.__importLive("/src/editor/store/projectStore.js");
         const meta = useProjectStore.getState().projectMeta;
         useProjectStore.setState({
-          projectMeta: { ...meta, settings: { ...meta.settings, build: { ...meta.settings.build, target: t } } },
+          projectMeta: { ...meta, settings: { ...meta.settings, build: { ...meta.settings.build, ...p } } },
         });
         globalThis
           .__importLive("/src/editor/exportGame.js")
@@ -303,11 +420,30 @@ try {
           .then((r) => Object.assign(globalThis.__build, { report: r, done: true }))
           .catch((e) => Object.assign(globalThis.__build, { error: String(e?.stack ?? e), done: true }));
       },
-      { target, outDir },
+      { buildPatch, outDir },
     );
     await page.waitForFunction(() => globalThis.__build?.done, { timeout: 120000, polling: 250 });
     return page.evaluate(() => ({ report: globalThis.__build.report, error: globalThis.__build.error ?? null }));
   };
+  const runTargetExport = (target, outDir) => runExportWith({ target }, outDir);
+
+  // --- Scene reachability (the default scene selection) ----------------------
+  // The project's build list is explicit above. On the default, only the start
+  // scene and what it names ship: Level2 through the script's loadScene
+  // literal, never Scratch. "all" is the opt-in for everything.
+  const reach = await runExportWith({ target: "web", scenes: null }, `${OUT}/reach`);
+  check("the default scene selection builds", reach.report?.ok === true, reach.error ?? reach.report?.error ?? "");
+  const reachScenes = (manifest?.files ?? []).filter(([rel]) => rel.endsWith(".scene")).map(([rel]) => rel).sort();
+  check(
+    "it ships the start scene and the level the script names, nothing else",
+    JSON.stringify(reachScenes) === JSON.stringify(["scenes/Level2.scene", "scenes/Main.scene"]),
+    reachScenes.join(", "),
+  );
+  check("the report lists them", JSON.stringify([...(reach.report?.scenes ?? [])].sort()) === JSON.stringify(reachScenes), String(reach.report?.scenes));
+  check("in reachable mode", reach.report?.sceneMode === "reachable", String(reach.report?.sceneMode));
+  const everything = await runExportWith({ target: "web", scenes: "all" }, `${OUT}/all`);
+  const allScenes = (manifest?.files ?? []).filter(([rel]) => rel.endsWith(".scene")).map(([rel]) => rel);
+  check('"all" ships every scene, Scratch included', everything.report?.ok === true && allScenes.length === 3, allScenes.join(", "));
 
   const zipRun = await runTargetExport("zip", `${OUT}/zip`);
   check("the zip target builds", zipRun.report?.ok === true, zipRun.error ?? zipRun.report?.error ?? "");

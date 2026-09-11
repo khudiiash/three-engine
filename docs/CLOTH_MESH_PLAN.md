@@ -1540,3 +1540,93 @@ runs whether or not anything is touched. A reported TRIGGER is a hypothesis,
 not data. The ledger had the answer the whole time and could not say it,
 because the work was unmarked — *"a large `(unattributed)` is a missing mark,
 not an absence of work"*, which is printed in the tool's own note.
+
+## Stage 4 — SHIPPED (2026-09-10): THE ARENA — one solver for every cloth, 1/360 s steps, a triangle grid
+
+*"our cloth is very expensive … I want it like three's `webgpu_compute_cloth`,
+here it runs perfectly well, ours look worse and a lot more expensive.
+Possibly we're doing something wrong."* (user). We were.
+
+### What was wrong, in one table
+
+| | the old cloth path (`createGridSimulation`) | three's example | the arena |
+|---|---|---|---|
+| step | 1/120 s, count capped at 2, size divided by the frame | 1/360 s fixed, count follows the frame | 1/360 s fixed, count follows the frame |
+| dispatches per step per cloth | ~16 (integrate, 8 Jacobi, commits, contact, 2 edge sweeps) | 2 | **1 fused kernel for EVERY cloth** |
+| dispatches per frame, ten curtains | ~300 | — | 6 steps + one surface per visible cloth ≈ **10–16** |
+| static contact | a stackless BVH walked per particle per edge sweep, 7 walks a substep | a sphere | **a per-cloth uniform grid**: one cell lookup, exact tests on ~1–12 triangles |
+| convergence | 8 Jacobi passes on a large step | force springs at 360 Hz | 1 Jacobi pass on a small step + the fabric-length cap |
+
+The lesson three's example teaches is not "explicit springs": it is **many
+small fixed steps beat few big ones** (Macklin et al. 2019, "Small Steps in
+Physics Simulation"). Jacobi's residual scales with h², so a step a third the
+size with a third of the passes per second is the same sag for a third of the
+dispatches per step — and fusing the whole step into one kernel over one
+particle set is what turns "a third" into "a tenth of a tenth".
+
+### The pieces
+
+- `clothArenaPack.js` — pure JS: the lattice as a mesh topology (a plane cloth
+  now runs the same path as a curtain, with both quad diagonals braced), the
+  particle-range allocator (first fit, **no compaction** — the GPU owns the
+  pose), the static/spring packing with **both** particle indices rebased (the
+  fan successor too — the flock's bug), the triangle grid, the collision
+  buffer layout, the parameter rows.
+- `clothArenaModel.js` — the step kernel transliterated to JS, over the same
+  packed arrays. ⛔ Change it with the kernel or every test lies.
+- `clothArena.js` — the buffers (seven storage bindings, inside WebGPU's
+  eight), the fused step kernel, the per-member surface kernel, membership,
+  the per-frame tick on `engine.onPreRender`, the pre-dispatch buffer audit.
+- `tests/cloth-arena.test.mjs` — 18 receipts on the model: a ½g·t·(t+h) fall
+  to 1e-4, a settling sheet, bit-identical results at 60 and 33 fps, a
+  72 m/s particle that cannot tunnel a triangle, the cap reeling a 3 m drag
+  back, two cloths solving as one would alone.
+- `scripts/cloth-arena-smoke.html` — a real device capped at eight storage
+  buffers: two cloths, a box and a concave slab, forced stride and capacity
+  rebuilds after dispatch, a detach/re-attach, a member leaving.
+
+### ⭐⭐⭐ THE FABRIC-LENGTH CAP IS THE LOAD PATH, NOT A SAFETY NET
+
+Measured on the model, a 48-ring 2.3 m sheet, one Jacobi pass a step:
+
+| relaxation ω | cap off: sag / worst strain | cap 0.5: sag / worst strain |
+|---|---|---|
+| 1.0 | 32 % / 191 % | **2.0 % / 3.2 %** |
+| 1.5 | 19 % / 113 % | 2.0 % / 3.0 % |
+| 1.8 | 17 % / 100 % | 1.9 % / 2.9 % |
+
+Averaged Jacobi propagates tension one ring a pass; forty rings of curtain
+never converge in the passes a frame affords, whatever ω. The cap (each
+particle within its geodesic fabric length of its nearest pin) carries the
+weight in one pass, and the springs do the local shape. ω stays 1 — it buys
+nothing once the cap is on — and a test now fails if the cap stops being
+load-bearing.
+
+### ⛔⛔ THE FLOCK'S ZERO-SIZED BINDING, FOUND AT LAST — AND IT WAS NOT THE FLOCK
+
+The first live boot printed the flock's exact epitaph: *"Binding size for
+[Buffer "arena:statics"] is zero"*, once, at boot, then silence — and the
+arena reported steps and dispatches every frame while (had the audit not
+caught it) solving nothing. The smoke could not reproduce it through forced
+rebuilds, re-attaches or member churn.
+
+**GI did it.** `GISystem`'s teardown walks its own state four levels deep
+through plain objects for stale compute nodes (`collectStateComputeNodes`,
+no bail-out on nodes), evicts them, harvests every storage buffer they bind,
+and a few frames later `releaseStorageAttributes` destroys those buffers AND
+replaces their CPU arrays with zero-length ones. Anything hung off a plain
+object the walk can reach is fair game — `engine.__clothArena` was, and the
+old flock's shared solver almost certainly was too. The arena now lives in a
+module WeakMap keyed by the engine (not enumerable, so unreachable), and its
+pre-dispatch audit rebuilds and shouts if any buffer ever comes up empty
+again, so this failure can never again look like a 120 fps success.
+
+### Dials and receipts
+
+`__clothLegacy = true` (reload) runs the old cloth path for an A/B.
+`__clothRelax`, `__clothLraRelax` are read every frame; `__clothArenaNoContact`
+drops contact as a measurement arm; `__clothArenaInitial = { capacity, stride }`
+forces rebuilds for a smoke; `__clothArenaLog` prints them. `vfx.cloth.status`
+reports `solver: "arena"` and an `arena` block: members, particles, capacity,
+stride, generation and rebuild count, steps and dispatches last frame, and
+this cloth's grid (triangles, cells, cell size) against the shared count.

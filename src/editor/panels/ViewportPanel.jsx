@@ -100,8 +100,12 @@ import {
 } from "../terrainBrush.js";
 import { useModulesStore } from "../modules.js";
 import { setupBlockoutTool } from "../blockoutTool.js";
+import { setupArchitecturePlacementTool, dispatchArchitecturePlacementKey, isArchitecturePlacementActive, subscribeArchitecturePlacement } from "../architecturePlacementTool.js";
+import { setupArchitectureSculptTool, dispatchArchitectureSculptKey, isArchitectureSculptActive, subscribeArchitectureSculpt } from "../architectureSculptTool.js";
 import { dispatchLevelToolKey, getLevelTool, subscribeLevelTool } from "../levelTool.js";
 import { LevelToolbar } from "../components/LevelToolbar.jsx";
+import { ArchitectureToolButton } from "../components/ArchitectureBuilder.jsx";
+import { ArchitectureDrawToolbar } from "../components/ArchitectureDrawToolbar.jsx";
 import { createStroke, resetStroke, strokeDabs } from "../brush.js";
 import { SetTerrainHeightsCommand, SetTerrainScatterCommand, SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
 import { GeometryEditorPanel } from "./GeometryEditorPanel.jsx";
@@ -377,6 +381,8 @@ async function ensureViewport() {
         sceneState.sceneName,
       );
 
+      setupArchitectureSculptTool(canvas, viewport);
+      setupArchitecturePlacementTool(canvas, viewport);
       setupGizmo(canvas);
       setupSplineEditing(canvas);
       setupPicking(canvas);
@@ -388,16 +394,26 @@ async function ensureViewport() {
       // viewport, and the gizmo's handles would swallow the drag that places
       // the piece under them.
       subscribeLevelTool(() => {
-        const armed = !!getLevelTool() && getLevelTool() !== "select";
+        const armed = isArchitectureSculptActive() || isArchitecturePlacementActive() || (!!getLevelTool() && getLevelTool() !== "select");
         if (armed || !getTerrainBrushMode()) {
           viewport.gizmo.enabled = !armed;
           viewport.gizmo.getHelper().visible = !armed;
         }
       });
+      subscribeArchitecturePlacement(() => {
+        const armed = isArchitectureSculptActive() || isArchitecturePlacementActive() || (!!getLevelTool() && getLevelTool() !== "select") || !!getTerrainBrushMode();
+        viewport.gizmo.enabled = !armed;
+        viewport.gizmo.getHelper().visible = !armed;
+      });
       // While a sculpt/paint brush is armed, hide the transform gizmo so its
       // arrow handles can't intercept brush strokes on the terrain mesh.
       subscribeTerrainBrush(() => {
-        const armed = !!getTerrainBrushMode();
+        const armed = !!getTerrainBrushMode() || isArchitectureSculptActive() || isArchitecturePlacementActive();
+        viewport.gizmo.enabled = !armed;
+        viewport.gizmo.getHelper().visible = !armed;
+      });
+      subscribeArchitectureSculpt(() => {
+        const armed = isArchitectureSculptActive() || isArchitecturePlacementActive() || !!getTerrainBrushMode() || (!!getLevelTool() && getLevelTool() !== "select");
         viewport.gizmo.enabled = !armed;
         viewport.gizmo.getHelper().visible = !armed;
       });
@@ -2059,9 +2075,11 @@ function setupPicking(canvas) {
   window.addEventListener("pointermove", trackCursor, true);
 
   canvas.addEventListener("pointerdown", (e) => {
+    if (isArchitectureSculptActive() || isArchitecturePlacementActive()) { downPos = null; return; }
     if (e.button === 0 && !getTerrainBrushMode()) downPos = { x: e.clientX, y: e.clientY };
   });
   canvas.addEventListener("pointerup", (e) => {
+    if (isArchitectureSculptActive() || isArchitecturePlacementActive()) { downPos = null; return; }
     if (e.button !== 0 || !downPos || viewport.terrainBrushing) return;
     const moved = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
     downPos = null;
@@ -3248,7 +3266,7 @@ function setupKeyboard(canvas) {
     if (e.target.closest?.(".geometry-editor")) return;
     // Before the terrain brush: the level tools are only live while explicitly
     // armed, and while they are they own the number keys and U/J.
-    if (!e.repeat && dispatchLevelToolKey(e)) {
+    if (!e.repeat && (dispatchArchitectureSculptKey(e) || dispatchArchitecturePlacementKey(e) || dispatchLevelToolKey(e))) {
       e.preventDefault();
       e.stopImmediatePropagation();
       return;
@@ -4110,6 +4128,7 @@ export function ViewportPanel() {
   const [layers, setLayers] = useState(viewport.layers);
   const [layersOpen, setLayersOpen] = useState(false);
   const levelDesignEnabled = useModulesStore((s) => s.enabled.includes("level-design"));
+  const architectureEnabled = useModulesStore((s) => s.enabled.includes("architecture"));
 
   const dropRef = useAssetDrop({
     accepts: [...MODEL_EXTENSIONS, ...TEXTURE_EXTENSIONS, ...SCRIPT_EXTENSIONS, ...MATERIAL_EXTENSIONS, ...PREFAB_EXTENSIONS],
@@ -4352,7 +4371,7 @@ export function ViewportPanel() {
         // and have their own gestures on the right button.
         if (dragged || e.shiftKey || playing) return;
         if (getTerrainBrushMode() || useGeometryEditStore.getState().entityId) return;
-        if (getLevelTool() && getLevelTool() !== "select") return;
+        if (isArchitectureSculptActive() || isArchitecturePlacementActive() || (getLevelTool() && getLevelTool() !== "select")) return;
         setViewportMenu({ x: e.clientX, y: e.clientY });
       }}
     >
@@ -4365,7 +4384,9 @@ export function ViewportPanel() {
         />
       )}
       {levelDesignEnabled && !playing && <LevelToolbar />}
+      {architectureEnabled && !playing && <ArchitectureDrawToolbar />}
       <div className="viewport-toolbar">
+        {architectureEnabled && !playing && <ArchitectureToolButton />}
         {/* Blockout tools. Gated on the module rather than always shown: the
             palette is modal over the viewport, and an editor that offers it
             without the components registered would arm a tool that can't

@@ -20,6 +20,7 @@ import {
 import { AssetPreview } from "../components/AssetPreview.jsx";
 import { loadObjArchivePreview } from "../previewSources.js";
 
+import { Select } from "../fields/Select.jsx";
 const TABS = [
   { id: "Material", label: "Materials" },
   { id: "HDRI", label: "HDRIs" },
@@ -155,14 +156,14 @@ export function AmbientCGPanel() {
             onChange={(e) => setQuery(e.target.value)}
           />
         </div>
-        <select className="acg-category" value={category} onChange={(e) => setCategory(e.target.value)}>
+        <Select className="acg-category" value={category} onChange={(e) => setCategory(e.target.value)}>
           <option value="">All categories</option>
           {categories.map((c) => (
             <option key={c} value={c}>
               {c}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
 
       <div className="acg-body">
@@ -337,13 +338,13 @@ function AssetDetail({ asset, dataType, hasProject, onClose }) {
         <>
           <div className="acg-detail-row">
             <label>Resolution</label>
-            <select value={res} disabled={busy} onChange={(e) => setRes(e.target.value)}>
+            <Select value={res} disabled={busy} onChange={(e) => setRes(e.target.value)}>
               {resolutions.map((r) => (
                 <option key={r} value={r}>
                   {r}
                 </option>
               ))}
-            </select>
+            </Select>
             <span className="acg-size">{size == null ? "—" : formatBytes(size)}</span>
           </div>
 

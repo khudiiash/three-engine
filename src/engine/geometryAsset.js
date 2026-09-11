@@ -521,6 +521,44 @@ export function acquireGeometryAsset(path) {
 }
 
 /**
+ * ONE shared instance per built-in primitive (`box`, `sphere`, …) — the
+ * synchronous sibling of `acquireGeometryAsset`.
+ *
+ * `MeshComponent` used to mint a fresh `SphereGeometry` for every entity, so a
+ * scene of 350 primitive balls was 350 distinct geometries: 350 vertex uploads
+ * and, because `engine/batching.js` groups by `geometry.uuid`, 350 draw calls
+ * that could never instance. Handing every primitive mesh the same object is
+ * what lets them batch — exactly what a `.geom` already gets from the cache
+ * above. Nothing mutates a primitive in place (the invariant the `.geom` cache
+ * rests on: modifiers, terrain, Edit Mode all swap `mesh.geometry` for a new
+ * object), so sharing is as safe as it is for assets. The instance keeps its
+ * three class (`geometry.type === "SphereGeometry"`), which is what GI's mover
+ * classifier switches on to trace a ball as an analytic sphere.
+ *
+ * The entry lives in the same cache/owners tables, so `releaseGeometryAsset`
+ * and `disposeOrReleaseGeometry` treat it as shared: a mesh letting go of its
+ * primitive decrements rather than disposes. It is PINNED (refs starts at 1):
+ * seven small geometries are not worth freeing and re-minting whenever a scene
+ * empties out, and a pinned instance can never be disposed out from under a
+ * batch proxy that is still drawing it.
+ *
+ * `kind` is the primitive's name; `factory` builds it on first use.
+ */
+export function acquirePrimitiveGeometry(kind, factory) {
+  const path = `primitive:${kind}`;
+  let entry = cache.get(path);
+  if (!entry?.geometry) {
+    const geometry = factory();
+    geometry.userData.primitive = kind;
+    entry = { path, refs: 1, geometry, promise: Promise.resolve(geometry) };
+    cache.set(path, entry);
+    owners.set(geometry, entry);
+  }
+  entry.refs++;
+  return entry.geometry;
+}
+
+/**
  * Returns a borrowed geometry, disposing the shared instance once the last
  * holder lets go. Returns false when `geometry` is not cache-owned — the
  * caller's signal that it owns the geometry and may dispose it itself.

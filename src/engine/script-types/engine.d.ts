@@ -1777,6 +1777,125 @@ declare module "engine" {
     setLimits(min: number, max: number): void;
   }
 
+  /**
+   * `entity.getComponent("destructible")`. An object that breaks into Voronoi
+   * pieces (requires the `physics-rapier` module) — on impact above
+   * `strength` newtons, on a named event, or when something calls `break()`.
+   * The pieces are cut ahead of time and cached; the break itself only spawns
+   * them.
+   */
+  export interface DestructibleComponent extends ComponentBase<{
+    pieces: number;
+    /** `impact` clusters the cells around the hit point; `uniform` dices evenly. */
+    pattern: "uniform" | "impact";
+    seed: number;
+    trigger: "impact" | "event" | "manual";
+    /** Contact force in newtons that breaks it (`trigger: "impact"`). */
+    strength: number;
+    breakEvent: string;
+    /** Outward speed of the pieces, m/s. */
+    scatter: number;
+    spin: number;
+    inheritVelocity: boolean;
+    debrisLifetime: number;
+    debrisLayer: string;
+    /** kg for the whole object, split by piece volume. 0 = take the Rigidbody's. */
+    debrisMass: number;
+    friction: number;
+    restitution: number;
+    prefracture: boolean;
+    depth: number;
+  }> {
+    /** True once it has broken; false again after `reset()`. */
+    broken: boolean;
+    /** The piece entities, while broken. */
+    debris: Entity[];
+    /** Breaks it now. False if it was already broken or has no pieces. */
+    break(options?: {
+      point?: [number, number, number];
+      scatter?: number;
+      by?: Entity | null;
+    }): boolean;
+    /** Destroys the debris and restores the original. */
+    reset(): boolean;
+    /** Cuts and caches the pieces in idle time; resolves with the count. */
+    prefracture(): Promise<number>;
+    /** Whether the pieces are already cut — i.e. whether a break will hitch. */
+    isBaked(): boolean;
+  }
+
+  /**
+   * `entity.getComponent("chain")`. Joints a run of objects together
+   * (requires the `physics-rapier` module) — child entities, or the instances
+   * of the entity's own Instancer, which become jointed bodies without
+   * becoming entities.
+   */
+  export interface ChainComponent extends ComponentBase<{
+    source: "children" | "instances";
+    jointKind: "ball" | "hinge" | "fixed" | "rope" | "spring";
+    axis: [number, number, number];
+    /** Extra metres of play per joint. */
+    slack: number;
+    stiffness: number;
+    damping: number;
+    pinFirst: boolean;
+    pinLast: boolean;
+    /** Entity whose Rigidbody the pinned ends hang from; empty = the world. */
+    attachTo: string;
+    loop: boolean;
+    linkCollision: boolean;
+    /** Give child links without a Rigidbody a dynamic one while playing. */
+    createBodies: boolean;
+    linkShape: "auto" | "box" | "sphere" | "capsule" | "convex";
+    linkMass: number;
+    layer: string;
+    friction: number;
+    restitution: number;
+    linearDamping: number;
+    angularDamping: number;
+  }> {
+    /** The live links: `{ body, entity? , index? }`. Empty outside play mode. */
+    links: Array<{ body: unknown; entity?: Entity; index?: number }>;
+    /** Rebuilds the bodies and joints from the current links and settings. */
+    rebuild(): boolean;
+  }
+
+  /**
+   * `entity.getComponent("ragdoll")`. A capsule per bone, jointed, posing the
+   * skeleton from the simulation (requires the `physics-rapier` module).
+   * Built from the skeleton's own shape — no bone-name mapping — so it works
+   * on any rig, humanoid or not.
+   */
+  export interface RagdollComponent extends ComponentBase<{
+    /** Physics drives the skeleton. Settable from a script or an Events row. */
+    active: boolean;
+    /** kg for the whole character, split across the bones by capsule volume. */
+    mass: number;
+    /** Capsule radius as a fraction of the bone's length. */
+    thickness: number;
+    minBoneLength: number;
+    maxBodies: number;
+    /** Half-angle of the cone each joint may swing through, in degrees. */
+    jointLimit: number;
+    linearDamping: number;
+    angularDamping: number;
+    layer: string;
+    selfCollision: boolean;
+    inheritVelocity: boolean;
+    followRoot: boolean;
+  }> {
+    /** True while the simulation is posing the bones. */
+    readonly simulating: boolean;
+    /** Goes limp; returns the number of bodies built. */
+    activate(options?: { impulse?: [number, number, number]; bone?: string }): number;
+    /** Hands the skeleton back to the animator, in whatever pose it landed. */
+    deactivate(): void;
+    /** Kicks one bone (or the root) — world space, N·s. */
+    applyImpulse(impulse: [number, number, number], bone?: string): boolean;
+    /** The bones that actually got a body, in build order. */
+    getBones(): string[];
+  }
+
   /** Import-created marker that mirrors one GLB bone onto an entity. */
   export interface BoneComponent extends ComponentBase<{ path: string }> {}
 
@@ -1981,6 +2100,156 @@ declare module "engine" {
   /** Heightmap, splatmap and scatter-painted terrain surface. */
   export interface TerrainComponent extends ComponentBase<Record<string, unknown>> {}
 
+  /** Procedural plants with surface scattering, wind, collider bending and distance LOD. */
+  export interface FoliageComponent extends ComponentBase<{
+    species: "oak" | "pine" | "birch" | "grass" | "wildflowers";
+    distribution: "single" | "scatter";
+    surface: string;
+    seed: number; height: number; width: number;
+    leafColor: string; barkColor: string; flowerColor: string;
+    density: number; maxInstances: number; minSpacing: number;
+    minScale: number; maxScale: number; minSlope: number; maxSlope: number;
+    minAltitude: number; maxAltitude: number; alignToNormal: boolean;
+    /** Follow Scene Wind direction, force and gust frequency while enabled. */
+    wind: boolean;
+    /** Plant response to Scene Wind force. */
+    windStrength: number;
+    /** Plant response to Scene Wind gusts. */
+    windGustStrength: number;
+    /** Spatial size of coherent gusts, in metres. */
+    windScale: number;
+    /** Local flutter mixed into the shared gust field. */
+    windTurbulence: number;
+    /** @deprecated Ignored: gust frequency follows Scene Wind. Retained for existing scripts. */
+    windSpeed: number;
+    /** @deprecated Ignored: direction follows Scene Wind. Retained for existing scripts. */
+    windDirection: number;
+    interaction: boolean; interactionStrength: number; interactionRadius: number;
+    lodNear: number; lodFar: number; maxDistance: number; chunkSize: number;
+    castShadow: boolean; receiveShadow: boolean;
+  }> {
+    readonly stats: {
+      instances: number; chunks: number; drawCalls: number; triangles: number;
+      nearChunks: number; midChunks: number; impostorChunks: number;
+      culledChunks: number; impostorReady: boolean; status: string;
+    };
+  }
+
+  /** Procedural sky, sun, moon, stars and clouds, with the weather that moves
+   *  through them. One per scene. While enabled it owns `scene.backgroundNode`,
+   *  `scene.environment`, `scene.fog`, the scene's directional light and
+   *  `engine.windOverride`, and hands every one of them back when detached. */
+  export interface AtmosphereComponent extends ComponentBase<{
+    /** Local apparent time, 0…24. 12 is near solar noon at every latitude. */
+    timeOfDay: number;
+    /** 1…365. This IS the season: it sets the sun's path and the day's length. */
+    dayOfYear: number;
+    /** Real minutes for one game day. 0 freezes the clock (the default). */
+    dayLength: number;
+    latitude: number;
+    /** Degrees the world's north is turned by. */
+    northOffset: number;
+    sky: boolean;
+    skyIntensity: number;
+    stars: boolean;
+    /** Scales moonlight and the night sky's own glow. */
+    nightLight: number;
+    clouds: boolean;
+    /** Entity id of the directional light to aim. Empty = the scene's first,
+     *  or a light the Atmosphere creates and owns. */
+    sun: string;
+    sunIntensity: number;
+    /** "auto" or a preset: clear, fair, cloudy, overcast, fog, drizzle, rain,
+     *  storm, snow, blizzard. */
+    weather: AtmosphereWeather | "auto";
+    /** 0…1, blending the chosen weather towards clear. */
+    weatherIntensity: number;
+    /** Seconds for a weather change to complete. */
+    transition: number;
+    /** Seeds the automatic weather chain, so a scene replays exactly. */
+    seed: number;
+    /** Degrees Celsius added to the modelled climate; decides rain vs snow. */
+    climate: number;
+    /** Compass bearing the wind blows FROM. */
+    windDirection: number;
+    /** Multiplies the weather's own wind speed. The Atmosphere owns
+     *  `engine.windOverride` while it runs, so this is the scene's wind dial:
+     *  0 is a dead calm, 1 is what the weather asks for. */
+    windSpeed: number;
+    /** Multiplies the weather's gust strength, on top of `windSpeed`. */
+    gustiness: number;
+    precipitation: boolean;
+    /** Capture what stands overhead so rain, snow and wet ground all stop under
+     *  a roof. One 128x128 top-down pass at 2 Hz, and only while something is
+     *  actually falling or lying; its pipelines are warmed off the main thread
+     *  before the first capture. */
+    sheltered: boolean;
+    /** Snow lying on the world and rain darkening it. Patches every eligible
+     *  material in the scene once, at attach — see `weatherSurface.js`. */
+    surfaces: boolean;
+    /** Cloud shadows drifting across the world, folded into the sun's own
+     *  shadow term. Falls back to dimming the whole light when the sun's
+     *  shadows are GI-traced. */
+    cloudShadows: boolean;
+    /** Drive the scene's ambient light from the sky, so a storm is not lit
+     *  like a clear noon. Restored on detach. */
+    ambient: boolean;
+    fog: boolean;
+    wind: boolean;
+    lightning: boolean;
+  }, { "weather-changed": [{ weather: string; previous: string | null }]; lightning: [AtmosphereStrike] }> {
+    /** Everything derived — where the sun is, what the light became, the
+     *  temperature, what is falling. The live clock is only readable here: a
+     *  running day writes `timeOfDay` without emitting a change. */
+    readonly state: {
+      status: string;
+      time: {
+        timeOfDay: number; dayOfYear: number; season: string | null; seasonPhase: number;
+        sunrise: number | null; sunset: number | null; dayLength: number; polar: "day" | "night" | null;
+      };
+      sun: { altitude: number; azimuth: number; direction: number[] } | null;
+      moon: { altitude: number; illumination: number; phase: number } | null;
+      light: {
+        body: "sun" | "moon";
+        /** What the sky model asked for, before the cloud in front of it. */
+        intensity: number;
+        /** What the scene's directional light is actually set to. */
+        applied: number;
+        /** 0…1 — how much cloud currently stands between the sun and here. */
+        cloudShade: number;
+        color: number[];
+        source: string;
+      } | null;
+      weather: { current: string; auto: boolean; blend: number; temperature: number | null } & Record<string, number | string | boolean>;
+      accumulation: { wetness: number; snowDepth: number };
+      /** What the weather is doing to the scene's materials right now. */
+      surfaces: { driving: boolean; snow: number; wetness: number };
+      sky: { irradiance: number[]; horizon: number[]; cloudOpacity: number; refreshing: boolean } | null;
+      shelter: { mapping: boolean; captured: boolean };
+      lightning: { flash: number; nextIn: number | null };
+    };
+    /** Cross to a weather, or to "auto", over `transition` seconds. */
+    setWeather(name: AtmosphereWeather | "auto", options?: { transition?: number }): unknown;
+    /** Set the clock. Returns the same state `state` reports. */
+    setTime(hours?: number | null, dayOfYear?: number | null): unknown;
+    /** Fire a lightning flash now. */
+    strike(strength?: number): AtmosphereStrike;
+  }
+
+  export type AtmosphereWeather =
+    | "clear" | "fair" | "cloudy" | "overcast" | "fog"
+    | "drizzle" | "rain" | "storm" | "snow" | "blizzard";
+
+  /** A lightning strike, as reported to `atmosphere-lightning` listeners. */
+  export interface AtmosphereStrike {
+    entityId: string | null;
+    strength: number;
+    /** Metres to the strike. */
+    distance: number;
+    /** Seconds until the thunder should be heard (distance / 343). */
+    thunderDelay: number;
+  }
+
   /** TSL post-processing graph attached to a camera. */
   export interface PostprocessComponent extends ComponentBase<Record<string, unknown>> {}
 
@@ -2051,17 +2320,68 @@ declare module "engine" {
     pieces(): BlockoutComponent[];
   }
 
-  /**
-   * `entity.getComponent("blockout")`. One greybox piece — a wall, slab,
-   * staircase, ramp, box or column — which builds its own geometry from
-   * `size` and its shape-specific props.
-   */
+  /** A connected architectural volume; walls and roof are derived automatically. */
+  export interface ArchitectureForm {
+    id: string;
+    shape: "box" | "round";
+    /** Base centre and continuous dimensions in composition-local metres. */
+    position: [number, number, number];
+    size: [number, number, number];
+    rotationY: number;
+    color: string;
+    roof: "hip" | "flat" | "none";
+    roofHeight: number;
+    windows: boolean;
+  }
+  export interface ArchitecturePath {
+    id: string;
+    points: [number, number][];
+    width: number;
+    elevation: number;
+  }
+  export interface ArchitectureOpening {
+    id: string;
+    formId: string;
+    position: [number, number, number];
+    normal: [number, number, number];
+    width: number;
+    height: number;
+    kind: "window" | "door" | "arch";
+  }
+  export interface ArchitectureModel {
+    version: 1;
+    cellSize: number;
+    forms: ArchitectureForm[];
+    paths: ArchitecturePath[];
+    openings: ArchitectureOpening[];
+  }
+  export interface ArchitectureComponent extends ComponentBase<{
+    model: ArchitectureModel | null;
+    collision: boolean;
+    followTerrain: boolean;
+    terrainId: string;
+    terrainBindings: Record<string, unknown>;
+    settings: Record<string, unknown>;
+    generatedRootId: string;
+    version: number;
+    preview: boolean;
+  }> {
+    pieces(): ArchitecturePieceComponent[];
+    surfaceAt(faceIndex: number): { start: number; count: number; formId: string | null; pathId?: string; kind: string; normal: number[]; face: string; interior?: boolean } | null;
+    rooms(options?: { cell?: number; minArea?: number; maxRooms?: number }): Array<{ key: string; center: number[]; size: number[]; capture: number[]; area: number }>;
+  }
+  /** An independent element under any assembly, with unrestricted transforms. */
+  export interface ArchitecturePieceComponent extends BlockoutComponent {}
+
   export interface BlockoutComponent extends ComponentBase<{
     shape: "floor" | "wall" | "stair" | "ramp" | "box" | "column" | "platform";
     /** Local extents [x, y, z]: X length/width, Y height (slab: thickness), Z depth. */
     size: [number, number, number];
     /** Walls: holes along the length. `offset` is metres from the centre. */
     openings: Array<{ offset: number; width: number; height: number; sill: number }>;
+    role: string;
+    footprint: Array<[number, number]>;
+    holes: Array<Array<[number, number]>>;
     steps: number;
     open: boolean;
     sides: number;
@@ -2088,9 +2408,9 @@ declare module "engine" {
    * {@link CharacterControllerComponent} automatically, with full
    * autocomplete on its methods — no cast needed.
    *
-   * Physics types (`rigidbody`, `collider`, `charactercontroller`, `joint`)
-   * are only actually attachable when the project has the `physics-rapier`
-   * module enabled; typing them here is safe either way since `getComponent`
+   * Physics types (`rigidbody`, `collider`, `charactercontroller`, `joint`,
+   * `destructible`, `chain`, `ragdoll`) are only actually attachable when the
+   * project has the `physics-rapier` module enabled; typing them here is safe either way since `getComponent`
    * already returns `| undefined`.
    *
    * Every key here MUST be the component's registered `static type` string —
@@ -2138,6 +2458,9 @@ declare module "engine" {
     collider: ColliderComponent;
     charactercontroller: CharacterControllerComponent;
     joint: JointComponent;
+    destructible: DestructibleComponent;
+    chain: ChainComponent;
+    ragdoll: RagdollComponent;
     bone: BoneComponent;
     skinnedmesh: SkinnedMeshComponent;
     "planar-reflection": PlanarReflectionComponent;
@@ -2154,6 +2477,8 @@ declare module "engine" {
     uiscroll: UiScrollComponent;
     uimask: UiMaskComponent;
     terrain: TerrainComponent;
+    foliage: FoliageComponent;
+    atmosphere: AtmosphereComponent;
     postprocess: PostprocessComponent;
     environment: EnvironmentComponent;
     objModel: ObjModelComponent;
@@ -2161,6 +2486,8 @@ declare module "engine" {
     "reflection-probe": ReflectionProbeComponent;
     script: ScriptComponent;
     level: LevelComponent;
+    architecture: ArchitectureComponent;
+    architecturepiece: ArchitecturePieceComponent;
     levelfloor: LevelFloorComponent;
     blockout: BlockoutComponent;
   }
@@ -2230,12 +2557,17 @@ declare module "engine" {
   export const ColliderComponent: ComponentClass<"collider">;
   export const CharacterControllerComponent: ComponentClass<"charactercontroller">;
   export const JointComponent: ComponentClass<"joint">;
+  export const DestructibleComponent: ComponentClass<"destructible">;
+  export const ChainComponent: ComponentClass<"chain">;
+  export const RagdollComponent: ComponentClass<"ragdoll">;
 
   export const NavMeshComponent: ComponentClass<"navmesh">;
   export const NavAgentComponent: ComponentClass<"navagent">;
   export const NavLinkComponent: ComponentClass<"navlink">;
 
   export const TerrainComponent: ComponentClass<"terrain">;
+  export const FoliageComponent: ComponentClass<"foliage">;
+  export const AtmosphereComponent: ComponentClass<"atmosphere">;
   export const PostprocessComponent: ComponentClass<"postprocess">;
   export const EnvironmentComponent: ComponentClass<"environment">;
   export const ObjModelComponent: ComponentClass<"objModel">;
@@ -2243,6 +2575,8 @@ declare module "engine" {
   export const ReflectionProbeComponent: ComponentClass<"reflection-probe">;
 
   export const LevelComponent: ComponentClass<"level">;
+  export const ArchitectureComponent: ComponentClass<"architecture">;
+  export const ArchitecturePieceComponent: ComponentClass<"architecturepiece">;
   export const LevelFloorComponent: ComponentClass<"levelfloor">;
   export const BlockoutComponent: ComponentClass<"blockout">;
 
@@ -2602,6 +2936,12 @@ declare module "engine" {
     /** Physics: a trigger volume was entered or left. */
     onTriggerEnter: [other: Entity];
     onTriggerExit: [other: Entity];
+    /** Physics: how hard `other` hit, in newtons. Only for entities that
+     *  asked — a Destructible set to break on impact, or a call to
+     *  `engine.physics.watchContactForce(entity, threshold)`. */
+    onContactForce: [other: Entity, magnitude: number, point: [number, number, number]];
+    /** Physics: this entity's Destructible broke. */
+    onBreak: [event: { point: [number, number, number]; by: Entity | null; pieces: number }];
     /** UI: this entity's button was clicked / hovered / focused. */
     onClick: [];
     onPointerEnter: [];
@@ -2692,6 +3032,15 @@ declare module "engine" {
   }
 
   export interface SceneSettings {
+    /** Shared Scene Wind, followed by foliage and cloth using scene wind. */
+    wind: {
+      /** Direction and force; a legacy scalar means [0, 0, scalar]. */
+      vector: [number, number, number] | number;
+      /** Gust force added to the steady wind. */
+      gust: number;
+      /** Gust frequency in hertz. */
+      gustFrequency: number;
+    };
     toneMapping: string;
     exposure: number;
     ambientColor: string;
@@ -4559,6 +4908,13 @@ declare module "engine" {
     onTriggerEnter?(other: Entity): void;
     /** Physics module: `other` left a sensor collider on this entity. */
     onTriggerExit?(other: Entity): void;
+    /** Physics module: `other` hit this entity with `magnitude` newtons of
+     *  contact force. Reported only for entities that asked to hear it — a
+     *  Destructible set to break on impact, or an explicit
+     *  `engine.physics.watchContactForce(entity, threshold)`. */
+    onContactForce?(other: Entity, magnitude: number, point: [number, number, number]): void;
+    /** Physics module: this entity's Destructible broke into `pieces`. */
+    onBreak?(event: { point: [number, number, number]; by: Entity | null; pieces: number }): void;
     /** UI button on this entity was clicked. */
     onClick?(): void;
     /** Pointer entered this entity's UI button. */

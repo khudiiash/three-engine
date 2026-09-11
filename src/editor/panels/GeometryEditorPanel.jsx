@@ -155,6 +155,7 @@ import { useProjectStore } from "../store/projectStore.js";
 import { attachCursor, detachCursor, getCursor3D, refreshCursor3D, setCursor3DPosition } from "../threeDCursor.js";
 import { SetCursor3DCommand } from "../commands/cursorCommands.js";
 
+import { Select } from "../fields/Select.jsx";
 const MODES = ["vert", "edge", "face"];
 const SHADING_MODES = [
   { id: "wireframe", label: "Wireframe", hint: "Edges only; select through the surface" },
@@ -164,6 +165,19 @@ const SHADING_MODES = [
 ];
 const MODE_LABELS = { vert: "Vertex", edge: "Edge", face: "Face" };
 const UNDO_DEPTH = 64;
+
+// Brush cursor. The ring geometry is authored in the XY plane, so +Z is the
+// direction that gets rotated onto the surface normal. The dot is held at a
+// fixed pixel size because it marks the dab *centre*, which is a point and has
+// no size of its own to show.
+const CURSOR_FORWARD = new THREE.Vector3(0, 0, 1);
+const CURSOR_DOT_PIXELS = 2.5;
+const CURSOR_SEGMENTS = 96;
+const _cursorNdc = new THREE.Vector2();
+const _cursorRay = new THREE.Raycaster();
+const _cursorNormal = new THREE.Vector3();
+const _cursorPlane = new THREE.Plane();
+const _cursorPoint = new THREE.Vector3();
 
 // Slot index is the geometry group index — the same eight keys the Mesh
 // component and the Inspector's material section use.
@@ -583,7 +597,6 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   const [dyntopo, setDyntopo] = useState(true);
   const [detailSize, setDetailSize] = useState(0.08);
   const [dyntopoMode, setDyntopoMode] = useState("both");
-  const [brushCursor, setBrushCursor] = useState(null);
   const [showHelp, setShowHelp] = useState(false);
   const [remeshDetail, setRemeshDetail] = useState(0);
   const [paintColor, setPaintColor] = useState("#d84a3f");
@@ -2250,25 +2263,128 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     return [local.x, local.y, local.z];
   };
 
-  /** Projected pixel radius of the brush, for the on-screen cursor ring. */
-  const projectedBrushRadius = (session, localPoint) => {
-    const camera = session.camera;
-    const rect = session.canvas.getBoundingClientRect();
-    // The brush radius is a local-space length, so it is measured out in local
-    // space and only then projected — on a scaled object the ring would
-    // otherwise be the wrong size on screen.
+  /* ---------------------------------------------------------------------- */
+  /* Brush cursor                                                            */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * The brush radius in world units at `localPoint`.
+   *
+   * The radius is authored as a local-space length, so on a scaled object it
+   * has to be measured out in local space and only then converted. On a
+   * non-uniformly scaled one it genuinely differs by direction, so it is
+   * measured along the camera's right — the direction the ring's width is read
+   * off in, and the axis the old screen-space cursor projected along.
+   */
+  const worldBrushRadius = (session, localPoint) => {
+    const right = session.toLocalDirection(
+      new THREE.Vector3().setFromMatrixColumn(session.camera.matrixWorld, 0),
+    ).normalize();
     const center = session.toWorldPoint(localPoint);
-    const right = session.toLocalDirection(new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0)).normalize();
     const edge = session.toWorldPoint(
       new THREE.Vector3(localPoint[0], localPoint[1], localPoint[2]).addScaledVector(right, session.brushRadius),
     );
-    const toScreen = (point) => {
-      const projected = point.clone().project(camera);
-      return [(projected.x + 1) * rect.width * 0.5, (-projected.y + 1) * rect.height * 0.5];
-    };
-    const [cx, cy] = toScreen(center);
-    const [ex, ey] = toScreen(edge);
-    return Math.max(Math.hypot(ex - cx, ey - cy), 3);
+    return Math.max(edge.distanceTo(center), 1e-6);
+  };
+
+  /** How much world space one pixel spans at `worldPoint`, for both cameras. */
+  const worldPerPixel = (session, worldPoint) => {
+    const height = Math.max(session.canvas.clientHeight, 1);
+    const camera = session.camera;
+    if (camera.isOrthographicCamera) return (camera.top - camera.bottom) / camera.zoom / height;
+    const distance = camera.getWorldPosition(_cursorPoint).distanceTo(worldPoint);
+    return (2 * distance * Math.tan((camera.fov * Math.PI) / 360)) / height;
+  };
+
+  /** Seats the cursor at a world point, sized to the brush. */
+  const seatBrushCursor = (session, worldPoint, worldNormal, radius, onSurface) => {
+    const cursor = session.brushCursor;
+    cursor.group.position.copy(worldPoint);
+    if (worldNormal) cursor.group.quaternion.setFromUnitVectors(CURSOR_FORWARD, worldNormal);
+    else session.camera.getWorldQuaternion(cursor.group.quaternion);
+    cursor.group.scale.setScalar(radius);
+    // Undoes the group's scale so the dot keeps its pixel size, exactly as the
+    // ring keeps its world size.
+    cursor.dot.scale.setScalar(Math.min(1, (CURSOR_DOT_PIXELS * worldPerPixel(session, worldPoint)) / radius));
+    const opacity = onSurface ? 0.8 : 0.28;
+    cursor.material.opacity = opacity;
+    cursor.outline.material.opacity = onSurface ? 0.9 : 0.3;
+    cursor.dot.visible = onSurface;
+    cursor.group.visible = true;
+  };
+
+  /**
+   * Places the brush cursor for one pointer sample.
+   *
+   * `hit` is a raycast result in local coordinates (see `castAt`), or null when
+   * the ray missed; `anchor` is a local point to fall back to, which is how a
+   * Grab stroke keeps its cursor once the pointer has left the surface.
+   *
+   * This used to be a DOM circle pinned at the pointer. A flat screen-space
+   * disc cannot show what the brush is about to touch: on a curved or steeply
+   * angled surface it reads as a far wider footprint than the dab really has.
+   * The ring lies on the surface instead, oriented to the hit normal.
+   *
+   * A miss still draws a cursor — dimmed, facing the camera, on the plane
+   * through the object's centre — because one that vanishes near a silhouette
+   * edge reads as a broken tool rather than as "nothing to sculpt here".
+   */
+  const updateBrushCursor = (session, { hit = null, anchor = null, clientX = 0, clientY = 0 }) => {
+    const cursor = session.brushCursor;
+    if (!cursor) return;
+    const camera = session.camera;
+    camera.updateWorldMatrix(true, false);
+
+    const localPoint = hit ? [hit.point.x, hit.point.y, hit.point.z] : anchor;
+    if (localPoint) {
+      // The interpolated vertex normal when the geometry has one — three
+      // already flipped it towards the ray — else the flat face normal. Both
+      // arrive in local space, so both go through the same normal matrix.
+      const localNormal = hit ? hit.normal ?? hit.face?.normal ?? null : null;
+      const worldNormal = localNormal
+        ? _cursorNormal.copy(localNormal).applyNormalMatrix(session.worldNormalMatrix).normalize()
+        : null;
+      seatBrushCursor(
+        session,
+        session.toWorldPoint(localPoint),
+        worldNormal && worldNormal.lengthSq() > 1e-12 ? worldNormal : null,
+        worldBrushRadius(session, localPoint),
+        true,
+      );
+      return;
+    }
+
+    const rect = session.canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return hideBrushCursor(session);
+    _cursorNdc.set(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    _cursorRay.setFromCamera(_cursorNdc, camera);
+    // The object's own centre depth, so the ring keeps roughly the size it had
+    // on the surface instead of jumping as the pointer crosses the silhouette.
+    const sphere = session.meshObject.geometry.boundingSphere;
+    const center = sphere ? session.toWorldPoint([sphere.center.x, sphere.center.y, sphere.center.z]) : new THREE.Vector3();
+    _cursorPlane.setFromNormalAndCoplanarPoint(camera.getWorldDirection(_cursorNormal), center);
+    const world = _cursorRay.ray.intersectPlane(_cursorPlane, new THREE.Vector3());
+    if (!world) return hideBrushCursor(session);
+    const local = session.toLocalPoint(world);
+    seatBrushCursor(session, world, null, worldBrushRadius(session, [local.x, local.y, local.z]), false);
+  };
+
+  const hideBrushCursor = (session) => {
+    if (session?.brushCursor) session.brushCursor.group.visible = false;
+  };
+
+  /** Re-seats the cursor from the last pointer position, after a radius or
+   *  camera change that moved the ring without the pointer moving. */
+  const refreshBrushCursor = (session) => {
+    if (!session?.sculpting || !session.lastPointer) return hideBrushCursor(session);
+    updateBrushCursor(session, {
+      hit: session.raycastAtLast?.() ?? null,
+      clientX: session.lastPointer.x,
+      clientY: session.lastPointer.y,
+    });
   };
 
   /* ---------------------------------------------------------------------- */
@@ -2407,6 +2523,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       paintBlend,
       paintResolution,
     });
+    // `[` and `]` resize the brush without the pointer moving, so the ring has
+    // to be re-seated here or it keeps the old radius until the next sample.
+    refreshBrushCursor(session);
   }, [proportional, proportionalConnected, falloff, pivot, orientation, snapEnabled, snapMode, snapIncrement, snapAbsolute,
     brush, brushRadius, brushStrength, brushFalloff, symmetry, dyntopo, detailSize, dyntopoMode,
     paintColor, paintBlend, paintResolution]);
@@ -2436,7 +2555,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         setDetailSize((current) => (current > average * 2 || current < average * 0.05 ? +(average * 0.5).toFixed(4) : current));
       }
     } else {
-      setBrushCursor(null);
+      hideBrushCursor(session);
     }
     refreshOverlays(session);
     touch();
@@ -2665,8 +2784,48 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     }
     for (const object of [basePoints, edgeOverlay, vertexOverlay, activeOverlay]) object.frustumCulled = false;
 
+    // ── THE BRUSH CURSOR ─────────────────────────────────────────────────
+    // A ring lying on the surface, oriented to the hit normal. It hangs off
+    // the *scene* rather than off `meshObject` like the other overlays do,
+    // because a non-uniformly scaled entity would otherwise shear the ring
+    // into an ellipse — and the ring's whole job is to report a radius.
+    const cursorMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffffff, side: THREE.DoubleSide, transparent: true, opacity: 0.8,
+      depthTest: false, depthWrite: false,
+    });
+    const cursorRing = new THREE.Mesh(new THREE.RingGeometry(0.94, 1, CURSOR_SEGMENTS), cursorMaterial);
+    // The ring is one uniformly scaled mesh, so its band thins on screen as
+    // the brush shrinks. This outline is a line, and a line is one pixel wide
+    // whatever the scale — it is what keeps a small brush readable.
+    //
+    // A `Line` closed by repeating its first point, NOT a `LineLoop`: WebGPU
+    // has no loop topology and this renderer drops the object outright, with
+    // nothing but a console warning to say the outline was never drawn.
+    const cursorOutline = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(Array.from({ length: CURSOR_SEGMENTS + 1 }, (_, index) => {
+        const angle = ((index % CURSOR_SEGMENTS) / CURSOR_SEGMENTS) * Math.PI * 2;
+        return new THREE.Vector3(Math.cos(angle), Math.sin(angle), 0);
+      })),
+      new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false }),
+    );
+    const cursorDot = new THREE.Mesh(new THREE.CircleGeometry(1, 24), cursorMaterial);
+    // One material across ring and dot; the teardown's sweep disposes it once.
+    cursorDot.userData.sharedMaterial = true;
+    const brushCursorGroup = new THREE.Group();
+    brushCursorGroup.add(cursorRing, cursorOutline, cursorDot);
+    brushCursorGroup.visible = false;
+    for (const object of [brushCursorGroup, cursorRing, cursorOutline, cursorDot]) {
+      object.renderOrder = 20;
+      object.frustumCulled = false;
+      // Never a pick target: the cursor sits exactly where the ray lands, so
+      // without this it would shadow the surface it is drawn on.
+      object.raycast = () => {};
+    }
+    scene.add(brushCursorGroup);
+
     const session = {
       mesh, meshObject, wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, activeOverlay, context, contextMaterial,
+      brushCursor: { group: brushCursorGroup, ring: cursorRing, outline: cursorOutline, dot: cursorDot, material: cursorMaterial },
       modifierPreviewObject, modifierCageMaterial, modifierWireframeMaterial,
       scene, editMaterials, realMaterials, wireframeMaterial, editorLights, sceneLights, shading,
       // Every material ever borrowed from the entity — the dispose sweep must
@@ -2716,6 +2875,10 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       : point.clone()).applyMatrix4(worldFromLocal);
     /** A world-space direction as the local displacement that produces it. */
     session.toLocalDirection = (direction) => direction.clone().applyMatrix3(linearToLocal);
+    /** Local normals to world ones. A normal is not a direction: under a
+     *  non-uniform scale it transforms by the inverse transpose, or the brush
+     *  cursor would tilt off a stretched surface. */
+    session.worldNormalMatrix = new THREE.Matrix3().getNormalMatrix(worldFromLocal);
     /** How many local units one world unit spans, averaged over the axes. */
     session.localPerWorld = 3 / Math.max(meshScale.x + meshScale.y + meshScale.z, 1e-6);
 
@@ -2954,19 +3117,23 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             if (session.painting) applyPaintAt(session, point);
             else applySculptAt(session, point);
           }
-          setBrushCursor({ x: event.clientX - rect.left, y: event.clientY - rect.top, radius: projectedBrushRadius(session, point ?? session.stroke.anchor) });
+          // Re-picked every sample rather than held from the stroke's start, so
+          // the ring hugs the surface as the dab deforms it. `point` covers the
+          // Grab case, where the pointer has left the surface but the stroke has
+          // not ended.
+          updateBrushCursor(session, {
+            hit, anchor: point ?? session.stroke.anchor, clientX: event.clientX, clientY: event.clientY,
+          });
           return;
         }
         if (!inside) {
-          setBrushCursor(null);
+          hideBrushCursor(session);
           return;
         }
-        const hover = castAt(event.clientX, event.clientY);
-        setBrushCursor({
-          x: event.clientX - rect.left,
-          y: event.clientY - rect.top,
-          radius: hover ? projectedBrushRadius(session, [hover.point.x, hover.point.y, hover.point.z]) : null,
-          off: !hover,
+        updateBrushCursor(session, {
+          hit: castAt(event.clientX, event.clientY),
+          clientX: event.clientX,
+          clientY: event.clientY,
         });
         return;
       }
@@ -3288,9 +3455,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             >
               <Magnet size={14} />
             </button>
-            <select className="geometry-header-select" title="Snap to" value={snapMode} onChange={(event) => setSnapMode(event.target.value)}>
+            <Select className="geometry-header-select" title="Snap to" value={snapMode} onChange={(event) => setSnapMode(event.target.value)}>
               {SNAP_MODES.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
-            </select>
+            </Select>
             <button
               className={`toolbar-btn icon-only ${proportional ? "active" : ""}`}
               title={`Proportional editing ${proportional ? "on" : "off"} (O) — Alt+O for connected only, scroll during a transform to resize`}
@@ -3299,9 +3466,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
               <CircleDot size={14} />
             </button>
             {proportional && (
-              <select className="geometry-header-select" title="Proportional falloff" value={falloff} onChange={(event) => setFalloff(event.target.value)}>
+              <Select className="geometry-header-select" title="Proportional falloff" value={falloff} onChange={(event) => setFalloff(event.target.value)}>
                 {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
-              </select>
+              </Select>
             )}
           </div>
         )}
@@ -3354,21 +3521,21 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button disabled={mode === "face" || !count} onClick={(e) => run(e, startVertSlide)}>Vertex Slide <kbd>G G</kbd></button>
             <hr />
             <label className="geometry-menu-field">Orientation
-              <select value={orientation} onChange={(event) => setOrientation(event.target.value)}>
+              <Select value={orientation} onChange={(event) => setOrientation(event.target.value)}>
                 {ORIENTATIONS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
-              </select>
+              </Select>
             </label>
             <label className="geometry-menu-field">Pivot
-              <select value={pivot} onChange={(event) => setPivot(event.target.value)}>
+              <Select value={pivot} onChange={(event) => setPivot(event.target.value)}>
                 {PIVOTS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
-              </select>
+              </Select>
             </label>
             <hr />
             <button className={snapEnabled ? "active" : ""} onClick={(e) => run(e, () => setSnapEnabled((value) => !value))}><Magnet size={13} /> Snap <kbd>Shift+Tab</kbd></button>
             <label className="geometry-menu-field">Snap To
-              <select value={snapMode} onChange={(event) => setSnapMode(event.target.value)}>
+              <Select value={snapMode} onChange={(event) => setSnapMode(event.target.value)}>
                 {SNAP_MODES.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
-              </select>
+              </Select>
             </label>
             <label className="geometry-menu-field">Increment
               <input type="number" min={0.001} step={0.05} value={snapIncrement} onChange={(event) => setSnapIncrement(Math.max(0.001, Number(event.target.value) || 0.25))} />
@@ -3379,9 +3546,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button className={proportional ? "active" : ""} onClick={(e) => run(e, () => setProportional((value) => !value))}>Proportional Editing <kbd>O</kbd></button>
             <button className={proportionalConnected ? "active" : ""} onClick={(e) => run(e, () => setProportionalConnected((value) => !value))}>Connected Only <kbd>Alt+O</kbd></button>
             <label className="geometry-menu-field">Falloff
-              <select value={falloff} onChange={(event) => setFalloff(event.target.value)}>
+              <Select value={falloff} onChange={(event) => setFalloff(event.target.value)}>
                 {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
-              </select>
+              </Select>
             </label>
             <hr />
             <span className="geometry-menu-heading">3D Cursor <kbd>Shift+S</kbd></span>
@@ -3547,13 +3714,13 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
               <button onClick={(e) => run(e, addModifiers)}><Shapes size={13} /> Add Modifier Stack</button>
             </>) : (<>
               <label className="geometry-menu-field">Add Modifier
-                <select value="" onChange={(event) => {
+                <Select value="" onChange={(event) => {
                   const modifier = createGeometryModifier(event.target.value);
                   if (modifier) setModifierStack([...(modifiers.props.modifiers ?? []), modifier], `Add ${GEOMETRY_MODIFIER_DEFINITIONS.find((entry) => entry.type === modifier.type)?.label ?? "modifier"}`);
                 }}>
                   <option value="">Choose…</option>
                   {GEOMETRY_MODIFIER_DEFINITIONS.map((definition) => <option key={definition.type} value={definition.type}>{definition.label}</option>)}
-                </select>
+                </Select>
               </label>
               {!(modifiers.props.modifiers ?? []).length && <span className="geometry-menu-note">No modifiers</span>}
               {(modifiers.props.modifiers ?? []).map((modifier, index) => {
@@ -3584,17 +3751,17 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
                       ));
                       if (field.type === "select") return (
                         <label className="geometry-menu-field" key={field.key}>{field.label}
-                          <select value={modifier[field.key]} onChange={(event) => updateModifier(index, { [field.key]: event.target.value }, `Set ${definition.label} ${field.label}`)}>
+                          <Select value={modifier[field.key]} onChange={(event) => updateModifier(index, { [field.key]: event.target.value }, `Set ${definition.label} ${field.label}`)}>
                             {field.options.map((option) => <option key={option} value={option}>{option}</option>)}
-                          </select>
+                          </Select>
                         </label>
                       );
                       if (field.type === "entity") return (
                         <label className="geometry-menu-field" key={field.key}>{field.label}
-                          <select value={modifier[field.key] ?? ""} onChange={(event) => updateModifier(index, { [field.key]: event.target.value }, `Set ${definition.label} ${field.label}`)}>
+                          <Select value={modifier[field.key] ?? ""} onChange={(event) => updateModifier(index, { [field.key]: event.target.value }, `Set ${definition.label} ${field.label}`)}>
                             <option value="">(none)</option>
                             {modifierEntityCandidates(!!field.meshOnly).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
-                          </select>
+                          </Select>
                         </label>
                       );
                       if (field.type === "boolean") return (
@@ -3668,11 +3835,11 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
                 <input type="number" min={0.002} step={0.01} value={detailSize} onChange={(event) => setDetailSize(Math.max(0.002, Number(event.target.value) || 0.05))} />
               </label>
               <label className="geometry-menu-field">Mode
-                <select value={dyntopoMode} onChange={(event) => setDyntopoMode(event.target.value)}>
+                <Select value={dyntopoMode} onChange={(event) => setDyntopoMode(event.target.value)}>
                   <option value="both">Subdivide &amp; Collapse</option>
                   <option value="subdivide">Subdivide Only</option>
                   <option value="collapse">Collapse Only</option>
-                </select>
+                </Select>
               </label>
               <hr />
               <span className="geometry-menu-note">Dyntopo triangulates the area under the brush, as it does in Blender.</span>
@@ -3699,9 +3866,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
               ))}
               <hr />
               <label className="geometry-menu-field">Falloff
-                <select value={brushFalloff} onChange={(event) => setBrushFalloff(event.target.value)}>
+                <Select value={brushFalloff} onChange={(event) => setBrushFalloff(event.target.value)}>
                   {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
-                </select>
+                </Select>
               </label>
             </ToolbarMenu>
           <ToolbarMenu label="View">
@@ -3738,14 +3905,14 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
               ))}
               <hr />
               <label className="geometry-menu-field">Falloff
-                <select value={brushFalloff} onChange={(event) => setBrushFalloff(event.target.value)}>
+                <Select value={brushFalloff} onChange={(event) => setBrushFalloff(event.target.value)}>
                   {FALLOFFS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
-                </select>
+                </Select>
               </label>
               <label className="geometry-menu-field">Resolution
-                <select value={paintResolution} onChange={(event) => setPaintResolution(Number(event.target.value))}>
+                <Select value={paintResolution} onChange={(event) => setPaintResolution(Number(event.target.value))}>
                   {[256, 512, 1024, 2048].map((size) => <option key={size} value={size}>{size}</option>)}
-                </select>
+                </Select>
               </label>
               <span className="geometry-menu-note">Changing the resolution starts a new blank layer.</span>
               <hr />
@@ -3802,17 +3969,8 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         );
       })()}
 
-      {(editorMode === "sculpt" || editorMode === "paint") && brushCursor && (
-        <div
-          className={`geometry-brush-cursor ${brushCursor.off ? "off-surface" : ""}`}
-          style={{
-            left: brushCursor.x - (brushCursor.radius ?? 24),
-            top: brushCursor.y - (brushCursor.radius ?? 24),
-            width: (brushCursor.radius ?? 24) * 2,
-            height: (brushCursor.radius ?? 24) * 2,
-          }}
-        />
-      )}
+      {/* The brush cursor is no longer here: it is a ring in the scene,
+          oriented to the surface normal. See `updateBrushCursor`. */}
       {/* Blender draws the proportional influence as a circle around the
           transform centre. Without it the wheel appears to do nothing and the
           only sign the mode is on at all is a number in the corner. */}

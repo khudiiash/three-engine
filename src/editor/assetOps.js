@@ -2,6 +2,7 @@ import { useProjectStore } from "./store/projectStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { syncScriptClassNameAfterRename, retargetScriptPath, retargetScriptFolder } from "./scriptClassSync.js";
 import { confirmDestructive } from "./components/ConfirmDialog.jsx";
+import { sceneAssetRetargeted } from "./sceneIO.js";
 
 /**
  * Filesystem operations behind the Assets panel (create / rename / move /
@@ -293,6 +294,10 @@ export async function renameEntry(entry, newName) {
     await invoke("rename_path", { from: `${entry.path}.basis`, to: `${newPath}.basis` }).catch(() => {});
     await invoke("rename_path", { from: `${entry.path}.tex`, to: `${newPath}.tex` }).catch(() => {});
     await invoke("rename_path", { from: `${entry.path}.aud`, to: `${newPath}.aud` }).catch(() => {});
+    // A renamed .scene must take the editor's scene record with it — the open
+    // path and project.json's references. Without this, the next save of the
+    // open scene writes the old path back into existence: a duplicate scene.
+    await sceneAssetRetargeted(entry.path, newPath);
 
     // Scripts: rewrite the default-exported class name to match the new
     // filename stem, and inject `extends Script` if the script predates the

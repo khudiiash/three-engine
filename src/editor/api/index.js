@@ -54,8 +54,11 @@ import "./ops/profile.js";
 import "./ops/events.js";
 import "./ops/post.js";
 import "./ops/level.js";
+import "./ops/architecture.js";
 import "./ops/character.js";
 import "./ops/vfx.js";
+import "./ops/physics.js";
+import "./ops/atmosphere.js";
 
 /** Runs an op synchronously, asserting it isn't one of the async ones. Used by
  *  the sync accessors below, where returning a promise would be a footgun. */
@@ -350,9 +353,35 @@ export const EditorApi = {
   },
 
   /**
-   * Greybox level blockouts. `addPiece` takes the two points of a drag, the
-   * same way the viewport tools do, so a generated room is one call per wall.
+   * Connected architectural forms and their derived exterior. Freeform parts
+   * and generator recipes remain available for detailed assemblies.
    */
+  architecture: {
+    createModel: (options = {}) => callOp("architecture.createModel", options),
+    setModel: (entityId, model) => callOp("architecture.setModel", { entityId, model }),
+    addForm: (entityId, form) => callOp("architecture.addForm", { entityId, form }),
+    updateForm: (entityId, formId, patch) => callOp("architecture.updateForm", { entityId, formId, patch }),
+    removeForm: (entityId, formId) => callOp("architecture.removeForm", { entityId, formId }),
+    addPath: (entityId, path) => callOp("architecture.addPath", { entityId, path }),
+    updatePath: (entityId, pathId, patch) => callOp("architecture.updatePath", { entityId, pathId, patch }),
+    removePath: (entityId, pathId) => callOp("architecture.removePath", { entityId, pathId }),
+    addModelOpening: (entityId, opening) => callOp("architecture.addModelOpening", { entityId, opening }),
+    updateModelOpening: (entityId, openingId, patch) => callOp("architecture.updateModelOpening", { entityId, openingId, patch }),
+    removeModelOpening: (entityId, openingId) => callOp("architecture.removeModelOpening", { entityId, openingId }),
+    sculpt: (options = {}) => callOp("architecture.sculpt", options),
+    presets: () => callOp("architecture.presets"),
+    list: () => callOp("architecture.list"),
+    preview: (settings = {}, options = {}) => callOp("architecture.preview", { settings, ...options }),
+    create: (settings = {}, options = {}) => callOp("architecture.create", { settings, ...options }),
+    rebuild: (entityId, settings = {}) => callOp("architecture.rebuild", { entityId, settings }),
+    createAssembly: (options = {}) => callOp("architecture.createAssembly", options),
+    addPiece: (options = {}) => callOp("architecture.addPiece", options),
+    duplicateAssembly: (entityId, options = {}) => callOp("architecture.duplicateAssembly", { entityId, ...options }),
+    materials: (entityId, materials) => callOp("architecture.materials", { entityId, materials }),
+    addColliders: (entityId) => callOp("architecture.addColliders", { entityId }),
+    setTool: (options = {}) => callOp("architecture.setTool", options),
+  },
+
   level: {
     list: () => callOp("level.list"),
     create: (options = {}) => callOp("level.create", options),

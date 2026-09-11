@@ -1,5 +1,8 @@
 # Level design: blockouts you can walk
 
+> Legacy workflow reference. New authoring uses the independent [Architecture module](ARCHITECTURE.md),
+> with freeform assemblies, viewport drawing and building/city recipes. Existing level-design scenes remain readable.
+
 Two features, shipped together because neither is much use alone: a greybox
 blockout tool, and a character that can walk what it draws.
 

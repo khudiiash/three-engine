@@ -6,6 +6,7 @@ import { downloadModel, getSavedToken, openModelPage, searchModels } from "../sk
 import { CREDENTIAL_CHANGED_EVENT } from "../credentialEvents.js";
 import { AssetPreview } from "../components/AssetPreview.jsx";
 
+import { Select } from "../fields/Select.jsx";
 const openModulesPanel = () => import("../EditorShell.jsx").then((m) => m.openPanel("modules"));
 
 export function SketchfabPanel() {
@@ -113,10 +114,10 @@ export function SketchfabPanel() {
         <button className="toolbar-btn icon-only" type="submit" title="Search">
           <Search size={13} />
         </button>
-        <select className="ph-category" value={category} onChange={(event) => setCategory(event.target.value)}>
+        <Select className="ph-category" value={category} onChange={(event) => setCategory(event.target.value)}>
           <option value="">All loaded categories</option>
           {categories.map((value) => <option key={value} value={value}>{value}</option>)}
-        </select>
+        </Select>
       </form>
 
       {!token && (

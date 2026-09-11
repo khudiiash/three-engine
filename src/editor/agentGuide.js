@@ -158,7 +158,30 @@ back. Two things worth knowing before you start:
   \`linked\` survive an operator rebuilding the topology. Element indices do not —
   they mean something different after every extrude.
 
-## Blocking out a level
+## Architecture: structures, buildings and cities
+
+Enable the architecture module. The default Build workflow edits connected volumes:
+architecture_createModel creates the root, architecture_addForm/updateForm/removeForm
+edit continuous forms, and architecture_addPath creates routes through walls.
+Exterior walls, roofs, windows and supports adapt to the model. architecture_sculpt
+hands the user direct build/grow/reshape/lift gestures in the compact viewport shelf.
+Model coordinates are local to the composition; root placement is world-space.
+
+For independent parts and complete recipes, architecture_presets lists available recipes;
+architecture_preview validates settings and scene placement without mutations.
+architecture_create builds editable parts in one undo step. architecture_createAssembly
+and architecture_addPiece allow arbitrary nested structures at any XYZ position and
+rotation, without storeys. architecture_rebuild explicitly regenerates owned recipe
+content while preserving hand-authored additions; architecture_duplicateAssembly
+creates an independent copy. architecture_materials assigns assets by role and
+architecture_addColliders repairs collision after enabling Physics.
+
+Terrain fitting, water clearance and reversible Foliage exclusion are recipe options.
+Use ordinary Mesh materials, transforms and prefabs for authored detail. Architecture
+rooms feed GI automatically. The old level-design module ID resolves to Architecture;
+new content should use Architecture operations.
+
+## Legacy level scenes
 
 With the \`level-design\` module on, a level is drawn rather than modelled:
 \`level_create\` makes one (it owns the grid and the storey height), and

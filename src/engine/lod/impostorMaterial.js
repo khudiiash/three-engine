@@ -60,10 +60,11 @@ import {
  * helper that returns a clip-space position for `material.vertexNode`, and
  * using it would break this material specifically: `vertexNode` replaces the
  * final position without touching `positionWorld`, which would then still
- * describe the un-billboarded quad — and `positionWorld` is exactly what the
- * fragment stage projects to find its texel. The offset is therefore applied
- * through `positionNode`, so world position, view position, and the lighting
- * that reads them, all agree with where the quad really is.
+ * describe the un-billboarded quad. The offset is therefore applied through
+ * `positionNode`, so world position, view position, and lighting agree with
+ * where the quad really is. Atlas projection retains the original billboard
+ * position separately: vertex animation must carry the texture with the quad,
+ * while lighting and GI continue to see its deformed world position.
  *
  * ## Three frames, weighted, premultiplied
  *
@@ -232,6 +233,7 @@ export function createImpostorMaterial(atlas, { alphaTest = 0.5, lit = true, rou
   material.positionNode = center
     .add(cameraRight.mul(positionGeometry.x.mul(size)))
     .add(cameraUp.mul(positionGeometry.y.mul(size)));
+  const atlasPosition = material.positionNode.toVarying();
 
   // ---- fragment: pick three frames and blend them --------------------------
   const albedoTexture = tslTexture(atlas.albedo);
@@ -242,7 +244,7 @@ export function createImpostorMaterial(atlas, { alphaTest = 0.5, lit = true, rou
 
   const sampleImpostor = Fn(() => {
     const axisZ = cross(axisX, axisY).toVar();
-    const toWorld = positionWorld.sub(center).toVar();
+    const toWorld = atlasPosition.sub(center).toVar();
     // Into the object's own space, where the atlas was baked. Three dot
     // products rather than an inverse matrix: the axes are orthonormal, so the
     // transpose IS the inverse, and a per-instance matrix would be nine floats

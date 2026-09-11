@@ -1,0 +1,29 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Foliage surface and wind GPU checks</title></head><body><canvas id="view"></canvas><script type="module">
+try {
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  const { runFoliageGpuChecks, checkFoliageImpostorMain } = await import('/scripts/lib/foliageGpuChecks.js');
+  const engine = new Engine(); engine.setSize(640, 400); await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer;
+  if (!renderer.backend.isWebGPUBackend || renderer.backend.device.limits.maxStorageBuffersPerShaderStage !== 8) throw new Error('Real portable-eight WebGPU required');
+  renderer.backend.device.addEventListener('uncapturederror', event => console.error('WebGPU validation', event.error.message));
+  if (new URLSearchParams(location.search).has('asyncCompute')) {
+    const { installAsyncComputePipelines } = await import('/src/modules/gi/GISystem.js');
+    installAsyncComputePipelines(renderer);
+  }
+  const result = await runFoliageGpuChecks(renderer);
+  registerBuiltInComponents(); await import('/src/modules/index.js');
+  const { enableEngineModule } = await import('/src/engine/modules.js'); await enableEngineModule(engine, 'foliage');
+  const camera = new THREE.PerspectiveCamera(40, 1.6, .01, 100); camera.position.set(0, .5, 3); camera.lookAt(0, .3, 0); engine.camera = camera;
+  const component = engine.createEntity({ name: 'Actual cloned grass impostor' }).addComponent('foliage', { species: 'grass', height: .65, width: .65, distribution: 'single', wind: false, interaction: false, lodNear: 0, lodFar: .1 });
+  const deadline = performance.now() + 30000;
+  while (!component.renderMeshes[2]?.visible && performance.now() < deadline) { component.update(true); await new Promise(resolve => setTimeout(resolve, 30)); }
+  if (!component.renderMeshes[2]?.visible) throw new Error('Actual grass far batch did not become visible');
+  result.impostorMain = await checkFoliageImpostorMain(renderer, component.renderMeshes[2], camera);
+  globalThis.__FOLIAGE_SURFACE_RESULT__ = { pass: true, ...result };
+  console.log('FOLIAGE-SURFACE PASS', JSON.stringify(result));
+} catch (error) {
+  globalThis.__FOLIAGE_SURFACE_RESULT__ = { pass: false, error: String(error.stack ?? error) };
+  console.error('FOLIAGE-SURFACE FAIL', error.stack ?? error);
+}
+</script></body></html>

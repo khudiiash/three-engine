@@ -208,6 +208,86 @@ check("destroying members below the threshold dissolves the batch", () => {
   assert.equal(crates[9].getComponent("mesh").mesh.visible, true);
 });
 
+// ── Primitives share one geometry per kind, so they batch out of the box ─────
+//
+// A mesh that shows a built-in primitive used to own a private
+// `SphereGeometry`, so 350 primitive balls were 350 geometries the batcher
+// could never group. `acquirePrimitiveGeometry` (geometryAsset.js) hands every
+// mesh the same instance per kind — nothing below assigns a geometry by hand.
+console.log("shared primitive geometry");
+
+const balls = [];
+for (let i = 0; i < 6; i++) {
+  const entity = engine.createEntity({ name: `Ball${i}` });
+  // Deliberately NOT float32-exact: the resting-member check below depends on
+  // world matrices that a Float32 cache cannot hold bit-for-bit.
+  entity.position = [i * 0.1 + 0.3, 1.7676540613174438, 3.6010959148406982];
+  entity.rotation = [0.9581721088110908, -0.07692816000681808, -2.3986441433977745];
+  entity.scale = [0.8, 0.8, 0.8];
+  entity.addComponent("mesh", { geometry: "sphere" });
+  balls.push(entity);
+}
+engine.flushHierarchyChanged();
+engine.batching.sync();
+
+check("every primitive mesh of one kind renders the SAME BufferGeometry", () => {
+  const first = balls[0].getComponent("mesh").mesh.geometry;
+  assert.ok(first?.isBufferGeometry, "no geometry on the primitive mesh");
+  // GI's mover classifier switches on `geometry.type` to trace a ball as an
+  // analytic sphere — sharing must not degrade the instance to a bare
+  // BufferGeometry.
+  assert.equal(first.type, "SphereGeometry");
+  for (const entity of balls) assert.equal(entity.getComponent("mesh").mesh.geometry, first);
+});
+
+check("a different primitive is a different shared instance", () => {
+  const box = engine.createEntity({ name: "Box" }).addComponent("mesh", { geometry: "box" });
+  const sphere = balls[0].getComponent("mesh").mesh.geometry;
+  assert.notEqual(box.mesh.geometry, sphere);
+  assert.equal(box.mesh.geometry.type, "BoxGeometry");
+});
+
+check("primitive meshes therefore batch without any asset", () => {
+  const batch = proxies().find((proxy) => proxy.count === 6);
+  assert.ok(batch, "no 6-instance proxy for the six primitive spheres");
+});
+
+check("a resting member is NOT re-uploaded every frame", () => {
+  // The batcher caches member matrices in a Float32Array and compared them to
+  // three's Float64 elements with `!==`, so anything float32 cannot hold read
+  // as motion every frame: a permanent re-upload, and (because GI keys its
+  // g-buffer hold on `instanceMatrix.version`) a depth prepass that never froze.
+  const batch = proxies().find((proxy) => proxy.count === 6);
+  const version = batch.instanceMatrix.version;
+  engine.batching.sync();
+  engine.batching.sync();
+  assert.equal(batch.instanceMatrix.version, version, "instance matrices were re-uploaded with nothing moving");
+  balls[1].position = [5, 5, 5];
+  engine.batching.sync();
+  assert.equal(batch.instanceMatrix.version, version + 1, "a real move must still upload");
+});
+
+check("letting go of a primitive releases the shared instance, never disposes it", () => {
+  const shared = balls[0].getComponent("mesh").mesh.geometry;
+  let disposed = false;
+  shared.addEventListener("dispose", () => { disposed = true; });
+  engine.destroyEntity(balls[0]);
+  engine.flushHierarchyChanged();
+  engine.batching.sync();
+  assert.equal(disposed, false, "a shared primitive was disposed while other meshes still render it");
+  assert.equal(balls[1].getComponent("mesh").mesh.geometry, shared);
+});
+
+check("clearing a geometry asset hands the mesh back the shared primitive", () => {
+  const component = balls[2].getComponent("mesh");
+  const shared = component.mesh.geometry;
+  // Simulate the asset path: a private geometry stands in for a loaded .geom,
+  // then the asset reference is cleared and the primitive must return.
+  component.mesh.geometry = new THREE.BoxGeometry(2, 2, 2);
+  component.setProp("geometryAsset", "");
+  assert.equal(component.mesh.geometry, shared);
+});
+
 if (failures) {
   console.error(`\n${failures} check(s) failed`);
   process.exit(1);

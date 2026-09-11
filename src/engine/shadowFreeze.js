@@ -80,7 +80,13 @@ function fingerprintCasters(scene) {
   };
   scene.traverse((object) => {
     if (dynamic || !object.isMesh) return;
-    if (object.isSkinnedMesh || object.morphTargetInfluences?.length || object.userData?.vfxSimulation) {
+    // `vfxStatic` (2026-09-10): a GPU-animated caster (foliage wind, cloth,
+    // water) whose animation clock is FROZEN this frame ("Run In Editor" off)
+    // deforms in the vertex shader off a HELD time, so its shadow is constant
+    // — treat it as an ordinary caster (fingerprinted by transform/visibility
+    // below) rather than a permanent deforming one, so the map can freeze at
+    // rest. `vfxSimulation` itself stays set (GI/physics/merge still read it).
+    if (object.isSkinnedMesh || object.morphTargetInfluences?.length || (object.userData?.vfxSimulation && object.userData?.vfxStatic !== true)) {
       dynamic = true;
       return;
     }
@@ -130,7 +136,9 @@ function sceneHasDeformingCaster(scene) {
     // ⚠ Deliberately NOT gated on `castShadow`, to match `fingerprintCasters`
     // exactly. Diverging here would make the fast path answer a different
     // question from the slow one, which is how a cache becomes a bug.
-    if (object.isSkinnedMesh || object.morphTargetInfluences?.length || object.userData?.vfxSimulation) found = true;
+    // See `vfxStatic` note in fingerprintCasters: a frozen-clock GPU caster is
+    // not deforming this frame, so it must not force the whole map dynamic.
+    if (object.isSkinnedMesh || object.morphTargetInfluences?.length || (object.userData?.vfxSimulation && object.userData?.vfxStatic !== true)) found = true;
   });
   return found;
 }

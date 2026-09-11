@@ -42,6 +42,17 @@ export class LightComponent extends Component {
   /** Last snapped shadow-origin / light direction — skip matrix writes when unchanged. */
   #lastSnapCentre = new THREE.Vector3(Number.NaN, Number.NaN, Number.NaN);
   #lastDirection = new THREE.Vector3(Number.NaN, Number.NaN, Number.NaN);
+  /**
+   * The inert `float(1)` THIS component put in `shadow.shadowNode` for a
+   * gi-mode light, kept so an in-place edit can tell its own placeholder from
+   * the GI module's node (which owns that slot once it has claimed the light).
+   */
+  #giPlaceholder = null;
+  /**
+   * `renderer.info.frame` at the last in-place castShadow flip — see
+   * `#castShadowInPlace` for the one case that must fall back to a rebuild.
+   */
+  #castShadowFlipFrame = -1;
 
   static type = "light";
   static label = "Light";
@@ -135,7 +146,7 @@ export class LightComponent extends Component {
     { key: "shadowNormalBias", label: "Normal Bias", type: "number", step: 0.005, showIf: (p) => (p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
     // Point lights keep this row in gi mode: the GI side reuses it as the
     // point light's source RADIUS (its directional twin is `sourceAngle`).
-    { key: "shadowRadius", label: "Radius / Light Size", type: "number", min: 0, step: 0.25, showIf: (p) => p.kind !== "ambient" && p.castShadow && (p.shadowMode !== "gi" || p.kind === "point"), section: "Shadow" },
+    { key: "shadowRadius", label: "Radius / Light Size", type: "number", min: 0, step: 0.25, showIf: (p) => p.kind !== "ambient" && p.castShadow && (p.shadowMode !== "gi" || p.kind === "point" || p.kind === "spot"), section: "Shadow" },
     { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
     { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
     { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm && p.shadowMode !== "gi"), section: "Shadow" },
@@ -165,6 +176,7 @@ export class LightComponent extends Component {
     // itself is discarded below, and the GI module drops nodes for lights that
     // stop appearing in its per-frame scan.
     this.#disposeCSM();
+    this.#giPlaceholder = null;
     if (!this.light) return;
     if (this.light.target) this.entity.object3D.remove(this.light.target);
     this.entity.object3D.remove(this.light);
@@ -181,24 +193,61 @@ export class LightComponent extends Component {
   }
 
   onPropChanged(key) {
-    // Switching `kind` swaps the entire three.js light instance (point vs
-    // spot vs directional have different constructors and shadow camera
-    // shapes). Tear the old one down and rebuild from current props.
-    // These settings change the composed lighting graph. Rebuild the light so
-    // three.js cannot retain an AnalyticLightNode compiled against the old
-    // custom shadow node (or its old cascade count/fade branch).
+    // ── WHICH EDITS REPLACE THE THREE.Light, AND WHY (three r185, read, not
+    // assumed — line numbers are three.webgpu.js) ────────────────────────────
+    //
+    // Every lit material in the scene compiles this light's shadow branch in,
+    // and three re-mints them all when the scene's `LightsNode` hash moves.
+    // That hash is `light.id` + `light.castShadow` per light (LightsNode.
+    // customCacheKey :43815-16), folded into every render object's dynamic
+    // cache key (Nodes.getCacheKey :55741 → RenderObject.getDynamicCacheKey
+    // :30534 → needsUpdate :30514). Nothing else about a light's shadow is in
+    // any key: `shadow.filterNode` is read ONCE into the ShadowNode's cached
+    // `_node` (:45164, :45299-45303), `shadow.shadowNode` (CSM / GI) is
+    // captured ONCE into AnalyticLightNode.shadowColorNode (:46052-46074) and
+    // only `light.dispose()` clears it (:45941-47, :45968-86), and the per-
+    // light `shadow.type` is never read at all (three uses the renderer's).
+    // `material.needsUpdate` does not help either: on WebGPU it re-creates the
+    // PIPELINE from the cached node-builder state (:85777, :30015), never the
+    // graph.
+    //
+    // So:
+    //   - `castShadow` has its OWN hash bit. Flipping it on the existing light
+    //     produces exactly the one wave three needs, and AnalyticLightNode.setup
+    //     (:46099-46113) builds the branch on true and disposes it on false.
+    //     Applied IN PLACE below: the light, its shadow camera and target, the
+    //     GI contract, ShadowFreeze's state and the GI module's claim all
+    //     survive the edit.
+    //   - `shadowMapType` (a filter swap), `shadowMode` (the slot), `csm` /
+    //     `csmCascades` / `csmFade` (a different custom node) change the
+    //     compiled branch WITHOUT moving any hash. The only per-light lever
+    //     that re-mints just the scene's lit materials is a new `light.id`;
+    //     the global ones (`renderer.contextNode.version` :30550, the
+    //     renderer's shadow type) would also re-mint every GI and post-process
+    //     screen quad, which a light swap never touches. These keep the swap.
+    //   - `kind` is a different constructor and shadow camera shape.
+    if (!this.light) {
+      this.onDetach();
+      this.#buildLight();
+      return;
+    }
+    if (key === "castShadow" && this.#castShadowInPlace()) return;
     if (
       key === "kind" ||
-      key === "shadowMapType" ||
       key === "castShadow" ||
+      key === "shadowMapType" ||
       key === "shadowMode" ||
       key === "csm" ||
       key === "csmCascades" ||
-      key === "csmFade" ||
-      !this.light
+      key === "csmFade"
     ) {
       this.onDetach();
       this.#buildLight();
+      // `castShadow` is no longer a structural prop (Component.js): the
+      // in-place path above is the normal one and nothing leaves the graph.
+      // This fallback DID replace the light, so the listeners that watch the
+      // graph (shadow freeze, merging, batching) hear about it here instead.
+      if (key === "castShadow") this.entity?.engine?.emit?.("hierarchy-changed");
       return;
     }
     if (key === "csmMode" || key === "csmMaxFar" || key === "csmSplitLambda") {
@@ -253,23 +302,59 @@ export class LightComponent extends Component {
     } else if (key in this.light) this.light[key] = this.props[key];
   }
 
+  /**
+   * Flip `castShadow` on the EXISTING light. Returns false when the flip has
+   * to go through the light swap after all — see the one case below.
+   *
+   * What three does with the flip (see the ledger in `onPropChanged`): the
+   * lights hash moves, every lit material re-mints on the next render, and
+   * AnalyticLightNode.setup builds the branch from whatever `shadow.shadowNode`
+   * holds at that moment (or disposes it, on false). So all this has to do is
+   * put the light in the state `#buildLight` would have built it in, and NOT
+   * `light.dispose()`: that would open the null-`shadowMap` window
+   * `shadowNodeGuard.js` exists for, a frame early, for nothing — the wave
+   * disposes the old branch itself.
+   *
+   * ⚠ THE ONE CASE THAT MUST STILL SWAP: two flips with no render in between
+   * (an undo+redo pair inside one paused-viewport tick, an MCP batch). The
+   * hash lands back where the compiled materials already are, so NO wave
+   * comes — and if the first flip disposed a CSM node, those materials keep
+   * sampling cascades whose lights have left the scene. A new `light.id` is
+   * the wave; `#castShadowFlipFrame` is how the second flip knows.
+   *
+   * `globalThis.__lightCastShadowInPlace = false` restores the swap for an
+   * A/B in one boot.
+   */
+  #castShadowInPlace() {
+    if (globalThis.__lightCastShadowInPlace === false) return false;
+    const light = this.light;
+    if (!light?.shadow) {
+      // Ambient: nothing compiled reads castShadow; the contract still does.
+      this.#publishGIShadowContract();
+      return true;
+    }
+    if (light.castShadow === !!this.props.castShadow) {
+      // The same value written again (undo of a no-op, a script). Nothing to
+      // re-mint — the swap used to pay a full wave for this.
+      this.#publishGIShadowContract();
+      return true;
+    }
+    const frame = this.#renderFrame();
+    if (frame !== null && frame === this.#castShadowFlipFrame) return false;
+    this.#castShadowFlipFrame = frame ?? -1;
+    this.#applyShadowState();
+    this.#syncCSM();
+    return true;
+  }
+
+  /** three's per-render counter (`renderer.info.frame`), or null with no renderer. */
+  #renderFrame() {
+    const frame = this.entity?.engine?.renderer?.info?.frame;
+    return typeof frame === "number" ? frame : null;
+  }
+
   #buildLight() {
-    const {
-      kind,
-      color,
-      intensity,
-      distance,
-      angle,
-      decay,
-      penumbra,
-      castShadow,
-      shadowMapWidth,
-      shadowMapHeight,
-      shadowCamNear,
-      shadowCamFar,
-      shadowCamSize,
-      shadowCamFov,
-    } = this.props;
+    const { kind, color, intensity, distance, angle, decay, penumbra } = this.props;
 
     switch (kind) {
       case "point":
@@ -296,45 +381,10 @@ export class LightComponent extends Component {
         break;
     }
     this.light.userData.entityId = this.entity.id;
-    // Publish before anything reads it: #isCSMUsable and the gi-mode shadow
-    // config below both branch on userData.giShadowMode.
-    this.#publishGIShadowContract();
-    if (this.light.shadow) {
-      this.#configureShadow({
-        shadowMapWidth,
-        shadowMapHeight,
-        shadowCamNear,
-        shadowCamFar,
-        shadowCamSize,
-        shadowCamFov,
-      });
-      this.light.castShadow = !!castShadow;
-      if (this.light.userData.giShadowMode === "gi") {
-        // castShadow STAYS true — three only compiles a shadow branch for
-        // shadow-casting lights, and the GI module's custom shadowNode
-        // replaces the map lookup inside that branch (same mechanism as CSM
-        // above, which also renders no map of its own).
-        //
-        // Belt-and-braces on the map itself: with a custom shadowNode three
-        // skips map rendering entirely, but if the GI module is absent (or
-        // hasn't claimed this light yet) three falls back to REAL shadow maps.
-        // A frozen 16×16 map keeps that fallback nearly free and visibly soft
-        // rather than silently shadowless.
-        this.light.shadow.autoUpdate = false;
-        this.light.shadow.mapSize.set(16, 16);
-        // INERT PLACEHOLDER, assigned from frame 1 — not left for the GI
-        // module's first light scan. A castShadow light with autoUpdate=false
-        // and NO rendered map crashes three's `updateShadow`
-        // (`shadow.map.depthTexture` on null) on every frame that renders it
-        // without a custom shadowNode — which is exactly the window between
-        // booting a scene SAVED with a gi-mode sun and the GI module's first
-        // 250ms scan. A custom node makes three skip the map path entirely,
-        // and `1` (unshadowed) is also the correct end state when the GI
-        // module never claims the light at all. The module replaces this node
-        // (and disposes the light's cached shadow branch) when it claims.
-        this.light.shadow.shadowNode = float(1);
-      }
-    }
+    // A fresh light is compiled from scratch on the next render; the in-place
+    // flip guard starts over with it.
+    this.#castShadowFlipFrame = -1;
+    this.#applyShadowState();
     this.entity.object3D.add(this.light);
     // Directional/spot lights aim at their target; keep the target with the entity
     // so rotating the entity re-aims the light.
@@ -368,6 +418,63 @@ export class LightComponent extends Component {
     }
     // Honour the enabled flag at attach time.
     this.light.visible = this._enabled;
+  }
+
+  /**
+   * Everything the shadow BRANCH is derived from, written onto the current
+   * light from the authored props: the GI contract, the map configuration,
+   * `castShadow`, and the gi-mode placeholder in `shadow.shadowNode`. Shared by
+   * `#buildLight` (a new light) and `#castShadowInPlace` (the same light), so
+   * the two can never drift. The CSM node is NOT here — `#syncCSM` owns it and
+   * both callers run it afterwards.
+   */
+  #applyShadowState() {
+    // Publish before anything reads it: #isCSMUsable and the gi-mode shadow
+    // config below both branch on userData.giShadowMode.
+    this.#publishGIShadowContract();
+    const s = this.light.shadow;
+    if (!s) return;
+    this.#configureShadow();
+    this.light.castShadow = !!this.props.castShadow;
+    if (this.light.userData.giShadowMode === "gi") {
+      // castShadow STAYS true — three only compiles a shadow branch for
+      // shadow-casting lights, and the GI module's custom shadowNode
+      // replaces the map lookup inside that branch (same mechanism as CSM
+      // above, which also renders no map of its own).
+      //
+      // Belt-and-braces on the map itself: with a custom shadowNode three
+      // skips map rendering entirely, but if the GI module is absent (or
+      // hasn't claimed this light yet) three falls back to REAL shadow maps.
+      // A frozen 16×16 map keeps that fallback nearly free and visibly soft
+      // rather than silently shadowless.
+      s.autoUpdate = false;
+      s.mapSize.set(16, 16);
+      // INERT PLACEHOLDER, assigned from frame 1 — not left for the GI
+      // module's first light scan. A castShadow light with autoUpdate=false
+      // and NO rendered map crashes three's `updateShadow`
+      // (`shadow.map.depthTexture` on null) on every frame that renders it
+      // without a custom shadowNode — which is exactly the window between
+      // booting a scene SAVED with a gi-mode sun and the GI module's first
+      // 250ms scan. A custom node makes three skip the map path entirely,
+      // and `1` (unshadowed) is also the correct end state when the GI
+      // module never claims the light at all. The module replaces this node
+      // (and disposes the light's cached shadow branch) when it claims.
+      //
+      // Only into a slot that is free or already ours: on an in-place flip the
+      // GI module may own it, and its release path hands the light back only
+      // when it still finds its OWN node there (GISystem#releaseLightShadowNode).
+      const slot = s.shadowNode;
+      if (slot === undefined || slot === this.#giPlaceholder) {
+        this.#giPlaceholder = float(1);
+        s.shadowNode = this.#giPlaceholder;
+      }
+    } else if (this.#giPlaceholder !== null && s.shadowNode === this.#giPlaceholder) {
+      // Left gi mode on the same light: hand the slot back to three's own map
+      // lookup. `undefined`, not null — three tests `!== undefined`. A node the
+      // GI module put there is left for the module to release.
+      s.shadowNode = undefined;
+      this.#giPlaceholder = null;
+    }
   }
 
   /**
@@ -757,7 +864,8 @@ export class LightComponent extends Component {
     if (force || this.#csm.camera === camera) this.#csm.updateFrustums();
   }
 
-  #configureShadow({ shadowMapWidth, shadowMapHeight, shadowCamNear, shadowCamFar, shadowCamSize, shadowCamFov }) {
+  #configureShadow() {
+    const { shadowMapWidth, shadowMapHeight, shadowCamNear, shadowCamFar, shadowCamSize, shadowCamFov } = this.props;
     const s = this.light.shadow;
     // The non-CSM half of the shadow-merge routing — same reasoning as the
     // cascade loop in #syncCSMCascadeShadows: without this bit the camera falls

@@ -7,7 +7,15 @@ import { fract, interleavedGradientNoise, screenCoordinate, viewportDepthTexture
 import { loadAssetBinary } from "./assetResolver.js";
 import { migrateLegacyGraph } from "./shaderGraph.js";
 
-import { compileShaderGraph, invalidateShaderTextureCache, loadShaderTexture, matchStockPbr, migrateGraph } from "./tslGraph.js";
+import {
+  compileShaderGraph,
+  invalidateShaderTextureCache,
+  loadShaderTexture,
+  matchStockPbr,
+  materialClassOf,
+  migrateGraph,
+  MATERIAL_NODE_SLOTS,
+} from "./tslGraph.js";
 import { loadTextureAsset } from "./textureAsset.js";
 import { freeze } from "./freezeLedger.js";
 
@@ -150,7 +158,7 @@ export function getDefaultMaterial() {
 // opened on a case-sensitive filesystem), but canonicalise separators.
 const assetKey = (path) => String(path ?? "").replaceAll("\\", "/");
 
-// canonical path -> { path, material, def, generation, migrated, isVolume, renderable }
+// canonical path -> { path, material, def, generation, migrated, materialClass, isVolume, renderable }
 // VM-wide: an editor material edit invalidates the cache and notifies
 // subscribers through whichever copy it imported, and a mesh that resolved its
 // material through the other copy would keep the stale instance forever.
@@ -196,62 +204,23 @@ function notifyMaterial(path) {
  *  A graph whose Output has neither wired is invisible (Blender parity). */
 
 function computeRenderable(graph) {
-
   const hasOutput = !!graph?.nodes?.some((n) => n.type === "output");
-
   if (!hasOutput) return true;
-
-  const { hasSurface, hasVolume } = graphOutputState(graph);
-
-  return hasSurface || hasVolume;
-
+  // A surface Output is a complete material on its own now: every channel it
+  // drives either carries an inline value or is deliberately unset, so there
+  // is no "nothing wired, so it draws nothing" state left to hide the mesh
+  // for. A VOLUME still is all-or-nothing — with no bundle there is no density
+  // field and the raymarch accumulates nothing at all.
+  if (materialClassOf(graph) !== "volume") return true;
+  return graphHasVolume(graph);
 }
 
 
 
-/** All material `*Node` slots a shader graph may populate on a
-
- *  MeshPhysicalNodeMaterial. Cleared on every apply. */
-
-const NODE_SLOTS = [
-
-  "colorNode",
-
-  "roughnessNode",
-
-  "metalnessNode",
-
-  "emissiveNode",
-
-  "opacityNode",
-
-  "iorNode",
-
-  "specularIntensityNode",
-
-  "specularColorNode",
-
-  "anisotropyNode",
-
-  "sheenNode",
-
-  "sheenRoughnessNode",
-
-  "clearcoatNode",
-
-  "clearcoatRoughnessNode",
-
-  "transmissionNode",
-
-  "thicknessNode",
-
-  "normalNode",
-
-  "aoNode",
-
-  "positionNode",
-
-];
+/** All material `*Node` slots a shader graph may populate. Sourced from the
+ *  graph registry itself (`OUTPUT_SLOT_SPECS`) so a slot added to the Material
+ *  Output can never be one this layer forgets to clear between compiles. */
+const NODE_SLOTS = MATERIAL_NODE_SLOTS;
 
 
 
@@ -333,59 +302,43 @@ export function applyGraphMutations(material, result, wantVolume) {
 
 
 
-/** Inspect the graph and return the wiring state of the Material Output. */
-
-function graphOutputState(graph) {
-
-  if (!graph?.nodes) return { hasSurface: false, hasVolume: false };
-
-  const output = graph.nodes.find((n) => n.type === "output");
-
-  if (!output) return { hasSurface: false, hasVolume: false };
-
-  const edges = graph.edges ?? [];
-
-  let hasSurface = false;
-
-  let hasVolume = false;
-
-  for (const e of edges) {
-
-    if (e.target !== output.id) continue;
-
-    if (e.targetHandle === "volume") hasVolume = true;
-
-    else hasSurface = true;
-
-  }
-
-  return { hasSurface, hasVolume };
-
-}
-
-
-
-/** True when the graph wires anything into the Output's `Volume` socket —
-
- *  in that case the material is a `VolumeNodeMaterial` and only the
-
- *  `scatteringNode` slot is populated. */
-
+/** True when the graph wires anything into the Material Output's Volume
+ *  socket — the one all-or-nothing channel left on the Output. */
 function graphHasVolume(graph) {
-
-  return graphOutputState(graph).hasVolume;
-
+  const output = graph?.nodes?.find((n) => n.type === "output");
+  if (!output) return false;
+  return (graph.edges ?? []).some((e) => e.target === output.id && e.targetHandle === "volume");
 }
 
 
 
-/** Create a fresh material instance sized for the def's intent. The caller
 
- *  must attach it to `entry.material` so the cache stays consistent. */
 
-function createMaterialFor(def) {
 
-  if (graphHasVolume(def.shaderGraph)) {
+
+/** Every node-material class the Material Output can name, by class key.
+ *  Held as real constructors rather than a string lookup on the THREE
+ *  namespace, so a class that ever stops being exported fails loudly here
+ *  instead of newing up `undefined` at runtime. */
+const MATERIAL_CTORS = {
+  physical: THREE.MeshPhysicalNodeMaterial,
+  standard: THREE.MeshStandardNodeMaterial,
+  basic: THREE.MeshBasicNodeMaterial,
+  lambert: THREE.MeshLambertNodeMaterial,
+  phong: THREE.MeshPhongNodeMaterial,
+  toon: THREE.MeshToonNodeMaterial,
+  matcap: THREE.MeshMatcapNodeMaterial,
+  normal: THREE.MeshNormalNodeMaterial,
+  sprite: THREE.SpriteNodeMaterial,
+  points: THREE.PointsNodeMaterial,
+  volume: THREE.VolumeNodeMaterial,
+};
+
+/** Create a fresh material instance for the class the graph's Output names.
+ *  The caller must attach it to `entry.material` so the cache stays
+ *  consistent. */
+function createMaterialFor(materialClass) {
+  if (materialClass === "volume") {
 
     const mat = new THREE.VolumeNodeMaterial();
 
@@ -414,13 +367,10 @@ function createMaterialFor(def) {
     // standalone depthPass does in a plain (non-PostProcessing) render loop.
 
     mat.depthNode = viewportDepthTexture();
-
     return mat;
-
   }
-
-  return new THREE.MeshPhysicalNodeMaterial();
-
+  const Ctor = MATERIAL_CTORS[materialClass] ?? THREE.MeshPhysicalNodeMaterial;
+  return new Ctor();
 }
 
 
@@ -517,24 +467,18 @@ function applyStockPbr(entry, material, stock, generation) {
 
 export function applyMaterialDef(entry, def) {
 
-  // If the new def switches the material kind (surface ↔ volume), swap the
-
-  // underlying instance so the new type's slots are clean.
-
-  const wantVolume = graphHasVolume(def.shaderGraph);
-
-  if (entry.material && !!entry.isVolume !== wantVolume) {
-
-    entry.material = createMaterialFor(def);
-
+  // The Material Output names its three.js class. Changing it cannot be done
+  // in place — a MeshPhongNodeMaterial has no `roughnessNode` to clear — so the
+  // instance is replaced and everything downstream recompiles against it.
+  const materialClass = materialClassOf(def.shaderGraph);
+  const wantVolume = materialClass === "volume";
+  if (entry.material && entry.materialClass !== materialClass) {
+    entry.material = createMaterialFor(materialClass);
     entry.migrated = false;
-
   } else if (!entry.material) {
-
-    entry.material = createMaterialFor(def);
-
+    entry.material = createMaterialFor(materialClass);
   }
-
+  entry.materialClass = materialClass;
   entry.isVolume = wantVolume;
 
   entry.renderable = computeRenderable(def.shaderGraph);
@@ -560,12 +504,11 @@ export function applyMaterialDef(entry, def) {
 
 
   if (!wantVolume) {
-
-    material.color.set(def.color ?? MATERIAL_DEFAULTS.color);
-
-    material.roughness = def.roughness ?? MATERIAL_DEFAULTS.roughness;
-
-    material.metalness = def.metalness ?? MATERIAL_DEFAULTS.metalness;
+    // `color` exists on every surface class; the PBR pair only from Standard
+    // up, so a Basic/Phong/Toon output must not be handed roughness/metalness.
+    if (material.color) material.color.set(def.color ?? MATERIAL_DEFAULTS.color);
+    if ("roughness" in material) material.roughness = def.roughness ?? MATERIAL_DEFAULTS.roughness;
+    if ("metalness" in material) material.metalness = def.metalness ?? MATERIAL_DEFAULTS.metalness;
 
     // A stock-matched graph owns every texture slot including `map`; letting
     // the def-level map race the graph's color texture would leave whichever
@@ -691,7 +634,7 @@ export async function loadMaterialAsset(path) {
 
     // material once the file is fetched and parsed.
 
-    entry = { path: key, material: new THREE.MeshPhysicalNodeMaterial(), def: { ...MATERIAL_DEFAULTS }, isVolume: false, renderable: true, migrated: false, promise: null };
+    entry = { path: key, material: new THREE.MeshPhysicalNodeMaterial(), def: { ...MATERIAL_DEFAULTS }, materialClass: "physical", isVolume: false, renderable: true, migrated: false, promise: null };
     cache.set(key, entry);
     entry.promise = (async () => {
       try {
@@ -722,6 +665,10 @@ export async function loadMaterialAsset(path) {
 /** True if the .mat asset at `path` resolves to a `VolumeNodeMaterial`. The
 
  *  editor uses this to flag / convert meshes that point at a volume .mat. */
+
+export function getMaterialClass(path) {
+  return cache.get(assetKey(path))?.materialClass ?? "physical";
+}
 
 export function isVolumeMaterial(path) {
   return cache.get(assetKey(path))?.isVolume === true;

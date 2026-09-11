@@ -21,6 +21,7 @@ import {
 import { AssetPreview } from "../components/AssetPreview.jsx";
 import { loadRemappedGltf } from "../previewSources.js";
 
+import { Select } from "../fields/Select.jsx";
 const TABS = [
   { id: "textures", label: "Materials" },
   { id: "models", label: "Models" },
@@ -146,14 +147,14 @@ export function PolyHavenPanel() {
             onChange={(e) => setQuery(e.target.value)}
           />
         </div>
-        <select className="ph-category" value={category} onChange={(e) => setCategory(e.target.value)}>
+        <Select className="ph-category" value={category} onChange={(e) => setCategory(e.target.value)}>
           <option value="">All categories</option>
           {categories.map((c) => (
             <option key={c} value={c}>
               {c}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
 
       <div className="ph-body">
@@ -316,13 +317,13 @@ function AssetDetail({ asset, type, hasProject, onClose }) {
         <>
           <div className="ph-detail-row">
             <label>Resolution</label>
-            <select value={res} disabled={busy} onChange={(e) => setRes(e.target.value)}>
+            <Select value={res} disabled={busy} onChange={(e) => setRes(e.target.value)}>
               {resolutions.map((r) => (
                 <option key={r} value={r}>
                   {r}
                 </option>
               ))}
-            </select>
+            </Select>
             <span className="ph-size">{formatBytes(size)}</span>
           </div>
 

@@ -17,13 +17,16 @@ import { navigationModule } from "./navigation/index.js";
 import { textureEditorModule } from "./texture-editor/index.js";
 import { audioLibraryModule } from "./audio-library/index.js";
 import { audioEditorModule } from "./audio-editor/index.js";
-import { levelDesignModule } from "./level-design/index.js";
+import { architectureModule } from "./architecture/index.js";
+const levelDesignModule = architectureModule;
 import { characterControllerModule } from "./character-controller/index.js";
 import { kimodoModule } from "./kimodo/index.js";
 import { vfxModule } from "./vfx/index.js";
 import { clothModule } from "./cloth/index.js";
 import { waterModule } from "./water/index.js";
 import { particlesModule } from "./particles/index.js";
+import { foliageModule } from "./foliage/index.js";
+import { atmosphereModule } from "./atmosphere/index.js";
 /**
  * Built-in module catalog. Importing this file registers every definition;
  * nothing runs until a host enables a module on an engine (editor: Modules
@@ -50,14 +53,17 @@ registerModuleDefinition(navigationModule);
 registerModuleDefinition(textureEditorModule);
 registerModuleDefinition(audioLibraryModule);
 registerModuleDefinition(audioEditorModule);
-registerModuleDefinition(levelDesignModule);
+registerModuleDefinition(architectureModule);
 registerModuleDefinition(characterControllerModule);
 registerModuleDefinition(kimodoModule);
 registerModuleDefinition(vfxModule);
 registerModuleDefinition(clothModule);
 registerModuleDefinition(waterModule);
 registerModuleDefinition(particlesModule);
+registerModuleDefinition(foliageModule);
+registerModuleDefinition(atmosphereModule);
 
-export { vfxModule, clothModule, waterModule, particlesModule };
+export { vfxModule, clothModule, waterModule, particlesModule, foliageModule, atmosphereModule };
+export { architectureModule };
 
 export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, polypizzaModule, kaykitModule, fabModule, itchioModule, giModule, navigationModule, textureEditorModule, audioLibraryModule, audioEditorModule, levelDesignModule, characterControllerModule, kimodoModule };

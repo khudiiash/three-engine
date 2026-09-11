@@ -21,7 +21,7 @@ import { engine } from "../../engineInstance.js";
 import { useModulesStore } from "../../modules.js";
 
 function requireLevelModule() {
-  if (!useModulesStore.getState().enabled.includes("level-design")) {
+  if (!useModulesStore.getState().enabled.some(id => id === "architecture" || id === "level-design")) {
     throw new Error(
       'The "level-design" module is not enabled for this project. Enable it with module.setEnabled.',
     );

@@ -81,13 +81,23 @@ export function createSrcBvhSceneTrace(dyn, world, { movers = true } = {}) {
     // §11.15: 1 when the winning mover hit was reached from INSIDE the mover.
     const insideMover = float(0).toVar();
     const s = dyn.traceStaticBvhSlot(o, d, tMin, tMax);
-    If(s.x.greaterThanEqual(0), () => {
-      hit.assign(1);
-      t.assign(s.x);
-      normal.assign(octDecodeTSL(unpack12(s.y).mul(2).sub(1)));
-      slot.assign(s.w);
-      uvPacked.assign(s.z);
-    });
+    // `traceStaticBvhSlot` returns JS `null` when the static BVH is not built
+    // yet — a rebuild-ordering race (a light move / preset change / re-enable
+    // rebuilds this kernel before the BVH lands). Reading `s.x` then crashed
+    // the whole `src:deposit` kernel BUILD ("Cannot read properties of null" /
+    // "trace is not a function") and GI stayed DARK. When it is null, skip the
+    // hit branch and leave `hit = 0` (a clean miss); the
+    // `static-bvh-manifest-stale` rebuild rebuilds this with the BVH ready and
+    // GI lights immediately. In steady state `s` is always a node.
+    if (s != null) {
+      If(s.x.greaterThanEqual(0), () => {
+        hit.assign(1);
+        t.assign(s.x);
+        normal.assign(octDecodeTSL(unpack12(s.y).mul(2).sub(1)));
+        slot.assign(s.w);
+        uvPacked.assign(s.z);
+      });
+    }
     if (moverTrace) {
       // §11.15 THE SELF-WALL. A skinned proxy is a fat hull: the receiver's
       // true skin sits centimetres INSIDE it, and the box/sphere intersectors
@@ -163,12 +173,20 @@ export function createSrcBvhVisibility(dyn, world, { movers = false } = {}) {
     ).toVar();
     const v = float(1).toVar();
     const st = dyn.traceStaticBvh(origin, l, selfBias, budget, { anyHit: true });
-    If(st.x.greaterThanEqual(0), () => { v.assign(0); });
+    // `traceStaticBvh` returns JS `null` when the static BVH is not built yet
+    // (rebuild-ordering race — a light move / preset change / post toggle
+    // rebuilds this shade kernel before the BVH lands). Reading `st.x` then
+    // crashed the kernel BUILD and GI went dark. Null → leave `v = 1` (no
+    // occlusion this transient frame); the `static-bvh-manifest-stale` rebuild
+    // re-emits this arm with the BVH ready. In steady state `st` is a node.
+    if (st != null) {
+      If(st.x.greaterThanEqual(0), () => { v.assign(0); });
+    }
     if (moverTrace) {
       If(v.greaterThan(0.5), () => {
         // §11.15: the shadow ray from a hit excludes the proxy it starts in,
         // like every other shadow marcher (see the transport's note above).
-        const m = dyn.trace(origin, l, selfBias, budget, { excludePoint: origin });
+        const m = dyn.trace(origin, l, selfBias, budget, { excludePoint: origin, excludeNormal: vec3(normal) });
         If(m.hit.greaterThan(0.5), () => { v.assign(0); });
       });
     }

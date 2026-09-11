@@ -4,6 +4,7 @@ import { invoke } from "../assetOps.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { getKimodoPrefs, setKimodoPrefs } from "../kimodoPrefs.js";
 
+import { Select } from "../fields/Select.jsx";
 /** Compact prompt-first surface for local text-to-motion generation. */
 export function GenerateMotionDialog({ onApply, onCancel, busy = false, error = "" }) {
   const prefs = getKimodoPrefs();
@@ -107,10 +108,10 @@ export function GenerateMotionDialog({ onApply, onCancel, busy = false, error = 
           <div className="motion-advanced">
             <label>
               <span>Model</span>
-              <select value={motionModel} onChange={(event) => setMotionModel(event.target.value)}>
+              <Select value={motionModel} onChange={(event) => setMotionModel(event.target.value)}>
                 <option value="rp">SOMA RP</option>
                 <option value="seed">SOMA SEED</option>
-              </select>
+              </Select>
             </label>
             <label><span>Steps</span><input type="number" min={1} max={150} value={steps} onChange={(event) => setSteps(Number(event.target.value))} /></label>
             <label><span>Seed</span><input type="number" min={0} step={1} value={seed} onChange={(event) => setSeed(Number(event.target.value))} /></label>

@@ -10,6 +10,7 @@ import { NumberField } from "../fields/NumberField.jsx";
 import { ACTION_KINDS, ACTION_KIND_IDS } from "../../engine/events/actions.js";
 import { RESERVED_EVENT_NAMES } from "../../engine/events/catalog.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * Inspector UI for event wiring — the editor half of `engine/events/actions.js`.
  *
@@ -46,11 +47,16 @@ function eventOptions() {
   };
 }
 
-function EventSelect({ value, onCommit }) {
+/**
+ * The project's declared events as a dropdown. Exported because a COMPONENT can
+ * name an event too (Destructible's `breakEvent`), and retyping a name the
+ * catalog already knows is how a wire ends up pointing at "explod".
+ */
+export function EventSelect({ value, onCommit }) {
   const { project, engine: builtIn } = eventOptions();
   const known = project.includes(value) || builtIn.includes(value);
   return (
-    <select className="select-field" value={value ?? ""} onChange={(e) => onCommit(e.target.value)}>
+    <Select className="select-field" value={value ?? ""} onChange={(e) => onCommit(e.target.value)}>
       <option value="">— none —</option>
       {/* A name saved before the event was renamed or deleted would otherwise
           render blank and silently rewrite the row on the next edit. */}
@@ -71,7 +77,7 @@ function EventSelect({ value, onCommit }) {
           </option>
         ))}
       </optgroup>
-    </select>
+    </Select>
   );
 }
 
@@ -81,7 +87,7 @@ function ComponentSelect({ entityId, targetId, value, onCommit, allowEmpty }) {
   const types = target ? [...(target.components?.keys() ?? [])] : [];
   const known = types.includes(value);
   return (
-    <select className="select-field" value={value ?? ""} onChange={(e) => onCommit(e.target.value)}>
+    <Select className="select-field" value={value ?? ""} onChange={(e) => onCommit(e.target.value)}>
       <option value="">{allowEmpty ? "— whole entity —" : "— none —"}</option>
       {!known && value ? <option value={value}>{`${value} (missing)`}</option> : null}
       {types.map((type) => (
@@ -89,7 +95,7 @@ function ComponentSelect({ entityId, targetId, value, onCommit, allowEmpty }) {
           {type}
         </option>
       ))}
-    </select>
+    </Select>
   );
 }
 
@@ -100,7 +106,7 @@ function ComponentPropSelect({ entityId, targetId, componentType, value, onCommi
   const keys = (component?.constructor?.schema ?? []).map((f) => f?.key).filter(Boolean);
   const known = keys.includes(value);
   return (
-    <select className="select-field" value={value ?? ""} onChange={(e) => onCommit(e.target.value)}>
+    <Select className="select-field" value={value ?? ""} onChange={(e) => onCommit(e.target.value)}>
       <option value="">— none —</option>
       {!known && value ? <option value={value}>{`${value} (missing)`}</option> : null}
       {keys.map((key) => (
@@ -108,7 +114,7 @@ function ComponentPropSelect({ entityId, targetId, componentType, value, onCommi
           {key}
         </option>
       ))}
-    </select>
+    </Select>
   );
 }
 
@@ -216,7 +222,7 @@ function ScriptMethodField({ entityId, targetId, value, onCommit }) {
 
   return (
     <div className="event-method">
-      <select
+      <Select
         className="select-field"
         value={known || !value ? (value ?? "") : "__missing__"}
         onChange={(e) => onCommit(e.target.value)}
@@ -232,7 +238,7 @@ function ScriptMethodField({ entityId, targetId, value, onCommit }) {
             {m.script ? ` — ${m.script}` : ""}
           </option>
         ))}
-      </select>
+      </Select>
       <button
         className="icon-btn"
         title={
@@ -329,7 +335,7 @@ function ActionRow({ action, entityId, index, count, onChange, onRemove, onMove 
         <button className="icon-btn" onClick={() => setOpen((v) => !v)} title={open ? "Collapse" : "Expand"}>
           {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
         </button>
-        <select
+        <Select
           className="select-field event-action-kind"
           value={action.type ?? ""}
           onChange={(e) => onChange({ id: action.id, enabled: action.enabled, type: e.target.value })}
@@ -340,7 +346,7 @@ function ActionRow({ action, entityId, index, count, onChange, onRemove, onMove 
               {ACTION_KINDS[id].label}
             </option>
           ))}
-        </select>
+        </Select>
         {!open && kind && <span className="event-action-summary">{safeSummary(kind, action)}</span>}
         <input
           type="checkbox"
@@ -500,7 +506,7 @@ function WhenEditor({ when, entityId, onChange }) {
     <div className="event-when">
       <div className="event-action-field">
         <label>Source</label>
-        <select
+        <Select
           className="select-field"
           value={source}
           // Only the source is kept: an event name from the engine bus is
@@ -513,7 +519,7 @@ function WhenEditor({ when, entityId, onChange }) {
               {label}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
 
       {source === "engine" && (
@@ -548,7 +554,7 @@ function WhenEditor({ when, entityId, onChange }) {
           </div>
           <div className="event-action-field">
             <label>Event</label>
-            <select
+            <Select
               className="select-field"
               value={when.event ?? ""}
               onChange={(e) => set({ event: e.target.value })}
@@ -561,7 +567,7 @@ function WhenEditor({ when, entityId, onChange }) {
                   {name}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
         </>
       )}
@@ -580,14 +586,14 @@ function WhenEditor({ when, entityId, onChange }) {
           </div>
           <div className="event-action-field">
             <label>Edge</label>
-            <select
+            <Select
               className="select-field"
               value={when.edge ?? "pressed"}
               onChange={(e) => set({ edge: e.target.value })}
             >
               <option value="pressed">pressed</option>
               <option value="released">released</option>
-            </select>
+            </Select>
           </div>
         </>
       )}
@@ -595,7 +601,7 @@ function WhenEditor({ when, entityId, onChange }) {
       {source === "lifecycle" && (
         <div className="event-action-field">
           <label>Phase</label>
-          <select
+          <Select
             className="select-field"
             value={when.phase ?? "start"}
             onChange={(e) => set({ phase: e.target.value })}
@@ -603,7 +609,7 @@ function WhenEditor({ when, entityId, onChange }) {
             <option value="start">on play start</option>
             <option value="stop">on play stop</option>
             <option value="destroy">on destroy</option>
-          </select>
+          </Select>
         </div>
       )}
     </div>

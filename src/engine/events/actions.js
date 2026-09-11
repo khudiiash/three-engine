@@ -61,6 +61,8 @@ const ENTITY_FIELDS = {
   setSave: [],
   log: [],
   wait: [],
+  breakObject: ["target"],
+  ragdoll: ["target"],
 };
 
 /**
@@ -247,6 +249,60 @@ export const ACTION_KINDS = {
       // would read as if pooling were being consulted when it isn't.
       if (target._poolGuid) ctx.engine.pool?.despawn?.(target);
       else ctx.engine.destroyEntity?.(target);
+    },
+  },
+
+  breakObject: {
+    label: "Break Destructible",
+    summary: () => "break it",
+    fields: [
+      { key: "target", label: "Entity", type: "entity" },
+      {
+        key: "scatter",
+        label: "Scatter",
+        type: "number",
+        description: "Outward speed of the pieces (m/s). Leave empty for the component's own.",
+      },
+    ],
+    run(action, ctx) {
+      const target = resolveEntity(action.target, ctx);
+      const destructible = target?.getComponent("destructible");
+      if (!destructible) return;
+      const scatter = Number(resolveValue(action.scatter, ctx));
+      // The explosion knows where it was, and the pieces should fly away from
+      // IT rather than from the wall's own centre — so a binding that lives on
+      // the bomb and targets the wall passes its own position through. When
+      // the binding is on the wall itself, `break` uses the wall's centre,
+      // which is the same thing.
+      // Read straight out of the world matrix rather than allocating a
+      // Vector3: this file is the one piece of engine code with no three.js
+      // import, and one action is not a reason to give that up.
+      const m = ctx.self && ctx.self !== target ? ctx.self.object3D?.matrixWorld?.elements : null;
+      destructible.break({
+        ...(Number.isFinite(scatter) && scatter > 0 ? { scatter } : {}),
+        ...(m ? { point: [m[12], m[13], m[14]] } : {}),
+      });
+    },
+  },
+
+  ragdoll: {
+    label: "Ragdoll",
+    summary: (a) => `${a.mode ?? "activate"} ragdoll`,
+    fields: [
+      { key: "target", label: "Entity", type: "entity" },
+      { key: "mode", label: "Mode", type: "select", options: ["activate", "deactivate"] },
+      { key: "impulse", label: "Impulse", type: "vec3", description: "World-space kick applied on activation." },
+    ],
+    run(action, ctx) {
+      const target = resolveEntity(action.target, ctx);
+      const ragdoll = target?.getComponent("ragdoll");
+      if (!ragdoll) return;
+      if ((action.mode ?? "activate") === "deactivate") {
+        ragdoll.deactivate();
+        return;
+      }
+      const impulse = action.impulse?.some?.((n) => n !== 0) ? action.impulse : null;
+      ragdoll.activate(impulse ? { impulse } : {});
     },
   },
 

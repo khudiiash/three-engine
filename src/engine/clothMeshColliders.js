@@ -335,11 +335,113 @@ export class ClothMeshColliderField {
       if (!diagnostic.triangles) diagnostic.status = 'empty-geometry';
     }
     this.error = errors.length ? errors.join('; ') : null;
+    // ⭐ PUBLISHED FOR THE PER-CLOTH VIEWS. The scan, the world transform and
+    // the triangle collection above stay SHARED and run once a frame — that is
+    // what stops the cost being cloths x colliders. Only the BVH pack is done
+    // per cloth, from this list. See `ClothMeshColliderView`.
+    this.triangles = triangles;
     this.triangleCount = triangles.length;
     this.closedShellCountUniform.value = closedShellCount;
     this.countUniform.value = packClothCollisionBVH(triangles, this.data);
     this.buffer.value.needsUpdate = true;
     this.revision++;
     } finally { freeze.end(rebuild); }
+  }
+}
+
+/**
+ * ⭐⭐⭐ ONE BVH PER CLOTH, OVER ONLY THE TRIANGLES THAT CLOTH CAN REACH.
+ *
+ * The shared field already drops a collider no cloth can touch, but it culls
+ * against the UNION of every cloth's reach sphere — so on the user's Sponza the
+ * field holds all 3 475 cooked triangles of the arcade and EVERY curtain
+ * traverses all of them. Measured with `profile.frameCensus`, ten curtains, the
+ * same camera:
+ *
+ *     with contact      Cloth 25.93 ms      frame 37.04 ms / 27 fps
+ *     `__clothNoContact` Cloth  2.07 ms     frame 13.70 ms / 73 fps
+ *
+ * **The solver is two milliseconds. The other twenty-four are contact**, and
+ * contact is a stackless-BVH traversal per particle per edge sweep. A 2.3 m
+ * curtain has no business walking a tree that spans the whole building, so each
+ * one gets its own tree over its own neighbourhood.
+ *
+ * ⚠ THE SCAN IS NOT DUPLICATED. Everything expensive about the shared field —
+ * the scene walk, the world-matrix updates, the signature, the triangle
+ * collection — still happens once a frame in `ClothMeshColliderField.refresh`.
+ * This only re-packs, and only when the shared set changed or this cloth moved
+ * far enough to matter. Duplicating the scan is exactly the cloths x colliders
+ * regression the shared field was built to fix.
+ *
+ * ⚠ FULL CAPACITY, DELIBERATELY. The view allocates the same triangle budget as
+ * the field (~1.3 MB) rather than sizing to its subset, because growing it
+ * would mean a NEW storage buffer and the kernels are already bound to this
+ * one. Memory for correctness: a subset can never overflow.
+ */
+export class ClothMeshColliderView {
+  constructor(field, user) {
+    this.field = field;
+    this.user = user;
+    this.data = new Float32Array((field.maxTriangles * 2 - 1) * CLOTH_MESH_COLLIDER_NODE_FLOATS);
+    this.buffer = instancedArray(this.data, 'vec4');
+    this.countUniform = uniform(0, 'int');
+    this.closedShellCountUniform = uniform(0, 'int');
+    this.triangleCount = 0;
+    this._revision = -1;
+    this._centre = new THREE.Vector3();
+    this._radius = -1;
+  }
+  /** The shared field owns identity and diagnostics; the view owns only geometry. */
+  get entityIndices() { return this.field.entityIndices; }
+  get error() { return this.field.error; }
+  get diagnostics() { return this.field.diagnostics; }
+  addUser(user) { this.field.addUser(user); }
+  removeUser(user) { this.field.removeUser(user); }
+
+  /** This cloth's reach: the culling sphere in world space, plus contact slack. */
+  _sphere() {
+    const mesh = this.user?.simulation?.mesh;
+    const sphere = mesh?.geometry?.boundingSphere;
+    if (!mesh || !sphere || !(sphere.radius > 0)) return null;
+    const centre = sphere.center.clone().applyMatrix4(mesh.matrixWorld);
+    const scale = new THREE.Vector3().setFromMatrixScale(mesh.matrixWorld);
+    return { centre, radius: sphere.radius * Math.max(scale.x, scale.y, scale.z) + REACH_MARGIN };
+  }
+
+  refresh() {
+    this.field.refresh();
+    const reach = this._sphere();
+    // No measurable sphere means no safe cull, so mirror the shared set whole.
+    const centre = reach?.centre, radius = reach?.radius ?? Infinity;
+    const moved = !reach ? false
+      : this._radius < 0 || Math.abs(this._radius - radius) > 0.05 || this._centre.distanceTo(centre) > 0.05;
+    if (this.field.revision === this._revision && !moved) return;
+    this._revision = this.field.revision;
+    if (reach) { this._centre.copy(centre); this._radius = radius; }
+    const all = this.field.triangles ?? [];
+    let subset = all;
+    if (reach) {
+      subset = [];
+      const r2 = radius * radius;
+      for (const triangle of all) {
+        const v = triangle.vertices;
+        // Sphere against the triangle's AABB — loose, and loose is the safe
+        // direction for a cull: it can keep a triangle that was unnecessary,
+        // never drop one that was needed.
+        let d2 = 0;
+        for (let axis = 0; axis < 3; axis++) {
+          const lo = Math.min(v[axis], v[axis + 3], v[axis + 6]);
+          const hi = Math.max(v[axis], v[axis + 3], v[axis + 6]);
+          const c = centre.getComponent(axis);
+          const gap = c < lo ? lo - c : c > hi ? c - hi : 0;
+          d2 += gap * gap;
+        }
+        if (d2 <= r2) subset.push(triangle);
+      }
+    }
+    this.triangleCount = subset.length;
+    this.countUniform.value = packClothCollisionBVH(subset, this.data);
+    this.closedShellCountUniform.value = this.field.closedShellCountUniform.value;
+    this.buffer.value.needsUpdate = true;
   }
 }

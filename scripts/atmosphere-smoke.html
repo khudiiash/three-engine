@@ -1,0 +1,573 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Atmosphere WebGPU verification</title>
+<style>html,body{margin:0;background:#0d1117;color:#e6edf3;font:14px system-ui}canvas{display:block;width:800px;height:500px}#status{padding:10px}</style></head>
+<body><canvas id="view"></canvas><div id="status">Atmosphere: checking real GPU rendering…</div><script type="module">
+/**
+ * What this proves that a unit test cannot: the sky's TSL graph COMPILES and
+ * the picture it draws answers to the model behind it. Every assertion is a
+ * comparison of real pixels read back off a real WebGPU device.
+ *
+ * The claims, in order:
+ *   · the background node and the environment map are installed on the scene
+ *   · noon is bright, midnight is dark, and the night sky is blue
+ *   · a storm darkens the picture and takes the sun's shadow away
+ *   · rain and snow actually draw, and snow — not rain — falls when it is cold
+ *   · the cloud layer moves the pixels it is supposed to move
+ *   · detaching gives the scene back exactly what it borrowed
+ */
+const assert = (ok, message) => { if (!ok) throw new Error(message); };
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const until = async (check, label, timeout = 20000) => {
+  const deadline = performance.now() + timeout;
+  while (!check() && performance.now() < deadline) await delay(50);
+  assert(check(), label);
+};
+const notes = {};
+try {
+  globalThis.__editorKeepRendering = true;
+  globalThis.__atmosphereFlatDrops = new URLSearchParams(location.search).get('flatdrops') ?? '';
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  // ⚠ ONLY THIS MODULE, not the whole catalog. `src/modules/index.js` imports
+  // every module in the project, so one half-written file in an unrelated
+  // module takes this test down with it — which is exactly what happened while
+  // it was being written. Registering the definition directly is also faster.
+  const { registerModuleDefinition } = await import('/src/engine/modules.js');
+  const { atmosphereModule } = await import('/src/modules/atmosphere/index.js');
+  registerModuleDefinition(atmosphereModule);
+  const { enableEngineModule } = await import('/src/engine/modules.js');
+  registerBuiltInComponents();
+
+  const engine = new Engine();
+  globalThis.__ATMOSPHERE_ENGINE__ = engine;
+  engine.setSize(800, 500);
+  await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer;
+  const errors = [];
+  assert(renderer.backend.isWebGPUBackend, 'real WebGPU required');
+  renderer.backend.device.addEventListener('uncapturederror', event => {
+    errors.push(event.error.message);
+    console.error('WebGPU validation', event.error.message);
+  });
+  // ⚠ SHADOW MAPS ARE OFF ON A BARE RENDERER, and three gates ALL of
+  // `setupShadow` on `renderer.shadowMap.enabled` — including a light's custom
+  // `shadow.shadowNode`. Without this line the cloud shadows below cannot
+  // appear no matter how correct they are, and the test reads as a broken
+  // feature. The engine turns this on from Scene Settings (`applySettings`),
+  // which a bare Engine in a test page never runs.
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  await enableEngineModule(engine, 'atmosphere');
+
+  // A camera looking at the horizon: half sky, half ground, so both halves of
+  // every comparison below are in frame.
+  const camera = new THREE.PerspectiveCamera(60, 1.6, 0.1, 4000);
+  camera.position.set(0, 2, 12);
+  camera.lookAt(0, 6, -40);
+  engine.camera = camera;
+  engine.scene.add(camera);
+
+  // ⚠ A COLOURED WORLD, DELIBERATELY. The first cut used the default white
+  // material and then asserted that snow lightens the scene — white snow on a
+  // white plane moves the picture by almost nothing, and the test was
+  // measuring the lighting rather than the snow.
+  const paint = (entity, hex) => entity.object3D.traverse((object) => { object.material?.color?.set(hex); });
+  const ground = engine.createEntity({ name: 'Ground' });
+  ground.addComponent('mesh', { geometry: 'plane', castShadow: false, receiveShadow: true });
+  ground.object3D.rotation.x = -Math.PI / 2;
+  ground.object3D.scale.setScalar(200);
+  paint(ground, 0x2f4a22);                                   // grass
+  const post = engine.createEntity({ name: 'Post' });
+  post.object3D.position.set(-2, 1.5, 2);
+  post.addComponent('mesh', { geometry: 'box', castShadow: true, receiveShadow: true });
+  paint(post, 0x5a4632);                                     // timber
+
+  const savedBackground = engine.scene.background;
+  const skyEntity = engine.createEntity({ name: 'Atmosphere' });
+  const sky = skyEntity.addComponent('atmosphere', {
+    timeOfDay: 12, dayOfYear: 172, latitude: 45, dayLength: 0,
+    weather: 'clear', transition: 0, precipitation: true, lightning: true,
+  });
+  engine.start();
+  await delay(300);
+
+  assert(!!engine.scene.backgroundNode, 'the sky installs a background node');
+  assert(engine.scene.environment === sky.skyTexture, 'the sky installs itself as the environment map');
+  assert(engine.scene.environment.type === THREE.HalfFloatType, 'the environment map is half-float (GI reads it on the CPU)');
+  assert(!!engine.scene.fog, 'the fog is installed once, at attach');
+  await until(() => sky.state?.light?.source, 'the sun resolves');
+  notes.sunSource = sky.state.light.source;
+  assert(sky.state.light.body === 'sun' && sky.state.light.intensity > 1, `midday sun: ${JSON.stringify(sky.state.light)}`);
+
+  // ── pixel capture ────────────────────────────────────────────────────────
+  // ⚠ TWO READBACK TRAPS, BOTH OF WHICH THIS FILE FELL INTO FIRST TIME.
+  //  1. `internalFormat = getPreferredCanvasFormat()` is BGRA on Windows, so
+  //     the red and blue channels come back swapped — a blue sky reads as a
+  //     warm one, and the assertion that catches it blames the shader.
+  //  2. A render target's texture defaults to NO colour space, so the values
+  //     land LINEAR in an 8-bit buffer. Asking for sRGB here makes the numbers
+  //     below the ones a person would see on the canvas.
+  const target = new THREE.RenderTarget(400, 250);
+  target.texture.colorSpace = THREE.SRGBColorSpace;
+  renderer.initRenderTarget(target);
+  const capture = async () => {
+    engine.stop();
+    renderer.setRenderTarget(target);
+    renderer.render(engine.scene, camera);
+    const pixels = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 400, 250);
+    renderer.setRenderTarget(null);
+    engine.start();
+    return pixels;
+  };
+  // ⚠ NO ROW ARITHMETIC. Which end of a readback is the top of the image is a
+  // backend detail (see the engine's WebGPU readback notes), and the first cut
+  // of this file got it backwards: it measured the sunlit white ground, called
+  // it the sky, and reported "the midday sky is not blue". So the CAMERA
+  // decides what is in frame, and every measurement is a whole-frame average.
+  const average = (pixels) => {
+    let r = 0, g = 0, b = 0;
+    const n = pixels.length / 4;
+    for (let i = 0; i < pixels.length; i += 4) { r += pixels[i]; g += pixels[i + 1]; b += pixels[i + 2]; }
+    return { r: r / n, g: g / n, b: b / n, luma: (0.2126 * r + 0.7152 * g + 0.0722 * b) / n };
+  };
+  const lookUp = () => { camera.position.set(0, 2, 12); camera.lookAt(0, 60, -12); };
+  const lookAtScene = () => { camera.position.set(0, 2, 12); camera.lookAt(-2, 1.2, 2); };
+  // Straight down: the frame is nothing but ground, which is the only way to
+  // measure what the weather did to a SURFACE without the sky diluting it.
+  const lookDown = () => { camera.position.set(0, 7, 0); camera.lookAt(0, 0, 0.001); };
+  const captureSky = async () => { lookUp(); return average(await capture()); };
+  const captureScene = async () => { lookAtScene(); return average(await capture()); };
+  const captureGround = async () => { lookDown(); return average(await capture()); };
+  const differing = (a, b) => {
+    let count = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      if (Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]) > 6) count++;
+    }
+    return count;
+  };
+
+  notes.zenithTexel = sky.state.sky.irradiance;
+  notes.noonSky = await captureSky();
+  assert(notes.noonSky.luma > 60, `a midday sky is bright: ${JSON.stringify(notes.noonSky)}`);
+  assert(notes.noonSky.b > notes.noonSky.r * 1.05, `a midday sky is blue: ${JSON.stringify(notes.noonSky)}`);
+
+  // ── night ────────────────────────────────────────────────────────────────
+  sky.setTime(0);
+  await delay(400);
+  notes.midnightSky = await captureSky();
+  assert(notes.midnightSky.luma < notes.noonSky.luma * 0.35,
+    `midnight is far darker than noon: ${JSON.stringify(notes.midnightSky)} vs ${JSON.stringify(notes.noonSky)}`);
+  assert(notes.midnightSky.b >= notes.midnightSky.r, `the night sky is not warm: ${JSON.stringify(notes.midnightSky)}`);
+  assert(sky.state.light.body === 'moon', `the moon carries the night: ${JSON.stringify(sky.state.light)}`);
+
+  // ── stars: the one thing only the shader can produce ─────────────────────
+  lookUp();
+  const starsOn = await capture();
+  sky.setProp('stars', false);
+  await delay(250);
+  const starsOff = await capture();
+  notes.starPixels = differing(starsOn, starsOff);
+  assert(notes.starPixels > 8, `stars draw on a clear night: ${notes.starPixels} pixels`);
+  sky.setProp('stars', true);
+
+  // ── weather ──────────────────────────────────────────────────────────────
+  sky.setTime(12);
+  await delay(400);
+  notes.clearScene = await captureScene();
+  notes.clearSky = await captureSky();
+  sky.setWeather('storm', { transition: 0 });
+  await until(() => sky.state.weather.current === 'storm' && sky.state.weather.blend >= 1, 'the storm arrives');
+  await delay(600);
+  notes.stormScene = await captureScene();
+  notes.stormSky = await captureSky();
+  assert(notes.stormScene.luma < notes.clearScene.luma * 0.75,
+    `a storm darkens the lit scene: ${JSON.stringify(notes.stormScene)} vs ${JSON.stringify(notes.clearScene)}`);
+  assert(sky.state.light.intensity < 0.2, `a storm takes the sun: ${sky.state.light.intensity}`);
+  notes.rain = sky.layers.rain.mesh.count;
+  assert(notes.rain > 100, `rain draws instances: ${notes.rain}`);
+  // ⚠ 1, NOT 0: one instance is kept drawable from attach so this layer's
+  // pipelines compile through the ordinary render path instead of on the frame
+  // it first snows. At amount 0 it is fully transparent.
+  assert(sky.layers.snow.mesh.count <= 1, `a warm storm does not snow: ${sky.layers.snow.mesh.count}`);
+
+  // Rain has to reach the picture, not just the instance count.
+  lookAtScene();
+  sky.setProp('precipitation', false);
+  await delay(300);
+  const dry = await capture();
+  sky.setProp('precipitation', true);
+  await delay(300);
+  const wet = await capture();
+  notes.rainPixels = differing(dry, wet);
+  assert(notes.rainPixels > 200, `rain reaches the pixels: ${notes.rainPixels}`);
+
+  // ── precipitation reacts to the light it falls in ────────────────────────
+  // ⛔ THE BUG THIS PINS: rain and snow were drawn with a fixed tint scaled by
+  // a sky term with a 0.35 FLOOR, so they ignored the sun completely and stayed
+  // a third lit at midnight — reported as "snow and rain do not react to
+  // lighting at all" and "remain fully white even at night".
+  // A light shower, so there is still a sun to scatter: the full `rain` preset
+  // deliberately takes the sun away, which leaves nothing for a phase function
+  // to do.
+  sky.setWeather('rain', { transition: 0 });
+  sky.setProp('weatherIntensity', 0.4);
+  sky.setTime(12);
+  await until(() => sky.layers.rain.mesh.count > 100, 'rain starts', 8000);
+  await delay(800);
+  const lookYaw = (yaw) => {
+    engine.camera.position.set(0, 2, 0);
+    camera.rotation.set(0, 0, 0);
+    camera.rotateY(yaw);
+    camera.rotateX(0.12);
+  };
+  // ⚠ MEASURE THE DROPS, NOT THE FRAME. The sky behind them changes with the
+  // view direction too, so the honest signal is what the precipitation ADDS:
+  // the same view with the layer off is the control.
+  //
+  // ⚠ AND AS THE MEAN ABSOLUTE CHANGE PER PIXEL, not the change in the frame
+  // average: drops cover a few percent of the screen, so their contribution to
+  // an average is indistinguishable from noise (measured 0.01 versus -0.06).
+  // What "brighter" means for rain is how hard it paints the pixels it covers.
+  const dropContribution = async (yaw) => {
+    lookYaw(yaw);
+    const withRain = await capture();
+    sky.setProp('precipitation', false);
+    await delay(250);
+    lookYaw(yaw);
+    const without = await capture();
+    sky.setProp('precipitation', true);
+    await delay(250);
+    let sum = 0;
+    const n = withRain.length / 4;
+    for (let i = 0; i < withRain.length; i += 4) {
+      const a = withRain[i] * 0.2126 + withRain[i + 1] * 0.7152 + withRain[i + 2] * 0.0722;
+      const b = without[i] * 0.2126 + without[i + 1] * 0.7152 + without[i + 2] * 0.0722;
+      sum += Math.abs(a - b);
+    }
+    return +(sum / n).toFixed(3);
+  };
+  // ⚠ MINUS the azimuth. `camera.rotateY(θ)` points the camera at
+  // (−sinθ, 0, −cosθ) while an azimuth A (clockwise from north) is
+  // (sin A, 0, −cos A), so looking AT it means θ = −A. Getting this backwards
+  // measured the two directions the wrong way round and reported the phase
+  // function as inverted when the shader was right.
+  const sunYaw = -THREE.MathUtils.degToRad(sky.state.sun.azimuth);
+  const towards = await dropContribution(sunYaw);
+  const away = await dropContribution(sunYaw + Math.PI);
+  notes.rainLight = { towards, away };
+  // Forward scattering: a drop is a lens, so it is far brighter with the sun
+  // behind it than in front of it.
+  assert(towards > away * 1.15, `rain is brighter looking into the sun: ${JSON.stringify(notes.rainLight)}`);
+
+  // …and it is not lit at all at night.
+  const noonDrops = await dropContribution(sunYaw);
+  sky.setTime(0);
+  await delay(1200);
+  const nightDrops = await dropContribution(sunYaw);
+  notes.rainNight = { noon: noonDrops, night: nightDrops };
+  // ⚠ Half, not a tenth: this metric is CONTRAST against the background, and at
+  // night the background is dark — so rain that is ~17× dimmer in absolute
+  // terms still paints visibly, which is exactly what rain at night does.
+  assert(nightDrops < noonDrops * 0.55, `rain goes dark at night: ${JSON.stringify(notes.rainNight)}`);
+  sky.setProp('weatherIntensity', 1);
+  sky.setTime(12);
+  await delay(700);
+
+  // ── naming a weather is an intent ────────────────────────────────────────
+  // ⛔ THE BUG THIS PINS: the scene's default day is a June afternoon at 45° N,
+  // about 26 °C, and picking "snow" used to hand back RAIN because the
+  // thermometer overrode the choice. The user's report was "snow looks more
+  // like rain, with long stripes rather than round snowflakes" — it WAS rain.
+  sky.setWeather('snow', { transition: 0 });
+  await until(() => sky.layers.snow.mesh.count > 100, 'choosing snow gives snow', 8000);
+  notes.temperature = sky.state.weather.temperature;
+  assert(sky.layers.rain.mesh.count <= 1, `and no rain at all: ${sky.layers.rain.mesh.count} drops`);
+  assert(notes.temperature <= 0, `the air agrees that it is snowing: ${notes.temperature} °C`);
+
+  // ── the world goes white ─────────────────────────────────────────────────
+  const beforeSettling = sky.state.accumulation.snowDepth;
+  sky.setProp('dayLength', 2);                       // run the clock so it settles
+  await until(() => sky.state.accumulation.snowDepth > beforeSettling + 0.01, 'snow settles on the ground', 12000);
+  sky.accumulation.snowDepth = 0.12;                 // a fully covered world
+  sky.setProp('dayLength', 0);
+  sky.setTime(12);
+  // ⭐ AND IT MUST ARRIVE SMOOTHLY. The accumulator integrates GAME time, so a
+  // long frame (a compile wave, a scene load) hands it a large step — the user
+  // saw the world turn white "within one frame". The surface uniforms are eased
+  // with a fixed time constant, so no single frame may move them far however
+  // the simulation behind them jumps.
+  const ramp = [sky.state.surfaces.snow];
+  const rampStarted = performance.now();
+  while (sky.state.surfaces.snow < 0.86 && performance.now() - rampStarted < 30000) {
+    await delay(50);
+    ramp.push(sky.state.surfaces.snow);
+  }
+  const jumps = ramp.slice(1).map((v, i) => v - ramp[i]);
+  notes.snowRamp = { steps: ramp.length, biggestJump: +Math.max(...jumps).toFixed(3) };
+  assert(sky.state.surfaces.snow > 0.85, `the surface uniform reaches full cover: ${sky.state.surfaces.snow}`);
+  assert(ramp.length > 12, `and it takes time to get there: ${ramp.length} samples`);
+  assert(notes.snowRamp.biggestJump < 0.2, `with no step change: ${JSON.stringify(notes.snowRamp)}`);
+  await delay(300);
+  notes.snowySurface = await captureGround();
+  notes.surfaceSnowUniform = sky.state.surfaces.snow;
+  sky.setProp('surfaces', false);
+  await delay(500);
+  notes.bareSurface = await captureGround();
+  // The only honest comparison is the SAME weather and the SAME light with the
+  // surface layer switched off — anything else is measuring the sky.
+  assert(notes.snowySurface.luma > notes.bareSurface.luma * 1.4,
+    `snow covers the world: ${notes.snowySurface.luma} vs bare ${notes.bareSurface.luma}`);
+  assert(notes.snowySurface.b > notes.bareSurface.b * 1.5, 'and it is white, not merely brighter');
+  sky.setProp('surfaces', true);
+  await delay(500);
+
+  // ── rain darkens what it falls on ────────────────────────────────────────
+  // ⚠ CLEAR THE WEATHER FIRST. Zeroing the accumulator while it is still
+  // snowing just refills it on the next frame, and the wait below never ends.
+  sky.setWeather('clear', { transition: 0 });
+  sky.accumulation.snowDepth = 0;
+  sky.accumulation.wetness = 0;
+  await until(() => sky.state.surfaces.snow < 0.05, 'the snow melts away', 25000);
+  // ⚠ Long enough for the eased sun occlusion to relax as well as the weather:
+  // a leftover cloud shadow from the previous phase dims the "dry" baseline and
+  // the comparison then measures the sky rather than the ground.
+  await delay(1400);
+  const dryWorld = await captureGround();
+  // ⚠ HOLD the accumulator while the eased uniform catches up: clear weather
+  // dries the ground faster than the 4 s ease fills it, so a single assignment
+  // never gets there.
+  const soakStarted = performance.now();
+  while (sky.state.surfaces.wetness < 0.86 && performance.now() - soakStarted < 30000) {
+    sky.accumulation.wetness = 1;
+    await delay(50);
+  }
+  assert(sky.state.surfaces.wetness > 0.85, `the ground soaks through: ${sky.state.surfaces.wetness}`);
+  await delay(200);
+  const wetWorld = await captureGround();
+  notes.wet = { dry: dryWorld.luma, wet: wetWorld.luma };
+  assert(wetWorld.luma < dryWorld.luma * 0.9, `rain darkens the ground: ${JSON.stringify(notes.wet)}`);
+  sky.accumulation.wetness = 0;
+
+  // ── clouds ───────────────────────────────────────────────────────────────
+  sky.setWeather('overcast', { transition: 0 });
+  await delay(700);
+  lookUp();
+  const cloudy = await capture();
+  sky.setProp('clouds', false);
+  await delay(500);
+  const cloudless = await capture();
+  notes.cloudPixels = differing(cloudy, cloudless);
+  assert(notes.cloudPixels > 500, `the cloud layer paints the sky: ${notes.cloudPixels}`);
+  sky.setProp('clouds', true);
+
+  // ⛔ AND A CLEAR SKY HAS NO CLOUDS IN IT. The first cut thresholded one noise
+  // plane, so at low coverage only the top 1 % of a Gaussian survived — a
+  // handful of small round lit blobs, reported as "random colour circles in
+  // the sky". Clear weather must differ from clouds-off by almost nothing.
+  sky.setWeather('clear', { transition: 0 });
+  await delay(700);
+  const clearWithClouds = await capture();
+  sky.setProp('clouds', false);
+  await delay(400);
+  const clearWithout = await capture();
+  notes.clearSkyCloudPixels = differing(clearWithClouds, clearWithout);
+  // ⛔ ZERO, not "few". The user reported "random colour spots in the sky" twice;
+  // the second time they were the handful of blobs that survived a 3 % coverage
+  // — the brightest tail of the field, lit by whatever the sun was doing. A
+  // clear sky must differ from clouds-off by NOTHING.
+  assert(notes.clearSkyCloudPixels < 50,
+    `a clear sky is clear: ${notes.clearSkyCloudPixels} pixels of cloud`);
+  sky.setProp('clouds', true);
+
+  // ── how much sky a "fair" day actually covers ────────────────────────────
+  // Coverage is meant to be readable as a fraction of the sky (see the
+  // quantile fit in `skyNode.js`), so a fair-weather sky should be scattered
+  // cloud: clearly present, nowhere near a lid.
+  sky.setWeather('fair', { transition: 0 });
+  await delay(700);
+  lookUp();
+  const fairSky = await capture();
+  sky.setProp('clouds', false);
+  await delay(400);
+  const fairBare = await capture();
+  sky.setProp('clouds', true);
+  notes.fairCloudFraction = +(differing(fairSky, fairBare) / (fairSky.length / 4)).toFixed(3);
+  assert(notes.fairCloudFraction > 0.08 && notes.fairCloudFraction < 0.72,
+    `a fair sky is scattered cloud: ${notes.fairCloudFraction * 100}% of the sky`);
+
+  // ── the sun goes behind a cloud ──────────────────────────────────────────
+  // ── cloud shadows on the world ───────────────────────────────────────────
+  // ⛔ FIRST, THE RISK THIS FEATURE CARRIES: it folds a cloud term into the
+  // sun's own `shadow.shadowNode`, and setting that node WITHOUT rebuilding
+  // three's own would silently delete every cast shadow in the scene.
+  sky.setWeather('clear', { transition: 0 });
+  sky.setTime(11);
+  await delay(900);
+  const postMesh = post.getComponent('mesh');
+  const withCastShadow = await captureGround();
+  postMesh.setProp('castShadow', false);
+  await delay(500);
+  const withoutCastShadow = await captureGround();
+  postMesh.setProp('castShadow', true);
+  await delay(400);
+  notes.castShadow = { on: +withCastShadow.luma.toFixed(2), off: +withoutCastShadow.luma.toFixed(2) };
+  assert(withCastShadow.luma < withoutCastShadow.luma * 0.995,
+    `the scene still casts real shadows: ${JSON.stringify(notes.castShadow)}`);
+
+  // The cloud's own shadow, moving across the ground.
+  //
+  // ⚠ MEASURED UNDER *FAIR* WEATHER, AND AS A SPREAD. Two things the first cut
+  // got wrong: under `cloudy` the sun is only a fraction of what lights the
+  // ground (the sky and the ambient carry the rest), so even a total cloud
+  // shadow moves the average by ~7 % and a `< 0.9` assertion could never pass;
+  // and a cloud shadow is kilometres across, so a single patch of ground is
+  // either in it or out of it — the signal is the DIFFERENCE BETWEEN PLACES,
+  // not the change at one place.
+  sky.setWeather('fair', { transition: 0 });
+  await delay(900);
+  assert(sky.state.light.cloudShadows === 'spatial',
+    `cloud shadows are per-pixel: ${sky.state.light.cloudShadows}`);
+  // ⛔ MEASURED ACROSS PLACES, NOT BY TOGGLING THE FEATURE. Two dead ends first:
+  // a cloud shadow is kilometres wide, so counting changed pixels in a small
+  // patch reports a handful either way; and toggling `cloudShadows` off does
+  // NOT give a clean control, because the component then falls back to the
+  // CPU-sampled GLOBAL dimming — the two roughly cancel and every ratio came
+  // out at exactly 1.000. The ground here is one flat plane under one sun, so
+  // any difference in brightness BETWEEN PLACES is the cloud's shadow and
+  // nothing else.
+  const places = [];
+  for (const x of [0, 1200, 2400, 3600, 4800, 6000, 7200, 8400]) {
+    // ⚠ THE GROUND HAS TO COME TOO. The plane is 200 m across, so a camera
+    // walked a kilometre is looking at empty background — which is identical
+    // at every position and made this test pass while measuring nothing.
+    ground.object3D.position.x = x;
+    post.object3D.position.x = x - 2;
+    engine.camera.position.set(x, 40, 0);
+    camera.lookAt(x, 0, 0.001);
+    await delay(180);
+    places.push(+(average(await capture()).luma).toFixed(2));
+  }
+  ground.object3D.position.x = 0;
+  post.object3D.position.x = -2;
+  const brightest = Math.max(...places), darkest = Math.min(...places);
+  notes.cloudShadowPlaces = places;
+  notes.cloudShadowSpread = +((brightest - darkest) / brightest).toFixed(3);
+  assert(notes.cloudShadowSpread > 0.15,
+    `the cloud's shadow falls on some places and not others: ${places}`);
+
+  // And with the spatial term switched off, the CPU-sampled global dimming
+  // stands in — the fallback a GI-traced sun gets.
+  sky.setProp('cloudShadows', false);
+  sky.setWeather('fair', { transition: 0 });
+  await delay(800);
+  const shades = [];
+  for (let i = 0; i < 90; i++) {
+    // Walking, rather than waiting for the wind — and it only works because
+    // the cloud field is anchored to the WORLD (see `layerUv`).
+    engine.camera.position.set(i * 420, 2, 0);
+    await delay(30);
+    shades.push(sky.state.light.cloudShade);
+  }
+  notes.cloudShade = { min: +Math.min(...shades).toFixed(3), max: +Math.max(...shades).toFixed(3) };
+  // Thresholds kept off the knife edge: the walk samples a random slice of a
+  // cloud field, so what is being asserted is "the sun measurably dims and
+  // measurably recovers", not a particular number.
+  assert(notes.cloudShade.max > 0.2, `the sun goes behind a cloud: ${JSON.stringify(notes.cloudShade)}`);
+  assert(notes.cloudShade.max - notes.cloudShade.min > 0.15,
+    `and comes back out: ${JSON.stringify(notes.cloudShade)}`);
+  sky.setProp('cloudShadows', true);
+  engine.camera.position.set(0, 2, 12);
+
+  // ── lightning ────────────────────────────────────────────────────────────
+  let struck = null;
+  engine.on('atmosphere-lightning', payload => { struck = payload; });
+  sky.strike(1);
+  await delay(60);
+  assert(struck && struck.thunderDelay > 0, `a strike reports its thunder delay: ${JSON.stringify(struck)}`);
+  assert(sky.state.lightning.flash > 0.2, `the flash is live: ${sky.state.lightning.flash}`);
+  await delay(1200);
+  assert(sky.state.lightning.flash < 0.05, `and it decays: ${sky.state.lightning.flash}`);
+
+  // ── what the sky costs ───────────────────────────────────────────────────
+  // Not a benchmark — a tripwire. The sky is a full-screen shader with a
+  // multi-slice cloud slab in it, and the project's floor is 60 fps, so a
+  // change that made it ten times more expensive should fail here rather than
+  // in someone's viewport.
+  // Timed at a REAL resolution, because the question is whether it fits a
+  // 1080p frame and a full-screen shader's cost is very nearly linear in
+  // pixels. A 400x250 measurement extrapolated 20x is not an answer.
+  const big = new THREE.RenderTarget(1600, 900);
+  big.texture.colorSpace = THREE.SRGBColorSpace;
+  renderer.initRenderTarget(big);
+  const timeFrames = async (count, target = big) => {
+    engine.stop();
+    renderer.setRenderTarget(target);
+    renderer.render(engine.scene, camera);
+    await renderer.backend.device.queue.onSubmittedWorkDone();
+    const started = performance.now();
+    for (let i = 0; i < count; i++) renderer.render(engine.scene, camera);
+    await renderer.backend.device.queue.onSubmittedWorkDone();
+    const each = (performance.now() - started) / count;
+    renderer.setRenderTarget(null);
+    engine.start();
+    return each;
+  };
+  sky.setWeather('cloudy', { transition: 0 });
+  await delay(600);
+  lookUp();
+  const withSky = await timeFrames(90);
+  sky.setProp('sky', false);
+  await delay(400);
+  const withoutSky = await timeFrames(90);
+  sky.setProp('sky', true);
+  // …and looking down, where the branch should make the deck cost nothing.
+  lookDown();
+  await delay(200);
+  const facingGround = await timeFrames(90);
+  sky.setProp('sky', false);
+  await delay(300);
+  const facingGroundBare = await timeFrames(90);
+  sky.setProp('sky', true);
+  lookUp();
+  notes.frameMs = {
+    resolution: '1600x900',
+    skyFillingTheFrame: +(withSky - withoutSky).toFixed(3),
+    lookingAtTheGround: +(facingGround - facingGroundBare).toFixed(3),
+  };
+  // The floor is 60 fps = 16.6 ms for EVERYTHING, and a sky that eats a
+  // quarter of it before the scene is drawn is not affordable.
+  assert(notes.frameMs.skyFillingTheFrame < 3.5, `the sky fits a 1600x900 frame: ${JSON.stringify(notes.frameMs)}`);
+
+  // ── the wind every other system reads ────────────────────────────────────
+  sky.setWeather('storm', { transition: 0 });
+  await delay(400);
+  const { sceneWind } = await import('/src/engine/vfx/clothWind.js');
+  const wind = sceneWind(engine);
+  notes.wind = wind;
+  assert(wind && Math.hypot(wind.vector[0], wind.vector[2]) > 5, `a storm blows: ${JSON.stringify(wind)}`);
+  assert(engine.settings.wind.vector[2] === 2, 'the AUTHORED scene wind is untouched — a gust must never be saved into the scene');
+
+  // ── give it all back ─────────────────────────────────────────────────────
+  // ⚠ Hold the reference BEFORE the detach: `sky.skyTexture` is null afterwards,
+  // and `null !== null` would fail an assertion the code actually satisfies.
+  const skyTexture = sky.skyTexture;
+  const savedEnvironment = engine.scene.environment;
+  assert(savedEnvironment === skyTexture, 'the environment is the sky right up to the detach');
+  skyEntity.removeComponent('atmosphere');
+  await delay(200);
+  assert(!engine.scene.backgroundNode, 'detaching removes the background node');
+  assert(engine.scene.environment !== skyTexture, 'detaching removes the environment map');
+  assert(engine.scene.background === savedBackground, 'the scene keeps the background it had');
+  assert(!engine.windOverride, 'detaching hands the wind back');
+  const after = await captureSky();
+  assert(Math.abs(after.luma - notes.noonSky.luma) > 1, 'the sky is really gone');
+
+  assert(errors.length === 0, `WebGPU validation errors: ${errors.join(' | ')}`);
+  globalThis.__VFX_SMOKE_RESULT__ = { pass: true, ...notes };
+  document.querySelector('#status').textContent = 'ATMOSPHERE-SMOKE PASS';
+  console.log('ATMOSPHERE-SMOKE PASS', JSON.stringify(notes));
+} catch (error) {
+  globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: error?.stack ?? String(error), ...notes };
+  document.querySelector('#status').textContent = `ATMOSPHERE-SMOKE FAIL: ${error?.message ?? error}`;
+  console.error('ATMOSPHERE-SMOKE FAIL', error);
+}
+</script></body></html>

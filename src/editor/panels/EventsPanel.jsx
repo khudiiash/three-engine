@@ -21,6 +21,7 @@ import { useProjectStore } from "../store/projectStore.js";
 import { engine } from "../engineInstance.js";
 import { EVENT_PARAM_TYPES, EVENT_SCOPES } from "../../engine/events/catalog.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * The project's event catalog, and a live tap on what's firing.
  *
@@ -398,7 +399,7 @@ function EventEditor({ event }) {
 
       <div className="events-field">
         <label>Scope</label>
-        <select
+        <Select
           value={event.scope}
           onChange={(e) => update(event.name, { scope: e.target.value })}
           title={
@@ -412,7 +413,7 @@ function EventEditor({ event }) {
               {label}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
 
       <div className="events-field">
@@ -457,7 +458,7 @@ function EventEditor({ event }) {
             onChange={(e) => updateParam(event.name, index, { name: e.target.value })}
             title="Parameter name — becomes the argument's label in autocomplete"
           />
-          <select
+          <Select
             value={param.type}
             onChange={(e) => updateParam(event.name, index, { type: e.target.value })}
           >
@@ -466,7 +467,7 @@ function EventEditor({ event }) {
                 {label}
               </option>
             ))}
-          </select>
+          </Select>
           <label className="events-param-optional" title="Optional parameters must come last">
             <input
               type="checkbox"

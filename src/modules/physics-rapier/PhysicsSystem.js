@@ -217,6 +217,13 @@ export class PhysicsSystem {
     this.kinematicBodies = []; // { entity, body, prev, delta }
     this.characters = []; // { entity, cc } — kinematic character controllers
     this.joints = []; // { entity, joint }
+    // Components that own Rapier bodies directly rather than through an entity
+    // — Ragdoll's bone capsules, Chain's per-instance links. See rig.js for
+    // why those cannot be entities, and `registerRig` for the contract.
+    this.rigs = new Set();
+    // entity -> newtons. Colliders belonging to these entities are built with
+    // Rapier's contact-force events armed; see `watchContactForce`.
+    this.contactForceEntities = new Map();
     // entity -> RAPIER.RigidBody. Held on the system rather than being a local
     // of the world build, because entities now arrive after it: a pooled bullet
     // spawned mid-play needs the same three passes the build does, and a child
@@ -250,6 +257,14 @@ export class PhysicsSystem {
       engine.on("entity-despawned", (entity) => this.removeEntity(entity)),
       engine.on("component-added", (info) => this.#componentStructureChanged(info)),
       engine.on("component-removed", (info) => this.#componentStructureChanged(info)),
+      // Heightfields read Terrain's live CPU buffer. Brush previews deliberately
+      // defer native collision work; the committed stroke (including scripts)
+      // replaces the heightfield before the next simulation/query sync.
+      engine.on("terrain-surface-changed", (info) => {
+        if (info?.phase !== "committed") return;
+        const entity = engine.getEntity(info.entityId);
+        if (entity?.getComponent("collider")?.props.shape === "heightfield") this.markDirty(entity, { subtree: false });
+      }),
       // Mesh assets and legacy OBJ/GLB components attach asynchronously. Cook
       // their collision after the real geometry arrives, not from a placeholder.
       engine.on("model-loaded", (entity) => {
@@ -259,6 +274,13 @@ export class PhysicsSystem {
       }),
       engine.on("component-changed", (info) => {
         if (!info?.entityId) return;
+        if (info.componentType === "terrain") {
+          if (["heights", "size", "resolution"].includes(info.key)) {
+            const entity = engine.getEntity(info.entityId);
+            if (entity?.getComponent("collider")?.props.shape === "heightfield") this.markDirty(entity, { subtree: false });
+          }
+          return;
+        }
         if (info.componentType === "rigidbody" || info.componentType === "charactercontroller") {
           this.#queueDefaultColliders();
           return;
@@ -286,9 +308,100 @@ export class PhysicsSystem {
       }),
     ];
     engine.physics = this;
+    // ⚠ RIGS THAT ATTACHED BEFORE RAPIER FINISHED LOADING. The module's setup
+    // resolves as soon as the JS module is in memory and installs this system
+    // several hundred milliseconds later, when the wasm is up — so a scene's
+    // Ragdolls and Chains have already run their `onAttach`, found
+    // `engine.physics` undefined, and registered with nobody. Adopt them here
+    // rather than making every rig component poll for the system to appear.
+    for (const entity of engine.entities.values()) {
+      for (const component of entity.components?.values?.() ?? []) {
+        if (component?.constructor?.physicsRig) this.rigs.add(component);
+      }
+    }
     this.#queueDefaultColliders();
     this.prewarmAutoColliders();
     if (engine.playing) this.#build();
+  }
+
+  /**
+   * Registers a component that builds its own Rapier bodies (see rig.js).
+   *
+   * The component supplies `buildRig(physics)`, `clearRig()` and optionally
+   * `syncRig(dt)`, and this system calls them when the world is built, torn
+   * down and stepped. Registering while a world already exists builds
+   * immediately — a ragdoll added mid-game has to work in the frame it
+   * appears, exactly like a spawned bullet's body does.
+   */
+  registerRig(component) {
+    if (!component || this.rigs.has(component)) return;
+    this.rigs.add(component);
+    if (this.world) this.#buildRig(component);
+  }
+
+  unregisterRig(component) {
+    if (!this.rigs.delete(component)) return;
+    try {
+      component.clearRig?.();
+    } catch (error) {
+      console.error(`Physics rig on "${component.entity?.name}" failed to clear:`, error);
+    }
+  }
+
+  #buildRig(component) {
+    try {
+      component.buildRig?.(this);
+    } catch (error) {
+      // One broken rig must not take the world build (or the frame) with it.
+      console.error(`Physics rig on "${component.entity?.name}" failed to build:`, error);
+    }
+  }
+
+  /**
+   * Drops every trace of a collider handle from this system's bookkeeping.
+   * Public for `PhysicsRig.clear`, whose colliders are freed with their body
+   * and so must be forgotten WITHOUT being removed a second time.
+   */
+  forgetCollider(handle) {
+    this.#forgetColliderContacts(handle);
+    this.colliderEntity.delete(handle);
+    this.colliderLayer.delete(handle);
+  }
+
+  /**
+   * Asks for CONTACT FORCE reports on an entity's colliders, above `threshold`
+   * newtons. Destructible uses it to know how hard it was hit.
+   *
+   * ⚠ NOT ON BY DEFAULT, AND THAT IS THE POINT. Rapier reports a contact force
+   * event for every manifold above the threshold, every step — a scene-wide
+   * opt-in would put a callback and a force accumulation on every crate
+   * resting on every floor. The flag is a COLLIDER property, so arming it
+   * re-builds the entity's colliders; that is one rebuild when the component
+   * attaches, not per frame.
+   */
+  watchContactForce(entity, threshold) {
+    if (!entity) return;
+    const previous = this.contactForceEntities.get(entity);
+    if (previous === threshold) return;
+    this.contactForceEntities.set(entity, threshold);
+    this.markDirty(entity, { subtree: false });
+  }
+
+  unwatchContactForce(entity) {
+    if (!this.contactForceEntities.delete(entity)) return;
+    this.markDirty(entity, { subtree: false });
+  }
+
+  /**
+   * The force threshold for a collider on `entity` hanging off `bodyEntity`,
+   * or 0 for the usual case of nobody asking. A child collider on a compound
+   * body inherits its body owner's watch — a destructible wall whose collision
+   * lives on a child mesh still has to hear the impact.
+   */
+  #contactForceThreshold(entity, bodyEntity) {
+    return this.contactForceEntities.get(entity) ?? (bodyEntity && bodyEntity !== entity
+      ? this.contactForceEntities.get(bodyEntity) ?? 0
+      : 0);
   }
 
   dispose() {
@@ -974,6 +1087,10 @@ export class PhysicsSystem {
     for (const entity of entities) this.#createColliders(entity);
     this.#applyFallbackMass(entities);
     this.#buildJoints(entities);
+    // Fourth: components that own their own bodies. After the joints, because
+    // a rig may pin itself to a body the entity passes built (a chain hanging
+    // from a hook, a ragdoll whose root follows a Rigidbody).
+    for (const rig of this.rigs) this.#buildRig(rig);
 
     // Scene queries read acceleration structures that `step` maintains, so a
     // world that has never stepped answers EVERY raycast with null — including
@@ -1008,7 +1125,7 @@ export class PhysicsSystem {
       this.#buildCharacter(entity, cc);
       return;
     }
-    const rb = entity.getComponent("rigidbody");
+    const rb = this.#rigidbody(entity);
     const col = entity.getComponent("collider");
     const implicit = this.#hasAutoColliderSource(entity);
     if (!rb && (!col || !col.enabled) && !implicit) return;
@@ -1052,6 +1169,22 @@ export class PhysicsSystem {
     else if (type === "kinematic") {
       this.kinematicBodies.push({ entity, body, prev: [_pos.x, _pos.y, _pos.z], delta: [0, 0, 0] });
     }
+  }
+
+  /**
+   * An entity's Rigidbody, or null when it is switched off.
+   *
+   * ⚠ A DISABLED COMPONENT MUST DO NOTHING (see Component's `enabled`), and
+   * this one used to keep simulating: `getComponent("rigidbody")` answers for a
+   * component whose eye is shut, so a body was still built, gravity still
+   * pulled on it and the entity still moved. An entity with a collider and a
+   * disabled Rigidbody becomes what it looks like — static level geometry.
+   * `DestructibleComponent` relies on this to take a broken wall out of the
+   * world without removing the author's component.
+   */
+  #rigidbody(entity) {
+    const rb = entity.getComponent?.("rigidbody");
+    return rb?.enabled ? rb : null;
   }
 
   /** Pass 2 for one entity: its collider, on its own body or its ancestor's. */
@@ -1377,7 +1510,7 @@ export class PhysicsSystem {
 
   #ancestorBodyEntity(entity) {
     for (let p = entity.parent; p; p = p.parent) {
-      if (p.getComponent("rigidbody")) return p;
+      if (this.#rigidbody(p)) return p;
     }
     return null;
   }
@@ -1425,7 +1558,7 @@ export class PhysicsSystem {
     const cooked = this.#getAutoGeometry(entity);
     if (!cooked) return null;
 
-    const bodyType = bodyEntity.getComponent?.("rigidbody")?.props?.bodyType ?? "fixed";
+    const bodyType = this.#rigidbody(bodyEntity)?.props?.bodyType ?? "fixed";
     const mode = this.#autoCollisionMode(entity);
     // A standalone fixed surface keeps exact holes/doorways. Anything moving,
     // or acting as a child shape on a compound body, must be a solid convex
@@ -1455,16 +1588,18 @@ export class PhysicsSystem {
       return null;
     }
 
+    const forceThreshold = this.#contactForceThreshold(entity, bodyEntity);
     for (const { desc } of shapes) {
       desc
         .setFriction(AUTO_COLLIDER_DEFAULTS.friction)
         .setRestitution(AUTO_COLLIDER_DEFAULTS.restitution)
         .setSensor(false)
         .setCollisionGroups(this.layers.groupsFor(AUTO_COLLIDER_DEFAULTS.layer))
-        .setActiveEvents(this.RAPIER.ActiveEvents.COLLISION_EVENTS);
+        .setActiveEvents(this.#activeEvents(forceThreshold));
+      if (forceThreshold > 0) desc.setContactForceEventThreshold(forceThreshold);
     }
 
-    const rb = bodyEntity.getComponent?.("rigidbody");
+    const rb = this.#rigidbody(bodyEntity);
     if (entity === bodyEntity) {
       // The label arms the zero-volume guard here too: a convex hull cannot be
       // built from coplanar points, but a very THIN one can still round to no
@@ -1509,7 +1644,7 @@ export class PhysicsSystem {
       ? collisionGeometryBounds(entity.object3D)
       : null;
     const fitSize = autoFit && fitBounds ? fitBounds.getSize(new THREE.Vector3()) : null;
-    const bodyType = bodyEntity.getComponent?.("rigidbody")?.props?.bodyType ?? "fixed";
+    const bodyType = this.#rigidbody(bodyEntity)?.props?.bodyType ?? "fixed";
     // ── A DYNAMIC BODY KEEPS THE SHAPE IT WAS AUTHORED WITH (2026-09-07) ────
     //
     // `concave`, `mesh` and `custom` used to be silently downgraded to a
@@ -1666,27 +1801,32 @@ export class PhysicsSystem {
         console.warn(`Collider on "${entity.name}": heightfield shape requires a Terrain component`);
         return null;
       }
+      // Authored resolution may be fractional or below the minimum. Rapier
+      // must use the clamped grid that actually produced heightsArray.
+      const resolution = terrain._gridResolution;
       desc = RAPIER.ColliderDesc.heightfield(
-        terrain.resolution,
-        terrain.resolution,
-        toColumnMajor(terrain.heightsArray, terrain.resolution),
+        resolution,
+        resolution,
+        toColumnMajor(terrain.heightsArray, resolution),
         { x: (terrain.props.size ?? 50) * sx, y: sy, z: (terrain.props.size ?? 50) * sz },
       );
     }
     const built = descs ?? (desc ? [desc] : []);
     if (!built.length) return null;
 
+    const forceThreshold = this.#contactForceThreshold(entity, bodyEntity);
     for (const builtDesc of built) {
       builtDesc
         .setFriction(friction)
         .setRestitution(restitution)
         .setSensor(!!isSensor)
         .setCollisionGroups(this.layers.groupsFor(col.props.layer))
-        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+        .setActiveEvents(this.#activeEvents(forceThreshold));
+      if (forceThreshold > 0) builtDesc.setContactForceEventThreshold(forceThreshold);
     }
 
     // A dynamic body's mass comes from its Rigidbody, not shape density.
-    const rb = bodyEntity.getComponent("rigidbody");
+    const rb = this.#rigidbody(bodyEntity);
     if (entity === bodyEntity) applyColliderMass(rb, built, massWeights, entity.name);
 
     // Collider pose relative to its body (child colliders + local offset).
@@ -1808,6 +1948,16 @@ export class PhysicsSystem {
   }
 
   #teardown() {
+    // Rigs first, while their handles are still valid: they hold bodies and
+    // joints the world is about to free, and a rig that learns about the stop
+    // afterwards would be freeing handles into a dead world.
+    for (const rig of this.rigs) {
+      try {
+        rig.clearRig?.();
+      } catch (error) {
+        console.error(`Physics rig on "${rig.entity?.name}" failed to clear:`, error);
+      }
+    }
     for (const { entity } of [...this.dynamicBodies, ...this.kinematicBodies]) {
       const rb = entity.getComponent("rigidbody");
       if (rb) rb.body = null;
@@ -1910,6 +2060,10 @@ export class PhysicsSystem {
       this.world.step(this.eventQueue);
       stepped = true;
       this.#dispatchEvents();
+      // Inside the substep loop, not after it: Rapier's queue holds only the
+      // LAST step's events, so a hit that happened in the first of four
+      // substeps is gone by the time the loop ends.
+      this.#dispatchContactForces();
     }
     if (!stepped) return;
 
@@ -1943,6 +2097,18 @@ export class PhysicsSystem {
         obj.position.copy(_pos).applyMatrix4(_mat.copy(entity.parent.object3D.matrixWorld).invert());
       } else {
         obj.position.copy(_pos);
+      }
+    }
+
+    // Rigs read back last: a ragdoll poses bones inside an entity whose own
+    // transform may have just been written above, and an instanced chain
+    // writes matrices relative to it.
+    for (const rig of this.rigs) {
+      try {
+        rig.syncRig?.(dt);
+      } catch (error) {
+        console.error(`Physics rig on "${rig.entity?.name}" failed to sync:`, error);
+        this.unregisterRig(rig);
       }
     }
   }
@@ -2011,6 +2177,73 @@ export class PhysicsSystem {
 
   #drainEvents(into) {
     this.eventQueue.drainCollisionEvents((h1, h2, started) => into.push([h1, h2, started]));
+  }
+
+  /** Which Rapier events a collider reports, given its force threshold. */
+  #activeEvents(forceThreshold) {
+    const { ActiveEvents } = this.RAPIER;
+    return forceThreshold > 0
+      ? ActiveEvents.COLLISION_EVENTS | ActiveEvents.CONTACT_FORCE_EVENTS
+      : ActiveEvents.COLLISION_EVENTS;
+  }
+
+  /**
+   * Contact forces, for the entities that asked for them.
+   *
+   * `magnitude` is the total force of the manifold in newtons over the step —
+   * "how hard", the number a destructible compares against its own strength.
+   * `point` is where it happened, which decides where the cracks start; it
+   * comes from the actual contact manifold when Rapier will give it and falls
+   * back to the midpoint between the two shapes when it will not.
+   */
+  #dispatchContactForces() {
+    if (!this.contactForceEntities.size) return;
+    // ⚠ DRAIN FIRST, ACT AFTERWARDS — AND THIS ONE IS FATAL, NOT UNTIDY. The
+    // drain callback runs INSIDE the wasm's borrow of the event queue, so
+    // anything that re-enters Rapier from in there — reading the contact
+    // manifold for the hit point, or a listener that breaks a wall and creates
+    // twenty bodies — trips "recursive use of an object detected which would
+    // lead to unsafe aliasing in rust". That leaves the module's RefCell
+    // mutably borrowed FOREVER: every later Rapier call in the session fails
+    // and only restarting clears it (see #finiteDims for the same trap from
+    // the other direction). Collecting three numbers per event and doing the
+    // work after the drain returns is the whole fix, and it is why the
+    // collision path is written the same way.
+    const events = [];
+    this.eventQueue.drainContactForceEvents?.((event) => {
+      events.push([event.collider1(), event.collider2(), event.totalForceMagnitude()]);
+    });
+    for (const [h1, h2, magnitude] of events) {
+      const a = this.colliderEntity.get(h1);
+      const b = this.colliderEntity.get(h2);
+      if (!a || !b || a === b) continue;
+      const point = this.#contactPoint(h1, h2);
+      a.getComponent("script")?.dispatch("onContactForce", b, magnitude, point);
+      b.getComponent("script")?.dispatch("onContactForce", a, magnitude, point);
+      this.engine.emit("contact-force", { a, b, magnitude, point });
+    }
+  }
+
+  /** World-space contact point for a colliding pair, as `[x, y, z]`. */
+  #contactPoint(h1, h2) {
+    const c1 = this.world.getCollider(h1);
+    const c2 = this.world.getCollider(h2);
+    let point = null;
+    try {
+      this.world.contactPair?.(c1, c2, (manifold, flipped) => {
+        if (point || !manifold?.numSolverContacts?.()) return;
+        const local = manifold.solverContactPoint(0);
+        if (local) point = [local.x, local.y, local.z];
+      });
+    } catch {
+      // Some builds refuse a pair that has already separated this step; the
+      // midpoint below is a perfectly good crack origin in that case.
+    }
+    if (point) return point;
+    const t1 = c1?.translation();
+    const t2 = c2?.translation();
+    if (!t1 || !t2) return [0, 0, 0];
+    return [(t1.x + t2.x) / 2, (t1.y + t2.y) / 2, (t1.z + t2.z) / 2];
   }
 
   #forgetColliderContacts(handle) {

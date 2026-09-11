@@ -5,6 +5,7 @@ import { useProjectStore } from "../store/projectStore.js";
 import { PACKS, downloadModel, fetchPackItems, openModelPage, packImageUrl } from "../kaykit.js";
 import { AssetPreview } from "../components/AssetPreview.jsx";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * KayKit's browse/import grid — structurally the Poly Pizza panel minus
  * credentials, with one structural difference of its own: there is no server
@@ -71,7 +72,7 @@ export function KayKitPanel() {
   return (
     <div className="ph-panel sf-panel">
       <form className="ph-toolbar" onSubmit={(event) => event.preventDefault()}>
-        <select
+        <Select
           className="ph-category"
           value={packId}
           onChange={(event) => setPackId(event.target.value)}
@@ -82,7 +83,7 @@ export function KayKitPanel() {
               {pack.title} — {pack.kind}
             </option>
           ))}
-        </select>
+        </Select>
         <div className="ph-search">
           <Search size={13} />
           <input

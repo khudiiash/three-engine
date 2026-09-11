@@ -1447,6 +1447,19 @@ export function createSrcProbeSystem({
           // §10: a BVH hit carries its SLOT; the attribution is by slot, and
           // the cell-keyed path below never runs for it.
           if (surfaces?.surfaceAtHit && hit.slot != null) return surfaces.surfaceAtHit(hit, dir);
+          // §10 BVH-only bundle: `staticSurfaceAt` (the cell-keyed grid) is null
+          // by design, and a BVH hit is attributed by SLOT above. A hit that
+          // reaches here WITHOUT a slot only happens transiently while the
+          // static BVH is still landing — the GISystem `bvhTrace` gate routes
+          // to the voxel path meanwhile, and those hits have no slot. Emitting
+          // an unattributed sample (valid 0) keeps the kernel BUILD from calling
+          // a null (`staticSurfaceAt is not a function` → the deposit pass fails
+          // to build and GI stays dark); the next rebuild, with the BVH ready,
+          // attributes it by slot. In steady state every BVH hit has a slot, so
+          // this branch never fires and shading is unchanged.
+          if (staticSurfaceAt == null) {
+            return { position: hit.exactPosition, normal: hit.normal, albedo: vec3(0), emissive: vec3(0), emitter: float(0), valid: float(0) };
+          }
           if (hit.voxel == null) {
             throw new Error(
               "srcSystem: the scene trace produced no `voxel`, so static hits have no " +
@@ -1510,7 +1523,16 @@ export function createSrcProbeSystem({
         visibility: globalThis.__giSrcNoShadow === true
           ? null
           : bvhTrace
-            ? createSrcBvhVisibility(bvhTrace.dyn, volume.world, { movers: globalThis.__giSrcBvhShadowMovers === true })
+            ? createSrcBvhVisibility(bvhTrace.dyn, volume.world, {
+              // DEFAULT ON (2026-09-11). Off, a hit's shadow ray toward a lamp
+              // ignored every mover: in the ball pool the probes saw the floor
+              // under 350 balls as fully lit, and that white flood was the whole
+              // bounce — 1.4× the path tracer's floor, walls washed out, no tint
+              // from the balls at all. Movers are analytic (~10 ALU each) in
+              // that scene; measured 65→76 fps at rest either way, so the ray
+              // is affordable. `__giSrcBvhShadowMovers = false` is the A/B.
+              movers: globalThis.__giSrcBvhShadowMovers !== false,
+            })
             : createSrcVisibility(volume.occupancyField, volume.world, {
           rayHitMode: volume.rayHitMode,
           // A shadow ray is SHORTER than a diffuse one by construction — it

@@ -925,7 +925,7 @@ body,
 /* Keyboard focus (mouse clicks don't show rings) */
 button:focus-visible,
 input:focus-visible,
-select:focus-visible {
+.tx-select:focus-visible {
   outline: 2px solid var(--accent-ring);
   outline-offset: 1px;
 }
@@ -1326,7 +1326,7 @@ select:focus-visible {
   font-size: 10px;
 }
 
-.geometry-material-popover select {
+.geometry-material-popover .tx-select {
   width: 100%;
   height: 27px;
 }
@@ -1416,7 +1416,7 @@ select:focus-visible {
   margin-left: auto;
 }
 
-.geometry-menu-field select {
+.geometry-menu-field .tx-select {
   height: 24px;
   margin-left: auto;
   max-width: 108px;
@@ -1584,23 +1584,6 @@ select:focus-visible {
   color: var(--text);
   border-color: rgba(242, 139, 48, 0.5);
   background: rgba(242, 139, 48, 0.16);
-}
-
-.geometry-brush-cursor {
-  position: absolute;
-  z-index: 6;
-  border: 1.5px solid rgba(255, 255, 255, 0.75);
-  border-radius: 999px;
-  pointer-events: none;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45) inset;
-}
-
-/* Off the surface there is nothing to sculpt, so the ring goes dim and dashed
-   rather than disappearing — otherwise the cursor looks broken near an edge. */
-.geometry-brush-cursor.off-surface {
-  border-style: dashed;
-  border-color: rgba(255, 255, 255, 0.3);
-  box-shadow: none;
 }
 
 .geometry-brush-field {
@@ -7693,7 +7676,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   font-size: 11px;
 }
 
-.ph-detail-row select {
+.ph-detail-row .tx-select {
   background: var(--bg-2);
   border: 1px solid var(--bg-3);
   border-radius: 5px;
@@ -8571,7 +8554,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   font-size: 11px;
 }
 
-.acg-detail-row select {
+.acg-detail-row .tx-select {
   background: var(--bg-2);
   border: 1px solid var(--bg-3);
   border-radius: 5px;
@@ -10744,7 +10727,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 }
 
 .tx-field > input,
-.tx-field > select {
+.tx-field > .tx-select {
   width: 100%;
   min-width: 0;
   height: 24px;
@@ -10868,7 +10851,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   border-top: 1px solid var(--border);
 }
 
-.texture-layer-props select { text-transform: capitalize; }
+.texture-layer-props .tx-select { text-transform: capitalize; }
 
 .texture-layer-actions {
   display: flex;
@@ -11125,7 +11108,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 .motion-advanced-toggle svg { transition: transform 120ms var(--ease); }
 .motion-advanced-toggle.open svg { transform: rotate(180deg); }
 .motion-advanced { display: grid; grid-template-columns: 1.35fr 1fr 1fr; gap: 8px; }
-.motion-advanced select {
+.motion-advanced .tx-select {
   min-width: 82px;
   height: 24px;
   padding: 0 6px;
@@ -11259,7 +11242,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 }
 
 .texture-dialog label > input:not([type="checkbox"]):not([type="color"]),
-.texture-dialog label > select {
+.texture-dialog label > .tx-select {
   width: 100%;
   min-width: 0;
 }
@@ -11341,7 +11324,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 
 .texture-pack-row { display: flex; align-items: center; gap: 6px; }
 .texture-pack-field { flex: 1; min-width: 0; }
-.texture-pack-row select { width: 96px; flex-shrink: 0; }
+.texture-pack-row .tx-select { width: 96px; flex-shrink: 0; }
 .texture-pack-row input[type="number"] { width: 64px; flex-shrink: 0; }
 .texture-pack-row .texture-check { flex-shrink: 0; }
 
@@ -11396,9 +11379,9 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
    chevron and border and a colour input keeps its OS swatch chrome, both of
    which read as unfinished next to everything else. */
 
-.texture-editor select,
-.atlas-editor select,
-.texture-dialog select {
+.texture-editor .tx-select,
+.atlas-editor .tx-select,
+.texture-dialog .tx-select {
   height: 24px;
   padding: 0 26px 0 8px;
   border: none;
@@ -11417,15 +11400,15 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   transition: background-color 0.12s var(--ease), box-shadow 0.12s var(--ease);
 }
 
-.texture-editor select:hover,
-.atlas-editor select:hover,
-.texture-dialog select:hover {
+.texture-editor .tx-select:hover,
+.atlas-editor .tx-select:hover,
+.texture-dialog .tx-select:hover {
   background-color: var(--fill-2);
 }
 
-.texture-editor select:focus-visible,
-.atlas-editor select:focus-visible,
-.texture-dialog select:focus-visible {
+.texture-editor .tx-select:focus-visible,
+.atlas-editor .tx-select:focus-visible,
+.texture-dialog .tx-select:focus-visible {
   outline: none;
   box-shadow: 0 0 0 2px var(--accent-ring);
 }
@@ -11605,15 +11588,22 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   padding: 4px;
 }
 
+/* A value list is part of its field, not a command menu: match the trigger's
+   type size and tighten the rows, so opening a 4-item numeric dropdown doesn't
+   drop a panel of oversized text over the inspector. */
+.tx-select-menu .dropdown-item {
+  min-height: 22px;
+  padding: 3px 8px;
+  font-size: 11.5px;
+}
+
 .tx-select-menu .dropdown-item.selected {
   color: var(--accent);
 }
 
-.tx-select-tick {
-  margin-left: auto;
-  flex-shrink: 0;
-  color: var(--accent);
-}
+/* The current entry is marked by the `checked` row treatment (accent text on
+   an accent-soft row), the same as every other menu in the editor — a tick
+   glyph beside a value reads as a checkbox, which is a different control. */
 
 /* Label-left / control-right inside a dialog, matching `.texture-dialog label`
  * for the rows that are a div (a SelectField is not a form control, so it
@@ -12313,7 +12303,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   font-size: 11px;
 }
 
-.aud-addtrack select {
+.aud-addtrack .tx-select {
   background: var(--bg-2);
   border: 1px solid var(--bg-3);
   border-radius: 5px;
@@ -12488,7 +12478,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 
 .aud-param-unit { width: 26px; flex: none; font-size: 10px; }
 
-.aud-param select {
+.aud-param .tx-select {
   flex: 1;
   background: var(--bg-1);
   border: 1px solid var(--bg-3);
@@ -13888,7 +13878,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   color: var(--text-dim);
 }
 .events-field input[type="text"],
-.events-field select,
+.events-field .tx-select,
 .events-field textarea {
   background: var(--bg-2);
   border: 1px solid var(--border);
@@ -13944,7 +13934,7 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   padding: 4px 6px;
 }
 .events-param input[type="text"],
-.events-param select {
+.events-param .tx-select {
   background: var(--bg-1);
   border: 1px solid var(--border);
   border-radius: var(--r-input);
@@ -14287,6 +14277,38 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   align-self: flex-start;
   margin-bottom: 4px;
 }
+/* Every `<select>` in the editor is now `fields/Select.jsx` — a real button
+   plus a portalled menu — because a native select's open list is drawn by the
+   platform and comes up white in this WebView whatever the page says.
+   The caller's old field class (`.select-field`, `.ph-category`, …) still
+   lands on that button, since that is exactly what it used to style. Two
+   things those classes carry only make sense for a native control and have to
+   go: the CSS chevron (a real icon is rendered now) and the right padding that
+   made room for it. `button.tx-select` outranks the bare class either way, so
+   this does not depend on which stylesheet loads last. */
+button.tx-select {
+  background-image: none;
+  padding-right: 7px;
+}
+
+/* Choice field on a graph node. `.gf-select` is the trigger of the editor's
+   own portalled dropdown (see fields/SelectField.jsx) — NOT a native
+   `<select>`. So there is no look to define here: `.tx-select` already carries
+   it, and this only brings the trigger down to a graph node's smaller
+   metrics. */
+.gf-select .tx-select {
+  height: 20px;
+  padding: 0 5px;
+  font-size: 10px;
+  gap: 4px;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+}
+
+.gf-select .tx-select:hover {
+  border-color: var(--border-strong);
+}
+
 /* One-line string field on a graph node. Matches .gf-select's metrics so a
    node mixing the two doesn't step. */
 .gf-text {

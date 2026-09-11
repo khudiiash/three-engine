@@ -8,16 +8,19 @@ import { useSceneStore } from "../store/sceneStore.js";
 import {
   NODE_TYPES,
   CATEGORY_LABELS,
+  DEFAULT_MATERIAL_CLASS,
   nodeDefaults,
   compileShaderGraph,
   migrateGraph,
   generateTslCode,
+  outputSlotsFor,
   setUniformValue,
 } from "../../engine/tslGraph.js";
 import { migrateLegacyGraph } from "../../engine/shaderGraph.js";
 import {
   MATERIAL_DEFAULTS,
   getDefaultMaterial,
+  getMaterialClass,
   getMaterialDef,
   loadMaterialAsset,
   updateMaterialAsset,
@@ -52,14 +55,13 @@ async function resolveMaterialDefForSave(matPath) {
   }
 }
 
-/** Fresh materials: a Principled BSDF wired into the Output's Surface socket
- *  (Blender-style — the BSDF carries Color/Roughness/… and drives the surface). */
+/** Fresh materials: the Material Output on its own. It carries Color /
+ *  Roughness / Metalness / … itself, so an untouched graph already compiles to
+ *  the same plain white Physical material the old Principled BSDF starting
+ *  point did — with nothing between the value nodes and the material. */
 const DEFAULT_GRAPH = {
-  nodes: [
-    { id: "bsdf", type: "principledBsdf", props: {}, position: { x: 200, y: 120 } },
-    { id: "output", type: "output", props: {}, position: { x: 560, y: 150 } },
-  ],
-  edges: [{ source: "bsdf", sourceHandle: "out", target: "output", targetHandle: "surface" }],
+  nodes: [{ id: "output", type: "output", props: { material: DEFAULT_MATERIAL_CLASS }, position: { x: 420, y: 150 } }],
+  edges: [],
 };
 
 /**
@@ -78,25 +80,47 @@ function inputWidget(spec) {
   return null;
 }
 
+/** The Material Output's socket list depends on its `material` param, but a
+ *  socket may NEVER simply disappear while a wire is attached to it: React Flow
+ *  drops any edge whose handle unmounts, which would silently delete the user's
+ *  wiring the moment they looked at another material class.
+ *
+ *  So a class narrows the list to its own slots PLUS every slot that still has
+ *  something plugged into it, and those extras render as inactive — visible,
+ *  still wired, ignored by the compiler until the class that reads them comes
+ *  back. `ctx` is absent when the caller only wants types (wire validation,
+ *  palette, edge colouring); then the full union is the right answer. */
+function outputInputs(def, ctx) {
+  if (!ctx) return def.inputs ?? [];
+  const active = new Set(outputSlotsFor(ctx.props?.material ?? DEFAULT_MATERIAL_CLASS).map((s) => s.key));
+  return (def.inputs ?? [])
+    .filter((s) => active.has(s.key) || ctx.connectedHandles?.has(s.key))
+    .map((s) => (active.has(s.key) ? s : { ...s, inactive: true }));
+}
+
 const shaderRegistry = {
-  describe(type) {
+  describe(type, ctx) {
     const def = NODE_TYPES[type];
     if (!def) return null;
     const isOutput = type === "output";
     const outputKeys = def.outputs ?? (isOutput ? [] : ["out"]);
+    const inputs = isOutput ? outputInputs(def, ctx) : def.inputs ?? [];
     return {
       label: def.label,
       cat: def.cat ?? "math",
       out: def.out ?? "any",
-      inputs: (def.inputs ?? []).map((s) => ({
+      inputs: inputs.map((s) => ({
         key: s.key,
         label: s.key,
         type: s.type ?? "any",
+        sect: s.sect ?? null,
+        inactive: !!s.inactive,
         widget: inputWidget(s),
         // Wire-only inputs (normal, clearcoat, transmission …) deliberately
         // have no inline default: three switches their expensive lighting path
-        // on the moment the node is non-null, even at 0.
-        editable: s.default != null && !Array.isArray(s.default),
+        // on the moment the node is non-null, even at 0. An inactive slot has
+        // no editor either — the class on screen would not read the value.
+        editable: s.default != null && !Array.isArray(s.default) && !s.inactive,
         default: s.default,
         step: 0.05,
       })),
@@ -331,7 +355,7 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
     // structural edit — the "preview sometimes doesn't work" case. Draw straight
     // away if we already have a tap for this node.
     const tap = compileRef.current.taps?.[id];
-    if (tap && !tap.__surface) renderNodeThumb(tap, el);
+    if (tap && !tap.__volume) renderNodeThumb(tap, el);
   }, []);
 
   /**
@@ -390,13 +414,15 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
       try {
         const result = await compileShaderGraph(graph, { taps });
         if (generation !== compileRef.current.generation) return;
-        // Wiring (or unwiring) the Output's Volume socket changes the material
-        // class (MeshPhysicalNodeMaterial ↔ the unlit volume MeshBasicNodeMaterial).
-        // A class swap can't be done in place — route it through the asset layer
-        // so the cached shared instance is replaced and recompiled, then adopt
-        // the new instance for the preview.
+        // The Output names the material class. A swap can't be done in place —
+        // a MeshPhongNodeMaterial has no roughnessNode to clear — so route it
+        // through the asset layer, which replaces the cached shared instance
+        // and recompiles, then adopt the new instance for the preview.
         const wantVolume = !!result?.isVolume;
-        if (wantVolume !== (material.userData?.isVolumeMaterial === true)) {
+        // The asset layer owns which class the shared instance currently IS,
+        // so ask it rather than sniffing the instance or keeping a second copy
+        // of the bookkeeping here.
+        if ((result?.materialClass ?? DEFAULT_MATERIAL_CLASS) !== getMaterialClass(path)) {
           const existing = await resolveMaterialDefForSave(path);
           const def = { ...MATERIAL_DEFAULTS, ...existing, shaderGraph: full };
           updateMaterialAsset(path, def);
@@ -410,8 +436,9 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
         // Volume materials wire scatteringNode/emissive/steps, surface ones map
         // onto *Node slots — the asset layer owns that logic so both paths agree.
         applyGraphMutations(material, result, wantVolume);
-        // In-place edit (no class change): refresh renderable state so scene
-        // meshes hide when nothing is wired to Surface/Volume, show otherwise.
+        // In-place edit (no class change): refresh renderable state, which now
+        // only hides a mesh whose Volume output has no bundle wired — a surface
+        // Output is a complete material with nothing plugged into it at all.
         syncMaterialRenderState(path, graph);
         compileRef.current.uniforms = result?.uniforms ?? {};
         // Kept so a thumb canvas mounting after this compile can still draw
@@ -419,10 +446,10 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
         compileRef.current.taps = result?.taps ?? {};
         for (const id of taps) {
           const canvas = thumbCanvases.current.get(id);
-          // Shader nodes (BSDF/Emission) yield a surface bundle, not a TSL
-          // value — skip their thumbnail (nothing single to preview).
+          // A Volume node yields a raymarch bundle, not a TSL value — skip
+          // its thumbnail (there is nothing single to preview).
           const tap = result?.taps?.[id];
-          if (canvas && tap && !tap.__surface) renderNodeThumb(tap, canvas);
+          if (canvas && tap && !tap.__volume) renderNodeThumb(tap, canvas);
         }
       } catch (err) {
         console.error(`Shader graph compile: ${err.message}`);

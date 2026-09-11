@@ -47,7 +47,8 @@ export class WaterComponent extends GridSimulationComponent {
     // `waterDepth` already has its own row above, so those three are dropped.
     ...["grid", "water", "material"].flatMap((type) => simulationNodeTypes("water")[type].params
       .filter((field) => !["width", "height"].includes(field.key) && !WaterComponent.hidden.includes(field.key))),
-  ].map((field) => Object.hasOwn(WATER_PHYSICS_DEFAULTS,field.key) || field.key === "asset" || field.key === "fitToPlane" ? field : { ...field, showIf: (props) => !props.asset });
+  ].map((field) => Object.hasOwn(WATER_PHYSICS_DEFAULTS,field.key) || field.key === "asset" || field.key === "fitToPlane" ? field : { ...field, showIf: (props) => !props.asset })
+    .concat([{ key: "runInEditor", label: "Run In Editor", type: "boolean" }]);
 
   onAttach() {
     // THE SLOT POOL EXISTS BEFORE THE SOLVER DOES. `super.onAttach` builds the

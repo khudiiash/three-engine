@@ -586,6 +586,207 @@
           compare("the rolled multi-light path gains only its named directional slot",
             delta(rolledChroma, rolledBase), delta(straightChroma, straightBase), 2e-4);
 
+          // ══ SPOT LIGHTS AND `decay`: three's OWN TWO EXPRESSIONS ═════════
+          //
+          // Added 2026-09-09 with spot support itself. Until then a spot light
+          // never reached GI at all (`GISystem#collectLightObjects` collected
+          // directional and point only) and `decay` never reached it either —
+          // every consumer hardcoded `1/max(d², 1)` where three evaluates
+          // `1/max(d^decay, 0.01)`. Both are now `giLight.punctualAttenuation`,
+          // once, for all five call sites.
+          //
+          // ══ WHY THIS ARM IS A RATIO AND NOT AN ABSOLUTE ═════════════════
+          //
+          // Two runs that differ ONLY in the slot's cone/decay fields divide out
+          // everything this arm is not about — the R4 albedo clamp, the 1/π, the
+          // face-forward, the cosine, the colour. On a hit with no emission of
+          // its own the shade is `ρ/π · E` and `E` is linear in the attenuation,
+          // so the ratio IS the term under test and can be compared against the
+          // JS transcription of three's own expression, exactly.
+          //
+          // ══ AND THE FIXTURE IS FITTED TO THE HITS, NOT GUESSED ══════════
+          //
+          // Both lights below are placed FROM the hit set rather than at
+          // hand-picked coordinates. A cone aimed by eye at a 4 m box of
+          // scattered points lands with every lit hit on one side of its edge —
+          // which passes a ratio check against a reference that is also constant
+          // there, and proves nothing. The cone's two cosines are quantiles of
+          // the fixture's own cos θ distribution, so "some hits inside, some in
+          // the penumbra band, some outside" is true BY CONSTRUCTION; the near
+          // light is anchored on the floor hit with the most neighbours, so the
+          // sub-metre population the `decay` floor needs is not left to luck.
+          say("");
+          say("── SPOT LIGHTS: three's cone, and three's `decay` ──");
+          {
+            const opts = (lights) => ({
+              visibility: null, sun: null, lights, maxRay: DIAG, neeEmitters: false,
+            });
+            const slotAt = (pos, extra = {}) => ({
+              kind: 0,
+              vector: uniform(new THREE.Vector3(...pos)),
+              color: uniform(new THREE.Color(9, 7, 5)),
+              range: 0,
+              active: 1,
+              ...extra,
+            });
+            // three's `SpotLightNode.getSpotAttenuation`, transcribed.
+            const smooth = (e0, e1, x) => {
+              const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+              return t * t * (3 - 2 * t);
+            };
+
+            // ── THE CONE ─────────────────────────────────────────────────
+            const LPOS = [0.35, 1.2, -0.25];
+            // `axis` points FROM the light toward its target — three's
+            // `spotAxis`, and the opposite of the slot's `vector` convention for
+            // a directional light. Hung near the ceiling, aimed down.
+            const AXIS = (() => {
+              const a = [0.12, -1, 0.08];
+              const l = Math.hypot(...a);
+              return f32v(a.map((c) => c / l));
+            })();
+            const conePoint = slotAt(LPOS);
+            const pointRun = await runGpu(opts([conePoint]));
+            // Only hits the POINT slot actually lights carry a readable ratio —
+            // a hit facing away from the lamp is zero on both sides and says
+            // nothing about the cone.
+            const lit = PLAIN_IDX.filter((i) => luma(pointRun[i]) > 1e-3);
+            const cosAt = (i) => {
+              const P = HITS[i].position;
+              const d = [P[0] - LPOS[0], P[1] - LPOS[1], P[2] - LPOS[2]];
+              const len = Math.max(Math.hypot(...d), 1e-4);
+              return (d[0] * AXIS[0] + d[1] * AXIS[1] + d[2] * AXIS[2]) / len;
+            };
+            // Quantiles of the LIT hits' cos θ, over the forward hemisphere only
+            // (a spot's half-angle can never exceed 90°, so a cone cosine has to
+            // be positive to describe a light three could render).
+            const forward = lit.map(cosAt).filter((c) => c > 0).sort((a, b) => a - b);
+            const at = (q) => forward[Math.min(forward.length - 1, Math.floor(q * forward.length))];
+            const CONE_COS = f32(at(0.35));
+            const PENUMBRA_COS = f32(Math.max(CONE_COS + 1e-4, at(0.75)));
+            const ANGLE = Math.acos(CONE_COS);
+            const PENUMBRA = 1 - Math.acos(PENUMBRA_COS) / ANGLE;
+            check("the fitted cone is one a SpotLight could hold — half-angle ≤ 90°, penumbra in [0, 1]",
+              ANGLE > 0 && ANGLE <= Math.PI / 2 && PENUMBRA > 0 && PENUMBRA < 1,
+              `angle ${((ANGLE * 180) / Math.PI).toFixed(1)}°, penumbra ${PENUMBRA.toFixed(3)}, ` +
+                `over ${forward.length} forward hits of ${lit.length} lit`);
+            const withCone = (coneCos, penumbraCos) => slotAt(LPOS, {
+              axis: uniform(new THREE.Vector3(...AXIS)),
+              coneCos,
+              penumbraCos,
+            });
+
+            // THE NEUTRAL PAIR, and it is the claim the whole design rests on:
+            // a directional or point slot publishes coneCos −2 / penumbraCos −1
+            // so that the cone term is 1 by ARITHMETIC, with no branch deciding
+            // which kind a slot holds. If that is off by anything at all, every
+            // non-spot light in every scene is being quietly shaped by a cone.
+            const neutralRun = await runGpu(opts([withCone(-2, -1)]));
+            compare("the neutral cone (−2, −1) is exactly 1 — a point slot is untouched by the spot machinery",
+              neutralRun, pointRun, 0);
+
+            const spotRun = await runGpu(opts([withCone(CONE_COS, PENUMBRA_COS)]));
+            const coneWeight = (i) => smooth(CONE_COS, PENUMBRA_COS, cosAt(i));
+            const outIdx = lit.filter((i) => coneWeight(i) === 0);
+            // A hit within f32 noise of the edge cosine can land on either side
+            // of it on the GPU, so the EXACTLY-zero claim is made only about
+            // hits that are unambiguously outside. The population count above
+            // keeps the mathematical boundary; this one keeps the assertion
+            // honest about float determinism.
+            const strictOut = outIdx.filter((i) => cosAt(i) < CONE_COS - 1e-3);
+            let worstCone = 0;
+            let worstConeAt = -1;
+            for (const i of lit) {
+              const e = relErr(luma(spotRun[i]) / luma(pointRun[i]), coneWeight(i));
+              if (e > worstCone) { worstCone = e; worstConeAt = i; }
+            }
+            check("the cone IS `smoothstep(cos angle, cos(angle·(1−penumbra)), cos θ)` — three's expression, at every lit hit",
+              worstCone < 5e-4 && lit.length > 20,
+              `worst ${(worstCone * 100).toFixed(4)}% at hit ${worstConeAt} over ${lit.length} lit hits`);
+            // AND THE ARM HAS ALL THREE POPULATIONS. A cone that returned a
+            // constant would pass the ratio check against a constant reference;
+            // what makes it a cone is that the fixture straddles its edge.
+            const inside = lit.filter((i) => coneWeight(i) > 0.999).length;
+            const band = lit.length - inside - outIdx.length;
+            check("and the fixture straddles the cone — fully lit, fully dark, and inside the penumbra band",
+              inside > 3 && outIdx.length > 3 && band > 3,
+              `${inside} inside / ${band} in the band / ${outIdx.length} outside, of ${lit.length}`);
+            check("a hit outside the cone gets exactly nothing from the spot — not a dimmed something",
+              strictOut.length > 3 && strictOut.every((i) => luma(spotRun[i]) === 0),
+              `${strictOut.length} hits clear of the edge, max luma ${Math.max(
+                ...strictOut.map((i) => luma(spotRun[i])), 0).toExponential(2)}`);
+
+            // ── `decay`, AND THE NEAR-FIELD FLOOR THAT COMES WITH IT ───────
+            //
+            // three: `1 / max(d^decay, 0.01)`. The ratio of a decay-0 run to a
+            // decay-2 run is therefore `max(d², 0.01)`, and TWO different things
+            // in the old expression fail it: `decay` was ignored outright (so
+            // the ratio would be 1 everywhere), and the denominator was floored
+            // at 1 rather than 0.01 (so it would be 1 again for every hit inside
+            // a metre — up to a 100x error, right where a lamp is brightest).
+            //
+            // The light is anchored on whichever floor hit has the most company
+            // within a metre, so the sub-metre population exists by construction
+            // rather than by where a hand-typed coordinate happened to fall.
+            // Restricted to hits the cone light already lit: a floor hit whose
+            // face-forwarded normal points DOWN takes nothing from a lamp above
+            // it, and anchoring on one would put the light's closest neighbour
+            // out of the measurable set — which is how the first cut of this
+            // check ended up reading the near field from 0.6 m instead of 0.3.
+            const floorIdx = lit.filter((i) => Math.abs(HITS[i].position[1] + 2) < 1e-3);
+            const gap = (a, b) => Math.hypot(
+              HITS[a].position[0] - HITS[b].position[0],
+              HITS[a].position[2] - HITS[b].position[2],
+            );
+            const anchor = floorIdx.reduce((best, i) =>
+              (floorIdx.filter((j) => gap(i, j) < 0.9).length >
+               floorIdx.filter((j) => gap(best, j) < 0.9).length ? i : best), floorIdx[0]);
+            const NPOS = f32v([HITS[anchor].position[0], -1.7, HITS[anchor].position[2]]);
+            const distTo = (i) => {
+              const P = HITS[i].position;
+              return Math.max(Math.hypot(P[0] - NPOS[0], P[1] - NPOS[1], P[2] - NPOS[2]), 1e-4);
+            };
+            const nearDefault = await runGpu(opts([slotAt(NPOS)]));
+            const decay0 = await runGpu(opts([slotAt(NPOS, { decay: 0 })]));
+            const decay2 = await runGpu(opts([slotAt(NPOS, { decay: 2 })]));
+            const nearLit = PLAIN_IDX.filter((i) => luma(decay2[i]) > 1e-3);
+            let worstDecay = 0;
+            let worstDecayAt = -1;
+            for (const i of nearLit) {
+              const d = distTo(i);
+              const expected = Math.max(d * d, 0.01) / Math.max(1, 0.01);
+              const e = relErr(luma(decay0[i]) / luma(decay2[i]), expected);
+              if (e > worstDecay) { worstDecay = e; worstDecayAt = i; }
+            }
+            check("`decay` is three's falloff EXPONENT — a decay-0 slot over a decay-2 one is exactly max(d², 0.01)",
+              worstDecay < 5e-4 && nearLit.length > 10,
+              `worst ${(worstDecay * 100).toFixed(4)}% at hit ${worstDecayAt} over ${nearLit.length} lit hits`);
+            const near = nearLit.filter((i) => distTo(i) < 1);
+            check("and the near field is where it bites — the old `max(d², 1)` floor read 1.0 at every one of these",
+              near.length >= 3 && near.every((i) => relErr(luma(decay0[i]) / luma(decay2[i]), 1) > 0.05),
+              `${near.length} hits inside 1 m, closest ${Math.min(...near.map(distTo)).toFixed(3)} m ` +
+                `→ ${Math.max(...near.map((i) => 1 / Math.max(distTo(i) ** 2, 0.01))).toFixed(1)}x the old attenuation`);
+            check("a default slot (no `decay` field at all) still falls off as inverse-square",
+              nearLit.every((i) => relErr(luma(nearDefault[i]), luma(decay2[i])) < 2e-4),
+              "an omitted field reads as three's default exponent of 2");
+
+            // The rolled loop is a DIFFERENT graph (one descent for the whole
+            // table, slot fields picked by index). It reads the cone and the
+            // decay through the same helper, and a table that carries the fields
+            // has to shade like the table that inlines them.
+            const litAlways = () => float(1);
+            const spotSlot = withCone(CONE_COS, PENUMBRA_COS);
+            const darkSlot = { ...withCone(-2, -1), color: uniform(new THREE.Color(0, 0, 0)) };
+            const rolledSpot = await runGpu({
+              ...opts([spotSlot, darkSlot]), visibility: litAlways,
+            });
+            const straightSpot = await runGpu({
+              ...opts([spotSlot]), visibility: litAlways,
+            });
+            compare("the rolled multi-slot loop picks the cone and the decay too",
+              rolledSpot, straightSpot, 2e-4);
+          }
+
           // ══ §12.82: THE SUN SPLIT IS AN IDENTITY AT ITS OWN SUN ANGLE ═════
           //
           // The split caches `ρ/π · V` and lets `[F]` close `E·max(0,n̂·l)` from

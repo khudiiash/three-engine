@@ -1,5 +1,6 @@
 import { forwardRef } from "react";
 import {
+  Leaf as PhLeaf,
   Aperture as PhAperture,
   Archive as PhArchive,
   ArrowCounterClockwise as PhArrowCounterClockwise,
@@ -41,6 +42,7 @@ import {
   Cloud as PhCloud,
   CloudArrowUp as PhCloudArrowUp,
   CloudCheck as PhCloudCheck,
+  CloudSun as PhCloudSun,
   Code as PhCode,
   Command as PhCommand,
   Copy as PhCopy,
@@ -273,7 +275,12 @@ export const BrainCircuit = /* @__PURE__ */ icon(PhBrain, "BrainCircuit");
 export const Brush = /* @__PURE__ */ icon(PhPaintBrush, "Brush");
 export const Building2 = /* @__PURE__ */ icon(PhBuildings, "Building2");
 export const Camera = /* @__PURE__ */ icon(PhCamera, "Camera");
-export const Check = /* @__PURE__ */ icon(PhCheck, "Check");
+// A tick is a STROKE, and Phosphor's `fill` weight does not fill a stroke —
+// it swaps in a filled tile with the mark knocked out, so the default weight
+// turned every "copied ✓" and every selected-row marker into what reads as a
+// checkbox. Bold draws the checkmark itself. (Same reason ChevronDown below
+// opts out of `fill`.)
+export const Check = /* @__PURE__ */ icon(PhCheck, "Check", "bold");
 export const CheckCircle2 = /* @__PURE__ */ icon(PhCheckCircle, "CheckCircle2");
 export const CheckSquare = /* @__PURE__ */ icon(PhCheckSquare, "CheckSquare");
 // A disclosure control is an ARROW, not a solid triangle: filled, Phosphor
@@ -292,6 +299,7 @@ export const ClipboardPaste = /* @__PURE__ */ icon(PhClipboardText, "ClipboardPa
 export const Clock = /* @__PURE__ */ icon(PhClock, "Clock");
 export const Cloud = /* @__PURE__ */ icon(PhCloud, "Cloud");
 export const CloudCheck = /* @__PURE__ */ icon(PhCloudCheck, "CloudCheck");
+export const CloudSun = /* @__PURE__ */ icon(PhCloudSun, "CloudSun");
 export const CloudUpload = /* @__PURE__ */ icon(PhCloudArrowUp, "CloudUpload");
 export const Code = /* @__PURE__ */ icon(PhCode, "Code");
 export const Command = /* @__PURE__ */ icon(PhCommand, "Command");
@@ -360,6 +368,7 @@ export const Link2Off = /* @__PURE__ */ icon(PhLinkSimpleBreak, "Link2Off");
 export const List = /* @__PURE__ */ icon(PhList, "List");
 export const ListChecks = /* @__PURE__ */ icon(PhListChecks, "ListChecks");
 export const ListTree = /* @__PURE__ */ icon(PhTreeStructure, "ListTree");
+export const Leaf = /* @__PURE__ */ icon(PhLeaf, "Leaf");
 export const Loader2 = /* @__PURE__ */ icon(PhCircleNotch, "Loader2", "bold");
 export const Lock = /* @__PURE__ */ icon(PhLock, "Lock");
 export const LockOpen = /* @__PURE__ */ icon(PhLockOpen, "LockOpen");

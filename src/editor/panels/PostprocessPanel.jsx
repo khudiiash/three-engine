@@ -25,6 +25,7 @@ import { invalidateBlobUrl, extOf } from "../assetLoader.js";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
+import { Select } from "../fields/Select.jsx";
 import {
   PP_NODE_TYPES,
   PP_CATEGORY_LABELS,
@@ -172,13 +173,13 @@ function ParamField({ param, value, onChange }) {
       );
     case "select":
       return (
-        <select className="select-field nodrag" value={v} onChange={(e) => onChange(e.target.value)}>
+        <Select className="select-field nodrag" value={v} onChange={(e) => onChange(e.target.value)}>
           {param.options.map((opt) => (
             <option key={opt} value={opt}>
               {opt}
             </option>
           ))}
-        </select>
+        </Select>
       );
     default:
       return null;

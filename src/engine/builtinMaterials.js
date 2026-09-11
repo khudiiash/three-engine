@@ -61,8 +61,7 @@ export function builtinMaterialDefinition(path) {
     pipeline: { cullMode: "none", transparent: true, depthWrite: false, blendMode: "normal" },
     shaderGraph: { nodes: [
       { id: "appearance", type: "waterColor", position: { x: -340, y: 100 }, props: { shallow: "#8fd8de", deep: "#2f7d92", opticalDepth: 1.2, absorption: .35, foamHeight: .07, foamAmount: .35 } },
-      { id: "water", type: "principledBsdf", position: { x: 80, y: 100 }, props: { color: "#8fd8de", roughness: .12, metalness: 0, ior: 1.333, specularIntensity: 1, transmission: .9, thickness: 0, opacity: 1 } },
-      { id: "output", type: "output", position: { x: 460, y: 100 }, props: {} },
-    ], edges: [{ source: "appearance", sourceHandle: "out", target: "water", targetHandle: "color" }, { source: "water", sourceHandle: "out", target: "output", targetHandle: "surface" }] },
+      { id: "output", type: "output", position: { x: 80, y: 100 }, props: { material: "physical", color: "#8fd8de", roughness: .12, metalness: 0, ior: 1.333, specularIntensity: 1, transmission: .9, thickness: 0, opacity: 1 } },
+    ], edges: [{ source: "appearance", sourceHandle: "out", target: "output", targetHandle: "color" }] },
   };
 }

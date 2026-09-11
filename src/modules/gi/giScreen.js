@@ -65,7 +65,7 @@ import {
   vec4,
   Return,
 } from "three/tsl";
-import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt, emitterSlotShadow } from "./giLight.js";
+import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt, emitterSlotShadow, spotReachAt, sunShadowVisibilityAt } from "./giLight.js";
 import { octDecodeTSL } from "./rayHit/rayHitTSL.js";
 import { DEBUG_LAYER, EDITOR_LAYER, GI_DEPTH_LAYER, GI_SHARP_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { readRenderTargetImage } from "../../engine/renderTargetImage.js";
@@ -737,7 +737,7 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
  * volume's LIVE world uniforms, so every F2 slide moves the feather with the
  * box for free.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, screenRadiance = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, ao = null, vxao = null, rawCopy = null, emitterTileCut = null, farField = null, bounceWeight = null, reflectionsEnabled = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, screenRadiance = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, ao = null, vxao = null, rawCopy = null, emitterTileCut = null, farField = null, bounceWeight = null, reflectionsEnabled = null, emitterShadowSize = null, projScale = null }) {
   // §11.35: an AO term computed at AO resolution is applied in the MATERIAL
   // (giLight samples it at the pixel's own screen UV); folding it into the
   // half-res irradiance here would put the last of the three blurs back.
@@ -1088,14 +1088,102 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       }
       if (emitter) {
         // The per-slot shadows come pre-traced and pre-filtered from the
-        // emitter shadow pass (LinearFilter over the shadow-res texture is
-        // the upsample). The trace left this kernel for the same reason the
-        // direct-light trace did: it was the most expensive per-pixel work
-        // here and its pixel count deserves its own budget.
-        const packedShadow = texture(
-          targets.emitterShadow,
-          vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height)),
-        ).level(0).toVar();
+        // emitter shadow pass. The trace left this kernel for the same reason
+        // the direct-light trace did: it was the most expensive per-pixel
+        // work here and its pixel count deserves its own budget.
+        //
+        // ── THE UPSAMPLE IS SURFACE-VALIDATED (2026-09-11) ──────────────────
+        //
+        // This used to be one hardware-bilinear sample of the shadow-res
+        // texture, and that was the "white dashed halo around every ball"
+        // (the ball-pool scene, 350 spheres under one emissive orb). The
+        // emitter mask runs at `emitterShadowScale` AND under a 160k-pixel
+        // ceiling — on a 2 MP viewport that is ~3.6 texels of resolve per
+        // mask texel — and a bilinear fetch has no idea which SURFACE a texel
+        // belongs to. At a silhouette the lit texels on the front ball blend
+        // into the shadowed pixels of the ball behind it: a bright rim one to
+        // two pixels wide, exactly along the camera silhouette, dashed with
+        // the mask grid's phase. No shadow bias can touch it — the trace was
+        // right at every texel it marched; the blend between texels was the
+        // artifact. (Six other causes were claimed and refuted before this
+        // one was read off the code: emitter scale, both checkerboards, seat
+        // rotation, resolve scale, the AO term, MSAA — none of them touched
+        // this line.)
+        //
+        // Now: the same 2×2 bilinear footprint, each tap weighted by its
+        // bilinear weight × a receiver-plane test × a normal gate against
+        // THIS pixel's P/N — the mask-res filter pass's own same-surface
+        // test (createGiLightShadowFilterPass), with the tap's receiver read
+        // from the gbuffer at the texel centre the shadow pass marched. The
+        // plane eps is distance-robust the same way (two mask texels of
+        // world footprint). A pixel whose four taps all fail — a sliver
+        // thinner than a mask texel — takes the tap NEAREST ITS OWN PLANE,
+        // never a blend, so a rim pixel on the front ball reads the front
+        // ball's shadow and a pixel just outside it reads the background's.
+        // `__giEmitterShadowValidatedUpsample = false` is the A/B arm (the
+        // plain bilinear fetch).
+        const shadowUv = vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height));
+        const packedShadow = vec4(texture(targets.emitterShadow, shadowUv).level(0)).toVar();
+        const validatedUpsample = !!emitterShadowSize
+          && globalThis.__giEmitterShadowValidatedUpsample !== false
+          && (emitterShadowSize.width !== width || emitterShadowSize.height !== height);
+        if (validatedUpsample) {
+          const ew = Math.max(1, emitterShadowSize.width | 0);
+          const eh = Math.max(1, emitterShadowSize.height | 0);
+          const sxE = width / ew;
+          const syE = height / eh;
+          const shadowTex = texture(targets.emitterShadow);
+          // Continuous mask-space coordinate of this pixel's centre, shifted
+          // by half a texel so (x0, y0)..(x0+1, y0+1) is the bilinear footprint.
+          const fx = px.toFloat().add(0.5).div(sxE).sub(0.5).toVar();
+          const fy = py.toFloat().add(0.5).div(syE).sub(0.5).toVar();
+          const x0 = fx.floor().toVar();
+          const y0 = fy.floor().toVar();
+          const tx = fx.sub(x0).toVar();
+          const ty = fy.sub(y0).toVar();
+          // One mask texel's world footprint at this receiver, from the same
+          // projection scale the AO and shadow filters use. Without a
+          // projection scale, a fixed 2 cm — the medium's own quantization.
+          const texelW = (cameraPosition && projScale)
+            ? P.sub(vec3(cameraPosition)).length().div(float(projScale).max(1e-3).mul(eh))
+            : float(0.01);
+          const eps = texelW.mul(2).max(1e-3).toVar();
+          const acc = vec4(0).toVar();
+          const wSum = float(0).toVar();
+          const bestD = float(1e9).toVar();
+          const bestS = vec4(packedShadow).toVar();
+          for (let j = 0; j < 2; j++) {
+            for (let i = 0; i < 2; i++) {
+              const tap = ivec2(
+                x0.add(i).toInt().clamp(0, ew - 1),
+                y0.add(j).toInt().clamp(0, eh - 1),
+              ).toVar();
+              // The receiver the shadow pass marched for this texel: the
+              // gbuffer at the texel centre, the pass's own mapping.
+              const tg = ivec2(
+                tap.x.toFloat().add(0.5).mul(sxE).toInt().clamp(0, width - 1),
+                tap.y.toFloat().add(0.5).mul(syE).toInt().clamp(0, height - 1),
+              ).toVar();
+              const q0 = positionNode.load(tg).toVar();
+              const q1 = normalNode.load(tg).toVar();
+              const wb = (i ? tx : float(1).sub(tx)).mul(j ? ty : float(1).sub(ty));
+              const planeD = q0.xyz.sub(P).dot(N).abs().toVar();
+              const wPlane = float(1).sub(planeD.div(eps)).clamp(0, 1);
+              // Length-guarded: a no-geometry tap's normal is zero and a
+              // normalize() there is NaN, which no multiply by q0.w removes.
+              const wNormal = q1.xyz.dot(N).div(q1.xyz.length().max(1e-3)).sub(0.7).mul(1 / 0.3).clamp(0, 1);
+              const w = wPlane.mul(wNormal).mul(q0.w).mul(wb).toVar();
+              const s = vec4(shadowTex.load(tap)).toVar();
+              acc.addAssign(s.mul(w));
+              wSum.addAssign(w);
+              If(q0.w.greaterThan(0.5).and(planeD.lessThan(bestD)), () => {
+                bestD.assign(planeD);
+                bestS.assign(s);
+              });
+            }
+          }
+          packedShadow.assign(select(wSum.greaterThan(1e-4), acc.div(wSum.max(1e-4)), bestS));
+        }
         const shadowChannels = [packedShadow.x, packedShadow.y, packedShadow.z, packedShadow.w];
         // §12.70 W4b slice (ii): under the tile cut, the evaluated slots are
         // the pixel's TILE's id-keyed emitters loaded from tree records — the
@@ -1239,7 +1327,7 @@ export function giBvhHitShadeReplicatesTarget(rawCopy, hatch = globalThis.__giBv
   return !!rawCopy && hatch !== false;
 }
 
-export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null, bounceWeight = null,
+export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null, bounceWeight = null, sunShadow = null,
   // Water refraction (2026-09-06): 'given' reconstructs the hit along the
   // direction stored in the gbuffer's normal attachment (see
   // createGiBvhReflect's rayMode); `causticGain(point, normal)` multiplies
@@ -1603,7 +1691,20 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
             // `__giHitBvhShadows = false` returns the whole light arm to the
             // occupancy cone for an A/B; `__giHitDynShadows = false` drops
             // just the dynamic union.
-            const bvhLightShadows = staticOcclude && globalThis.__giHitBvhShadows !== false;
+            // ── THE MAPPED SUN IS A TEXEL, SO THE BVH PAIR IS NOT EMITTED ──
+            //
+            // MEASURED, Sponza at ultra, resolve 931x772: the static+dynamic
+            // any-hit pair below costs `bvhHitShade` **3.57 ms against 1.22**
+            // — ~19 % of GI's whole budget — to answer a question the frame has
+            // ALREADY answered by rasterising the sun into a 4096² shadow map.
+            //
+            // ⚠ IT HAS TO BE A BUILD-TIME SWAP, NOT A RUNTIME `If`. A kernel's
+            // register allocation is set by the code PRESENT, not by how much
+            // of it executes: gating the trace behind a condition was measured
+            // (admission 24 -> 4) at 3.53 -> 3.59 ms, i.e. nothing. Only the
+            // pair being ABSENT recovers the occupancy.
+            const sunMapShadows = hitShadows && !!sunShadow;
+            const bvhLightShadows = staticOcclude && globalThis.__giHitBvhShadows !== false && !sunMapShadows;
             // Reach is derived, never a constant in metres (this module has
             // been burned by hard-coded world distances twice — the emitter
             // power gate and the 4 m march cap). `shadowReach` is the GI
@@ -1637,14 +1738,52 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
                   }
                   return vis;
                 }
-              : hitShadows && emitter?.shadowTraceFn
-                ? (dirTo, isDir, pointDist, cosH) => {
+              : hitShadows && (sunMapShadows || emitter?.shadowTraceFn)
+                ? (dirTo, isDir, pointDist, cosH, slotIndex) => {
+                    // ── THE MAPPED SUN IS READ, NOT TRACED (2026-09-09) ──────
+                    //
+                    // `slotIndex` is the 5th argument `analyticDirectAt` now
+                    // passes — a build-time constant on the unrolled path, the
+                    // Loop's own node on the rolled one. Without it there is no
+                    // way to tell WHICH light is being asked about, and handing
+                    // a second directional light the sun's map would be simply
+                    // wrong.
+                    //
+                    // −1 from the sampler means "no cascade covers this hit",
+                    // and then the cone below stands exactly as it did. That
+                    // fallback is the whole reason it returns −1 rather than 0.
+                    const vis = float(1).toVar();
+                    if (sunMapShadows && slotIndex) {
+                      If(slotIndex.equal(sunShadow.slot).and(sunShadow.count.greaterThan(0)), () => {
+                        const mapped = float(sunShadowVisibilityAt(sunShadow, shadePoint, nFace)).toVar();
+                        If(mapped.greaterThanEqual(0), () => { vis.assign(mapped); });
+                      });
+                    }
+                    if (!emitter?.shadowTraceFn) return vis;
                     const cap = float(6);
                     const maxT = mix(pointDist.sub(0.3), cap, isDir).min(cap).max(0).toVar();
-                    return emitter.shadowTraceFn(
+                    // The cone answers for everything the map did not: every
+                    // punctual light, and any sun hit outside the cascades.
+                    // ⚠ 32 IS A LITERAL AND STAYS ONE. A hatch here was swept
+                    // 32/16/8 and read flat (1.20-1.24 ms), then removed — and
+                    // removing it left `float(marchSteps)` referring to a
+                    // deleted const, a ReferenceError that only stayed quiet
+                    // because this branch was not being emitted. Instrumentation
+                    // on a hot path must not be able to break the thing it
+                    // measures; this is the second time that exact shape has
+                    // bitten this module.
+                    const coned = float(emitter.shadowTraceFn(
                       shadePoint, dirTo, maxT, float(32), cosH,
                       vec3(0), float(0), null,
-                    );
+                    )).toVar();
+                    if (sunMapShadows && slotIndex) {
+                      If(slotIndex.notEqual(sunShadow.slot).or(sunShadow.count.lessThanEqual(0)), () => {
+                        vis.assign(coned);
+                      });
+                    } else {
+                      vis.assign(coned);
+                    }
+                    return vis;
                   }
                 : null;
             // ⭐ ONE-SIDED (§18.10, 2026-08-25). `nFace` was face-forwarded
@@ -3131,7 +3270,17 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
       // point paints a black band; the ray must also START outside its own
       // voxel or the first sample is already a hit.
       lightShadow.slots.slice(0, lightShadowVars.length).forEach((slot, index) => {
-        If(slot.giShadow.greaterThan(0.5).and(slot.active.greaterThan(0.5)), () => {
+        // ── AND A SPOT ONLY SHADOWS INSIDE ITS OWN CONE ────────────────────
+        // This trace is the most expensive per-pixel work the module does
+        // (~29 ms GPU/frame on the user's Sponza), and outside a spot's cone
+        // its light is exactly zero — whatever the march found there gets
+        // multiplied by nothing. The channel keeps its load-bearing default of
+        // 1 (unshadowed) on the pixels this skips, which is the same value a
+        // zero light would have rendered anyway. Non-spot slots return null
+        // here and the condition is unchanged.
+        const cone = spotReachAt(slot, P);
+        const traceGate = slot.giShadow.greaterThan(0.5).and(slot.active.greaterThan(0.5));
+        If(cone ? traceGate.and(cone.greaterThan(0)) : traceGate, () => {
           const isDir = float(slot.kind).toVar();
           const rel = vec3(slot.vector).sub(P).toVar();
           const pointDist = rel.length().max(1e-4).toVar();

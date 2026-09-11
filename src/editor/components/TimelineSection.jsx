@@ -8,6 +8,7 @@ import { openPanel } from "../EditorShell.jsx";
 import { invoke } from "../assetOps.js";
 import { normalizeTimeline, trackLabel } from "../../engine/timeline/timelineAsset.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * The Timeline component's inspector extras: an "Edit Timeline" jump, and the
  * per-track binding table.
@@ -82,7 +83,7 @@ export function TimelineSection({ entityId, props }) {
               <span className="field-label" title={trackLabel(track)}>
                 {trackLabel(track)}
               </span>
-              <select
+              <Select
                 className="select-field"
                 value={props.bindings?.[track.id] ?? ""}
                 onChange={(e) => setBinding(track.id, e.target.value)}
@@ -97,7 +98,7 @@ export function TimelineSection({ entityId, props }) {
                     {e.name}
                   </option>
                 ))}
-              </select>
+              </Select>
             </div>
           ))}
         </>

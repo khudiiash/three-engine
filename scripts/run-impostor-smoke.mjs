@@ -203,10 +203,11 @@ try {
     `corner alpha ${baked.corner?.[3]}`,
   );
   check(
-    "the neutral ambient really captured ALBEDO, not a lighting solution",
-    // The centre of the top-down frame is the green box on +Y. If the bake had
-    // kept the scene's lighting the channel would be anything but this.
-    baked.centre && baked.centre[1] > 140 && baked.centre[0] < 110 && baked.centre[3] > 200,
+    "the unlit source colour survives the atlas in absolute RGB",
+    // These MeshBasic materials bypass diffuse lighting. The separate
+    // impostor-lighting smoke compares lit Standard surfaces across the LOD
+    // switch; this gate specifically pins the unlit #20ff20 source bytes.
+    baked.centre && baked.centre.every((value, index) => Math.abs(value - [32,255,32,255][index]) <= 2),
     `rgba(${baked.centre})`,
   );
   check(

@@ -15,6 +15,7 @@ import {
 import { CREDENTIAL_CHANGED_EVENT } from "../credentialEvents.js";
 import { AssetPreview } from "../components/AssetPreview.jsx";
 
+import { Select } from "../fields/Select.jsx";
 const openModulesPanel = () => import("../EditorShell.jsx").then((m) => m.openPanel("modules"));
 
 const PAGE_SIZE = 24;
@@ -166,7 +167,7 @@ export function PolyPizzaPanel() {
         <button className="toolbar-btn icon-only" type="submit" title="Search">
           <Search size={13} />
         </button>
-        <select
+        <Select
           className="ph-category"
           value={filters.category}
           onChange={(event) => setFilter({ category: event.target.value })}
@@ -175,8 +176,8 @@ export function PolyPizzaPanel() {
           {CATEGORIES.map((value) => (
             <option key={value.id} value={value.id}>{value.label}</option>
           ))}
-        </select>
-        <select
+        </Select>
+        <Select
           className="ph-category"
           value={filters.license}
           onChange={(event) => setFilter({ license: event.target.value })}
@@ -184,7 +185,7 @@ export function PolyPizzaPanel() {
           {LICENSES.map((value) => (
             <option key={value.id || "any"} value={value.id}>{value.label}</option>
           ))}
-        </select>
+        </Select>
         <label className="pp-animated" title="Only models that ship with animation clips">
           <input
             type="checkbox"

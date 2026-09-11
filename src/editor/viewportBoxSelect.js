@@ -6,6 +6,8 @@ import { useSelectionStore } from "./store/selectionStore.js";
 import { useGeometryEditStore } from "./store/geometryEditStore.js";
 import { getTerrainBrushMode } from "./terrainBrush.js";
 import { getLevelTool } from "./levelTool.js";
+import { isArchitecturePlacementActive } from "./architecturePlacementTool.js";
+import { isArchitectureSculptActive } from "./architectureSculptTool.js";
 import { activeSpline } from "./splineEditing.js";
 import { resolveTargets } from "./selectionRect.js";
 import {
@@ -77,7 +79,7 @@ export function setupBoxSelect(canvas) {
       // Spline edit mode spends Ctrl+click (insert knot) and Shift+click
       // (append knot) on the two modifiers this gesture uses.
       !!activeSpline() ||
-      (!!getLevelTool() && getLevelTool() !== "select")
+      isArchitectureSculptActive() || isArchitecturePlacementActive() || (!!getLevelTool() && getLevelTool() !== "select")
     );
   };
 

@@ -1,6 +1,14 @@
 import * as THREE from "three/webgpu";
 import { matchCaptureTargetFormat, readRenderTargetImage } from "../engine/renderTargetImage.js";
 import { EDITOR_LAYER, PHYSICS_DEBUG_LAYER } from "../engine/editorLayers.js";
+import {
+  FRAME_DEADLINE_MS,
+  captureFrameDownsampled,
+  disposeFrameCopy,
+  frameCopyEnabled,
+} from "./frameCopy.js";
+
+export { FRAME_DEADLINE_MS, frameCopyEnabled };
 
 /**
  * The colour of what the viewport is looking at, small enough to be free.
@@ -12,20 +20,20 @@ import { EDITOR_LAYER, PHYSICS_DEBUG_LAYER } from "../engine/editorLayers.js";
  * 32 px wide, it is taken two and a half times a second, and every part of
  * it that could cost real time is switched off.
  *
- * WHY A SECOND RENDER RATHER THAN READING THE ONE ON SCREEN: a WebGPU
- * swapchain texture is not readable after it is presented, and the copy that
- * IS possible (`readLiveCanvasImage`) takes the whole canvas — some 17 MB a
- * frame at this window size, which is precisely the cost this feature must
- * not have. Re-rendering the scene into a 32×18 target costs one more draw
- * encode of a picture with 576 pixels in it.
+ * THE SAMPLE IS THE FRAME THAT WAS ALREADY RENDERED, NEVER A SECOND RENDER.
+ * The first version re-rendered the whole scene into the 32×N target, and
+ * every scene material paid for it with a second compiled pipeline (963 ms
+ * per light toggle against 698 ms with the glow off — the whole story, with
+ * three's line anchors, is the header of `frameCopy.js`). The sample is now
+ * `captureFrameDownsampled`: the presented frame copied on the GPU and
+ * averaged down by one fixed quad, so no scene material ever sees the glow's
+ * context. The editor's gizmos and grid ARE in that picture; blurred to a
+ * few colours they vanish, and a grid tint, should it ever show, is a
+ * follow-up rather than a reason to render the scene twice.
  *
- * What is switched off for the sample, and why each one matters:
- *   · SHADOW MAPS. `renderer.render` re-renders every shadow map it thinks
- *     is dirty. That is the one thing here that could genuinely cost
- *     milliseconds, and a 32 px thumbnail has no use for a shadow atlas.
- *   · The editor's own layers — gizmos, the grid, collider wireframes.
- *     They are chrome, not the picture, and a green grid would tint the
- *     whole editor green.
+ * `globalThis.__ambientGlowFrameCopy = false` restores the scene re-render
+ * (`renderSample`, kept below as the fallback), and a WebGL backend — which
+ * has no swapchain texture to copy — takes it automatically.
  *
  * The caller decides WHEN; this module only knows how to take one sample.
  */
@@ -37,6 +45,7 @@ let target = null;
 let targetHeight = 0;
 let warned = false;
 
+/** The fallback's target: the scene render wants its output encoded on the way in. */
 function ensureTarget(renderer, height) {
   if (target && targetHeight === height) return target;
   target?.dispose();
@@ -49,11 +58,12 @@ function ensureTarget(renderer, height) {
   return target;
 }
 
-/** Frees the sample target. Call when the glow is switched off for good. */
+/** Frees the sample target and the shared frame copy. Call when the glow is switched off for good. */
 export function disposeAmbientSampler() {
   target?.dispose();
   target = null;
   targetHeight = 0;
+  disposeFrameCopy();
 }
 
 /** The sample height that matches a viewport of `aspect`, 8–32 px. */
@@ -63,7 +73,9 @@ export function sampleHeightFor(aspect) {
 }
 
 /**
- * The masked render, and NOTHING ELSE, in one synchronous turn.
+ * THE FALLBACK: the masked scene render, and NOTHING ELSE, in one
+ * synchronous turn. Taken only by the `__ambientGlowFrameCopy = false` hatch
+ * and the WebGL backend — see `frameCopy.js` for what it costs.
  *
  * ⚠ THIS IS WHY IT IS A SEPARATE FUNCTION. The camera, its layer mask and
  * the renderer's shadow flag all belong to the LIVE VIEWPORT — this borrows
@@ -74,6 +86,11 @@ export function sampleHeightFor(aspect) {
  * and once the glow started sampling every frame during an orbit, that was
  * every frame of the orbit. Everything borrowed is given back before this
  * function returns, so no frame can ever observe the masked state.
+ *
+ * What is switched off, and why: SHADOW MAPS, because `renderer.render`
+ * re-renders every map it thinks is dirty and a thumbnail has no use for a
+ * shadow atlas; and the editor's own layers, because a green grid would tint
+ * the whole editor green.
  */
 function renderSample(renderer, scene, camera, sampleTarget) {
   const previousTarget = renderer.getRenderTarget();
@@ -96,11 +113,21 @@ function renderSample(renderer, scene, camera, sampleTarget) {
 }
 
 /**
- * One sample of the live scene as tightly packed RGBA, row 0 at the top.
- * Returns null when there is nothing to sample.
+ * One sample of the live viewport as tightly packed RGBA, row 0 at the top.
+ * Returns null when there is nothing to sample, or when no frame was
+ * presented within the deadline.
+ *
+ * @param {any} engine   The engine: `renderer`, `scene`, `onPostRender`, `stats`.
+ * @param {any} camera   The viewport camera (only the fallback renders with it).
+ * @param {number} height  Sample height in pixels, see `sampleHeightFor`.
  */
-export async function sampleViewportColour(renderer, scene, camera, height) {
+export async function sampleViewportColour(engine, camera, height, { deadlineMs = FRAME_DEADLINE_MS } = {}) {
+  const renderer = engine?.renderer;
+  const scene = engine?.scene;
   if (!renderer || !scene || !camera || !(height > 0)) return null;
+  if (frameCopyEnabled(renderer) && typeof engine.onPostRender === "function") {
+    return captureFrameDownsampled(engine, { width: SAMPLE_WIDTH, height, deadlineMs });
+  }
   const sampleTarget = ensureTarget(renderer, height);
   try {
     renderSample(renderer, scene, camera, sampleTarget);

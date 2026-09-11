@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -820,6 +820,7 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<u64> {
         dst,
         "",
         &mut Vec::new(),
+        &mut Vec::new(),
         &std::collections::HashSet::new(),
     )
 }
@@ -829,6 +830,9 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// preview's hot-update client decides between an in-place refresh and a full
 /// page reload based on WHAT a rebuild touched — a runtime file from the
 /// player template in this list means "new engine code, reload the page".
+///
+/// `owned` collects every file the copy is responsible for, rewritten or
+/// not: the pruning step needs the whole set, not the delta.
 ///
 /// `exclude` exists because the exporter REGENERATES some template files
 /// (index.html gets themed + the preview client injected). Copying the raw
@@ -840,6 +844,7 @@ fn copy_dir_tracking(
     dst: &Path,
     prefix: &str,
     changed: &mut Vec<String>,
+    owned: &mut Vec<String>,
     exclude: &std::collections::HashSet<&str>,
 ) -> std::io::Result<u64> {
     fs::create_dir_all(dst)?;
@@ -854,12 +859,15 @@ fn copy_dir_tracking(
         };
         let dest = dst.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copied += copy_dir_tracking(&entry.path(), &dest, &rel, changed, exclude)?;
+            copied += copy_dir_tracking(&entry.path(), &dest, &rel, changed, owned, exclude)?;
         } else if exclude.contains(rel.as_str()) {
             // The generated version is written (and diffed) by the caller.
-        } else if copy_file_if_changed(&entry.path(), &dest)? {
-            changed.push(rel);
-            copied += 1;
+        } else {
+            if copy_file_if_changed(&entry.path(), &dest)? {
+                changed.push(rel.clone());
+                copied += 1;
+            }
+            owned.push(rel);
         }
     }
     Ok(copied)
@@ -1169,21 +1177,48 @@ async fn rebuild_player_template() -> Result<(), String> {
     .map_err(|e| e.to_string())?
 }
 
-/// Copies the prebuilt player template into `out_dir`, writes scene.json,
-/// and copies referenced assets to their relative destinations. Returns the
-/// source paths of referenced assets that no longer exist on disk — a deleted
-/// asset a scene still points at is the caller's warning to surface, not a
-/// reason to refuse the whole build.
-/// What one export actually did: which referenced sources no longer exist, and
-/// which build-relative files were (re)written. `changed` feeds the live
+/// What one export actually did: which referenced sources no longer exist,
+/// which build-relative files were (re)written, and which leftovers of the
+/// previous build into the same folder were deleted. `changed` feeds the live
 /// preview's revision manifest so the browser can update in place instead of
 /// reloading the whole page.
 #[derive(Serialize)]
 struct ExportGameReport {
     missing: Vec<String>,
     changed: Vec<String>,
+    removed: Vec<String>,
 }
 
+/// The build's own record of which files it wrote, kept in the output folder
+/// so the NEXT build into the same folder can tell its predecessor's leftovers
+/// from files that were never ours. Before this existed nothing was ever
+/// deleted: an asset dropped from a scene stayed in `assets/` forever, every
+/// live-preview rebuild into the same folder added another hashed runtime
+/// chunk, and the zip a user uploaded carried every asset the project had ever
+/// referenced. Dot-prefixed, and skipped by `zip_dir`.
+const BUILD_MANIFEST_NAME: &str = ".build-manifest.json";
+
+/// Written by the exporter AFTER `export_game` returns (PREVIEW_REVISION_PATH
+/// in build/playerHtml.js), so it is never in a run's owned set — and must
+/// never be swept as a leftover.
+const PREVIEW_REVISION_NAME: &str = "__preview_revision.json";
+
+#[derive(Serialize, Deserialize)]
+struct BuildManifest {
+    version: u32,
+    files: Vec<String>,
+}
+
+/// Copies the prebuilt player template into `out_dir` — all of it, or only
+/// the `template_files` allow-list the exporter derived from the Vite
+/// manifest — writes scene.json, copies referenced assets to their relative
+/// destinations and writes the generated documents. With `prune`, whatever
+/// the previous build into this folder owned and this one does not is deleted,
+/// so the folder holds exactly one build's worth of files.
+///
+/// A referenced asset that no longer exists on disk is returned in `missing`
+/// — a deleted asset a scene still points at is the caller's warning to
+/// surface, not a reason to refuse the whole build.
 #[tauri::command]
 fn export_game(
     app: tauri::AppHandle,
@@ -1191,22 +1226,62 @@ fn export_game(
     scene_json: String,
     assets: Vec<(String, String)>,
     files: Vec<(String, String)>,
+    template_files: Option<Vec<String>>,
+    prune: Option<bool>,
 ) -> Result<ExportGameReport, String> {
     let player = player_template_dir(&app)?;
-    let out = Path::new(&out_dir);
+    export_game_into(
+        &player,
+        Path::new(&out_dir),
+        &scene_json,
+        assets,
+        files,
+        template_files,
+        prune.unwrap_or(false),
+    )
+}
+
+/// `export_game` minus the app handle, so the whole write-and-prune contract
+/// is testable against a scratch template.
+fn export_game_into(
+    player: &Path,
+    out: &Path,
+    scene_json: &str,
+    assets: Vec<(String, String)>,
+    files: Vec<(String, String)>,
+    template_files: Option<Vec<String>>,
+    prune: bool,
+) -> Result<ExportGameReport, String> {
     let mut changed = Vec::new();
+    let mut owned: Vec<String> = Vec::new();
+    let mut missing = Vec::new();
     // Template files the exporter re-emits itself must not be copied raw
     // first — the copy and the regeneration would take turns rewriting them,
     // polluting the change manifest on every single rebuild.
     let generated: std::collections::HashSet<&str> =
         files.iter().map(|(rel, _)| rel.as_str()).collect();
-    copy_dir_tracking(&player, out, "", &mut changed, &generated).map_err(|e| {
-        format!(
-            "copy player template {} to {}: {e}",
-            player.display(),
-            out.display()
-        )
-    })?;
+    match &template_files {
+        Some(rels) => copy_template_files(
+            player,
+            out,
+            rels,
+            &mut changed,
+            &mut owned,
+            &mut missing,
+            &generated,
+        )?,
+        None => {
+            copy_dir_tracking(player, out, "", &mut changed, &mut owned, &generated).map_err(
+                |e| {
+                    format!(
+                        "copy player template {} to {}: {e}",
+                        player.display(),
+                        out.display()
+                    )
+                },
+            )?;
+        }
+    }
     let scene_path = out.join("scene.json");
     // Atomic: a live browser preview is serving this exact file while the
     // rebuild runs (see replace_atomically).
@@ -1215,7 +1290,7 @@ fn export_game(
     {
         changed.push("scene.json".into());
     }
-    let mut missing = Vec::new();
+    owned.push("scene.json".into());
     for (src, rel) in assets {
         let dest = out.join(&rel);
         if let Some(parent) = dest.parent() {
@@ -1223,10 +1298,15 @@ fn export_game(
                 .map_err(|e| format!("create asset directory {}: {e}", parent.display()))?;
         }
         match copy_file_if_changed(Path::new(&src), &dest) {
-            Ok(true) => changed.push(rel),
-            Ok(false) => {}
+            Ok(true) => {
+                changed.push(rel.clone());
+                owned.push(rel);
+            }
+            Ok(false) => owned.push(rel),
             // Only a vanished source is survivable. Permission and disk
             // errors still fail: they would ship a silently incomplete build.
+            // A copy of the vanished file left by an earlier build is NOT
+            // kept alive: the honest build 404s exactly where the project does.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(src),
             Err(e) => return Err(format!("copy asset {src} to {}: {e}", dest.display())),
         }
@@ -1241,10 +1321,183 @@ fn export_game(
         if write_if_different(&dest, contents.as_bytes())
             .map_err(|e| format!("write generated file {}: {e}", dest.display()))?
         {
-            changed.push(rel);
+            changed.push(rel.clone());
+        }
+        owned.push(rel);
+    }
+    let previous = read_build_manifest(out);
+    let removed = if prune {
+        prune_stale_output(out, &owned, &previous)?
+    } else {
+        // Nothing deleted, so everything the previous build owned may still be
+        // on disk: carry it forward, or the next pruning build could not see it.
+        owned.extend(previous);
+        Vec::new()
+    };
+    owned.sort();
+    owned.dedup();
+    let manifest = serde_json::to_string(&BuildManifest { version: 1, files: owned })
+        .map_err(|e| format!("encode build manifest: {e}"))?;
+    // Not in `changed`: the manifest is bookkeeping, not part of the game, and
+    // the live preview must not read a rebuild that touched only it as an edit.
+    write_if_different(&out.join(BUILD_MANIFEST_NAME), manifest.as_bytes())
+        .map_err(|e| format!("write {BUILD_MANIFEST_NAME}: {e}"))?;
+    Ok(ExportGameReport {
+        missing,
+        changed,
+        removed,
+    })
+}
+
+/// Copies exactly the listed template files. A listed file that has vanished
+/// lands in `missing` rather than failing the build: the editor rebuilds the
+/// template on its own schedule, and a rebuild landing between the exporter's
+/// listing and its copy renames every hashed chunk.
+fn copy_template_files(
+    player: &Path,
+    out: &Path,
+    rels: &[String],
+    changed: &mut Vec<String>,
+    owned: &mut Vec<String>,
+    missing: &mut Vec<String>,
+    exclude: &std::collections::HashSet<&str>,
+) -> Result<(), String> {
+    for rel in rels {
+        if rel.is_empty()
+            || rel.split(['/', '\\']).any(|seg| seg == "..")
+            || Path::new(rel).is_absolute()
+        {
+            return Err(format!("invalid template path: {rel}"));
+        }
+        if exclude.contains(rel.as_str()) {
+            continue;
+        }
+        let src = player.join(rel);
+        let dest = out.join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create template directory {}: {e}", parent.display()))?;
+        }
+        match copy_file_if_changed(&src, &dest) {
+            Ok(true) => {
+                changed.push(rel.clone());
+                owned.push(rel.clone());
+            }
+            Ok(false) => owned.push(rel.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(src.to_string_lossy().into_owned())
+            }
+            Err(e) => return Err(format!("copy player template file {rel}: {e}")),
         }
     }
-    Ok(ExportGameReport { missing, changed })
+    Ok(())
+}
+
+/// Deletes the previous build's leftovers: every file the manifest left behind
+/// by the last build into `out` names, plus anything under `_engine/` (the
+/// runtime folder has exactly one writer, so a chunk this build did not copy
+/// is a chunk from an older player template), minus what this build owns.
+/// Files the exporter never wrote — a first build into a folder that already
+/// held things — are left alone: the manifest is the only evidence a file was
+/// ever ours, and "the build deleted my notes" is worse than a stale texture.
+fn prune_stale_output(
+    out: &Path,
+    owned: &[String],
+    previous: &[String],
+) -> Result<Vec<String>, String> {
+    let keep: std::collections::HashSet<&str> = owned.iter().map(|s| s.as_str()).collect();
+    let mut candidates: Vec<String> = previous.to_vec();
+    let engine_dir = out.join("_engine");
+    if engine_dir.is_dir() {
+        for entry in walkdir::WalkDir::new(&engine_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if let Ok(rel) = entry.path().strip_prefix(out) {
+                candidates.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    let mut removed = Vec::new();
+    for rel in candidates {
+        if keep.contains(rel.as_str())
+            || rel == BUILD_MANIFEST_NAME
+            || rel == PREVIEW_REVISION_NAME
+        {
+            continue;
+        }
+        // The manifest is our own file, but it is still input read off a disk
+        // anyone can edit: never follow it outside `out`.
+        if rel.is_empty() || rel.split('/').any(|seg| seg == "..") || Path::new(&rel).is_absolute()
+        {
+            continue;
+        }
+        let path = out.join(&rel);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                remove_empty_parents(out, &path);
+                removed.push(rel);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove stale {}: {e}", path.display())),
+        }
+    }
+    Ok(removed)
+}
+
+/// What the last build into `out` recorded as its own — empty when there was
+/// none, or the file is unreadable.
+fn read_build_manifest(out: &Path) -> Vec<String> {
+    fs::read_to_string(out.join(BUILD_MANIFEST_NAME))
+        .ok()
+        .and_then(|text| serde_json::from_str::<BuildManifest>(&text).ok())
+        .map(|manifest| manifest.files)
+        .unwrap_or_default()
+}
+
+/// Removes the now-empty directories a deleted file leaves behind, up to (not
+/// including) `out`. `remove_dir` refuses a non-empty directory, which is the
+/// stop condition.
+fn remove_empty_parents(out: &Path, path: &Path) {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d == out || !d.starts_with(out) {
+            break;
+        }
+        if fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
+/// Every file in the player template with its size, template-relative with
+/// forward slashes. The exporter joins this with the Vite manifest
+/// (`.vite/manifest.json`) to decide which runtime chunks a game can reach.
+#[tauri::command]
+fn list_player_template(app: tauri::AppHandle) -> Result<Vec<(String, u64)>, String> {
+    let dir = player_template_dir(&app)?;
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(&dir) else {
+            continue;
+        };
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        files.push((rel.to_string_lossy().replace('\\', "/"), size));
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Atomic sibling of `save_scene`, for files that are READ WHILE BEING
@@ -1300,6 +1553,10 @@ fn zip_dir(dir: String, dest: String) -> Result<u64, String> {
         }
         // Zip entries always use forward slashes, whatever the host OS does.
         let name = rel.to_string_lossy().replace('\\', "/");
+        // The build's own bookkeeping, not part of the game.
+        if name == BUILD_MANIFEST_NAME {
+            continue;
+        }
         if entry.file_type().is_dir() {
             zip.add_directory(format!("{name}/"), options)
                 .map_err(|e| e.to_string())?;
@@ -2205,11 +2462,137 @@ async fn ai_chat(url: String, api_key: Option<String>, body: String) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_dir_tracking, decode_hex_exact, fill_artifact_checksum, newest_player_source,
-        pack_binary_files, percent_decode, player_checkout_root, validate_browser_preview_url,
-        write_binary_parts_atomic, write_if_different, zip_dir,
+        copy_dir_tracking, decode_hex_exact, export_game_into, fill_artifact_checksum,
+        newest_player_source, pack_binary_files, percent_decode, player_checkout_root,
+        validate_browser_preview_url, write_binary_parts_atomic, write_if_different, zip_dir,
+        BUILD_MANIFEST_NAME, PREVIEW_REVISION_NAME,
     };
     use std::fs;
+
+    /// A folder that is built into twice must hold exactly the second build: a
+    /// file the first build wrote and the second did not is deleted, while
+    /// files the exporter never wrote — and the live preview's revision marker
+    /// — are left alone. The runtime folder is the one exception to "only what
+    /// the manifest names": it has a single writer, so an unknown chunk there
+    /// is always an older template's.
+    #[test]
+    fn a_rebuild_removes_only_what_the_previous_build_owned() {
+        let base = std::env::temp_dir().join("three-engine-prune-test");
+        let _ = fs::remove_dir_all(&base);
+        let player = base.join("player");
+        let out = base.join("out");
+        fs::create_dir_all(player.join("_engine")).unwrap();
+        fs::write(player.join("index.html"), "<!doctype html>").unwrap();
+        fs::write(player.join("_engine").join("player-new.js"), "boot()").unwrap();
+        // Already in the folder: an older runtime chunk, a stray texture, a
+        // note, and a live preview's revision marker.
+        fs::create_dir_all(out.join("_engine")).unwrap();
+        fs::create_dir_all(out.join("assets")).unwrap();
+        fs::write(out.join("_engine").join("player-old.js"), "old()").unwrap();
+        fs::write(out.join("assets").join("stray.png"), "png").unwrap();
+        fs::write(out.join("notes.txt"), "mine").unwrap();
+        fs::write(out.join(PREVIEW_REVISION_NAME), "{}").unwrap();
+        let src = base.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a.png"), "a").unwrap();
+        fs::write(src.join("b.png"), "b").unwrap();
+        let asset = |name: &str| (src.join(name).to_string_lossy().into_owned(), format!("assets/{name}"));
+        let index = || ("index.html".to_string(), "<!doctype html>".to_string());
+
+        let first = export_game_into(
+            &player,
+            &out,
+            "{}",
+            vec![asset("a.png"), asset("b.png")],
+            vec![index(), ("docs/m.mat".into(), "{}".into())],
+            None,
+            true,
+        )
+        .unwrap();
+        // No manifest yet: only the runtime folder is swept.
+        assert_eq!(first.removed, vec!["_engine/player-old.js".to_string()]);
+        assert!(out.join("assets/stray.png").exists(), "a file we never wrote survives");
+        assert!(out.join("notes.txt").exists());
+        assert!(out.join(PREVIEW_REVISION_NAME).exists());
+        assert!(out.join(BUILD_MANIFEST_NAME).exists(), "the build records what it owns");
+
+        // b.png and the material fell out of the scene.
+        let second = export_game_into(
+            &player,
+            &out,
+            "{}",
+            vec![asset("a.png")],
+            vec![index()],
+            None,
+            true,
+        )
+        .unwrap();
+        let mut removed = second.removed.clone();
+        removed.sort();
+        assert_eq!(removed, vec!["assets/b.png".to_string(), "docs/m.mat".to_string()]);
+        assert!(out.join("assets/a.png").exists());
+        assert!(out.join("assets/stray.png").exists(), "still never ours");
+        assert!(!out.join("docs").exists(), "an emptied folder goes with its last file");
+        assert!(out.join(PREVIEW_REVISION_NAME).exists(), "the preview marker is never swept");
+        assert!(second.changed.is_empty(), "nothing was rewritten: {:?}", second.changed);
+
+        // Without pruning nothing is deleted, but the manifest still records
+        // this build — so the next pruning build knows what to sweep.
+        let third = export_game_into(&player, &out, "{}", vec![], vec![index()], None, false).unwrap();
+        assert!(third.removed.is_empty());
+        assert!(out.join("assets/a.png").exists());
+        let fourth = export_game_into(&player, &out, "{}", vec![], vec![index()], None, true).unwrap();
+        assert_eq!(fourth.removed, vec!["assets/a.png".to_string()]);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The exporter hands over the runtime files a game can reach; nothing else
+    /// in the template is copied, a listed file that has vanished (the template
+    /// was rebuilt mid-export) is reported rather than fatal, and a generated
+    /// file is never overwritten by its raw template twin.
+    #[test]
+    fn a_template_allow_list_copies_only_those_files() {
+        let base = std::env::temp_dir().join("three-engine-template-allowlist-test");
+        let _ = fs::remove_dir_all(&base);
+        let player = base.join("player");
+        let out = base.join("out");
+        fs::create_dir_all(player.join("_engine")).unwrap();
+        fs::create_dir_all(player.join("basis")).unwrap();
+        fs::write(player.join("index.html"), "<!doctype html>RAW").unwrap();
+        fs::write(player.join("_engine").join("player-a.js"), "boot()").unwrap();
+        fs::write(player.join("_engine").join("rapier-b.js"), "physics()").unwrap();
+        fs::write(player.join("basis").join("t.wasm"), "wasm").unwrap();
+        let report = export_game_into(
+            &player,
+            &out,
+            "{}",
+            vec![],
+            vec![("index.html".into(), "<!doctype html>THEMED".into())],
+            Some(vec![
+                "_engine/player-a.js".into(),
+                "index.html".into(),
+                "_engine/gone.js".into(),
+            ]),
+            true,
+        )
+        .unwrap();
+        assert!(out.join("_engine/player-a.js").exists());
+        assert!(!out.join("_engine/rapier-b.js").exists(), "an unlisted chunk is not copied");
+        assert!(!out.join("basis").exists(), "an unlisted folder is not copied");
+        assert_eq!(report.missing.len(), 1, "the vanished chunk is reported: {:?}", report.missing);
+        assert!(report.missing[0].ends_with("gone.js"));
+        assert_eq!(
+            fs::read_to_string(out.join("index.html")).unwrap(),
+            "<!doctype html>THEMED",
+            "the generated index.html wins over the raw template"
+        );
+        assert!(
+            export_game_into(&player, &out, "{}", vec![], vec![], Some(vec!["../x.js".into()]), false)
+                .is_err(),
+            "a path that climbs out of the template is refused"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
 
     /// The hot-update client trusts this list to tell a material tweak from an
     /// engine rebuild — an unchanged file reported as changed downgrades every
@@ -2226,7 +2609,7 @@ mod tests {
         fs::write(src.join("_engine").join("player.js"), "boot()").unwrap();
 
         let mut changed = Vec::new();
-        copy_dir_tracking(&src, &dst, "", &mut changed, &Default::default()).unwrap();
+        copy_dir_tracking(&src, &dst, "", &mut changed, &mut Vec::new(), &Default::default()).unwrap();
         changed.sort();
         assert_eq!(
             changed,
@@ -2235,7 +2618,7 @@ mod tests {
 
         // Second pass over an unchanged tree: nothing may report as changed.
         let mut second = Vec::new();
-        copy_dir_tracking(&src, &dst, "", &mut second, &Default::default()).unwrap();
+        copy_dir_tracking(&src, &dst, "", &mut second, &mut Vec::new(), &Default::default()).unwrap();
         assert!(second.is_empty(), "unchanged copies reported: {second:?}");
 
         // A template file the exporter regenerates (the themed index.html)
@@ -2245,7 +2628,7 @@ mod tests {
         fs::write(dst.join("index.html"), "<themed>").unwrap();
         let mut third = Vec::new();
         let generated = std::collections::HashSet::from(["index.html"]);
-        copy_dir_tracking(&src, &dst, "", &mut third, &generated).unwrap();
+        copy_dir_tracking(&src, &dst, "", &mut third, &mut Vec::new(), &generated).unwrap();
         assert!(
             third.is_empty(),
             "excluded template file was copied: {third:?}"
@@ -2544,6 +2927,7 @@ pub fn run() {
             export_game,
             write_file_atomic,
             read_player_template,
+            list_player_template,
             player_template_status,
             rebuild_player_template,
             zip_dir,

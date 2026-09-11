@@ -1,5 +1,6 @@
 // @ts-check
 import * as THREE from "three/webgpu";
+import { buildPolygonSlab } from "../architecture/polygonGeometry.js";
 
 /**
  * The geometry behind every blockout piece.
@@ -342,6 +343,7 @@ export function defaultSteps(rise) {
  * preview ghost alike.
  */
 export function buildBlockoutGeometry(shape, props = {}) {
+  if ((shape === "floor" || shape === "platform") && props.footprint?.length) return buildPolygonSlab(props);
   const sink = makeSink();
   emitShape(sink, shape, props);
   const geometry = new THREE.BufferGeometry();
@@ -357,6 +359,8 @@ export function buildBlockoutGeometry(shape, props = {}) {
 /** The box list alone — the same numbers the geometry is built from, without
  *  allocating buffers. Used by physics and by tests. */
 export function blockoutBoxes(shape, props = {}) {
+  // Polygon slabs collide through their exact indexed mesh, never their AABB.
+  if ((shape === "floor" || shape === "platform") && props.footprint?.length) return [];
   const sink = makeSink();
   emitShape(sink, shape, props);
   return sink.boxes;
@@ -371,6 +375,10 @@ export function blockoutBounds(shape, props = {}) {
   const size = props.size ?? BLOCKOUT_DEFAULT_SIZE[shape] ?? [1, 1, 1];
   const [sx, sy, sz] = size.map((v) => Math.max(0.001, Number(v) || 0));
   const below = shape === "floor" || shape === "platform";
+  if (below && props.footprint?.length) {
+    const xs = props.footprint.map(p => p[0]), zs = props.footprint.map(p => p[1]);
+    return [[Math.min(...xs), -sy, Math.min(...zs)], [Math.max(...xs), 0, Math.max(...zs)]];
+  }
   return [
     [-sx / 2, below ? -sy : 0, -sz / 2],
     [sx / 2, below ? 0 : sy, sz / 2],

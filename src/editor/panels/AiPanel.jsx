@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, Camera, History, Paperclip, Plus, Sparkles, Square, Trash2, X } from "../icons/index.jsx";
+import { ArrowUp, Check, ChevronRight, Camera, Copy, History, Paperclip, Plus, Sparkles, Square, Trash2, X } from "../icons/index.jsx";
+import { Markdown } from "../ai/markdown.jsx";
 import {
   useAiStore,
   activeConversation,
@@ -18,6 +19,7 @@ import { useAssetDrop } from "../assetDrag.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import { PopoverMenu } from "../fields/PopoverMenu.jsx";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * The AI conversation.
  *
@@ -44,6 +46,9 @@ import { PopoverMenu } from "../fields/PopoverMenu.jsx";
  *    so `dragover`/`drop` never fire here. Both those modules are pointer
  *    gestures with `elementFromPoint` hit-testing for exactly that reason.
  */
+
+/** Openers for an empty thread — one per thing the assistant can actually reach. */
+const SUGGESTIONS = ["What's in this scene?", "Why is my frame rate low?", "Explain the selected entity"];
 
 function formatTokens(n) {
   if (!n) return null;
@@ -130,6 +135,25 @@ function Chip({ context, onRemove }) {
   );
 }
 
+/** Copies a whole answer. Hover-revealed, the way a chat client does it. */
+function CopyButton({ text }) {
+  const [done, setDone] = useState(false);
+  return (
+    <button
+      className="ai-copy"
+      title="Copy this answer"
+      onClick={() => {
+        navigator.clipboard?.writeText(text).catch(() => {});
+        setDone(true);
+        setTimeout(() => setDone(false), 1200);
+      }}
+    >
+      {done ? <Check size={11} /> : <Copy size={11} />}
+      <span>{done ? "Copied" : "Copy"}</span>
+    </button>
+  );
+}
+
 function Message({ message, live }) {
   if (message.role === "user") {
     return (
@@ -163,11 +187,22 @@ function Message({ message, live }) {
   return (
     <div className="ai-msg assistant">
       <ToolTrail lines={message.lines} live={live} />
-      {body && <div className="ai-answer">{body}</div>}
-      {live && !body && message.lines.length === 0 && <div className="ai-thinking">Thinking…</div>}
+      {body && <Markdown className={`ai-answer${live ? " streaming" : ""}`} text={body} />}
+      {live && !body && message.lines.length === 0 && (
+        <div className="ai-thinking">
+          Thinking<i />
+          <i />
+          <i />
+        </div>
+      )}
       {message.cancelled && <div className="ai-note">Stopped. Anything it already changed is on the undo stack.</div>}
       {message.error && <div className="ai-line error">{message.error}</div>}
-      {footer && <div className="ai-msg-meta">{footer}</div>}
+      {(footer || (body && !live)) && (
+        <div className="ai-msg-foot">
+          {body && !live && <CopyButton text={body} />}
+          {footer && <span className="ai-msg-meta">{footer}</span>}
+        </div>
+      )}
     </div>
   );
 }
@@ -242,6 +277,16 @@ export function AiPanel() {
     inputRef.current?.focus();
   }, [conversation?.id]);
 
+  // The composer grows with what you are writing, up to a third of the panel.
+  // A fixed two-row box hides the top of a long question behind its own
+  // scrollbar, in a panel that has plenty of room to just be taller.
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+  }, [draft]);
+
   // Dropping an entity from the Hierarchy, or an asset from the browser,
   // ATTACHES it rather than replacing what is there: "why does this material
   // look wrong on that mesh" is a two-chip question, and a drop that wiped the
@@ -284,6 +329,14 @@ export function AiPanel() {
 
   const subtitle = [provider, model].filter(Boolean).join(" · ");
 
+  // A blank panel that only says "ask anything" teaches nothing about what
+  // this assistant can reach. These are openers, not commands: clicking one
+  // fills the box so you can edit it before sending.
+  const onSuggestion = (text) => {
+    setDraft(text);
+    inputRef.current?.focus();
+  };
+
   const send = () => {
     const text = draft.trim();
     if (!text || running) return;
@@ -313,32 +366,33 @@ export function AiPanel() {
         </button>
         {historyOpen && <HistoryMenu anchorRef={historyBtnRef} onClose={() => setHistoryOpen(false)} />}
 
-        <select
-          className="ai-bar-select"
-          title="Model — Default leaves the CLI's own setting alone"
-          value={prefs.claudeModel}
-          onChange={(e) => setAiPrefs({ claudeModel: e.target.value })}
-        >
-          {CLAUDE_MODELS.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
-        </select>
-        <select
-          className="ai-bar-select"
-          title="Effort — how hard the model works before answering"
-          value={prefs.claudeEffort}
-          onChange={(e) => setAiPrefs({ claudeEffort: e.target.value })}
-        >
-          {CLAUDE_EFFORTS.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
-        </select>
+        <span className="ai-bar-sub" title={subtitle}>
+          {subtitle}
+        </span>
 
-        <span className="ai-bar-sub">{subtitle}</span>
+        {/* Two pickers that both read "Default" are indistinguishable, so each
+            wears its caption. They sit at the far end, where a chat client
+            keeps its model picker. */}
+        <label className="ai-pick" title="Model — Default leaves the CLI's own setting alone">
+          <span>Model</span>
+          <Select value={prefs.claudeModel} onChange={(e) => setAiPrefs({ claudeModel: e.target.value })}>
+            {CLAUDE_MODELS.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </Select>
+        </label>
+        <label className="ai-pick" title="Effort — how hard the model works before answering">
+          <span>Effort</span>
+          <Select value={prefs.claudeEffort} onChange={(e) => setAiPrefs({ claudeEffort: e.target.value })}>
+            {CLAUDE_EFFORTS.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </Select>
+        </label>
       </div>
 
       <div
@@ -351,12 +405,19 @@ export function AiPanel() {
       >
         {messages.length === 0 ? (
           <div className="ai-empty">
-            <Sparkles size={14} />
-            <p>Ask about the scene, an entity, an asset — anything in this project.</p>
+            <Sparkles size={18} />
+            <p className="ai-empty-lead">Ask about anything in this project.</p>
             <p className="ai-empty-sub">
-              Drag entities or assets in to attach them. It can read and change the editor through the same API the
-              MCP tools use; edits go through undo.
+              Drag entities or assets in to attach them. It reads and changes the editor through the same API the MCP
+              tools use, and every edit goes through undo.
             </p>
+            <div className="ai-suggestions">
+              {SUGGESTIONS.map((s) => (
+                <button key={s} className="ai-suggestion" onClick={() => onSuggestion(s)}>
+                  {s}
+                </button>
+              ))}
+            </div>
           </div>
         ) : (
           messages.map((message, i) => (
@@ -366,44 +427,55 @@ export function AiPanel() {
         {error && status === "error" && <div className="ai-line error">{error}</div>}
       </div>
 
-      <div className="ai-attach-row">
-        {contexts.map((c) => (
-          <Chip key={contextKey(c)} context={c} onRemove={removeAiContext} />
-        ))}
-        <button className="ai-attach-btn" title="Attach files" onClick={attachFiles}>
-          <Paperclip size={12} />
-        </button>
-        <button
-          className="ai-attach-btn"
-          title="Let the assistant look at the viewport"
-          onClick={() => addAiContext(viewportContext())}
-        >
-          <Camera size={12} />
-        </button>
-        <button className="ai-attach-btn wide" title="Ask about the whole scene" onClick={() => addAiContext(sceneContext())}>
-          Scene
-        </button>
-      </div>
+      {/* One card: the chips, the text, and the buttons that act on them are
+          the same object — split across two bars they read as unrelated
+          furniture, which is exactly how the old layout looked. */}
+      <div className="ai-dock">
+        <div className="ai-composer">
+          {contexts.length > 0 && (
+            <div className="ai-composer-chips">
+              {contexts.map((c) => (
+                <Chip key={contextKey(c)} context={c} onRemove={removeAiContext} />
+              ))}
+            </div>
+          )}
 
-      <div className="ai-composer">
-        <textarea
-          ref={inputRef}
-          className="ai-input"
-          rows={2}
-          placeholder={contexts.length ? `Ask about ${contexts.map((c) => c.label).join(", ")}…` : "Ask anything…"}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={onKeyDown}
-        />
-        {running ? (
-          <button className="ai-send stop" title="Stop" onClick={() => cancelRun()}>
-            <Square size={12} />
-          </button>
-        ) : (
-          <button className="ai-send" title="Send (Enter)" disabled={!draft.trim()} onClick={send}>
-            <ArrowUp size={13} />
-          </button>
-        )}
+          <textarea
+            ref={inputRef}
+            className="ai-input"
+            rows={1}
+            placeholder={contexts.length ? `Ask about ${contexts.map((c) => c.label).join(", ")}…` : "Ask anything…"}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={onKeyDown}
+          />
+
+          <div className="ai-composer-actions">
+            <button className="ai-tool-btn" title="Attach files" onClick={attachFiles}>
+              <Paperclip size={13} />
+            </button>
+            <button
+              className="ai-tool-btn"
+              title="Let the assistant look at the viewport"
+              onClick={() => addAiContext(viewportContext())}
+            >
+              <Camera size={13} />
+            </button>
+            <button className="ai-tool-btn wide" title="Ask about the whole scene" onClick={() => addAiContext(sceneContext())}>
+              Scene
+            </button>
+            <span className="ai-composer-gap" />
+            {running ? (
+              <button className="ai-send stop" title="Stop" onClick={() => cancelRun()}>
+                <Square size={11} />
+              </button>
+            ) : (
+              <button className="ai-send" title="Send (Enter)" disabled={!draft.trim()} onClick={send}>
+                <ArrowUp size={13} />
+              </button>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );

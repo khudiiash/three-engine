@@ -38,6 +38,8 @@
  */
 
 /** Spans shorter than this never reach the ring: a freeze is not built of them. */
+import { WgslRegistry } from "./wgslStable.js";
+
 const MIN_SPAN_MS = 0.4;
 
 /** Ring capacity. ~4 s of a busy boot at 500 spans/s. */
@@ -54,6 +56,10 @@ const LOG_MS = 150;
 /** At most this many console lines per window, so a bad boot stays readable. */
 const LOG_BUDGET = 12;
 const LOG_WINDOW_MS = 10_000;
+/** How far back a synchronous pipeline creation can still be blamed for a
+ * spanless block: an 80 s kernel compile parks the GPU process for 80 s. */
+const STALL_LOOKBACK_MS = 90_000;
+const SYNC_COMPILE_RING = 64;
 
 const now = () => performance.now();
 
@@ -86,7 +92,21 @@ class FreezeLedger {
     // Sync GPU-object creation counted per task window. These are the calls
     // that block without appearing in any JS profile (the driver parses WGSL
     // on the calling thread), so they are counted as well as spanned.
-    this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0 };
+    this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0, writeBytes: 0, writes: 0, largestWrite: 0 };
+    /**
+     * What the GPU process may be busy with, kept ACROSS task windows: the
+     * synchronous pipeline creations of the last `STALL_LOOKBACK_MS` and the
+     * asynchronous ones still in flight. A block with no engine span and no
+     * GPU call in it is the page's main thread waiting for the GPU process
+     * (its command thread executes a sync `createRenderPipeline` in order, so
+     * every later command — including the flow-control ack the renderer is
+     * blocked on — queues behind the compile). Without this the 21.5 s block
+     * of 2026-09-09 read `(unattributed) 21528` and nothing else.
+     */
+    this.syncCompileLog = [];
+    this.asyncInFlight = new Map();
+    /** Shader-module text registry (raw/canonical hashes); set by the GPU ledger. */
+    this.wgsl = null;
 
     this._logCount = 0;
     this._logWindow = 0;
@@ -259,10 +279,15 @@ class FreezeLedger {
   recordTask(start, duration) {
     const owners = this.attribute(start, start + duration);
     const causes = this.#causesWithin(start, start + duration);
+    // `writeBytes` rides along only when it is large: a `queue.writeBuffer`
+    // that blocked for 178 ms (2026-09-09) is either a real copy of that many
+    // bytes or the wire's back-pressure, and the byte count is what tells them
+    // apart.
     const gpu = this.gpu.renderPipelines || this.gpu.computePipelines || this.gpu.shaderModules
+      || this.gpu.writeBytes >= 1 << 20
       ? { ...this.gpu }
       : null;
-    this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0 };
+    this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0, writeBytes: 0, writes: 0, largestWrite: 0 };
     const task = {
       at: +start.toFixed(0),
       ms: +duration.toFixed(0),
@@ -273,6 +298,13 @@ class FreezeLedger {
       causes,
       gpu,
     };
+    // A block that nothing marked: name what the GPU process was doing, so
+    // the reader can tell "a missing span" from "waiting on the driver".
+    const unattributed = owners.find((o) => o.name === "(unattributed)")?.ms ?? 0;
+    if (unattributed >= duration * 0.5 && unattributed >= 50) {
+      const load = this.gpuLoadAt(start);
+      if (load) task.gpuLoad = load;
+    }
     this.tasks.push(task);
     if (this.tasks.length > TASK_RING) this.tasks.splice(0, this.tasks.length - TASK_RING);
     this.totals.tasks++;
@@ -296,12 +328,61 @@ class FreezeLedger {
     const who = task.owners.map((o) => `${o.name} ${o.ms}`).join(", ") || "unattributed";
     const gpu = task.gpu
       ? ` [sync gpu: ${task.gpu.renderPipelines}r/${task.gpu.computePipelines}c/${task.gpu.shaderModules}m` +
-        `${task.gpu.bytes ? `, ${(task.gpu.bytes / 1024).toFixed(0)}kB WGSL` : ""}]`
+        `${task.gpu.bytes ? `, ${(task.gpu.bytes / 1024).toFixed(0)}kB WGSL` : ""}` +
+        `${task.gpu.writeBytes >= 1 << 20 ? `, ${(task.gpu.writeBytes / 1048576).toFixed(1)}MB written in ${task.gpu.writes} write(s), largest ${(task.gpu.largestWrite / 1048576).toFixed(1)}MB` : ""}]`
       : "";
     const why = task.causes?.length
       ? ` [rebuilt: ${task.causes.map((c) => `${c.name} x${c.count}`).join(", ")}]`
       : "";
-    console.warn(`[freeze] ${task.ms} ms — ${who}${gpu}${why}`);
+    const load = task.gpuLoad
+      ? ` [GPU process busy? ${task.gpuLoad.syncRecent.count} sync pipeline(s) / ${task.gpuLoad.syncRecent.kB}kB WGSL in the last ${task.gpuLoad.syncRecent.windowS}s`
+        + `${task.gpuLoad.syncRecent.names.length ? `: ${task.gpuLoad.syncRecent.names.join(", ")}` : ""}`
+        + `${task.gpuLoad.asyncInFlight.count ? `; ${task.gpuLoad.asyncInFlight.count} async / ${task.gpuLoad.asyncInFlight.kB}kB still compiling` : ""}]`
+      : "";
+    console.warn(`[freeze] ${task.ms} ms — ${who}${gpu}${why}${load}`);
+  }
+
+  /** A synchronous pipeline creation, remembered past its own task window. */
+  noteSyncCompile(at, kind, name, bytes) {
+    const log = this.syncCompileLog;
+    log.push({ at, kind, name, bytes });
+    if (log.length > SYNC_COMPILE_RING) log.splice(0, log.length - SYNC_COMPILE_RING);
+  }
+
+  /**
+   * What the GPU process had been handed before `at`: the sync pipelines of
+   * the look-back window (by name, so the module that owns them is the
+   * answer) and the async ones still in flight (they compile on the driver's
+   * worker threads, but a saturated pool is still a busy GPU process).
+   */
+  gpuLoadAt(at) {
+    const from = at - STALL_LOOKBACK_MS;
+    const recent = this.syncCompileLog.filter((c) => c.at >= from && c.at <= at);
+    let asyncCount = 0;
+    let asyncBytes = 0;
+    for (const entry of this.asyncInFlight.values()) {
+      if (entry.at <= at) { asyncCount++; asyncBytes += entry.bytes; }
+    }
+    if (!recent.length && !asyncCount) return null;
+    const byName = new Map();
+    for (const c of recent) {
+      const key = c.name || c.kind;
+      byName.set(key, (byName.get(key) ?? 0) + 1);
+    }
+    const names = [...byName.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4)
+      .map(([name, count]) => (count > 1 ? `${name} x${count}` : name));
+    const windowS = recent.length ? Math.max(1, Math.round((at - recent[0].at) / 1000)) : 0;
+    return {
+      syncRecent: {
+        count: recent.length,
+        kB: +(recent.reduce((sum, c) => sum + (c.bytes || 0), 0) / 1024).toFixed(0),
+        windowS,
+        names,
+      },
+      asyncInFlight: { count: asyncCount, kB: +(asyncBytes / 1024).toFixed(0) },
+    };
   }
 
   /** The report `profile.freezes` returns. */
@@ -361,6 +442,24 @@ class FreezeLedger {
         .map((r) => ({ ...r, ms: +r.ms.toFixed(1) }))
         .sort((a, b) => b.ms - a.ms)
         .slice(0, limit),
+      // The spanless blocks, split by whether the GPU process had been handed
+      // a synchronous compile shortly before. `waitingOnGpuMs` is the part of
+      // `(unattributed)` this session that has a named driver-side cause; the
+      // remainder is a missing span or the browser's own work.
+      stalls: (() => {
+        let waiting = 0;
+        let waitingBlocks = 0;
+        let unmarked = 0;
+        for (const task of tasks) {
+          const un = task.owners.find((o) => o.name === "(unattributed)")?.ms ?? 0;
+          if (!un) continue;
+          if (task.gpuLoad?.syncRecent?.count) { waiting += un; waitingBlocks++; } else unmarked += un;
+        }
+        return { waitingOnGpuMs: +waiting.toFixed(0), waitingBlocks, unmarkedMs: +unmarked.toFixed(0) };
+      })(),
+      // Whether the browser's compiled-shader disk cache can serve this boot's
+      // shader text next time. See wgslStable.js.
+      wgsl: this.wgsl ? this.wgsl.summary() : null,
     };
   }
 
@@ -380,7 +479,10 @@ class FreezeLedger {
     this.nodeBuildCauses?.clear();
     this.buildCauseLog = [];
     this.syncPipelines?.clear();
-    this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0 };
+    this.gpu = { renderPipelines: 0, computePipelines: 0, shaderModules: 0, ms: 0, bytes: 0, writeBytes: 0, writes: 0, largestWrite: 0 };
+    // The compile history goes too, for the same reason: a cleared ledger
+    // must not blame the next block on a compile from before the A/B began.
+    this.syncCompileLog.length = 0;
   }
 
   // ------------------------------------------------------------- boot table
@@ -521,6 +623,23 @@ export function installNodeBuildLedger(renderer) {
       shadowMap: read(() => `${renderer.shadowMap?.enabled}/${renderer.shadowMap?.type}`),
       lighting: read(() => String(renderer.lighting?.enabled)),
       context: read(() => `${renderer.contextNode?.id}/${renderer.contextNode?.version}`),
+      // `scene.backgroundNode` is the sky; its cache key is what three's
+      // `Background.update` diffs to decide whether to re-mint `Background
+      // .material`. Sampled because a day/night sky is the one node in the
+      // scene most likely to re-key per frame. (`getCacheKey()`, no force:
+      // the same call three makes.)
+      background: read(() => scene?.backgroundNode?.getCacheKey?.() ?? "-"),
+      // ⭐ THE TWO HALVES three ACTUALLY keys the render object on, whole.
+      // Every named input above is a GUESS at what might move; these are the
+      // ground truth. When nothing named moved but `dynHalf` did, the cause is
+      // a dynamic input this list does not sample yet (a fog node, the output
+      // target's multiview flag, a clipping context) — and the report says
+      // `dynHalf` instead of `?`, which is the difference between "I cannot
+      // say" and "look in getDynamicCacheKey". `matHalf` likewise localises an
+      // unnamed material-property fork. This is what turns the Foliage scene's
+      // 10 000 `material key: ?` rows into a named driver.
+      dynHalf: read(() => String(renderObject?.getDynamicCacheKey?.() ?? "-")),
+      matHalf: read(() => String(renderObject?.getMaterialCacheKey?.() ?? "-")),
     };
   };
   // The key inputs as they stood the last time THIS MATERIAL INSTANCE was
@@ -549,6 +668,31 @@ export function installNodeBuildLedger(renderer) {
    * exactly (r185 RenderObject.js), or the diff reports fields three ignores.
    */
   const SKIP_PROPERTY = /^(is[A-Z]|_)|^(visible|version|uuid|name|opacity|userData)$/;
+  /**
+   * A render context, named rather than numbered.
+   *
+   * `material key: renderContext` was the second-largest cause on the user's
+   * Sponza — EVERY scene-wide change (a light toggle, sky lighting) produced a
+   * `lights`/`environment` wave and then a near-identical second wave over the
+   * same 6-8 materials, ~100-220 ms, because each of them has one built graph
+   * PER CONTEXT and a scene-wide input invalidates all of them. Both builds
+   * are legitimate given two contexts; the question is what the second context
+   * IS, and a bare `context.id` cannot say. An hour went into guessing it from
+   * the outside (the postprocess MRT — ruled out by disabling it and watching
+   * the doubling survive; `allowOverride` — ruled out, nothing in this repo
+   * sets it). The instrument should have answered it, so now it does.
+   */
+  const renderContextLabel = (context) => {
+    if (!context) return "none";
+    const size = context.width && context.height ? `${context.width}x${context.height}` : "?";
+    const samples = context.sampleCount > 1 ? `msaa${context.sampleCount}` : "";
+    // `textures[0].name` is what the draw-call audit labels a target by; fall
+    // back to whether this context has a render target at all (the canvas
+    // context has none), so the two are always distinguishable by eye.
+    const name = context.textures?.[0]?.name || context.renderTarget?.texture?.name
+      || (context.renderTarget ? "rt" : "canvas");
+    return `${name}:${size}${samples}#${context.id ?? "?"}`;
+  };
   const materialFields = (material, renderObject) => {
     const fields = new Map();
     if (!material) return fields;
@@ -565,7 +709,7 @@ export function installNodeBuildLedger(renderer) {
     // select), so it is closed here rather than worked around.
     read("customProgramCacheKey", () => material.customProgramCacheKey?.() ?? "");
     if (renderObject) {
-      read("renderContext", () => renderObject.context?.id);
+      read("renderContext", () => renderContextLabel(renderObject.context));
       read("clippingContext", () => renderObject.clippingContextCacheKey);
       read("geometry", () => renderObject.getGeometryCacheKey?.());
       read("receiveShadow", () => renderObject.object?.receiveShadow);
@@ -643,6 +787,16 @@ export function installNodeBuildLedger(renderer) {
         // `map` went null → texture was DRAWN BEFORE IT WAS READY, and that
         // first build was pure waste.
         cause = moved.length ? moved.join("+") : `material key: ${changedFields.slice(0, 4).join(",") || "?"}`;
+        // NAME THE TWO CONTEXTS. Without this the row reads
+        // `material key: renderContext` — true, and useless: it says a
+        // material is drawn through more than one context without saying
+        // which, and the fix (stop drawing it through the second one, or make
+        // the second one share a key) needs exactly that. Contexts are pooled
+        // by (scene, camera, target), so the set is small and this cannot
+        // explode the cause table.
+        if (!moved.length && changedFields.includes("renderContext")) {
+          cause += ` (${beforeFields.get("renderContext")} → ${fields.get("renderContext")})`;
+        }
       }
       freeze.noteBuildCause(t0, cause, ms);
       const causeRow = causes.get(cause) ?? { name: cause, count: 0, ms: 0, materials: new Set() };
@@ -712,9 +866,23 @@ export function installGpuCallLedger(device) {
           row.count++;
           row.ms += ms;
           offenders.set(key, row);
+          // A synchronous PIPELINE parks the GPU process's command thread for
+          // its whole driver compile — long after this call returned. Keep it,
+          // sized by its shader text, so a later spanless block can be read.
+          if (counter !== "shaderModules") freeze.noteSyncCompile(t0, counter, info.name, info.bytes ?? 0);
         }
       }
     };
+  };
+
+  /** The WGSL bytes a pipeline descriptor compiles (both stages, or the one). */
+  const pipelineBytes = (d) => {
+    let bytes = 0;
+    for (const stage of [d?.vertex, d?.fragment, d?.compute]) {
+      const mod = stage?.module;
+      if (mod) bytes += moduleBytes.get(mod) ?? 0;
+    }
+    return bytes;
   };
 
   wrap("createShaderModule", "gpu:shaderModule", "shaderModules", (d) => {
@@ -723,11 +891,11 @@ export function installGpuCallLedger(device) {
   });
   wrap("createRenderPipeline", "gpu:renderPipeline(sync)", "renderPipelines", (d) => ({
     name: describe(d, d?.fragment ?? d?.vertex),
-    bytes: 0,
+    bytes: pipelineBytes(d),
   }));
   wrap("createComputePipeline", "gpu:computePipeline(sync)", "computePipelines", (d) => ({
     name: describe(d, d?.compute),
-    bytes: 0,
+    bytes: pipelineBytes(d),
   }));
 
   // ⭐ THE **ASYNC** PIPELINE CALLS BLOCK TOO, AND THEY WERE NOT MEASURED.
@@ -752,8 +920,10 @@ export function installGpuCallLedger(device) {
       if (!freeze.enabled) return original.call(this, descriptor, ...rest);
       const t0 = now();
       const token = freeze.begin(name);
+      let result;
       try {
-        return original.call(this, descriptor, ...rest);
+        result = original.call(this, descriptor, ...rest);
+        return result;
       } finally {
         freeze.end(token);
         const ms = now() - t0;
@@ -767,6 +937,14 @@ export function installGpuCallLedger(device) {
           row.ms += ms;
           offenders.set(key, row);
         }
+        // In flight until the driver settles the promise — the count a
+        // spanless block reads to say whether the GPU process was saturated.
+        if (result && typeof result.then === "function") {
+          const ticket = { at: t0, bytes: pipelineBytes(descriptor), name: info?.name ?? name };
+          freeze.asyncInFlight.set(ticket, ticket);
+          const done = () => { freeze.asyncInFlight.delete(ticket); };
+          try { result.then(done, done); } catch { freeze.asyncInFlight.delete(ticket); }
+        }
       }
     };
   };
@@ -778,14 +956,124 @@ export function installGpuCallLedger(device) {
   }));
 
   // Record every module's source length as it is created, so the pipeline
-  // wrappers above can size what they are compiling.
-  const rawShaderModule = device.createShaderModule;
+  // wrappers above can size what they are compiling — and hand the driver
+  // BYTE-STABLE text (wgslStable.js), so the browser's compiled-shader disk
+  // cache can serve the same graph on the next boot. `__wgslCanonical = false`
+  // sends three's text through unchanged (the A/B arm).
+  let storage = null;
+  try { storage = typeof localStorage !== "undefined" ? localStorage : null; } catch { storage = null; }
+  const registry = freeze.wgsl ?? (freeze.wgsl = new WgslRegistry(storage));
   const wrappedShaderModule = device.createShaderModule;
   device.createShaderModule = function (descriptor, ...rest) {
-    const module = wrappedShaderModule.call(this, descriptor, ...rest);
-    if (module && descriptor?.code) moduleBytes.set(module, descriptor.code.length);
+    let desc = descriptor;
+    if (descriptor && typeof descriptor.code === "string" && freeze.enabled) {
+      const entry = registry.record(descriptor.label, descriptor.code, {
+        canonical: globalThis.__wgslCanonical !== false,
+      });
+      if (entry.renamed && entry.code !== descriptor.code) desc = { ...descriptor, code: entry.code };
+    }
+    const module = wrappedShaderModule.call(this, desc, ...rest);
+    if (module && desc?.code) moduleBytes.set(module, desc.code.length);
     return module;
   };
-  void rawShaderModule;
+
+  // ── the other doors a GPU-process stall can come through ──────────────────
+  //
+  // Chromium's WebGPU client serialises every call into a shared ring the GPU
+  // process consumes; when the ring is full the CALLING thread waits for the
+  // GPU process to catch up. Which call blocks is therefore luck — a
+  // `writeBuffer` of uniforms, a `createBindGroup`, the `submit` — so each is
+  // its own span (no counters: these run hundreds of times a frame and a span
+  // under the ring floor costs two `performance.now()`s).
+  const span = (target, method, name, bytesOf = null) => {
+    const original = target?.[method];
+    if (typeof original !== "function") return;
+    target[method] = function (...args) {
+      if (!freeze.enabled) return original.apply(this, args);
+      if (bytesOf) {
+        const n = bytesOf(args) || 0;
+        freeze.gpu.writeBytes += n;
+        freeze.gpu.writes++;
+        if (n > freeze.gpu.largestWrite) freeze.gpu.largestWrite = n;
+      }
+      const token = freeze.begin(name);
+      try {
+        return original.apply(this, args);
+      } finally {
+        freeze.end(token);
+      }
+    };
+  };
+  span(device, "createBindGroup", "gpu:createBindGroup");
+  span(device, "createBuffer", "gpu:createBuffer");
+  span(device, "createTexture", "gpu:createTexture");
+  span(device.queue, "submit", "gpu:submit");
+  // writeBuffer(buffer, offset, data, dataOffset?, size?) — three hands the
+  // WHOLE attribute array as `data` and bounds the write with `dataOffset` /
+  // `size` (in elements for a typed view), so the view's byteLength would
+  // over-count a partial upload by the size of the array: the first version
+  // read 10 GB written in one 60 ms task.
+  span(device.queue, "writeBuffer", "gpu:writeBuffer", (args) => {
+    const data = args[2];
+    if (!data) return 0;
+    const unit = data.BYTES_PER_ELEMENT ?? 1;
+    const size = args[4];
+    if (size != null && Number.isFinite(size)) return Math.max(0, size * unit);
+    const offset = (args[3] ?? 0) * unit;
+    return Math.max(0, (data.byteLength ?? 0) - offset);
+  });
+  span(device.queue, "writeTexture", "gpu:writeTexture", (args) => args[1]?.byteLength ?? 0);
+  span(device.queue, "copyExternalImageToTexture", "gpu:copyExternalImageToTexture");
+  return true;
+}
+
+/**
+ * Spans INSIDE three's render, so a `frame:renderEncode` block can say which
+ * half of the render it was.
+ *
+ * 2026-09-09, after a light's castShadow flip: `[freeze] 475 ms —
+ * frame:renderEncode 433.5, gpu:writeBuffer 36.7` with no node build in it.
+ * The render is one span from the outside, and inside it are at least five
+ * different owners with five different fixes: the shadow-map pass (a nested
+ * `_renderScene` into the shadow target), bind-group creation for re-created
+ * render objects, texture uploads, geometry uploads, and the per-object
+ * `updateBefore` hooks (skinning, instancing, and the shadow node's own
+ * render). Each is a few calls per object per frame, so a span costs two
+ * `performance.now()`s and nothing reaches the ring below the 0.4 ms floor.
+ */
+export function installRenderSpans(renderer) {
+  if (!renderer || renderer.__freezeRenderSpans) return false;
+  renderer.__freezeRenderSpans = true;
+  const wrapMethod = (target, method, label) => {
+    const original = target?.[method];
+    if (typeof original !== "function") return;
+    target[method] = function (...args) {
+      if (!freeze.enabled) return original.apply(this, args);
+      const token = freeze.begin(typeof label === "function" ? label(this, args) : label);
+      try {
+        return original.apply(this, args);
+      } finally {
+        freeze.end(token);
+      }
+    };
+  };
+  // The scene render, labelled by its target: the main one presents to the
+  // canvas; a shadow map, a reflection, a bake each name their own.
+  wrapMethod(renderer, "_renderScene", (self) => {
+    let target = null;
+    try { target = self.getRenderTarget?.(); } catch { target = null; }
+    if (!target) return "render:scene→canvas";
+    const name = target.texture?.name || target.depthTexture?.name || "rt";
+    return `render:scene→${name}:${target.width}x${target.height}`;
+  });
+  // Per object: `onBeforeRender` callbacks, the render-object lookup, the
+  // per-object update chain. A 261 ms `render:scene→canvas` SELF time with
+  // no build in it (2026-09-10, after a terrain heights undo) is exactly the
+  // kind of thing that lives in an object's `onBeforeRender`.
+  wrapMethod(renderer, "renderObject", "render:object");
+  wrapMethod(renderer._bindings, "_createBindings", "render:createBindings");
+  wrapMethod(renderer._textures, "updateTexture", "render:updateTexture");
+  wrapMethod(renderer._geometries, "updateForRender", "render:geometry");
+  wrapMethod(renderer._nodes, "updateBefore", "render:updateBefore");
   return true;
 }

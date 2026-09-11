@@ -9,7 +9,7 @@ import { BackSide, FrontSide, Matrix4, Vector3 } from "three/webgpu";
 import { waterAutoResolution } from "./waterVolume.js";
 import { seaQuality } from "./waterSpectrum.js";
 import { analyseClothMesh, packClothTopology } from "./clothMeshTopology.js";
-import { clothFlocks } from "./clothFlockRuntime.js";
+import { createClothMember } from "./clothArena.js";
 
 const _cameraWorld = new Vector3(), _waterInverse = new Matrix4();
 const _reachCentre = new Vector3(), _reachScale = new Vector3();
@@ -31,7 +31,7 @@ function clothWorldBox(entity) {
   return (source ?? geometry.boundingBox).clone().applyMatrix4(entity.object3D.matrixWorld);
 }
 import { ParticleColliderField } from "../particleColliders.js";
-import { ClothMeshColliderField } from "../clothMeshColliders.js";
+import { ClothMeshColliderField, ClothMeshColliderView } from "../clothMeshColliders.js";
 
 /** The source primitives water can fill (the plane is the open-water case). */
 const WATER_SOLIDS = new Set(["box", "cylinder", "sphere", "cone", "capsule"]);
@@ -66,6 +66,20 @@ export class GridSimulationComponent extends Component {
       if (this.entity.engine.simulationSuspended === true) return;
       if (["cloth", "water"].includes(this.constructor.type)) this.syncPlane();
       if (!this.enabled || !this.graphEnabled || !this.simulation?.mesh.visible) return;
+      // "Run In Editor" (default off): freeze the solver while editing so a
+      // wave/cloth/grid sim does not tick every editor frame. `syncPlane`
+      // above still runs, so a cloth/water plane follows its transform; only
+      // the solve is frozen (static snapshot). Play mode always solves.
+      if (!this.shouldAnimate) return;
+      // ⭐ AN ARENA CLOTH ALWAYS SOLVES; only its SURFACE is gated on the view.
+      // Ten cloths cost what one costs in the arena, so the frustum gate that
+      // once saved 3 ms (and froze a curtain mid-contact when the camera
+      // looked away) has nothing left to buy on the solve side. It still
+      // saves the per-cloth surface dispatch for a curtain nobody can see.
+      if (this.constructor.type === "cloth" && this.simulation.arena) {
+        this.simulation.tick(this.entity.engine.renderer, this.entity.engine.deltaTime ?? 0, this.isInView());
+        return;
+      }
       if (this.constructor.type !== "water" && !this.isInView() && !this.disturbed()) return;
       this.simulation.tick(this.entity.engine.renderer, this.entity.engine.deltaTime ?? 0);
       this.refreshWaterSlot();
@@ -320,11 +334,42 @@ export class GridSimulationComponent extends Component {
       this.sourceGroups = JSON.stringify(plane.geometry.groups);
       this.resolvedProps = { ...this.resolvedProps, ...this.sourceProps(plane) };
     }
+    // ⭐⭐⭐ CLOTH IS SOLVED IN THE ARENA (clothArena.js): every cloth in the
+    // scene in one particle set, one fused kernel per fixed 1/360 s step, one
+    // submission a frame, contact against a per-cloth uniform grid of the
+    // static triangles. The solver below (`createGridSimulation`'s cloth
+    // path, ~16 dispatches per substep per cloth) is kept for water, and as
+    // an A/B arm behind `__clothLegacy = true`.
+    const legacy = globalThis.__clothLegacy === true;
+    if (cloth && plane && !legacy) {
+      const material = this.sourceMaterial(plane.mesh.material);
+      this.simulation = createClothMember(this, { plane, props: this.resolvedProps, material });
+      // The fields belong to the arena; the component only points at them for
+      // the Inspector and `vfx.cloth.status`.
+      this.colliderField = this.simulation.arena.colliderField;
+      this.meshColliderField = this.simulation.arena.meshColliderField;
+      this.meshColliderView = null;
+      this.ownsColliderUsers = false;
+      this.surfaceError = this.simulation.error ?? this.surfaceError;
+      this.simulation.mesh.userData.entityId = this.entity.id;
+      this.entity.object3D.add(this.simulation.mesh);
+      this.syncAppearance();
+      return;
+    }
     if (cloth && this.resolvedProps.sceneCollision !== false) {
       this.colliderField = this.entity.engine.particleColliders ??= new ParticleColliderField(this.entity.engine);
       this.colliderField.addUser();
       this.meshColliderField = this.entity.engine.clothMeshColliders ??= new ClothMeshColliderField(this.entity.engine);
       this.meshColliderField.addUser(this);
+      this.ownsColliderUsers = true;
+      // ⭐ THIS CLOTH'S OWN BVH, over only the triangles it can reach. The scan
+      // stays on the shared field above (once a frame, for everyone); this only
+      // re-packs. Contact is 92 % of cloth cost and it is tree traversal, so
+      // the size of the tree each particle walks is the lever.
+      // `__clothLocalColliders = false` goes back to the shared tree.
+      this.meshColliderView = globalThis.__clothLocalColliders === false
+        ? this.meshColliderField
+        : new ClothMeshColliderView(this.meshColliderField, this);
     }
     // The slot is claimed BEFORE the solver, because the solver builds the
     // kernel that writes into it. A scene past `MAX_WATER_SLOTS` surfaces gets
@@ -340,15 +385,7 @@ export class GridSimulationComponent extends Component {
     const quality = this.entity.engine?.project?.settings?.build?.quality ?? this.entity.engine?.projectSettings?.build?.quality ?? "high";
     // The ripple window is a size in METRES: hand the solver the box's scale.
     const worldScale = this.constructor.type === "water" && plane ? this.worldScaleOf(plane) : null;
-    // ⭐⭐⭐ JOIN THE FLOCK. Cloths that share a solver configuration are solved
-    // TOGETHER over one particle set, because the solver's cost is per DISPATCH
-    // and ten curtains issued ten times as many for the same work (see
-    // clothFlock.js). The first cloth to attach gets no handle — the flock has
-    // nothing to merge yet — so it builds its own solver and is re-attached
-    // onto the shared set at the next frame, once every member is known.
-    const flock = cloth ? clothFlocks(this.entity.engine)?.join(this) ?? null : null;
-    this.__inFlock = !!flock;
-    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, topology: plane?.topology ?? null, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality), worldScale, flock });
+    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderView ?? this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, topology: plane?.topology ?? null, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality), worldScale });
     this.simulation.mesh.userData.entityId = this.entity.id;
     this.entity.object3D.add(this.simulation.mesh);
     // The sea's spray sprites live in the LID's frame — a child of the lid
@@ -359,21 +396,6 @@ export class GridSimulationComponent extends Component {
     if (spray) { spray.userData.entityId = this.entity.id; this.simulation.mesh.add(spray); }
     this.syncAppearance();
     this.refreshWaterSlot();
-  }
-  /**
-   * The flock was (re)built, or gave up. Re-attach onto whatever the answer is,
-   * but only when it actually changed — a rebuild that leaves this cloth where
-   * it was must not tear its simulation down and lose its pose.
-   */
-  rejoinFlock(built, generation = 0) {
-    // ⛔ A REBUILD RE-BINDS EVEN A MEMBER THAT STAYED IN. The flock disposes the
-    // old particle set and mints a new one, and this cloth's surface kernel was
-    // built against the old buffers — comparing only "in a flock or not" left it
-    // pointing at freed memory, which fails the whole command buffer.
-    if (!!built === !!this.__inFlock && generation === this.__flockGeneration) return;
-    this.__flockGeneration = generation;
-    this.detachSimulation();
-    this.attachSimulation();
   }
   sourceMaterial(material) {
     if (this.constructor.type !== "water") return material;
@@ -536,8 +558,6 @@ export class GridSimulationComponent extends Component {
     return now - (this._gridWantedSince ?? now) > 500;
   }
   onDetach() {
-    // Leaving is what makes the remaining members rebuild without this one.
-    if (this.constructor.type === "cloth") this.entity?.engine?.__clothFlocks?.leave(this);
     this._unbindVfxAsset?.(); this._unbindVfxAsset = null;
     this.unsubscribeTick?.(); this.unsubscribeTick = null;
     this.unsubscribeMesh?.(); this.unsubscribeMesh = null;
@@ -554,8 +574,11 @@ export class GridSimulationComponent extends Component {
     this.waterSurfaceLook?.dispose(); this.waterSurfaceLook = null;
     this.simulation?.dispose(this.entity?.engine?.renderer); this.simulation = null;
     this.waterMaterials?.forEach(m => m.dispose()); this.waterMaterials = null; this.waterMaterialSignature = null;
-    this.colliderField?.removeUser(); this.colliderField = null;
-    this.meshColliderField?.removeUser(this); this.meshColliderField = null;
+    // An arena cloth never registered as a field user (the arena did); only
+    // the legacy path's users are balanced here.
+    if (this.ownsColliderUsers) { this.colliderField?.removeUser(); this.meshColliderField?.removeUser(this); }
+    this.ownsColliderUsers = false;
+    this.colliderField = null; this.meshColliderField = null; this.meshColliderView = null;
   }
   onPropChanged(key) {
     if (key === "asset") bindVfxAsset(this, () => this.applyGraph());
@@ -566,7 +589,11 @@ export class GridSimulationComponent extends Component {
     const previous = this.resolvedProps;
     this.resolveGraph();
     if (this.planeSource) this.resolvedProps = { ...this.resolvedProps, ...this.sourceProps(this.planeSource) };
-    if (!this.simulation || ["resolution", "width", "height", "sceneCollision", "fill"].some((field) => previous?.[field] !== this.resolvedProps[field])) { this.detachSimulation(); this.attachSimulation(); }
+    // ⚠ `pinning` rebuilds a cloth: its pins are DATA in the arena (a lattice
+    // packs them by mode, a mesh bakes them into its analysis), not a uniform.
+    // A member rebuild is a re-pack and an upload now, not a pipeline compile.
+    const structural = ["resolution", "width", "height", "sceneCollision", "fill", ...(this.simulation?.arena ? ["pinning"] : [])];
+    if (!this.simulation || structural.some((field) => previous?.[field] !== this.resolvedProps[field])) { this.detachSimulation(); this.attachSimulation(); }
     else {
       this.simulation.update(this.resolvedProps);
       if (previous?.amplitude !== this.resolvedProps.amplitude || previous?.pinning !== this.resolvedProps.pinning) this.restart();

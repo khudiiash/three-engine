@@ -144,6 +144,9 @@ export { NavAgentComponent } from "../../modules/navigation/NavAgentComponent.js
 export { NavLinkComponent } from "../../modules/navigation/NavLinkComponent.js";
 
 export { TerrainComponent } from "../../modules/terrain/TerrainComponent.js";
+export { ArchitectureComponent } from "../../modules/architecture/ArchitectureComponent.js";
+export { ArchitecturePieceComponent } from "../../modules/architecture/ArchitecturePieceComponent.js";
+export { FoliageComponent } from "../../modules/foliage/FoliageComponent.js";
 export { PostprocessComponent } from "../../modules/postprocessing/PostprocessComponent.js";
 export { EnvironmentComponent } from "../../modules/polyhaven/EnvironmentComponent.js";
 export { ObjModelComponent } from "../../modules/ambientcg/ObjModelComponent.js";

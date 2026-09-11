@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { currentAccent } from "../../accent.js";
+import { SelectField as EditorSelectField } from "../../fields/SelectField.jsx";
 
 /**
  * Inline widgets for node-graph params, shared by the shader and particle
@@ -171,19 +172,26 @@ export function ColorField({ value, onChange, showHex = true }) {
   );
 }
 
+/**
+ * Choice field on a graph node — the editor's own portalled dropdown, not a
+ * native `<select>`.
+ *
+ * This used to be a raw `<select>`, which is styleable down to its trigger and
+ * no further: the open list is drawn by the platform, so in a near-black editor
+ * it comes up as a white box, and CSS on `option` does not fix that in a
+ * WebView. `fields/SelectField.jsx` exists precisely for this and is what every
+ * other choice list in the app already uses; the only thing this wrapper adds
+ * is the graph's `(value, gesture)` onChange shape and the `nodrag`/`nopan`
+ * guards, so clicking the trigger doesn't pan the canvas out from under it.
+ */
 export function SelectField({ value, options, onChange }) {
   return (
-    <select className="gf-select nodrag nopan" value={value} onChange={(e) => onChange?.(e.target.value, false)}>
-      {options.map((opt) => {
-        const key = typeof opt === "string" ? opt : opt.value;
-        const label = typeof opt === "string" ? opt : opt.label;
-        return (
-          <option key={key} value={key}>
-            {label}
-          </option>
-        );
-      })}
-    </select>
+    <EditorSelectField
+      className="gf-select nodrag nopan"
+      value={value}
+      options={options}
+      onChange={(next) => onChange?.(next, false)}
+    />
   );
 }
 

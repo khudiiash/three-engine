@@ -19,6 +19,7 @@ import {
 import { AudioScrubber } from "../components/AudioScrubber.jsx";
 import { usePanelVisible } from "../usePanelVisible.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * The licence chip's colour is the whole message: green = take it and go,
  * amber = you owe a credit line, red = you cannot sell this. The words live in
@@ -240,13 +241,13 @@ export function AudioLibraryPanel({ api } = {}) {
           </label>
         )}
         {provider === "freesound" && (
-          <select className="audiolib-sort" value={sort} onChange={(e) => setSort(e.target.value)}>
+          <Select className="audiolib-sort" value={sort} onChange={(e) => setSort(e.target.value)}>
             {SORTS.map((s) => (
               <option key={s.id} value={s.id}>
                 {s.label}
               </option>
             ))}
-          </select>
+          </Select>
         )}
       </div>
 

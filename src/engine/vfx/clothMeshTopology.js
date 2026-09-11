@@ -484,8 +484,12 @@ function hemRelief(rest, island, id, axis, cross, wantMax, members) {
  */
 const FLAT_AXIS_LIMIT = 0.05;
 
-/** How much longer than the taut geodesic a particle may sit from its pin. */
-const LRA_SLACK = 1.02;
+/**
+ * How much longer than the taut geodesic a particle may sit from its pin.
+ * Exported because `cloth-health` measures the cap's step-invariance and the
+ * two must not drift apart.
+ */
+export const LRA_SLACK = 1.02;
 
 export function clothPinFlags(rest, island, islandCount, mode) {
   const count = rest.length / 3;

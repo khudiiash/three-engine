@@ -1,0 +1,63 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Foliage tree closeups</title>
+<style>html,body{margin:0;background:#b9ccd0}canvas{display:block}#label{position:fixed;top:16px;left:20px;padding:9px 14px;background:#17291bd9;color:white;font:16px system-ui;border-radius:5px}</style></head>
+<body><canvas id="view"></canvas><div id="label">Preparing trees…</div><script type="module">
+try {
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const { enableEngineModule } = await import('/src/engine/modules.js');
+  const { FOLIAGE_SPECIES } = await import('/src/modules/foliage/foliageGeometry.js');
+  registerBuiltInComponents();
+  const engine = new Engine(); engine.setSize(1300, 724);
+  await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer;
+  if (!renderer.backend.isWebGPUBackend) throw new Error('Real WebGPU required');
+  await enableEngineModule(engine, 'foliage');
+  engine.scene.background = new THREE.Color('#bdced0');
+  engine.scene.add(new THREE.HemisphereLight('#eaf5ff', '#746444', 2));
+  const sun = new THREE.DirectionalLight('#fff2db', 3.5);
+  sun.position.set(-5, 12, 9); engine.scene.add(sun);
+  renderer.shadowMap.enabled = true; sun.castShadow = true;
+  sun.shadow.mapSize.set(2048,2048);
+  Object.assign(sun.shadow.camera,{left:-9,right:9,top:12,bottom:-9,near:.1,far:40});
+  sun.shadow.bias=-.0003; sun.shadow.normalBias=.025;
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(100,100), new THREE.MeshStandardNodeMaterial({color:'#8d9471',roughness:1}));
+  ground.rotation.x = -Math.PI/2; ground.position.y = -.025; engine.scene.add(ground);
+  ground.receiveShadow = true;
+  const camera = new THREE.PerspectiveCamera(44, 1300/724, .03, 200);
+  engine.camera = camera; engine.scene.add(camera);
+  const trees = new Map();
+  for (const species of ['oak','birch','pine']) {
+    const entity = engine.createEntity({name:species});
+    const component = entity.addComponent('foliage', {...FOLIAGE_SPECIES[species],species,seed:42,distribution:'single',minScale:1,maxScale:1,
+      wind:false,interaction:false,lodNear:100,lodFar:150,maxDistance:180});
+    trees.set(species,component);
+  }
+  const pause = ms => new Promise(resolve=>setTimeout(resolve,ms));
+  const ready = async () => {
+    const until = performance.now()+90000;
+    while ([...trees.values()].some(c=>!c.stats?.impostorReady || c._foliageWarmup?.pending > 0) && performance.now()<until) await pause(100);
+    if ([...trees.values()].some(c=>!c.stats?.impostorReady)) throw new Error('Tree atlas preparation timed out');
+  };
+  engine.start(); await ready(); engine.stop();
+  const show = async (species, view='full', lod=0, turn=0) => {
+    const selected = trees.get(species);
+    for (const c of trees.values()) c.root.visible = c === selected;
+    const {height:h,width:w} = FOLIAGE_SPECIES[species];
+    if(view==='bark') {camera.position.set(1.4,1.5,1.9);camera.lookAt(0,1.5,0);}
+    else if(view==='leaves') {camera.position.set(w*.50,h*.72,w*.53);camera.lookAt(0,h*.67,0);}
+    else {camera.position.set(Math.sin(.58+turn)*h*1.72,h*.6,Math.cos(.58+turn)*h*1.72);camera.lookAt(0,h*.48,0);}
+    camera.updateMatrixWorld(true);
+    selected.update(true);
+    for(const chunk of selected.chunks) chunk.level=lod;
+    selected._commitBatches();
+    document.querySelector('#label').textContent = `${FOLIAGE_SPECIES[species].label} · ${view} · LOD ${lod}`;
+    await renderer.compileAsync(engine.scene,camera);
+    renderer.render(engine.scene,camera);
+    await renderer.backend.device.queue.onSubmittedWorkDone();
+    return {species,view,lod,stats:selected.stats,geometry:selected.geometries?.map(g=>({triangles:g.index.count/3,...g.userData.foliage}))};
+  };
+  globalThis.__TREE_PREVIEW__ = {show,engine,trees};
+  await show('oak'); globalThis.__TREE_PREVIEW_READY__=true;
+} catch(error) { console.error(error); globalThis.__TREE_PREVIEW_ERROR__=error.stack??String(error); }
+</script></body></html>

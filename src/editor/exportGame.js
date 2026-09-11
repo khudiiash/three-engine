@@ -2,7 +2,14 @@ import { ensureEngine } from "./engineInstance.js";
 import { isBuiltinMaterial } from "../engine/builtinMaterials.js";
 import { createAssetNames, basename } from "./build/assetNames.js";
 import { rewriteComponentAssets, rewriteVfxGraphAssets, DOCUMENT_KINDS, extOf, ASSET_EXTENSIONS } from "./build/assetRefs.js";
-import { BUILD_DEFAULTS, resolveBuildScenes, normalizeRelPath, toProjectRelative } from "./build/buildSettings.js";
+import { selectRuntimeFiles, scriptImportSpecifiers } from "./build/runtimeFiles.js";
+import {
+  BUILD_DEFAULTS,
+  resolveBuildScenes,
+  findSceneReferences,
+  normalizeRelPath,
+  toProjectRelative,
+} from "./build/buildSettings.js";
 import { themePlayerHtml, injectLivePreviewClient, PREVIEW_REVISION_PATH } from "./build/playerHtml.js";
 import { desktopScaffoldFiles } from "./build/desktopScaffold.js";
 import { serializeEventCatalog } from "../engine/events/catalog.js";
@@ -24,9 +31,17 @@ export async function exportGame(options = {}) {
   if (report.ok) {
     console.log(
       `Build complete → ${report.outDir}\n` +
-        `  ${report.sceneCount} scene(s), ${report.assetCount} asset file(s)` +
+        `  ${report.sceneCount} scene(s), ${report.prefabCount ?? 0} prefab(s), ${report.assetCount} asset file(s)` +
         `${report.preloadCount ? `, ${report.preloadCount} preloaded` : ""}` +
-        `${report.savedBytes ? `, ${formatBytes(report.savedBytes)} saved by compression` : ""}`,
+        `${report.savedBytes ? `, ${formatBytes(report.savedBytes)} saved by compression` : ""}` +
+        `${report.prefabsSkipped ? `\n  ${report.prefabsSkipped} prefab(s) no shipped scene reaches were left out` : ""}` +
+        `${report.removed?.length ? `\n  ${report.removed.length} leftover file(s) from the previous build removed` : ""}` +
+        `${
+          report.runtime?.trimmed
+            ? `\n  runtime: ${report.runtime.files} of ${report.runtime.files + report.runtime.skipped} template files ` +
+              `(${formatBytes(report.runtime.skippedBytes)} this game cannot reach left out)`
+            : ""
+        }`,
     );
     for (const warning of report.warnings) console.warn(`Build: ${warning}`);
   } else if (report.error) {
@@ -118,6 +133,9 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   };
   const engine = await ensureEngine();
   const { serializeScene, prefabRegistry, getComponentClass } = await import("../engine/index.js");
+  const { dependenciesOf } = await import("../engine/prefab/index.js");
+  const { resolveModuleId } = await import("../engine/modules.js");
+  const { readAssetFlags } = await import("./assetFlags.js");
   const { getProjectSettings } = await import("./projectSettings.js");
   const { useProjectStore } = await import("./store/projectStore.js");
   const { useModulesStore } = await import("./modules.js");
@@ -168,6 +186,25 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   warnings.push(...plan.warnings);
   if (!plan.startScene) return fail("No scene to build — save a scene first.");
 
+  // The scenes that ship. In "reachable" mode (the default) this starts as the
+  // start scene alone and grows as shipped content names other scenes — a
+  // script's `engine.loadScene("scenes/Level2.scene")`, an event action, a
+  // prefab's script — the same rule assets follow. A `.scene` flagged Preload
+  // always ships (a level only ever named by data). The explicit list and
+  // "all" modes ship exactly what they say.
+  const shippedScenes = [...plan.scenes];
+  const queuedScenes = new Set(shippedScenes.map((s) => normalizeRelPath(s).toLowerCase()));
+  const enqueueScene = (rel) => {
+    const key = normalizeRelPath(rel).toLowerCase();
+    if (queuedScenes.has(key)) return;
+    queuedScenes.add(key);
+    shippedScenes.push(rel);
+  };
+  const enqueueScenes = (text) => {
+    if (plan.mode !== "reachable") return;
+    for (const rel of findSceneReferences(text, { available, root })) enqueueScene(rel);
+  };
+
   const samePath = (a, b) =>
     !!a && !!b && normalizeRelPath(a).toLowerCase() === normalizeRelPath(b).toLowerCase();
   /**
@@ -176,20 +213,19 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
    * one moment where "what I'm looking at" and "what ships" diverging is
    * unforgivable, and unsaved edits are the normal state of an editor.
    */
-  const readScene = async (rel, { embedPrefabs = false } = {}) => {
+  const readScene = async (rel) => {
     if (samePath(rel, openRel)) {
       // Component.toJSON() intentionally makes a cheap shallow props copy, but
       // build rewriting changes nested values such as script slot paths. Give
       // the exporter a fully detached snapshot so generated `assets/*.js`
       // paths can never leak back into the live editor scene.
-      return structuredClone(serializeScene(engine, { embedPrefabs }));
+      return structuredClone(serializeScene(engine));
     }
-    const json = JSON.parse(await invoke("load_scene", { path: joinPath(root, rel) }));
-    // Prefab definitions live in the registry, not in each scene file. The
-    // start scene carries them for the whole build, so a level that isn't open
-    // still resolves its instances by guid.
-    if (embedPrefabs) json.prefabs = structuredClone(prefabRegistry.all());
-    return json;
+    // Prefab definitions live in the registry, not in each scene file; the
+    // start scene carries the reachable ones for the whole build
+    // (embedReachablePrefabs), so a level that isn't open still resolves its
+    // instances by guid.
+    return JSON.parse(await invoke("load_scene", { path: joinPath(root, rel) }));
   };
 
   // --- Asset collection ------------------------------------------------------
@@ -219,9 +255,23 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
    * build, so swap them for the prefab's guid — which is stable and is what the
    * player's registry is keyed by. `engine.instantiate` accepts either.
    */
+  // Every prefab a shipped scene — or a shipped prefab — names, by guid. Only
+  // these (and what they depend on) are embedded; see embedReachablePrefabs.
+  const referencedPrefabs = new Set();
+  const notePrefab = (link) => {
+    const guid = prefabRegistry.resolveLink(link);
+    if (guid) referencedPrefabs.add(guid);
+    return guid;
+  };
   const toPrefabGuid = (value) => {
     if (typeof value !== "string") return value;
-    return prefabRegistry.guidForPath(value) ?? value;
+    const guid = prefabRegistry.guidForPath(value);
+    if (guid) {
+      referencedPrefabs.add(guid);
+      return guid;
+    }
+    if (prefabRegistry.has(value)) referencedPrefabs.add(value);
+    return value;
   };
   const rewritePrefabRefs = (props) => {
     for (const [key, value] of Object.entries(props ?? {})) {
@@ -246,6 +296,36 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     if (!kind) return claim(value);
     documentBuckets[kind]?.add(sourcePath(value));
     return claimDoc(value);
+  };
+
+  /**
+   * Transpiled, path-rewritten source of every shipped script, read once. The
+   * prefab closure has to look inside scripts before the document loops run
+   * (a script can name a prefab by guid), so reading is memoised rather than
+   * done in the loop. `null` records an unreadable script.
+   */
+  const scriptSources = new Map();
+  const readScriptSource = async (src) => {
+    if (scriptSources.has(src)) return scriptSources.get(src);
+    let code = null;
+    try {
+      const raw = await readRequiredText(src, "script");
+      code = rewriteSourceAssetPaths(await transpileScript(raw), {
+        root,
+        rewriteAssetValue,
+        onFound: (original) =>
+          warnings.push(
+            `${basename(src)} hard-codes the absolute path "${original}". It was rewritten so the ` +
+              `build works, but the path is specific to this machine — prefer an ` +
+              `@attribute({ type: "asset" }) field and pick the asset in the Inspector.`,
+          ),
+      });
+      enqueueScenes(code);
+    } catch (err) {
+      warnings.push(`Skipped script ${src}: ${err?.message ?? err}`);
+    }
+    scriptSources.set(src, code);
+    return code;
   };
 
   /**
@@ -287,7 +367,10 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   const visit = (node) => {
     // Instances resolve by guid in a build; the authoring path is a local
     // absolute path and has no business shipping.
-    if (node.prefab) delete node.prefab.path;
+    if (node.prefab) {
+      notePrefab(node.prefab);
+      delete node.prefab.path;
+    }
     for (const c of node.components ?? []) visitComponent(c);
     for (const ov of node.overrides ?? []) visitOverride(ov);
     (node.children ?? []).forEach(visit);
@@ -308,18 +391,131 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       }
     }
     (sceneJson.entities ?? []).forEach(visit);
-    for (const def of sceneJson.prefabs ?? []) {
-      if (def.root) visit(def.root);
-      for (const ov of def.overrides ?? []) visitOverride(ov); // variants
-      // The registry in the build is keyed by guid; drop the authoring path so
-      // a machine-specific absolute path doesn't ship inside the bundle.
-      delete def.path;
+    // Prefab defs are never read from scene files: the registry is the source
+    // of truth in the editor, and the build embeds the reachable subset of it
+    // on the start scene (embedReachablePrefabs).
+    delete sceneJson.prefabs;
+  };
+  /** Claims a prefab def's assets exactly as a scene subtree's are claimed. */
+  const visitPrefabDef = (def) => {
+    if (def.root) visit(def.root);
+    for (const ov of def.overrides ?? []) visitOverride(ov); // variants
+  };
+
+  // --- Prefabs: the reachable subset of the registry -------------------------
+  // The player has no project to scan, so prefab defs ride along in scene.json.
+  // Embedding every def in the project (the old behaviour) also claimed every
+  // asset every prefab touched — a build carried the meshes, materials and
+  // textures of prefabs no shipped scene could ever spawn. Now a def ships when
+  // a shipped scene instances it, a shipped prefab nests it or derives from it
+  // (variants), a shipped script's attribute names it, a shipped script's
+  // SOURCE mentions its guid or `.prefab` path, or its `.prefab` file is
+  // flagged Preload — the "always ship" escape hatch for a prefab only ever
+  // named at runtime (a spawn table, a name assembled from data). An Exclude
+  // flag on the `.prefab` keeps it out even when something references it.
+  //
+  // Incremental, and called twice: once after the start scene (so its prefabs'
+  // assets count as start-scene assets for the boot preload list) and once
+  // after every level has been walked.
+  const shippedPrefabs = new Map(); // guid -> def, as it ships
+  const consideredPrefabs = new Set();
+  const excludedPrefabs = new Set();
+  const scannedScripts = new Set();
+  let prefabFlagsRead = false;
+  async function embedReachablePrefabs() {
+    const all = prefabRegistry.all();
+    const frontier = new Set();
+    const enqueue = (guid) => {
+      if (!guid || consideredPrefabs.has(guid)) return;
+      consideredPrefabs.add(guid);
+      frontier.add(guid);
+    };
+    if (!prefabFlagsRead) {
+      prefabFlagsRead = true;
+      for (const def of all) {
+        const path = prefabRegistry.pathOf(def.guid);
+        const flags = path ? await readAssetFlags(path) : null;
+        if (flags?.exclude) excludedPrefabs.add(def.guid);
+        else if (flags?.preload) enqueue(def.guid);
+      }
     }
+    for (const guid of referencedPrefabs) enqueue(guid);
+
+    const prefabPathLiteral = /(['"`])([^'"`\r\n]+\.prefab)\1/gi;
+    const literalHits = (code) => {
+      const hits = new Set();
+      for (const def of all) if (code.includes(def.guid)) hits.add(def.guid);
+      for (const match of code.matchAll(prefabPathLiteral)) {
+        const guid =
+          prefabRegistry.guidForPath(match[2]) ??
+          (root ? prefabRegistry.guidForPath(joinPath(root, match[2])) : null);
+        if (guid) hits.add(guid);
+      }
+      return hits;
+    };
+
+    while (frontier.size) {
+      const closure = new Set();
+      for (const guid of frontier) dependenciesOf(guid, closure);
+      frontier.clear();
+      for (const guid of closure) {
+        consideredPrefabs.add(guid);
+        if (shippedPrefabs.has(guid)) continue;
+        if (excludedPrefabs.has(guid)) {
+          warnings.push(
+            `Prefab ${basename(prefabRegistry.pathOf(guid) ?? guid)} is flagged Exclude but a shipped ` +
+              `scene or prefab references it — its instances will not spawn.`,
+          );
+          continue;
+        }
+        const def = prefabRegistry.getDef(guid);
+        if (!def) continue;
+        const copy = structuredClone(def);
+        // Claims the def's assets, and records any prefab it names in turn.
+        visitPrefabDef(copy);
+        // The registry in the build is keyed by guid. The authoring path is a
+        // machine-specific absolute path; ship the project-relative form, so
+        // `engine.instantiate("prefabs/Enemy.prefab")` resolves in a build the
+        // way it does in the editor.
+        const path = prefabRegistry.pathOf(guid);
+        if (path && root) copy.path = toProjectRelative(root, path);
+        else delete copy.path;
+        if (copy.variantOf?.path) {
+          copy.variantOf.path = root ? toProjectRelative(root, copy.variantOf.path) : null;
+        }
+        shippedPrefabs.set(guid, copy);
+        enqueueScenes(JSON.stringify(copy));
+      }
+      // A script reached so far may name a prefab the walk cannot see — by guid
+      // (`engine.instantiate("p_…")`) or by path literal.
+      for (const src of scriptPaths) {
+        if (scannedScripts.has(src)) continue;
+        scannedScripts.add(src);
+        if ((await readAssetFlags(src)).exclude) continue;
+        const code = await readScriptSource(src);
+        if (code) for (const guid of literalHits(code)) enqueue(guid);
+      }
+      // Attribute-level references discovered while visiting the defs above.
+      for (const guid of referencedPrefabs) enqueue(guid);
+    }
+  }
+
+  // Build-relative destinations dropped by an Exclude flag. Checked BEFORE a
+  // document is read, so an excluded material's textures are never claimed:
+  // "exclude" means the file and everything only it references stay home.
+  const excluded = [];
+  const skipExcluded = async (src, bucket) => {
+    if (!(await readAssetFlags(src)).exclude) return false;
+    const rel = names.peek(src);
+    if (rel) excluded.push(rel);
+    names.release(src);
+    bucket?.delete(src);
+    return true;
   };
 
   try {
     // --- The start scene, which is also the build's config carrier ----------
-    const scene = await readScene(plan.startScene, { embedPrefabs: true });
+    const scene = await readScene(plan.startScene);
     scene.player = {
       title,
       pixelRatioCap: projectSettings.rendering.pixelRatioCap,
@@ -357,28 +553,56 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       autoCollidersEnabled: projectSettings.physics.autoCollidersEnabled === true,
     };
     rewriteScene(scene);
-    // Only the start scene's assets feed the boot preload list below. Levels
-    // the game loads later preload themselves, on demand.
+    onProgress({ phase: "prefabs", message: "Collecting prefabs…" });
+    await embedReachablePrefabs();
+    // Only the start scene's assets (its prefabs' included) feed the boot
+    // preload list below. Levels the game loads later preload themselves, on
+    // demand.
     const startAssets = new Set(names.entries().map(([source]) => source).filter(Boolean));
     const startMaterials = new Set(materialPaths);
 
     const files = []; // [relativePath, contents]
 
     // --- Every other shipped scene, at its project-relative path -------------
-    onProgress({ phase: "scenes", message: `Collecting ${plan.scenes.length} scene(s)…` });
-    for (const rel of plan.scenes) {
-      try {
-        // The start scene ships twice — as scene.json (what the player boots)
-        // and at its own path — so a script can reload the level it started in.
-        // Serialized fresh so the rewrite can't touch the copy already bound
-        // for scene.json.
-        const json = await readScene(rel);
-        rewriteScene(json);
-        files.push([rel, JSON.stringify(json)]);
-      } catch (err) {
-        warnings.push(`Skipped scene ${rel}: ${err?.message ?? err}`);
+    if (plan.mode === "reachable") {
+      if (root) {
+        for (const rel of available) {
+          if ((await readAssetFlags(joinPath(root, rel))).preload) enqueueScene(rel);
+        }
       }
+      enqueueScenes(JSON.stringify(scene));
     }
+    onProgress({ phase: "scenes", message: "Collecting scenes…" });
+    // A worklist, not a fixed list: a level can name the next one, and a prefab
+    // a level embeds can name another, so shipping repeats until nothing new
+    // turns up. The start scene ships twice — as scene.json (what the player
+    // boots) and at its own path — so a script can reload the level it started in.
+    const shippedSceneList = [];
+    let nextScene = 0;
+    while (nextScene < shippedScenes.length) {
+      while (nextScene < shippedScenes.length) {
+        const rel = shippedScenes[nextScene++];
+        if (root && !samePath(rel, plan.startScene) && (await readAssetFlags(joinPath(root, rel))).exclude) {
+          warnings.push(`Scene ${rel} is flagged Exclude — not shipped.`);
+          continue;
+        }
+        try {
+          // Serialized fresh so the rewrite can't touch the copy already bound
+          // for scene.json.
+          const json = await readScene(rel);
+          rewriteScene(json);
+          enqueueScenes(JSON.stringify(json));
+          files.push([rel, JSON.stringify(json)]);
+          shippedSceneList.push(rel);
+        } catch (err) {
+          warnings.push(`Skipped scene ${rel}: ${err?.message ?? err}`);
+        }
+      }
+      // Prefabs only a later level reaches — and any scene THEY name.
+      await embedReachablePrefabs();
+    }
+    scene.prefabs = [...shippedPrefabs.values()];
+    const prefabsSkipped = prefabRegistry.all().length - shippedPrefabs.size - excludedPrefabs.size;
 
     // --- Referenced documents ------------------------------------------------
     onProgress({ phase: "assets", message: "Rewriting asset references…" });
@@ -387,27 +611,16 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     // policy as the scene loop above. The runtime already tolerates the
     // resulting 404 with a default material/skipped script, and "I deleted an
     // asset and now nothing builds" is worse than either.
-    for (const src of scriptPaths) {
+    for (const src of [...scriptPaths]) {
       onProgress({ phase: "assets", message: `Reading script ${basename(src)}…` });
-      try {
-        const raw = await readRequiredText(src, "script");
-        const code = rewriteSourceAssetPaths(await transpileScript(raw), {
-          root,
-          rewriteAssetValue,
-          onFound: (original) =>
-            warnings.push(
-              `${basename(src)} hard-codes the absolute path "${original}". It was rewritten so the ` +
-                `build works, but the path is specific to this machine — prefer an ` +
-                `@attribute({ type: "asset" }) field and pick the asset in the Inspector.`,
-            ),
-        });
-        files.push([claimDoc(src, (name) => name.replace(/\.ts$/i, ".js")), code]);
-      } catch (err) {
-        warnings.push(`Skipped script ${src}: ${err?.message ?? err}`);
-      }
+      if (await skipExcluded(src, scriptPaths)) continue;
+      const code = await readScriptSource(src);
+      if (code == null) continue;
+      files.push([claimDoc(src, (name) => name.replace(/\.ts$/i, ".js")), code]);
     }
-    for (const src of vfxPaths) {
+    for (const src of [...vfxPaths]) {
       onProgress({ phase: "assets", message: `Reading VFX ${basename(src)}...` });
+      if (await skipExcluded(src, vfxPaths)) continue;
       try {
         const { parseVfxAsset } = await import("../engine/vfx/vfxAsset.js");
         const doc = parseVfxAsset(JSON.parse(await readRequiredText(src, "VFX")));
@@ -417,8 +630,9 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
         warnings.push(`Skipped VFX ${src}: ${err?.message ?? err}`);
       }
     }
-    for (const src of materialPaths) {
+    for (const src of [...materialPaths]) {
       onProgress({ phase: "assets", message: `Reading material ${basename(src)}…` });
+      if (await skipExcluded(src, materialPaths)) continue;
       try {
         const def = JSON.parse(await readRequiredText(src, "material"));
         if (def.map) def.map = claim(def.map);
@@ -431,8 +645,9 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       }
     }
     const { normalizeCubemapDef, CUBEMAP_FACES } = await import("../engine/cubemapAsset.js");
-    for (const src of cubemapPaths) {
+    for (const src of [...cubemapPaths]) {
       onProgress({ phase: "assets", message: `Reading cubemap ${basename(src)}…` });
+      if (await skipExcluded(src, cubemapPaths)) continue;
       try {
         const def = normalizeCubemapDef(JSON.parse(await readRequiredText(src, "cubemap")));
         for (const { key } of CUBEMAP_FACES) {
@@ -443,8 +658,9 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
         warnings.push(`Skipped cubemap ${src}: ${err?.message ?? err}`);
       }
     }
-    for (const src of timelinePaths) {
+    for (const src of [...timelinePaths]) {
       onProgress({ phase: "assets", message: `Reading timeline ${basename(src)}…` });
+      if (await skipExcluded(src, timelinePaths)) continue;
       let def;
       try {
         def = JSON.parse(await readRequiredText(src, "timeline"));
@@ -468,8 +684,9 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       }
       files.push([claimDoc(src), JSON.stringify(def)]);
     }
-    for (const src of atlasPaths) {
+    for (const src of [...atlasPaths]) {
       onProgress({ phase: "assets", message: `Reading atlas ${basename(src)}…` });
+      if (await skipExcluded(src, atlasPaths)) continue;
       let def;
       try {
         def = JSON.parse(await readRequiredText(src, "atlas"));
@@ -484,7 +701,8 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       for (const region of def.regions ?? []) delete region.source;
       files.push([claimDoc(src), JSON.stringify(def)]);
     }
-    for (const src of audioSidecarPaths) {
+    for (const src of [...audioSidecarPaths]) {
+      if (await skipExcluded(src, audioSidecarPaths)) continue;
       // Sidecar may reference a sibling raw audio file (def.path) — copy that
       // and rewrite the path. When the sidecar JSON is missing or has no
       // `path`, the runtime falls back to the sidecar's own path minus its
@@ -550,9 +768,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     }
 
     // --- Per-asset build flags ----------------------------------------------
-    const { readAssetFlags } = await import("./assetFlags.js");
     const preload = [];
-    const excluded = [];
     // `engine.assets.findByName`/`byTag` at runtime — one entry per shipped
     // asset, name = the AUTHORING basename (stable across a collision rename,
     // so `wood/color.png` and `stone/color.png` both search as "color.png"
@@ -605,7 +821,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     // which scene still needs one editor bake before release.
     const derivedByDestination = new Map();
     if (root) {
-      for (const rel of plan.scenes) {
+      for (const rel of shippedSceneList) {
         const sceneKey = samePath(rel, openRel) ? openScenePath : joinPath(root, rel);
         try {
           const candidates = [];
@@ -690,11 +906,44 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
           `field it came from.`,
       );
     }
+    // --- The runtime: only the engine code this game can reach --------------
+    // The player template is code-split behind dynamic imports; a game with no
+    // physics module has no reason to ship Rapier. See build/runtimeFiles.js.
+    let runtime = null;
+    if (build.trimRuntime !== false) {
+      try {
+        const templateFiles = await invoke("list_player_template");
+        const manifest = JSON.parse(await invoke("read_player_template", { rel: ".vite/manifest.json" }));
+        const copySources = names.copyEntries().map(([source]) => source);
+        const dracoDecided = enabledModules.includes("draco") || !!build.compressModels;
+        runtime = selectRuntimeFiles({
+          manifest,
+          templateFiles,
+          modules: [...enabledModules, ...enabledModules.map(resolveModuleId)],
+          assetExtensions: [...copySources.map(extOf), ...shippedFiles.map(([rel]) => extOf(rel))],
+          scriptImports: scriptImportSpecifiers(scriptSources.values()),
+          livePreview: !!build.livePreview,
+          compressTextures: !!build.compressTextures,
+          compressModels: !!build.compressModels,
+          dracoModels: dracoDecided ? false : await anyDracoModel(invoke, copySources),
+        });
+      } catch (err) {
+        runtime = null;
+        warnings.push(
+          `Runtime not trimmed — the whole player template ships (${err?.message ?? err}). ` +
+            "Run `npm run build:player` to refresh the template.",
+        );
+      }
+    }
     const exportReport = await invoke("export_game", {
       outDir: contentDir,
       sceneJson: JSON.stringify(scene, null, 2),
       assets: [...names.copyEntries(), ...shippedSidecars, ...derivedCopies],
       files: shippedFiles,
+      // Only the runtime files selected above (null = the whole template), and
+      // sweep whatever the previous build into this folder left behind.
+      templateFiles: runtime?.files ?? null,
+      prune: true,
     });
     // Test shims may still answer with the old bare missing-list (or null).
     const missingAssets = Array.isArray(exportReport)
@@ -702,6 +951,12 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       : (exportReport?.missing ?? []);
     const changedFiles = Array.isArray(exportReport) ? null : (exportReport?.changed ?? null);
     for (const src of missingAssets) {
+      if (runtime?.files && /[\\/]_engine[\\/]|[\\/]dist-player[\\/]/.test(src)) {
+        warnings.push(
+          `Player template file ${basename(src)} vanished during the build (template rebuilt?) — build again.`,
+        );
+        continue;
+      }
       warnings.push(`Skipped missing asset ${src} — a scene or material still references it.`);
     }
 
@@ -797,11 +1052,26 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
       contentDir,
       target: build.target,
       startScene: plan.startScene,
-      sceneCount: plan.scenes.length,
+      sceneCount: shippedSceneList.length,
+      scenes: shippedSceneList,
+      sceneMode: plan.mode,
       assetCount:
         names.copyEntries().length + shippedSidecars.length + derivedCopies.length + shippedFiles.length,
       preloadCount: preload.length,
+      prefabCount: scene.prefabs.length,
+      prefabsSkipped: Math.max(0, prefabsSkipped),
       excluded,
+      // Leftovers of the previous build into this folder that were deleted.
+      removed: Array.isArray(exportReport) ? [] : (exportReport?.removed ?? []),
+      runtime: runtime
+        ? {
+            trimmed: runtime.trimmed,
+            files: runtime.files.length,
+            skipped: runtime.skipped.length,
+            shippedBytes: runtime.shippedBytes,
+            skippedBytes: runtime.skippedBytes,
+          }
+        : null,
       savedBytes: compression.savedBytes,
       compressed: compression.count,
       warnings,
@@ -882,6 +1152,29 @@ export function findLeakedAbsolutePaths(files, root) {
     }
   }
   return leaks;
+}
+
+/**
+ * Whether any shipped model needs the Draco decoder. The engine core attaches
+ * a DRACOLoader to every glTF load and fetches the decoder only for a mesh
+ * that declares `KHR_draco_mesh_compression`, so a downloaded model can need
+ * it with the Draco module off. The declaration sits in the glTF JSON's
+ * `extensionsUsed`, inside the first 64 KB of any realistic file.
+ */
+export async function anyDracoModel(invoke, sources) {
+  const decoder = new TextDecoder();
+  for (const src of sources) {
+    if (!/\.(glb|gltf)$/i.test(src)) continue;
+    try {
+      const head = await invoke("read_binary_file_head", { path: src, maxBytes: 65536 });
+      const bytes =
+        head instanceof ArrayBuffer ? new Uint8Array(head) : ArrayBuffer.isView(head) ? head : Uint8Array.from(head);
+      if (decoder.decode(bytes).includes("KHR_draco_mesh_compression")) return true;
+    } catch {
+      // Unreadable here → the copy step reports it. Assume no Draco.
+    }
+  }
+  return false;
 }
 
 async function pickOutputDirectory() {

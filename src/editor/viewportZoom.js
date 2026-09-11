@@ -1,5 +1,6 @@
 import * as THREE from "three/webgpu";
 import { isPickVisible } from "./pickVisibility.js";
+import { freeze } from "../engine/freezeLedger.js";
 
 /**
  * Distance-aware wheel dolly, shared by the scene viewport and the geometry
@@ -72,11 +73,42 @@ function isSceneObject(object) {
  *  none of which are things you fly at, so only meshes count — and a batched or
  *  merged member is on screen even though `visible` is false, which is what
  *  isPickVisible is for (most of an imported scene is drawn that way). */
+/**
+ * ⛔ SKINNED MESHES ARE NOT CANDIDATES, AND THAT IS THE WHOLE COST.
+ *
+ * `THREE.SkinnedMesh.raycast` computes the SKINNED position of every vertex it
+ * tests, on the CPU, through the full bone chain — and `pickAcceleration.js`
+ * deliberately builds no bounds tree for one (a bind-pose BVH is wrong for a
+ * posed mesh), so a skinned mesh always takes the stock linear scan. The
+ * user's Sponza carries a 104-bone character of 55 320 triangles across two
+ * skinned meshes; every probe re-cast paid for all of it on the main thread.
+ *
+ * That is why ZOOM froze and ORBIT did not: orbit never casts a ray, and the
+ * probe re-casts whenever the cursor moves, the cache ages out, or the camera
+ * flies PAST the pivot surface — which is what zooming in does, every notch.
+ *
+ * A character is not a thing you fly at, and even if it were, a depth from its
+ * bind pose would be the wrong depth. Excluding it costs nothing real.
+ *
+ * The candidate walk also moves `isPickVisible`/`isSceneObject` BEFORE the
+ * raycast instead of filtering hits afterwards: an editor overlay that was
+ * going to be discarded should not be intersected first.
+ */
+function pickCandidates(root) {
+  const out = [];
+  root.traverse((object) => {
+    if (!object.isMesh || object.isSkinnedMesh) return;
+    if (!isPickVisible(object) || !isSceneObject(object)) return;
+    out.push(object);
+  });
+  return out;
+}
+
 function firstSurface(raycaster, root) {
   if (!root) return null;
-  for (const hit of raycaster.intersectObjects(root.children ?? [root], true)) {
+  // `false` — the candidate list is already flat, so nothing is walked twice.
+  for (const hit of raycaster.intersectObjects(pickCandidates(root), false)) {
     if (!hit.object.isMesh) continue;
-    if (!isPickVisible(hit.object) || !isSceneObject(hit.object)) continue;
     return hit;
   }
   return null;
@@ -130,7 +162,15 @@ export function installWheelZoom(canvas, { getCamera, getControls, getRoot, isEn
       if (depth > 0) return depth;
     }
 
-    const hit = firstSurface(raycaster, getRoot?.());
+    // Spanned: a zoom stall used to land in the ledger as `(unattributed)`,
+    // which is the one answer that cannot be acted on.
+    const span = freeze.begin("editor:zoomProbe");
+    let hit;
+    try {
+      hit = firstSurface(raycaster, getRoot?.());
+    } finally {
+      freeze.end(span);
+    }
     probe = { x: event.clientX, y: event.clientY, time: now, point: hit ? hit.point.clone() : null };
     if (!probe.point) return 0;
     return Math.max(toPoint.copy(probe.point).sub(camera.position).dot(raycaster.ray.direction), 0);

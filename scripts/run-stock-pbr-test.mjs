@@ -5,7 +5,14 @@
 // else bails to the compile path unchanged. A false MATCH is a rendering bug
 // (the graph's real look silently replaced); a false BAIL is only a perf miss.
 // Every bail case here guards a specific correctness edge, so keep them.
-import { matchStockPbr } from "../src/engine/tslGraph.js";
+import { matchStockPbr, migrateGraph } from "../src/engine/tslGraph.js";
+
+// Production calls the matcher on a MIGRATED graph (materialAsset.js migrates
+// once, up front, precisely so the matcher and the compiler read the same
+// shape). These fixtures are still written in the retired Principled BSDF
+// shape, so running them through migrateGraph tests both halves at once: the
+// rewrite has to land the channels where the matcher now looks for them.
+const match = (g) => matchStockPbr(migrateGraph(g));
 
 let failures = 0;
 const check = (name, got) => {
@@ -22,7 +29,7 @@ const graph = (nodes, edges) => ({ nodes, edges });
 // ── the three canonical import shapes ────────────────────────────────────────
 {
   const g = graph([bsdf({ roughness: 0.82, metalness: 0 }), output], [surface]);
-  const m = matchStockPbr(g);
+  const m = match(g);
   check("constants-only matches", !!m);
   check("constants: roughness carried", m?.roughness === 0.82);
   check("constants: no maps", m?.map === null && m?.normalMap === null);
@@ -32,7 +39,7 @@ const graph = (nodes, edges) => ({ nodes, edges });
     [tex("t"), bsdf({ roughness: 0.7 }), output],
     [{ source: "t", sourceHandle: "out", target: "bsdf", targetHandle: "color" }, surface],
   );
-  const m = matchStockPbr(g);
+  const m = match(g);
   check("texture→color matches", !!m);
   check("wired color pins factor to white (graph path has no factor multiply)", m?.color === "#ffffff");
   check("map path carried", m?.map === "t.png");
@@ -47,7 +54,7 @@ const graph = (nodes, edges) => ({ nodes, edges });
       surface,
     ],
   );
-  const m = matchStockPbr(g);
+  const m = match(g);
   check("texture+normalMap matches", !!m);
   check("normalMap path carried", m?.normalMap === "tn.png");
   check("normalMap scale carried", m?.normalScale === 0.8);
@@ -72,7 +79,7 @@ const graph = (nodes, edges) => ({ nodes, edges });
       surface,
     ],
   );
-  const m = matchStockPbr(g);
+  const m = match(g);
   check("ORM graph matches (one texture feeding .g→roughness and .b→metalness)", !!m);
   check("ORM: roughnessMap carried", m?.roughnessMap === "tarm.png");
   check("ORM: metalnessMap carried", m?.metalnessMap === "tarm.png");
@@ -93,7 +100,7 @@ const graph = (nodes, edges) => ({ nodes, edges });
       surface,
     ],
   );
-  const m = matchStockPbr(g);
+  const m = match(g);
   check("ORM: a wired channel overrides its stored scalar", m?.roughness === 1 && m?.metalness === 1);
 }
 {
@@ -102,7 +109,7 @@ const graph = (nodes, edges) => ({ nodes, edges });
     [tex("tarm"), bsdf({ roughness: 0.25, metalness: 0.75 }), output],
     [{ source: "tarm", sourceHandle: "g", target: "bsdf", targetHandle: "roughness" }, surface],
   );
-  const m = matchStockPbr(g);
+  const m = match(g);
   check("ORM: an unwired channel keeps its scalar", m?.roughness === 1 && m?.metalness === 0.75);
   check("ORM: half-wired carries only the mapped slot",
     m?.roughnessMap === "tarm.png" && m?.metalnessMap === null);
@@ -118,7 +125,7 @@ const graph = (nodes, edges) => ({ nodes, edges });
       surface,
     ],
   );
-  const m = matchStockPbr(g);
+  const m = match(g);
   check("colour map's own alpha → opacity matches (three's map is a vec4)", !!m);
   check("alpha wire needs no extra slot — it rides on map", m?.map === "td.png");
 }
@@ -171,11 +178,30 @@ const bails = [
     graph([bsdf({}), output], [])],
   ["empty graph", graph([], [])],
 ];
-for (const [name, g] of bails) check(`bails: ${name}`, matchStockPbr(g) === null);
+for (const [name, g] of bails) check(`bails: ${name}`, match(g) === null);
 
-// Emissive black with strength is fine — black × anything is black.
+// Emissive black with strength is fine — black × anything is black, and the
+// migration folds the constant pair rather than leaving a Multiply node the
+// matcher cannot express.
 check("black emissive with strength still matches",
-  !!matchStockPbr(graph([bsdf({ emissive: "#000000", emissiveStrength: 5 }), output], [surface])));
+  !!match(graph([bsdf({ emissive: "#000000", emissiveStrength: 5 }), output], [surface])));
+// A non-black emissive bails either way (the GI emitter guard), but it must
+// bail for THAT reason — with the constant pair folded, not with a stray
+// Multiply node left in the graph for the compiler to spell out.
+{
+  const migrated = migrateGraph(graph([bsdf({ emissive: "#804000", emissiveStrength: 0.5 }), output], [surface]));
+  const out = migrated.nodes.find((n) => n.type === "output");
+  check("dimmed emissive folds into the Output prop", out?.props?.emissive === "#402000");
+  check("dimmed emissive leaves no Multiply behind", !migrated.nodes.some((n) => n.type === "multiply"));
+  check("non-black emissive still bails (GI emitter guard)", matchStockPbr(migrated) === null);
+}
+// A product that would clip cannot be folded, so the multiply has to survive
+// as a real node — and a graph carrying one is not stock-expressible.
+{
+  const migrated = migrateGraph(graph([bsdf({ emissive: "#ffffff", emissiveStrength: 4 }), output], [surface]));
+  check("clipping emissive strength keeps an explicit Multiply", migrated.nodes.some((n) => n.type === "multiply"));
+  check("clipping emissive strength stays on the compile path", matchStockPbr(migrated) === null);
+}
 
 if (failures) {
   console.error(`\n${failures} check(s) failed`);

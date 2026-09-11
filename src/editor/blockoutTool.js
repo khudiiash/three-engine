@@ -4,7 +4,8 @@ import { useHistoryStore } from "./commands/CommandBus.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { EDITOR_LAYER } from "../engine/editorLayers.js";
 import { buildBlockoutGeometry } from "../modules/level-design/blockoutGeometry.js";
-import { pieceFromDrag, snapPoint, offsetAlongWall } from "./blockoutDraw.js";
+import { pieceFromDrag, snapPoint } from "./blockoutDraw.js";
+import { getArchitectureDrawContext, setArchitectureToolError, validateArchitectureDrawTarget } from "./architectureTool.js";
 import {
   DRAW_TOOLS,
   activeAngleSnap,
@@ -157,7 +158,7 @@ function showGhost(spec) {
   const edges = new THREE.EdgesGeometry(geometry, 30);
   view.ghostEdges.geometry.dispose();
   view.ghostEdges.geometry = edges;
-  const color = new THREE.Color(shapeColor(spec.shape));
+  const color = new THREE.Color(getArchitectureDrawContext()?.color || shapeColor(spec.shape));
   view.ghost.material.color.copy(color);
   view.ghostEdges.material.color.copy(color).offsetHSL(0, 0, 0.25);
   for (const object of [view.ghost, view.ghostEdges]) {
@@ -225,7 +226,8 @@ export function setupBlockoutTool(canvas, viewport) {
       while (node) {
         if (node.userData.editorOnly) break;
         const id = node.userData.entityId;
-        const piece = id ? engine.getEntity(id)?.getComponent?.("blockout") : null;
+        const entity = id ? engine.getEntity(id) : null;
+        const piece = entity?.getComponent?.("architecturepiece") ?? entity?.getComponent?.("blockout");
         if (piece) return { entityId: id, piece, point: hit.point };
         node = node.parent;
       }
@@ -237,7 +239,12 @@ export function setupBlockoutTool(canvas, viewport) {
   const drawSettings = () => ({ ...getLevelToolSettings(), grid: activeGrid(), angleSnap: activeAngleSnap() });
 
   const refresh = () => {
+    if (getArchitectureDrawContext()) validateArchitectureDrawTarget();
     const tool = getLevelTool();
+    if (drag && drag.tool !== tool) {
+      drag = null;
+      viewport.orbit.enabled = true;
+    }
     const view = ensureOverlay();
     // Middle-drag rotates while any tool is armed. The wheel already dollies
     // (installWheelZoom), so the button's default job is the redundant one.
@@ -251,7 +258,7 @@ export function setupBlockoutTool(canvas, viewport) {
       hideOverlay();
       return;
     }
-    validateActiveLevel();
+    if (!getArchitectureDrawContext()) validateActiveLevel();
     view.group.visible = true;
     const drawing = DRAW_TOOLS.has(tool);
     const point = drag?.current ?? hoverPoint;
@@ -287,12 +294,9 @@ export function setupBlockoutTool(canvas, viewport) {
         erasePiece(hit.entityId);
       } else if (hit.piece.props.shape === "wall") {
         const object3D = engine.getEntity(hit.entityId).object3D;
-        const world = object3D.getWorldPosition(new THREE.Vector3());
-        const yaw = new THREE.Euler().setFromQuaternion(
-          object3D.getWorldQuaternion(new THREE.Quaternion()), "YXZ",
-        ).y;
+        object3D.updateWorldMatrix(true, false);
         addOpening(hit.entityId, {
-          offset: offsetAlongWall(hit.point, world.toArray(), yaw),
+          offset: object3D.worldToLocal(hit.point.clone()).x,
           kind: getLevelToolSettings().opening,
         });
       }
@@ -303,7 +307,7 @@ export function setupBlockoutTool(canvas, viewport) {
     if (!point) return;
     e.preventDefault();
     e.stopImmediatePropagation();
-    drag = { start: point, current: point };
+    drag = { start: point, current: point, tool };
     viewport.orbit.enabled = false;
     refresh();
   };
@@ -333,13 +337,18 @@ export function setupBlockoutTool(canvas, viewport) {
     const tool = getLevelTool();
     const spec = tool ? pieceFromDrag(tool, start, current, drawSettings()) : null;
     if (spec) {
-      createPiece({
-        shape: spec.shape,
-        position: spec.position,
-        rotationY: spec.rotationY,
-        size: spec.size,
-        props: spec.props ?? {},
-      });
+      try {
+        createPiece({
+          shape: spec.shape,
+          position: spec.position,
+          rotationY: spec.rotationY,
+          size: spec.size,
+          props: spec.props ?? {},
+        });
+      } catch (error) {
+        if (getArchitectureDrawContext()) setArchitectureToolError(error?.message ?? String(error));
+        else throw error;
+      }
     }
     refresh();
   };
@@ -395,7 +404,7 @@ export function setupBlockoutTool(canvas, viewport) {
     const id = state.ids[0] ?? null;
     if (id === lastSelection) return;
     lastSelection = id;
-    if (id) syncActiveFromEntity(id);
+    if (id && !getArchitectureDrawContext()) syncActiveFromEntity(id);
   });
 
   return () => {

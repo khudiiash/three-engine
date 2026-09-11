@@ -6,7 +6,7 @@ import { splitGeometryIslandsWithPrompt, canSplitEntity } from "../geometrySplit
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
-  X, Plus, Crosshair, Eye, EyeOff, ScanEye, Package, ChevronRight, ChevronUp, ChevronDown, Sparkles, Link, Link2Off, Search, Pencil, ExternalLink, PanelsTopLeft, Waypoints, Layers2, FilePlus, Axis3d, Play, Pin, Lock, Check, RotateCcw, GitFork, PackageOpen, Power, PencilRuler, PencilOff } from "../icons/index.jsx";
+  X, Plus, Crosshair, Eye, EyeOff, ScanEye, Package, ChevronRight, ChevronUp, ChevronDown, Sparkles, Link, Link2Off, Search, Pencil, ExternalLink, PanelsTopLeft, Waypoints, Layers2, FilePlus, Axis3d, Play, Pin, Lock, Check, RotateCcw, GitFork, PackageOpen, Power, PencilRuler, PencilOff, Hammer, PersonStanding } from "../icons/index.jsx";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { getComponentClass, getComponentTypes, getModuleDefinition } from "../../engine/index.js";
@@ -36,11 +36,14 @@ import { applyPrefab, revertPrefab, unpackPrefab, openPrefabMode, createVariantF
 import { SoundSection } from "../components/SoundSection.jsx";
 import { ListenerSection } from "../components/ListenerSection.jsx";
 import { TerrainSection } from "../components/TerrainSection.jsx";
+import { FoliageSection, FoliageSurfaceSection } from "../components/FoliageSection.jsx";
+import { AtmosphereSection } from "../components/AtmosphereSection.jsx";
 import { LevelSection } from "../components/LevelSection.jsx";
+import { ArchitecturePieceSection, ArchitectureSection } from "../components/ArchitectureSection.jsx";
 import { BlockoutSection } from "../components/BlockoutSection.jsx";
 import { TimelineSection } from "../components/TimelineSection.jsx";
 import { LinePointsSection, DecalSection, TrailSection } from "../components/VfxSections.jsx";
-import { EventBindingsSection, ActionListSections } from "../components/EventSections.jsx";
+import { EventBindingsSection, ActionListSections, EventSelect } from "../components/EventSections.jsx";
 import { LodSection } from "../components/LodSection.jsx";
 import { ImpostorSection } from "../components/ImpostorSection.jsx";
 import { SplineSection, SplineMeshSection, SplineFollowerSection } from "../components/SplineSection.jsx";
@@ -63,6 +66,7 @@ import { openInIDE } from "../openInIde.js";
 import { GEOMETRY_MODIFIER_DEFINITIONS, createGeometryModifier } from "../../engine/geometryModifiers.js";
 import { applyGeometryModifier } from "../geometryModifierEditing.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * Returns the live engine entity referenced by `targetId` (the value stored
  * on the camera's `followTarget` prop), or null when nothing is set / the
@@ -665,7 +669,7 @@ export function PropField({ descriptor, value, onCommit, mixed = false, mixedAxe
         onCommit(match === undefined ? raw : match);
       };
       return (
-        <select className="select-field" value={mixed ? "" : value} onChange={(e) => commitOption(e.target.value)}>
+        <Select className="select-field" value={mixed ? "" : value} onChange={(e) => commitOption(e.target.value)}>
           {mixed && <option value="">— Mixed —</option>}
           {stale && <option value={value}>{`${value} (missing)`}</option>}
           {options.map((opt) => (
@@ -673,13 +677,18 @@ export function PropField({ descriptor, value, onCommit, mixed = false, mixedAxe
               {opt}
             </option>
           ))}
-        </select>
+        </Select>
       );
     }
     case "boolean":
       return (
         <MixedCheckbox checked={value} mixed={mixed} onChange={(e) => onCommit(e.target.checked)} />
       );
+    // The project's declared events, the same picker an Events row uses — a
+    // component whose behaviour is triggered by an event (Destructible's
+    // `breakEvent`) must not ask the author to retype the name from memory.
+    case "event":
+      return <EventSelect value={value} onCommit={onCommit} />;
     default:
       return <TextPropField value={value} mixed={mixed} onCommit={onCommit} readOnly={descriptor.readOnly} />;
   }
@@ -1448,7 +1457,7 @@ function IKBoneField({ entityId, props }) {
       <div className="field-row">
         <span className="field-label">Tip Bone</span>
         {bones.length ? (
-          <select
+          <Select
             className="select-field"
             value={props.tipBone ?? ""}
             onChange={(e) =>
@@ -1461,7 +1470,7 @@ function IKBoneField({ entityId, props }) {
                 {" ".repeat(b.depth * 2) + b.name}
               </option>
             ))}
-          </select>
+          </Select>
         ) : (
           <input
             className="text-field"
@@ -1695,6 +1704,102 @@ function ImpulseSourceActions({ entityId }) {
   );
 }
 
+/**
+ * Break / Reset / Bake for a Destructible. Fracture settings are numbers whose
+ * result you cannot picture, so the only useful control is the one that shows
+ * you the pieces — and `Bake` reports how many there will be without breaking
+ * anything.
+ */
+function DestructibleActions({ entityId }) {
+  const [status, setStatus] = useState("");
+  const component = () => engine.getEntity(entityId)?.getComponent("destructible");
+  return (
+    <>
+      <EditorActionRow
+        actions={[
+          {
+            label: "Break",
+            hint: "break it now, wherever it is",
+            Icon: Hammer,
+            color: "#ff8080",
+            onClick: () => {
+              const destructible = component();
+              if (!destructible) return;
+              setStatus(destructible.break() ? `broke into ${destructible.debris.length} pieces` : "already broken");
+            },
+          },
+          {
+            label: "Reset",
+            hint: "put it back together",
+            Icon: RotateCcw,
+            color: "#4fd475",
+            onClick: () => {
+              component()?.reset();
+              setStatus("");
+            },
+          },
+          {
+            label: "Bake",
+            hint: "cut the pieces now so the first break costs nothing",
+            Icon: Play,
+            color: "#4da3ff",
+            onClick: async () => {
+              setStatus("cutting…");
+              const pieces = await component()?.prefracture();
+              setStatus(pieces ? `${pieces} pieces ready` : "nothing to fracture");
+            },
+          },
+        ]}
+      />
+      {status && (
+        <div className="field-row">
+          <span className="field-label" style={{ opacity: 0.7 }}>{status}</span>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** Go limp / get up. A ragdoll is unjudgeable without watching it fall over. */
+function RagdollActions({ entityId }) {
+  const [status, setStatus] = useState("");
+  const component = () => engine.getEntity(entityId)?.getComponent("ragdoll");
+  return (
+    <>
+      <EditorActionRow
+        actions={[
+          {
+            label: "Activate",
+            hint: "hand the skeleton to the simulation (play mode)",
+            Icon: PersonStanding,
+            color: "#ff8080",
+            onClick: () => {
+              const ragdoll = component();
+              const bodies = ragdoll?.activate() ?? 0;
+              setStatus(bodies ? `${bodies} bodies: ${ragdoll.getBones().join(", ")}` : "no bones to simulate");
+            },
+          },
+          {
+            label: "Get Up",
+            hint: "give the skeleton back to the animator",
+            Icon: RotateCcw,
+            color: "#4fd475",
+            onClick: () => {
+              component()?.deactivate();
+              setStatus("");
+            },
+          },
+        ]}
+      />
+      {status && (
+        <div className="field-row">
+          <span className="field-label" style={{ opacity: 0.7 }}>{status}</span>
+        </div>
+      )}
+    </>
+  );
+}
+
 /** Blender-style ordered modifier cards for the Geometry Modifiers component. */
 function GeometryModifiersSection({ entityId, props }) {
   const [busyId, setBusyId] = useState(null);
@@ -1724,7 +1829,7 @@ function GeometryModifiersSection({ entityId, props }) {
 
   return (
     <div className="modifier-stack-editor">
-      <select
+      <Select
         className="select-field modifier-add"
         value=""
         onChange={(event) => {
@@ -1736,7 +1841,7 @@ function GeometryModifiersSection({ entityId, props }) {
         {GEOMETRY_MODIFIER_DEFINITIONS.map((definition) => (
           <option key={definition.type} value={definition.type}>{definition.label}</option>
         ))}
-      </select>
+      </Select>
       {!modifiers.length && <div className="modifier-stack-empty">No modifiers</div>}
       {modifiers.map((modifier, index) => {
         const definition = GEOMETRY_MODIFIER_DEFINITIONS.find((entry) => entry.type === modifier.type);
@@ -2056,6 +2161,7 @@ function ComponentSection({ entityId, type, props }) {
         {(() => {
           const installed = new Set(enabledModules);
           const visible = cls.schema.filter((descriptor) => {
+            if (type === "foliage") return false;
             if (descriptor.hidden) return false;
             // A field that belongs to an optional module is invisible — not
             // disabled — until that module is installed (see Component.js).
@@ -2247,6 +2353,8 @@ function ComponentSection({ entityId, type, props }) {
         {type === "vcam" && <VirtualCameraActions entityId={entityId} />}
         {type === "navmesh" && <NavMeshActions entityId={entityId} />}
         {type === "impulsesource" && <ImpulseSourceActions entityId={entityId} />}
+        {type === "destructible" && <DestructibleActions entityId={entityId} />}
+        {type === "ragdoll" && <RagdollActions entityId={entityId} />}
         {moduleGroups}
         {type === "sound" && <SoundSection entityId={entityId} props={props} />}
         {type === "listener" && <ListenerSection entityId={entityId} />}
@@ -2260,7 +2368,12 @@ function ComponentSection({ entityId, type, props }) {
         {type === "splineMesh" && <SplineMeshSection entityId={entityId} />}
         {type === "splineFollower" && <SplineFollowerSection entityId={entityId} />}
         {type === "terrain" && <TerrainSection entityId={entityId} props={props} />}
+        {type === "foliage" && <FoliageSection entityId={entityId} props={props} />}
+        {type === "atmosphere" && <AtmosphereSection entityId={entityId} props={props} />}
+        {["mesh", "model"].includes(type) && !engine.getEntity(entityId)?.getComponent("terrain") && <FoliageSurfaceSection entityId={entityId} />}
         {type === "level" && <LevelSection entityId={entityId} />}
+        {type === "architecture" && <ArchitectureSection entityId={entityId} props={props} />}
+        {type === "architecturepiece" && <ArchitecturePieceSection entityId={entityId} props={props} />}
         {type === "blockout" && <BlockoutSection entityId={entityId} props={props} />}
         {type === "collider" && props.shape === "heightfield" && !engine.getEntity(entityId)?.getComponent("terrain") && (
           <div className="field-row">
@@ -2915,8 +3028,8 @@ function addComponentCommands(entity, type) {
   const has = (name) =>
     typeof components?.has === "function" ? components.has(name) : !!components && name in components;
   const commands = [];
-  if (type === "blockout" && !has("mesh")) {
-    commands.push(new AddComponentCommand(entity.id, "mesh", { castShadow: true, receiveShadow: true }));
+  if (["blockout", "architecturepiece"].includes(type) && !has("mesh")) {
+    commands.push(new AddComponentCommand(entity.id, "mesh", { castShadow: true, receiveShadow: true, ...(type === "architecturepiece" ? { collision: "none" } : {}) }));
   }
   commands.push(new AddComponentCommand(entity.id, type));
   return commands;

@@ -25,7 +25,7 @@ import { AudioSystem } from "./audio/AudioSystem.js";
 import { prefabRegistry } from "./prefab/registry.js";
 import { instantiatePrefabNode } from "./prefab/expand.js";
 import { StatsSystem, PHASE } from "./StatsSystem.js";
-import { freeze, installFreezeObserver, installGpuCallLedger, installNodeBuildLedger } from "./freezeLedger.js";
+import { freeze, installFreezeObserver, installGpuCallLedger, installNodeBuildLedger, installRenderSpans } from "./freezeLedger.js";
 import { SaveSystem, PreferenceStore } from "./saveSystem.js";
 import { Tween, TweenSystem } from "./tween.js";
 import { TimeSystem } from "./time.js";
@@ -924,6 +924,7 @@ export class Engine extends EventEmitter {
         // GPUDevice, so a swap silently loses them.
         installGpuCallLedger(this.renderer?.backend?.device);
         installNodeBuildLedger(this.renderer);
+        installRenderSpans(this.renderer);
         this.emit("renderer-ready", this.renderer);
         configureTextureAssetLoader(this.renderer);
     // Sub-LSB dither on the output transform — without it every smooth GI
@@ -1198,6 +1199,7 @@ export class Engine extends EventEmitter {
     // after every device swap because a rebuild hands us a new one.
     installGpuCallLedger(this.renderer?.backend?.device);
     installNodeBuildLedger(this.renderer);
+    installRenderSpans(this.renderer);
     // What this session actually got. A rebuild after a device loss insists on
     // the same backend rather than accepting a WebGL fallback the canvas
     // cannot serve — see #rebuildRenderer's header.

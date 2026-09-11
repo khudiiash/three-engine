@@ -4,6 +4,7 @@ import { useInputStore } from "../store/inputStore.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { describePath, rebindNextInput, suggestedPaths } from "../input/bindingLabels.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * Unity-style Input editor. The left rail lists action maps; the main pane
  * lists actions in the selected map. Each action expands into its bindings
@@ -265,23 +266,23 @@ function MapEditor({ map, selectedAction, onSelectAction, onPatch }) {
               <div className="input-action-body">
                 <div className="field-row">
                   <span className="field-label">Type</span>
-                  <select className="select-field" value={action.type} onChange={(e) => setActionType(action.name, e.target.value)}>
+                  <Select className="select-field" value={action.type} onChange={(e) => setActionType(action.name, e.target.value)}>
                     <option value="button">Button</option>
                     <option value="value">Value (axis)</option>
                     <option value="vec2">Vec2 (stick)</option>
-                  </select>
+                  </Select>
                 </div>
                 {action.type === "vec2" && (
                   <div className="field-row">
                     <span className="field-label" title="Rotate the action's vec2 by the active camera before storing it. World keeps the input-space (x=strafe, y=forward) interpretation; Camera gives you world-space (x=worldX, y=worldZ) ready to add to entity.position.">Space</span>
-                    <select
+                    <Select
                       className="select-field"
                       value={action.space ?? "world"}
                       onChange={(e) => setActionSpace(action.name, e.target.value)}
                     >
                       <option value="world">World (input axes)</option>
                       <option value="camera">Camera (world XZ)</option>
-                    </select>
+                    </Select>
                   </div>
                 )}
                 <BindingList

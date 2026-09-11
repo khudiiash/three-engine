@@ -28,15 +28,15 @@
 // path remains the fallback for everything this module excludes). Capacity
 // MAX_BVH_MESHES; scenes with more seat only the first N (console.warn).
 //
-// PER-GEOMETRY BLAS CACHE: keyed by geometry object identity (WeakMap), so
-// N mesh instances sharing one geometry (an instanced prop, a duplicated
-// wall) build the BVH once. v1 does NOT track content versioning the way
-// the SDF cache's `contentKey` does (no `position.version` in the key) — an
-// in-place geometry edit (BMesh editor) that mutates the SAME geometry
-// object will not refresh cached BVH triangles until the object identity
-// changes (e.g. a new geometry asset load). This mirrors the task's scoped
-// ask ("keyed by geometry") and is an accepted v1 gap alongside the skinned
-// exclusion.
+// PER-GEOMETRY BLAS CACHE: a WeakMap keyed by geometry object, holding the
+// pack at the geometry's CONTENT REVISION (`staticBvhGeometryRevision`: id +
+// position/index/uv version and count), so N mesh instances sharing one
+// geometry build the BVH once, and an in-place edit of the SAME object (a
+// terrain stroke, the BMesh editor) misses instead of handing back the pre-
+// edit triangles. The build itself runs OFF the main thread when it can:
+// `prewarmGeometryBlas` fills the cache from `bvhBlasWorker.js`, and
+// `buildBvhScene` stays synchronous and hits it (falling back to a main-
+// thread MeshBVH build for anything still cold).
 //
 // CRITICAL — DO NOT normalize the local-space ray direction: with an
 // unnormalized `rd` (world `rd` transformed by the mesh's worldToLocal
@@ -49,6 +49,8 @@ import * as THREE from "three/webgpu";
 import { If, Loop, attributeArray, cross, float, fract, mat3, max, min, select, texture, uniform, uniformArray, vec2, vec3, vec4, wgslFn } from "three/tsl";
 import { MeshBVH } from "three-mesh-bvh";
 import { resolveMaterialAlbedo } from "../materialNodeBindings.js";
+import { freeze } from "../../../engine/freezeLedger.js";
+import { staticBvhGeometryRevision } from "../staticBvhBuildCache.js";
 
 /**
  * Hard cap on meshes seated into one BVH scene — bounds per-frame loop cost.
@@ -61,63 +63,104 @@ import { resolveMaterialAlbedo } from "../materialNodeBindings.js";
  * meshCountUniform, so a 64-mesh scene pays exactly what it paid — only
  * scenes that actually seat more pay more, and the prepass they feed has
  * been stride-2 + half-res-shaded since the same day.
+ *
+ * 128 → 512 (2026-09-10): a ball pool is 350 SMALL meshes, and seat-by-size
+ * put every one of them in the overflow — 238 balls outside the BVH, casting
+ * no traced shadow at all, which reads as "some objects don't even have
+ * shadows" and a floor that stays lit under a metre of balls. The same "only
+ * scenes that actually seat more pay more" argument applies: the TLAS loop is
+ * bounded by the live count, so nothing that fits in 128 changes. What DOES
+ * change is that a scene of many small movers now pays a ~3× longer TLAS
+ * loop per ray — measure before assuming a scene at this scale still clears
+ * the frame budget.
  */
-export const MAX_BVH_MESHES = 128;
+export const MAX_BVH_MESHES = 512;
 /** Per-mesh triangle cap — a single 150k-tri BLAS is already a deep tree. */
 export const MAX_TRIS_PER_BVH_MESH = 150_000;
 
 const BYTES_PER_NODE = 32; // 6 f32 (24B) + 2 u32 (8B) — three-mesh-bvh core/Constants.js
 const UINT32_PER_NODE = BYTES_PER_NODE / 4; // 8
 
-// geometry -> { nodeCount, triCount, vertexCount, bounds, contents, index, position, boundsMin, boundsMax }
+// geometry -> { revision, packed } — `packed` is { nodeCount, triCount,
+// vertexCount, bounds, contents, index, position, uv, boundsMin, boundsMax },
+// or null for a geometry the BVH cannot seat (multi-root after degrouping).
+//
+// KEYED BY CONTENT REVISION, NOT IDENTITY ALONE (2026-09-10). Terrain
+// sculpting edits the position attribute of the SAME BufferGeometry object,
+// and an identity-only lookup kept returning the pre-stroke pack: the scene-
+// level resync saw the edit (`giBvhContentKey` mixes `position.version`) and
+// rebuilt the whole scene around triangles this cache had frozen. Still a
+// WeakMap, so a disposed geometry stays collectable.
 const blasCache = new WeakMap();
 // Scratch for the seat-by-size ranking below (never held across calls).
 const _capScale = new THREE.Vector3();
 
 /**
- * Packs one geometry's MeshBVH into flat CPU typed arrays, byte-identical
- * in layout to bvhGpu.js's `buildBvhTextures` (see that file's header for
- * why: three-mesh-bvh's packed node = 6 f32 bounds + 2 u32 contents, read
- * straight out of `bvh._roots[0]`). Cached per geometry so repeated
- * instances / repeated builds reuse the same CPU work. Returns null for
+ * Receipt counters. `syncBuilds` is the number of MeshBVH builds paid ON THE
+ * MAIN THREAD — the freeze class `prewarmGeometryBlas` exists to remove, so a
+ * warm scene leaves it untouched; `asyncBuilds` were packed from the worker
+ * (or an injected builder) and cost the main thread only the copy and pack.
+ */
+export const blasBuildStats = { syncBuilds: 0, syncMs: 0, asyncBuilds: 0, asyncMs: 0, workerFailures: 0 };
+
+/**
+ * "warm" — cached at the geometry's current revision; "stale" — cached at an
+ * older one (an in-place edit since); "cold" — never packed.
+ */
+export function blasCacheState(geometry) {
+  const cached = blasCache.get(geometry);
+  if (!cached) return "cold";
+  return cached.revision === staticBvhGeometryRevision(geometry) ? "warm" : "stale";
+}
+
+/** The cached pack at the geometry's CURRENT revision; undefined when cold or stale. */
+export function peekGeometryBlas(geometry) {
+  const cached = blasCache.get(geometry);
+  return cached && cached.revision === staticBvhGeometryRevision(geometry) ? cached.packed : undefined;
+}
+
+/**
+ * Geometry-level eligibility: indexed, has positions, within the per-mesh
+ * triangle cap. The mesh-level half (isMesh, not skinned) is
+ * `selectBvhMeshes`'s. Single-root-ness is only known after a build — a
+ * multi-root geometry is cached as `null` at its revision and counts as warm.
+ */
+export function blasEligibleGeometry(geometry) {
+  const index = geometry?.index;
+  if (!index || !geometry.attributes?.position) return false;
+  return index.count / 3 <= MAX_TRIS_PER_BVH_MESH;
+}
+
+function boxFromRoot(rootF32) {
+  return new THREE.Box3(
+    new THREE.Vector3(rootF32[0], rootF32[1], rootF32[2]),
+    new THREE.Vector3(rootF32[3], rootF32[4], rootF32[5]),
+  );
+}
+
+/**
+ * Packs an ALREADY-BUILT MeshBVH's single root into flat CPU typed arrays,
+ * byte-identical in layout to bvhGpu.js's `buildBvhTextures` (see that
+ * file's header for why: three-mesh-bvh's packed node = 6 f32 bounds + 2 u32
+ * contents, read straight out of `bvh._roots[0]`). Returns null for
  * multi-root geometry (multi-material groups) — out of scope, same as the
  * spike, callers treat it as an exclusion.
+ *
+ * The triangle order the roots' leaf offsets refer to is the order the BUILD
+ * left the index in — so the index is read off `bvh.geometry`, which is
+ * `geometry` itself for a main-thread build (three-mesh-bvh partitions the
+ * live index in place) and a proxy over the returned array for a worker
+ * build (`blasFromWorkerResult`), where the live index is never touched.
+ * Positions and UVs come from `geometry`, which no build reorders.
  */
-function packGeometryBlas(geometry) {
-  const cached = blasCache.get(geometry);
-  if (cached) return cached;
-
-  // Standard three geometries define per-face/segment material GROUPS even
-  // with a single material assigned — BoxGeometry always calls addGroup()
-  // 6 times (one per face) regardless of how many materials the mesh
-  // actually has. three-mesh-bvh builds ONE BVH ROOT PER GROUP
-  // unconditionally (core/build/geometryUtils.js getPrimitiveGroupRanges
-  // reads geometry.groups directly, no check for
-  // "do these groups actually differ in material") to keep triangles from
-  // migrating across a group boundary during the build — a concern for
-  // multi-material rendering, irrelevant here (the BVH never looks up
-  // per-triangle material; v1's hit shading reads one constant albedo per
-  // MESH from the SDF atlas slot regardless). Without stripping groups,
-  // every analytic box (walls, this exact floor/lamp rig) hit the
-  // multi-root guard below and silently vanished from exact reflections —
-  // the opposite of "walls are just box tris, include them". Swap
-  // `.groups` out for the build only; synchronous, no yield point before
-  // the restore, so this never races the renderer reading it mid-frame.
-  const savedGroups = geometry.groups;
-  geometry.groups = [];
-  let bvh;
-  try {
-    bvh = new MeshBVH(geometry);
-  } finally {
-    geometry.groups = savedGroups;
-  }
-  if (bvh._roots.length !== 1) {
-    console.warn(`[gi] bvh: skipping a geometry (${bvh._roots.length} BVH roots after degrouping — unexpected, likely a non-contiguous draw range)`);
-    blasCache.set(geometry, null);
+export function packGeometryBlasFrom(geometry, bvh) {
+  const roots = bvh?._roots;
+  if (!roots || roots.length !== 1) {
+    console.warn(`[gi] bvh: skipping a geometry (${roots?.length ?? 0} BVH roots after degrouping — unexpected, likely a non-contiguous draw range)`);
     return null;
   }
 
-  const root = bvh._roots[0];
+  const root = roots[0];
   const nodeCount = root.byteLength / BYTES_PER_NODE;
   const rootF32 = new Float32Array(root);
   const rootU32 = new Uint32Array(root);
@@ -137,7 +180,7 @@ function packGeometryBlas(geometry) {
     contents[i * 2 + 1] = rootU32[base + 7];
   }
 
-  const indexAttr = geometry.index;
+  const indexAttr = bvh.geometry?.index ?? geometry.index;
   const triCount = indexAttr.count / 3;
   const index = new Uint32Array(indexAttr.count);
   for (let i = 0; i < indexAttr.count; i++) index[i] = indexAttr.getX(i);
@@ -168,17 +211,258 @@ function packGeometryBlas(geometry) {
     uv.fill(0.5);
   }
 
-  if (!geometry.boundingBox) geometry.computeBoundingBox();
-  const bb = geometry.boundingBox;
+  // The per-mesh AABB (the TLAS slab reject in `firstHit`) is the ROOT'S
+  // box — the union of exactly the triangles packed above — never
+  // `geometry.boundingBox`: three does not recompute that on an attribute
+  // edit, so after a sculpt it still described the flat terrain and every
+  // mirror ray towards the raised part was rejected before the BLAS saw it.
+  // The same box is also mirrored onto a geometry that arrives without one
+  // (MeshBVH's own `setBoundingBox` side effect), so a main-thread and a
+  // worker build leave the geometry in the same state.
+  const rootBox = boxFromRoot(rootF32);
+  if (!geometry.boundingBox) geometry.boundingBox = rootBox.clone();
 
-  const packed = {
+  return {
     nodeCount, triCount, vertexCount,
     bounds, contents, index, position, uv,
-    boundsMin: bb ? bb.min.clone() : new THREE.Vector3(-0.5, -0.5, -0.5),
-    boundsMax: bb ? bb.max.clone() : new THREE.Vector3(0.5, 0.5, 0.5),
+    boundsMin: rootBox.min,
+    boundsMax: rootBox.max,
   };
-  blasCache.set(geometry, packed);
+}
+
+/**
+ * Main-thread build + pack, on a cache miss only. This is the path
+ * `prewarmGeometryBlas` exists to keep cold: a 700k-triangle terrain is one
+ * to two seconds here, inside whatever frame called `buildBvhScene`.
+ */
+export function packGeometryBlas(geometry) {
+  const revision = staticBvhGeometryRevision(geometry);
+  const cached = blasCache.get(geometry);
+  if (cached && cached.revision === revision) return cached.packed;
+
+  // Standard three geometries define per-face/segment material GROUPS even
+  // with a single material assigned — BoxGeometry always calls addGroup()
+  // 6 times (one per face) regardless of how many materials the mesh
+  // actually has. three-mesh-bvh builds ONE BVH ROOT PER GROUP
+  // unconditionally (core/build/geometryUtils.js getPrimitiveGroupRanges
+  // reads geometry.groups directly, no check for
+  // "do these groups actually differ in material") to keep triangles from
+  // migrating across a group boundary during the build — a concern for
+  // multi-material rendering, irrelevant here (the BVH never looks up
+  // per-triangle material; v1's hit shading reads one constant albedo per
+  // MESH from the SDF atlas slot regardless). Without stripping groups,
+  // every analytic box (walls, this exact floor/lamp rig) hit the
+  // multi-root guard below and silently vanished from exact reflections —
+  // the opposite of "walls are just box tris, include them". Swap
+  // `.groups` out for the build only; synchronous, no yield point before
+  // the restore, so this never races the renderer reading it mid-frame.
+  // (The worker path builds a groupless copy — the same single root.)
+  const savedGroups = geometry.groups;
+  geometry.groups = [];
+  const t0 = performance.now();
+  const span = freeze.begin("gi:bvh/blasBuild(sync)");
+  let bvh;
+  try {
+    bvh = new MeshBVH(geometry);
+  } finally {
+    geometry.groups = savedGroups;
+    freeze.end(span);
+  }
+  blasBuildStats.syncBuilds++;
+  blasBuildStats.syncMs += performance.now() - t0;
+  const packed = packGeometryBlasFrom(geometry, bvh);
+  blasCache.set(geometry, { revision, packed });
   return packed;
+}
+
+// ── Off-thread builds ──────────────────────────────────────────────────────
+//
+// ONE persistent worker (`bvhBlasWorker.js`), created on first use and kept
+// for the session; each job posts COPIES of the position/index arrays and
+// gets the packed roots + reordered index back by transfer. The live
+// geometry's attributes are never detached (three-mesh-bvh's own
+// GenerateMeshBVHWorker transfers them — see the worker file's header).
+
+let _blasWorker = null;          // { worker, pending: Map<id, { resolve, reject }>, nextId }
+let _blasWorkerDead = false;     // a worker that errored is not retried this session
+let _blasFallbackWarned = false; // "builds stay on the main thread" is said once
+
+function blasWorkerAvailable() {
+  return !_blasWorkerDead
+    && globalThis.__giBvhWorker !== false
+    && typeof Worker === "function";
+}
+
+function warnBlasFallbackOnce(reason) {
+  if (_blasFallbackWarned) return;
+  _blasFallbackWarned = true;
+  console.warn(`[gi] bvh: ${reason} — BLAS builds stay on the main thread`);
+}
+
+function retireBlasWorker(error) {
+  const client = _blasWorker;
+  _blasWorker = null;
+  _blasWorkerDead = true;
+  if (client) {
+    try { client.worker.terminate(); } catch { /* already gone */ }
+    for (const job of client.pending.values()) job.reject(error);
+    client.pending.clear();
+  }
+  warnBlasFallbackOnce(`worker unavailable (${error?.message ?? error})`);
+}
+
+function ensureBlasWorker() {
+  if (_blasWorker) return _blasWorker;
+  const worker = new Worker(new URL("./bvhBlasWorker.js", import.meta.url), { type: "module" });
+  const client = { worker, pending: new Map(), nextId: 1 };
+  worker.onmessage = ({ data }) => {
+    const job = client.pending.get(data?.id);
+    if (!job) return;
+    client.pending.delete(data.id);
+    if (data.error) job.reject(new Error(`bvh worker: ${data.error}`));
+    else job.resolve(data);
+  };
+  // A broken worker (a module that failed to load, an out-of-memory build)
+  // fails every pending job; the callers fall back to the sync build.
+  worker.onerror = (event) => retireBlasWorker(new Error(event?.message || "worker error"));
+  _blasWorker = client;
+  return client;
+}
+
+/** Terminates the persistent worker (idle cleanup); the next prewarm recreates it. */
+export function disposeBlasWorker() {
+  const client = _blasWorker;
+  _blasWorker = null;
+  if (!client) return;
+  try { client.worker.terminate(); } catch { /* already gone */ }
+  const error = new Error("bvh worker disposed");
+  for (const job of client.pending.values()) job.reject(error);
+  client.pending.clear();
+}
+
+/**
+ * Flat COPIES of the arrays the build reads — the live attributes stay
+ * attached to the geometry the renderer is drawing. A plain float32 position
+ * / integer index is one memcpy (a Uint16 index widens to Uint32 in the same
+ * pass); anything else (interleaved, normalized) goes through the accessor.
+ */
+function copyBlasArrays(geometry) {
+  const posAttr = geometry.attributes.position;
+  let position;
+  if (!posAttr.isInterleavedBufferAttribute && !posAttr.normalized && posAttr.itemSize === 3 && posAttr.array instanceof Float32Array) {
+    position = posAttr.array.slice(0, posAttr.count * 3);
+  } else {
+    position = new Float32Array(posAttr.count * 3);
+    for (let i = 0; i < posAttr.count; i++) {
+      position[i * 3 + 0] = posAttr.getX(i);
+      position[i * 3 + 1] = posAttr.getY(i);
+      position[i * 3 + 2] = posAttr.getZ(i);
+    }
+  }
+  const indexAttr = geometry.index;
+  let index;
+  if (!indexAttr.isInterleavedBufferAttribute && ArrayBuffer.isView(indexAttr.array)) {
+    index = new Uint32Array(indexAttr.array.subarray(0, indexAttr.count));
+  } else {
+    index = new Uint32Array(indexAttr.count);
+    for (let i = 0; i < indexAttr.count; i++) index[i] = indexAttr.getX(i);
+  }
+  return { position, index };
+}
+
+/**
+ * Wraps a worker result as a MeshBVH over a PROXY geometry: the live
+ * geometry's position attribute (shared, never copied or reordered) plus the
+ * index the worker's build left reordered. `packGeometryBlasFrom` reads the
+ * index off `bvh.geometry` for exactly this reason.
+ */
+export function blasFromWorkerResult(geometry, { roots, index }) {
+  const proxy = new THREE.BufferGeometry();
+  proxy.setAttribute("position", geometry.attributes.position);
+  proxy.setIndex(new THREE.BufferAttribute(index, 1, false));
+  return MeshBVH.deserialize({ version: 1, roots, index, indirectBuffer: null }, proxy, { setIndex: false });
+}
+
+/** Default off-thread builder: copy out, build in the worker, wrap. */
+async function buildBlasInWorker(geometry) {
+  const client = ensureBlasWorker();
+  const { position, index } = freeze.run("gi:bvh/blasCopy", () => copyBlasArrays(geometry));
+  const id = client.nextId++;
+  const data = await new Promise((resolve, reject) => {
+    client.pending.set(id, { resolve, reject });
+    try {
+      client.worker.postMessage({ id, position, index, options: null }, [position.buffer, index.buffer]);
+    } catch (error) {
+      client.pending.delete(id);
+      reject(error);
+    }
+  });
+  return blasFromWorkerResult(geometry, data);
+}
+
+/**
+ * Fills the BLAS cache for `geometries` OFF the main thread, one build at a
+ * time, so the `buildBvhScene` that follows finds every seated geometry warm
+ * and pays no MeshBVH build inside its frame. Skips what is ineligible or
+ * already warm; a geometry edited WHILE its build ran is dropped (`stale`)
+ * rather than cached against triangles that no longer exist — the next
+ * prewarm builds the current revision. When there is no worker (node, a
+ * worker that died, `__giBvhWorker = false`) or a build fails, the geometry
+ * is built on the main thread here instead, so the contract "warm after
+ * resolve" holds either way — the receipt says which happened.
+ *
+ * @param {Iterable<import("three").BufferGeometry>} geometries
+ * @param {{ signal?: AbortSignal|null, builder?: ((geometry: object, ctx: { signal: AbortSignal|null }) => Promise<object>)|null }} [options]
+ *   `builder` injects the off-thread build (tests run under node, which has
+ *   no Worker). It resolves to a MeshBVH-shaped object — `_roots`, and
+ *   `geometry.index` in the build's triangle order; `blasFromWorkerResult`
+ *   makes one from `bvhBlasWorker.js`'s output.
+ * @returns {Promise<{ built: number, warm: number, stale: number, failed: number, fallback: number, ineligible: number, ms: number, worker: boolean }>}
+ */
+export async function prewarmGeometryBlas(geometries, { signal = null, builder = null } = {}) {
+  const receipt = { built: 0, warm: 0, stale: 0, failed: 0, fallback: 0, ineligible: 0, ms: 0, worker: false };
+  const t0 = performance.now();
+  const seen = new Set();
+  for (const geometry of geometries ?? []) {
+    if (!geometry || seen.has(geometry)) continue;
+    seen.add(geometry);
+    if (signal?.aborted) break;
+    if (!blasEligibleGeometry(geometry)) { receipt.ineligible++; continue; }
+    const revision = staticBvhGeometryRevision(geometry);
+    const cached = blasCache.get(geometry);
+    if (cached && cached.revision === revision) { receipt.warm++; continue; }
+
+    let build = builder;
+    if (!build && blasWorkerAvailable()) build = buildBlasInWorker;
+    if (!build) {
+      warnBlasFallbackOnce("no worker available");
+      packGeometryBlas(geometry);
+      receipt.fallback++;
+      continue;
+    }
+
+    let bvh = null;
+    const tb = performance.now();
+    try {
+      bvh = await build(geometry, { signal });
+    } catch (error) {
+      receipt.failed++;
+      if (!builder) blasBuildStats.workerFailures++;
+      warnBlasFallbackOnce(`off-thread build failed (${error?.message ?? error})`);
+      packGeometryBlas(geometry);
+      receipt.fallback++;
+      continue;
+    }
+    if (staticBvhGeometryRevision(geometry) !== revision) { receipt.stale++; continue; }
+    const packed = freeze.run("gi:bvh/blasPack", () => packGeometryBlasFrom(geometry, bvh));
+    blasCache.set(geometry, { revision, packed });
+    blasBuildStats.asyncBuilds++;
+    blasBuildStats.asyncMs += performance.now() - tb;
+    receipt.built++;
+    if (!builder) receipt.worker = true;
+  }
+  receipt.ms = performance.now() - t0;
+  return receipt;
 }
 
 /**
@@ -555,20 +839,13 @@ export function buildSlotAlbedoAtlas(placements) {
 }
 
 /**
- * Builds a multi-mesh BVH scene from `meshes` (the SAME mesh list the GI
- * mesh-SDF atlas entries cover — see GISystem's `#syncBvhScene`). Filters to
- * eligible meshes, concatenates their BLASes into 4 shared storage buffers,
- * and returns a scene object whose `firstHit(ro, rd, maxT)` traces a ray
- * through the whole set (world-AABB reject per mesh, local-space BLAS
- * traversal, smallest t wins — see bvhMeshFirstHitFn above and the
- * CRITICAL note on unnormalized local rays at the top of this file).
- *
- * Rebuild cost lives here (new concatenated buffers + a fresh `firstHit`
- * closure over them) — call this again whenever the mesh SET changes
- * (add/remove/topology), never for a pure transform change (that's
- * `refreshTransforms()`, cheap, every frame).
+ * Which of `meshes` the BVH scene seats, and which it can only cover with a
+ * live AABB (`dynamicMeshes`) — shared by `buildBvhScene` and the prewarm so
+ * the set warmed off-thread is exactly the set the build will pack. Warnings
+ * are returned rather than printed: the build prints them once; the prewarm's
+ * earlier look at the same list must not print them twice.
  */
-export function buildBvhScene(meshes) {
+export function selectBvhMeshes(meshes) {
   const eligible = [];
   // Real geometry the BVH cannot see (skinned/unindexed/over-cap). These
   // are NOT dropped silently: their live world AABBs feed the coverage
@@ -577,6 +854,7 @@ export function buildBvhScene(meshes) {
   // every mirror (user-reported regression).
   const dynamicMeshes = [];
   const excludedNames = [];
+  const warnings = [];
   for (const mesh of meshes) {
     if (!mesh?.isMesh) continue;
     if (mesh.isSkinnedMesh) {
@@ -592,16 +870,16 @@ export function buildBvhScene(meshes) {
     }
     const triCount = geometry.index.count / 3;
     if (triCount > MAX_TRIS_PER_BVH_MESH) {
-      console.warn(`[gi] bvh: skipping "${mesh.name || "mesh"}" (${Math.round(triCount)} tris > ${MAX_TRIS_PER_BVH_MESH} bvh cap)`);
+      warnings.push(`[gi] bvh: skipping "${mesh.name || "mesh"}" (${Math.round(triCount)} tris > ${MAX_TRIS_PER_BVH_MESH} bvh cap)`);
       dynamicMeshes.push(mesh);
       continue;
     }
     eligible.push(mesh);
   }
   if (excludedNames.length) {
-    console.warn(`[gi] bvh: excluded (skinned/unindexed): ${excludedNames.join(", ")} — SDF fallback via coverage flag`);
+    warnings.push(`[gi] bvh: excluded (skinned/unindexed): ${excludedNames.join(", ")} — SDF fallback via coverage flag`);
   }
-  let capped = eligible;
+  let seated = eligible;
   if (eligible.length > MAX_BVH_MESHES) {
     // SEAT BY SIZE, NOT WALK ORDER (2026-08-21): with more eligible meshes
     // than seats, "the first 64" left whole WALLS unseated on scene-walk
@@ -625,10 +903,48 @@ export function buildBvhScene(meshes) {
       .map((mesh) => [mesh, worldArea(mesh)])
       .sort((a, b) => b[1] - a[1])
       .map((pair) => pair[0]);
-    console.warn(`[gi] bvh: ${eligible.length} eligible meshes exceed the ${MAX_BVH_MESHES}-mesh cap — seating the ${MAX_BVH_MESHES} LARGEST (overflow: smallest props)`);
-    capped = ranked.slice(0, MAX_BVH_MESHES);
+    warnings.push(`[gi] bvh: ${eligible.length} eligible meshes exceed the ${MAX_BVH_MESHES}-mesh cap — seating the ${MAX_BVH_MESHES} LARGEST (overflow: smallest props)`);
+    seated = ranked.slice(0, MAX_BVH_MESHES);
     dynamicMeshes.push(...ranked.slice(MAX_BVH_MESHES));
   }
+  return { seated, dynamicMeshes, warnings };
+}
+
+/**
+ * The seated geometries whose BLAS is missing or stale at their current
+ * revision — what to hand `prewarmGeometryBlas` before the next
+ * `buildBvhScene`, so that build finds a warm cache. Empty means the build
+ * will pay no main-thread MeshBVH.
+ */
+export function coldBlasGeometries(meshes) {
+  const { seated } = selectBvhMeshes(meshes);
+  const cold = [];
+  const seen = new Set();
+  for (const mesh of seated) {
+    const geometry = mesh.geometry;
+    if (seen.has(geometry)) continue;
+    seen.add(geometry);
+    if (blasCacheState(geometry) !== "warm") cold.push(geometry);
+  }
+  return cold;
+}
+/**
+ * Builds a multi-mesh BVH scene from `meshes` (the SAME mesh list the GI
+ * mesh-SDF atlas entries cover — see GISystem's `#syncBvhScene`). Filters to
+ * eligible meshes, concatenates their BLASes into 4 shared storage buffers,
+ * and returns a scene object whose `firstHit(ro, rd, maxT)` traces a ray
+ * through the whole set (world-AABB reject per mesh, local-space BLAS
+ * traversal, smallest t wins — see bvhMeshFirstHitFn above and the
+ * CRITICAL note on unnormalized local rays at the top of this file).
+ *
+ * Rebuild cost lives here (new concatenated buffers + a fresh `firstHit`
+ * closure over them) — call this again whenever the mesh SET changes
+ * (add/remove/topology), never for a pure transform change (that's
+ * `refreshTransforms()`, cheap, every frame).
+ */
+export function buildBvhScene(meshes) {
+  const { seated: capped, dynamicMeshes, warnings } = selectBvhMeshes(meshes);
+  for (const line of warnings) console.warn(line);
 
   const entries = [];
   let totalNodes = 0;

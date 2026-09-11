@@ -128,7 +128,7 @@ defineOp({
   name: "terrain.create",
   undoable: true,
   description:
-    "Create a terrain: an entity with a Terrain component plus the heightmap and splat assets it needs. Sculpting and painting are brush work in the viewport and are not exposed as tools; what an agent can do is create the terrain, size it, and set its material layers with component.setProp.",
+    "Create a terrain: an entity with a Terrain component plus the heightmap and splat assets it needs. Painting is brush work in the viewport and is not exposed as a tool; sculpting is (terrain.sculpt); an agent can also size the terrain and set its material layers with component.setProp.",
   params: {
     size: { type: "number", default: 50, description: "World size of one side, in metres." },
     resolution: { type: "number", default: 128, description: "Heightmap resolution per side, in samples." },
@@ -150,32 +150,106 @@ defineOp({
   },
 });
 
+defineOp({
+  name: "terrain.sculpt",
+  undoable: true,
+  description:
+    "Apply ONE sculpt stroke to a terrain — the same brush the viewport's pointer drag uses (`TerrainComponent.applyHeightBrush` per dab, `commitHeights` at the end, one undo entry), so an agent can shape terrain and, just as important, MEASURE what a stroke costs: the freeze ledger names the dab (`terrain:brush`), the stroke commit (`terrain:stroke-commit`) and the scatter re-seat (`terrain:scatter`), and everything that reacts to the committed heights afterwards (foliage re-layout, the GI reflection-BVH resync, colliders) shows up in profile.freezes with its own owner. Dabs are laid evenly along the straight line from (x, z) to (x2, z2) in WORLD space, at the brush's own cadence; omit x2/z2 for a single dab. Returns the main-thread ms the dabs and the commit took.",
+  params: {
+    entityId: { type: "string", description: "The terrain entity. Defaults to the only terrain in the scene." },
+    x: { type: "number", required: true, description: "World X of the stroke start." },
+    z: { type: "number", required: true, description: "World Z of the stroke start." },
+    x2: { type: "number", description: "World X of the stroke end (defaults to x)." },
+    z2: { type: "number", description: "World Z of the stroke end (defaults to z)." },
+    tool: { type: "string", default: "raise", description: "raise | lower | smooth | flatten | sharpen | erode | noise | pinch | contrast." },
+    radius: { type: "number", default: 4, description: "Brush radius in metres." },
+    strength: { type: "number", default: 1, description: "Brush strength, on the viewport's own scale (a viewport dab applies 0.15 × strength)." },
+    hardness: { type: "number", default: 0.5, description: "Falloff hardness 0-1." },
+    dabs: { type: "number", default: 12, description: "How many dabs along the line (1-200)." },
+  },
+  async run({ entityId, x, z, x2, z2, tool = "raise", radius = 4, strength = 1, hardness = 0.5, dabs = 12 }) {
+    requireModule("terrain");
+    const hosts = [...engine.entities.values()].filter((e) => e.getComponent?.("terrain"));
+    const host = entityId ? engine.getEntity(entityId) : hosts[0];
+    const component = host?.getComponent?.("terrain");
+    if (!component || typeof component.applyHeightBrush !== "function") {
+      throw new Error(entityId ? `Entity "${entityId}" has no Terrain component.` : "No Terrain component in the scene — terrain.create first.");
+    }
+    if (!entityId && hosts.length > 1) {
+      throw new Error(`${hosts.length} entities carry a Terrain component — pass entityId to say which to sculpt.`);
+    }
+    const THREE = await import("three/webgpu");
+    const { SetTerrainHeightsCommand } = await import("../../commands/terrainCommands.js");
+    const { commandBus } = await import("../../commands/CommandBus.js");
+    const count = Math.max(1, Math.min(200, Math.round(Number(dabs) || 1)));
+    const endX = Number.isFinite(Number(x2)) ? Number(x2) : Number(x);
+    const endZ = Number.isFinite(Number(z2)) ? Number(z2) : Number(z);
+    const before = component.props.heights;
+    const object = host.object3D;
+    object?.updateWorldMatrix?.(true, false);
+    const local = new THREE.Vector3();
+    const t0 = performance.now();
+    for (let i = 0; i < count; i++) {
+      const t = count === 1 ? 0 : i / (count - 1);
+      local.set(Number(x) + (endX - Number(x)) * t, 0, Number(z) + (endZ - Number(z)) * t);
+      if (object) object.worldToLocal(local);
+      local.y = component.heightAtLocal?.(local.x, local.z) ?? 0;
+      component.applyHeightBrush(local, {
+        tool: String(tool),
+        radius: Math.max(0.01, Number(radius) || 4),
+        strength: (Number(strength) || 1) * 0.15,
+        hardness: Math.max(0, Math.min(1, Number(hardness) || 0.5)),
+        falloff: null,
+        flattenHeight: local.y,
+        seed: 0,
+      });
+    }
+    const dabMs = performance.now() - t0;
+    const t1 = performance.now();
+    component.commitHeights();
+    commandBus.execute(new SetTerrainHeightsCommand(host.id, before, component.props.heights));
+    const commitMs = performance.now() - t1;
+    return {
+      entityId: host.id,
+      dabs: count,
+      dabMs: +dabMs.toFixed(1),
+      commitMs: +commitMs.toFixed(1),
+      note: "dabMs is the brush itself (O(brush area) per dab); commitMs is the stroke end — full normals, bounding sphere, scatter re-seat, heights encode. What reacts to the commit (foliage, GI, colliders) lands in later frames: read profile.freezes for those.",
+    };
+  },
+});
+
 // ---- build and publish -----------------------------------------------------
 
 defineOp({
   name: "build.getSettings",
   readOnly: true,
   description:
-    "The project's build settings — target, output folder, which scenes ship and which one boots, quality ceiling, compression — plus the resolved scene list those settings actually produce. Read this before build.export to see what a build would contain.",
+    "The project's build settings — target, which scenes ship and which one boots, quality ceiling, compression, runtime trimming — plus the resolved scene plan. `scenes: null` (the default) ships the start scene plus every scene it can reach — the plan then lists only the seed and build.export's `sceneList` the final set; 'all' ships every scene; an array is an explicit list. A build ships only the assets the chosen scenes (and the prefabs and scripts they reach) reference; an asset flagged Exclude never ships, a prefab flagged Preload always does.",
   params: {},
   async run() {
-    const { BUILD_DEFAULTS, resolveBuildScenes } = await import("../../build/buildSettings.js");
+    const { BUILD_DEFAULTS, resolveBuildScenes, toProjectRelative } = await import("../../build/buildSettings.js");
     const { getProjectSettings } = await import("../../projectSettings.js");
+    const { useProjectStore } = await import("../../store/projectStore.js");
+    const root = requireProject();
     const settings = getProjectSettings();
     const build = { ...BUILD_DEFAULTS, ...(settings.build ?? {}) };
-    const available = (await import("../../assetLoader.js")).withoutSidecars(
-      await (await import("../../assetLoader.js")).listProjectEntries(requireProject(), 8),
-    )
+    // Project-relative, exactly as the exporter resolves them — the listing is
+    // absolute, and comparing that against the relative build list reported
+    // every listed scene as "no longer exists".
+    const { withoutSidecars, listProjectEntries } = await import("../../assetLoader.js");
+    const available = withoutSidecars(await listProjectEntries(root, 8))
       .filter((entry) => !entry.is_dir && entry.name.endsWith(".scene"))
-      .map((entry) => entry.path.replaceAll("\\", "/"));
+      .map((entry) => toProjectRelative(root, entry.path));
     const { currentScenePath } = await import("../../sceneIO.js");
+    const open = currentScenePath();
     return {
       settings: build,
       resolved: resolveBuildScenes({
         available,
         build,
-        mainScene: build.mainScene ?? "",
-        openScene: currentScenePath() ?? "",
+        mainScene: useProjectStore.getState().projectMeta?.mainScene ?? "",
+        openScene: open ? toProjectRelative(root, open) : "",
       }),
     };
   },
@@ -190,7 +264,7 @@ defineOp({
       type: "object",
       required: true,
       description:
-        "Keys from build.getSettings' `settings`, e.g. { target: 'web' | 'zip' | 'desktop', outDir, mainScene, scenes, quality, compress }.",
+        "Keys from build.getSettings' `settings`, e.g. { target: 'web' | 'zip' | 'desktop', startScene, scenes (null = the start scene + what it reaches, 'all' = every scene, or an array of project-relative paths), quality, compressTextures, compressModels, trimRuntime, icon, loading, pagesProject }.",
     },
   },
   async run({ patch }) {
@@ -205,20 +279,26 @@ defineOp({
 defineOp({
   name: "build.export",
   description:
-    "Run a build with the current settings: writes the player, the selected scenes and every asset they reference into the output folder. Minutes, not seconds, on a real project. Returns the report — output folder, scene and asset counts, bytes saved by compression, and any warnings, which are worth reading.",
+    "Run a build with the current settings: writes the player runtime (trimmed to the modules the game enables), the selected scenes, the prefabs they can reach and every asset those reference into the output folder, and removes files a previous build left there. Minutes, not seconds, on a real project. Returns the report — output folder, scene/prefab/asset counts, leftover files removed, runtime files shipped vs left out, and any warnings, which are worth reading.",
   params: {
     target: { type: "string", enum: ["web", "zip", "desktop"], description: "Override the configured target for this run only." },
   },
   async run({ target }) {
     requireProject();
     const { exportGame } = await import("../../exportGame.js");
-    const report = await exportGame(target ? { target } : {});
+    const report = await exportGame(target ? { buildOverride: { target } } : {});
     if (!report.ok) throw new Error(report.error ?? "The build failed — check console.read for details.");
     return {
       outDir: report.outDir,
       target: report.target ?? target ?? null,
       scenes: report.sceneCount,
+      sceneList: report.scenes ?? [],
+      sceneMode: report.sceneMode ?? null,
+      prefabs: report.prefabCount ?? 0,
+      prefabsLeftOut: report.prefabsSkipped ?? 0,
       assets: report.assetCount,
+      removed: report.removed ?? [],
+      runtime: report.runtime ?? null,
       warnings: report.warnings ?? [],
     };
   },

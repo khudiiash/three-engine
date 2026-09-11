@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2 } from "../icons/index.jsx";
 import { EFFECTS, defaultParams } from "../audio/effects.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * One dialog for every effect, generated from the registry descriptor.
  *
@@ -90,11 +91,11 @@ function ParamField({ name, descriptor, value, onChange }) {
     return (
       <label className="aud-param" title={descriptor.hint ?? ""}>
         <span className="aud-param-label">{descriptor.label}</span>
-        <select value={value} onChange={(e) => onChange(name, e.target.value)}>
+        <Select value={value} onChange={(e) => onChange(name, e.target.value)}>
           {descriptor.options.map((option) => (
             <option key={option} value={option}>{option}</option>
           ))}
-        </select>
+        </Select>
       </label>
     );
   }

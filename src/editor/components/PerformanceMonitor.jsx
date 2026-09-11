@@ -17,6 +17,7 @@ import {
 import { holdViewportAwake } from "../viewportFreeze.js";
 import { PerfChart } from "./PerfChart.jsx";
 
+import { Select } from "../fields/Select.jsx";
 /** The engine's tick phases, in words. */
 const PHASE_LABELS = {
   frustumCull: "Frustum culling",
@@ -661,7 +662,7 @@ export function PerformanceMonitor({ size = "full", hud = false }) {
           ))}
         </span>
         <span className="perf-toolbar-right">
-          <select
+          <Select
             className="select-field perf-window"
             value={windowSec}
             aria-label="Time window"
@@ -672,7 +673,7 @@ export function PerformanceMonitor({ size = "full", hud = false }) {
                 {w} s
               </option>
             ))}
-          </select>
+          </Select>
           <button
             type="button"
             className={`icon-btn perf-pause${paused ? " on" : ""}`}

@@ -47,7 +47,45 @@ export async function readSceneThumb(scenePath) {
 }
 
 /**
- * Renders the viewport at thumbnail size and writes the picture. Silent on
+ * The viewport at thumbnail size, as a PNG data URL.
+ *
+ * FROM THE PRESENTED FRAME, NOT A RENDER. The first version rendered the
+ * scene into a 320×200 target on every save, and a render target is its own
+ * three `RenderContext` — part of the material cache key — so every scene
+ * material was re-minted for it and compiled SYNCHRONOUSLY (a one-shot render
+ * runs outside the engine's async-pipeline scope). The freeze ledger printed
+ * it every ~20 s of autosave: `material key: renderContext (rt:1866x1156msaa4#1
+ * → rt:320x200#8)`, ~400 ms of node builds plus 70 kB pipeline compiles.
+ * `captureFrameDownsampled` (frameCopy.js) copies the canvas on the GPU and
+ * averages it down with one fixed quad instead; no scene material ever sees
+ * the thumbnail's context. The editor's gizmos and grid ARE in this picture,
+ * as they were on screen when the user saved — acceptable for a preview.
+ *
+ * The old gizmo-less render stays as the fallback: WebGL (no swapchain to
+ * copy), the `__ambientGlowFrameCopy = false` hatch, or no frame presented
+ * within the deadline (a frozen, unfocused viewport still autosaves).
+ */
+async function captureThumbDataUrl() {
+  const [{ captureFrameDownsampled }, { ensureEngine }, { imageDataToDataUrl }] = await Promise.all([
+    import("./frameCopy.js"),
+    import("./engineInstance.js"),
+    import("../engine/renderTargetImage.js"),
+  ]);
+  const engine = await ensureEngine().catch(() => null);
+  const pixels = engine ? await captureFrameDownsampled(engine, { width: THUMB_W, height: THUMB_H }) : null;
+  if (pixels) return imageDataToDataUrl(pixels, THUMB_W, THUMB_H);
+
+  const [{ captureViewportFrame }, { getViewportHandle }] = await Promise.all([
+    import("./api/ops/viewport.js"),
+    import("./viewportHandle.js"),
+  ]);
+  const camera = getViewportHandle()?.camera;
+  if (!camera) return null;
+  return captureViewportFrame({ width: THUMB_W, height: THUMB_H, camera, includeGizmos: false });
+}
+
+/**
+ * Takes the viewport's picture at thumbnail size and writes it. Silent on
  * every failure — a save must never fail because its preview did.
  */
 export async function captureSceneThumb(scenePath, { force = false } = {}) {
@@ -58,13 +96,8 @@ export async function captureSceneThumb(scenePath, { force = false } = {}) {
   if (!force && now - (lastCapture.get(key) ?? -Infinity) < MIN_INTERVAL_MS) return false;
   lastCapture.set(key, now);
   try {
-    const [{ captureViewportFrame }, { getViewportHandle }] = await Promise.all([
-      import("./api/ops/viewport.js"),
-      import("./viewportHandle.js"),
-    ]);
-    const camera = getViewportHandle()?.camera;
-    if (!camera) return false;
-    const dataUrl = await captureViewportFrame({ width: THUMB_W, height: THUMB_H, camera, includeGizmos: false });
+    const dataUrl = await captureThumbDataUrl();
+    if (!dataUrl) return false;
     const comma = dataUrl.indexOf(",");
     if (comma < 0) return false;
     const binary = atob(dataUrl.slice(comma + 1));

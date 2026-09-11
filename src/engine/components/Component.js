@@ -82,8 +82,12 @@ const STRUCTURAL_PROPS = new Map([
   // against the old shadow node), so the object in the scene is a new one.
   // `intensity`, `color`, the csm tuning and every shadow-camera number write
   // in place and are NOT structural — the light-intensity edit this whole unit
-  // exists for.
-  ["light", ["kind", "castShadow", "shadowMode", "shadowMapType", "csm", "csmCascades", "csmFade"]],
+  // exists for. `castShadow` left this list on 2026-09-10: it is applied IN
+  // PLACE now (LightComponent.#castShadowInPlace — same THREE.Light, same
+  // shadow camera), so nothing leaves or enters the graph; the material
+  // re-mint it costs is three's own and rides `component-changed`. The rare
+  // fallback that still swaps the light emits `hierarchy-changed` itself.
+  ["light", ["kind", "shadowMode", "shadowMapType", "csm", "csmCascades", "csmFade"]],
   // Instancing count/mode/source add and remove InstancedMesh objects.
   ["instancer", ["mode", "count", "pathEntity"]],
   // The impostor bakes a billboard from another entity and swaps it in.
@@ -345,6 +349,25 @@ export class Component extends EventEmitter {
     // Paused for editing: off while the editor is stopped, on in play mode.
     if (this.props.editorEnabled === false && !this.entity?.engine?.playing) return false;
     return this.props.enabled !== false;
+  }
+
+  /**
+   * ── "RUN IN EDITOR" (2026-09-10) ────────────────────────────────────────
+   * Whether this component's ANIMATION / SIMULATION should advance THIS frame.
+   * The editor contract: a sim advances in PLAY mode, and while EDITING only
+   * when the component opts in with its `runInEditor` toggle (DEFAULT OFF — an
+   * undefined prop reads as false via the `=== true` test). This is what keeps
+   * a static editor cheap: a day/night clock, wave sim, cloth solve, particle
+   * emit or wind sway advancing every editor frame forced GI to re-transport
+   * and re-mint the scene and dropped the editor to 30 fps. RENDERING IS NOT
+   * gated by this — a frozen component still draws its current (static)
+   * snapshot; only its clock stops. A `simulationSuspended` hold (a
+   * geometry-edit overlay, say) still overrides both.
+   */
+  get shouldAnimate() {
+    const engine = this.entity?.engine;
+    if (!engine || engine.simulationSuspended === true) return false;
+    return engine.playing === true || this.props?.runInEditor === true;
   }
 
   /**

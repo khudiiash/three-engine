@@ -5,6 +5,7 @@ import { engine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";
 import { AssetField } from "../fields/AssetField.jsx";
+import { Select } from "../fields/Select.jsx";
 import {
   FALLOFF_OPTIONS,
   LOOP_OPTIONS,
@@ -263,11 +264,11 @@ function PlainNumberInput({ value, min, max, step, onCommit, allowNull, placehol
 
 function SelectInput({ value, options, onCommit }) {
   return (
-    <select className="select-field" value={value} onChange={(e) => onCommit(e.target.value)}>
+    <Select className="select-field" value={value} onChange={(e) => onCommit(e.target.value)}>
       {options.map((o) => (
         <option key={o} value={o}>{o}</option>
       ))}
-    </select>
+    </Select>
   );
 }
 

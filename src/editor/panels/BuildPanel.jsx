@@ -16,6 +16,7 @@ import { currentScenePath } from "../sceneIO.js";
 import { useModulesStore } from "../modules.js";
 import { exportGame, formatBytes } from "../exportGame.js";
 
+import { Select } from "../fields/Select.jsx";
 function Row({ label, children, hint }) {
   return (
     <div className="field-row" title={hint || undefined}>
@@ -82,10 +83,15 @@ export function BuildPanel() {
   const openScene = currentScenePath() ? toProjectRelative(rootPath, currentScenePath()) : "";
   const plan = resolveBuildScenes({ available: scenes, build, mainScene, openScene });
 
-  const shipsAll = !Array.isArray(build.scenes);
-  const shipping = new Set((build.scenes ?? scenes).map((s) => normalizeRelPath(s).toLowerCase()));
+  // null = the start scene plus what it reaches (the default), "all" = every
+  // scene, an array = an explicit list. See BUILD_DEFAULTS.
+  const sceneMode = Array.isArray(build.scenes) ? "list" : build.scenes === "all" ? "all" : "reachable";
+  const shipsAll = sceneMode === "all";
+  const pinned = sceneMode === "list" ? build.scenes : sceneMode === "all" ? scenes : [plan.startScene].filter(Boolean);
+  const shipping = new Set(pinned.map((s) => normalizeRelPath(s).toLowerCase()));
   const toggleScene = (rel) => {
-    const list = shipsAll ? [...scenes] : [...build.scenes];
+    // Checking a scene in the other two modes switches to an explicit list.
+    const list = [...pinned];
     const i = list.findIndex((s) => normalizeRelPath(s).toLowerCase() === normalizeRelPath(rel).toLowerCase());
     if (i === -1) list.push(rel);
     else list.splice(i, 1);
@@ -193,7 +199,7 @@ export function BuildPanel() {
       <div className="inspector-section">
         <div className="section-header">Target</div>
         <Row label="Target" hint={BUILD_TARGETS[build.target]?.hint}>
-          <select
+          <Select
             className="text-field"
             value={build.target}
             onChange={(e) => patch({ target: e.target.value })}
@@ -203,7 +209,7 @@ export function BuildPanel() {
                 {def.label}
               </option>
             ))}
-          </select>
+          </Select>
         </Row>
       </div>
 
@@ -217,7 +223,7 @@ export function BuildPanel() {
               : "No scene found — save a scene into the project first."
           }
         >
-          <select
+          <Select
             className="text-field"
             value={normalizeRelPath(build.startScene)}
             onChange={(e) => patch({ startScene: e.target.value })}
@@ -230,25 +236,31 @@ export function BuildPanel() {
                 {rel}
               </option>
             ))}
-          </select>
+          </Select>
         </Row>
         <Row
           label="Ship"
           hint={
-            shipsAll
-              ? "Every scene in the project ships. Uncheck one to switch to an explicit list."
-              : "Only the checked scenes ship. The start scene is always included."
+            sceneMode === "reachable"
+              ? "The start scene plus every scene it can reach — one a shipped script, prefab or event names by " +
+                "path. Assets follow the same rule. Check a scene below to pin it."
+              : sceneMode === "all"
+                ? "Every scene in the project ships, with everything it references."
+                : "Only the checked scenes ship. The start scene is always included."
           }
         >
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-            <label style={{ display: "flex", gap: 4, alignItems: "center" }}>
-              <input
-                type="checkbox"
-                checked={shipsAll}
-                onChange={(e) => patch({ scenes: e.target.checked ? null : [...scenes] })}
-              />
-              All
-            </label>
+            <Select
+              className="text-field"
+              value={sceneMode}
+              onChange={(e) =>
+                patch({ scenes: e.target.value === "all" ? "all" : e.target.value === "list" ? [...scenes] : null })
+              }
+            >
+              <option value="reachable">Start scene + what it reaches</option>
+              <option value="all">Every scene</option>
+              <option value="list">Chosen scenes</option>
+            </Select>
             <button className="toolbar-btn icon-only" title="Rescan the project for scenes" onClick={refreshScenes}>
               <RefreshCw size={12} />
             </button>
@@ -289,7 +301,7 @@ export function BuildPanel() {
             "authored. Ultra ships every scene exactly as saved."
           }
         >
-          <select
+          <Select
             className="text-field"
             value={build.quality}
             onChange={(e) => patch({ quality: e.target.value })}
@@ -299,7 +311,7 @@ export function BuildPanel() {
                 {preset.label}
               </option>
             ))}
-          </select>
+          </Select>
         </Row>
       </div>
 
@@ -397,6 +409,28 @@ export function BuildPanel() {
             onChange={(e) => patch({ compressModels: e.target.checked })}
           />
         </Row>
+      </div>
+
+      <div className="inspector-section">
+        <div className="section-header">Contents</div>
+        <Row
+          label="Trim runtime"
+          hint={
+            "Ship only the engine code this game can reach: the modules it enables, the loaders its " +
+            "assets need, the script proxies its scripts import. Off copies the whole player template."
+          }
+        >
+          <input
+            type="checkbox"
+            checked={build.trimRuntime !== false}
+            onChange={(e) => patch({ trimRuntime: e.target.checked })}
+          />
+        </Row>
+        <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
+          An asset ships only when a built scene, a prefab it can spawn or a script reaches it. An asset
+          flagged Exclude never ships; a prefab flagged Preload always does. Files a previous build left in
+          the output folder are removed.
+        </div>
       </div>
 
       <div className="inspector-section">
@@ -554,6 +588,28 @@ function BuildReport({ report }) {
         ) : null}
         {report.savedBytes ? `  ·  ${formatBytes(report.savedBytes)} saved by compression` : ""}
       </div>
+      {report.scenes?.length || report.prefabCount || report.prefabsSkipped || report.removed?.length || report.runtime?.trimmed ? (
+        <div className="asset-hint" style={{ padding: "0 2px 6px" }}>
+          {[
+            report.scenes?.length
+              ? `scenes: ${report.scenes.map((s) => basename(s).replace(/\.scene$/i, "")).join(", ")}`
+              : null,
+            report.prefabCount ? `${report.prefabCount} prefab${report.prefabCount === 1 ? "" : "s"}` : null,
+            report.prefabsSkipped
+              ? `${report.prefabsSkipped} unreachable prefab${report.prefabsSkipped === 1 ? "" : "s"} left out`
+              : null,
+            report.removed?.length
+              ? `${report.removed.length} leftover file${report.removed.length === 1 ? "" : "s"} removed`
+              : null,
+            report.runtime?.trimmed
+              ? `runtime ${report.runtime.files}/${report.runtime.files + report.runtime.skipped} files ` +
+                `(${formatBytes(report.runtime.skippedBytes)} left out)`
+              : null,
+          ]
+            .filter(Boolean)
+            .join("  ·  ")}
+        </div>
+      ) : null}
       <div className="asset-hint" style={{ padding: "0 2px 6px", wordBreak: "break-all" }}>
         {report.zipPath ?? report.outDir}
       </div>

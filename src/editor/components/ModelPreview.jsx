@@ -3,6 +3,7 @@ import * as THREE from "three/webgpu";
 import { createGltfLoader } from "../../engine/gltfLoader.js";
 import { throttlePreviewFrame, stopPreviewRenderer } from "../previewLoop.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * An interactive GLB preview: drag to turn it, pick which animation plays.
  *
@@ -296,7 +297,7 @@ export function ModelPreview({ src, load = null, onError = null, className = "" 
       {/* One clip is not a choice — the selector only earns its row when there
           is something to switch between. */}
       {clips.length > 1 && (
-        <select
+        <Select
           className="ph-category model-preview-clips"
           value={clipIndex}
           onChange={(event) => setClipIndex(Number(event.target.value))}
@@ -305,7 +306,7 @@ export function ModelPreview({ src, load = null, onError = null, className = "" 
           {clips.map((name, i) => (
             <option key={`${name}-${i}`} value={i}>{name}</option>
           ))}
-        </select>
+        </Select>
       )}
       {clips.length === 1 && <div className="model-preview-clipname">{clips[0]}</div>}
     </div>

@@ -37,6 +37,7 @@ import {
   smoothstep,
   step,
   cross,
+  ivec2,
   uniform,
   vec2,
   vec3,
@@ -1597,9 +1598,196 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
   return shadow;
 }
 
+// ── THE PUNCTUAL LIGHT MODEL, AND IT IS three's, TERM FOR TERM ─────────────
+//
+// Five call sites shade a GI hit against the engine's light slots — this file's
+// `analyticDirectAt` (unrolled), its mirror-hit block inside
+// `GICascadeLightNode.setup`, `analyticDirectAtRolled`, and `srcShade.js`'s
+// `lightTermsAt`. Each of them carried its OWN copy of the attenuation, and the
+// copies were a hardcoded inverse-square with a 1 m denominator floor. That was
+// wrong twice over against the renderer the GI has to agree with:
+//
+//   · `decay` never arrived. three evaluates `1 / max(d^decay, 0.01)`
+//     (`LightUtils.getDistanceAttenuation`); GI evaluated `1 / max(d², 1)`. A
+//     lamp authored at any decay but 2 lit its bounce on a different curve from
+//     its own direct light.
+//   · the near-field floor differed by 100x. Inside a metre of a point light
+//     three's attenuation keeps climbing to 100 and GI's stopped at 1 — a bulb
+//     0.3 m off a ceiling delivered 11.1 to the raster and 1.0 to the bounce.
+//
+// And the cone never existed at all, so a spot light had no way into the slots:
+// `GISystem#collectLightObjects` did not collect one, because a slot that
+// ignores the cone would light a full sphere from it.
+//
+// So the model lives HERE, once, and every consumer calls it. Two terms:
+//
+//   DISTANCE  `getDistanceAttenuation` verbatim — the Frostbite windowed
+//             falloff, `decay` as the exponent, the `distance` cutoff as the
+//             window. Directional slots keep exactly 1 (`mix` on `isDir`).
+//   CONE      `SpotLightNode.getSpotAttenuation` verbatim —
+//             `smoothstep(cos(angle), cos(angle·(1−penumbra)), cos(θ))`.
+//
+// ⚠ THE CONE TERM IS BRANCHLESS, AND THAT IS WHAT MAKES IT FREE FOR EVERY
+// OTHER KIND. A directional or point slot publishes `coneCos = -2`,
+// `penumbraCos = -1` (see GISystem's `#updateLightUniforms`): every cosine a
+// real direction can produce is already at or past the upper edge, so the
+// smoothstep is exactly 1 and the same expression serves all three kinds
+// without a uniform read deciding which code runs. Which kind a slot holds
+// stays a RUNTIME fact — R11: adding a light updates uniforms and never
+// recompiles.
+//
+// Slots that predate these fields (the `gi-src-shade.html` fixture builds slot
+// objects by hand) simply omit them, and the terms they gate compile out —
+// `decay` absent reads as 2, `coneCos` absent emits no cone at all.
+
 /**
- * Analytic (point/directional) direct irradiance at an arbitrary world point,
- * from the shared GI light slots. UNSHADOWED by design.
+ * three's punctual attenuation for one GI light slot: distance falloff times
+ * the spot cone. 1 for a directional slot, by construction.
+ *
+ * @param {object} slot a light slot (uniforms, or picked vars from the rolled
+ *   loop — every field is read through `float()`/`vec3()`, so either works)
+ * @param {*} dirTo unit direction from the receiver TOWARD the light
+ * @param {*} dist distance to the light (ignored for a directional slot)
+ * @param {*} isDir the slot's `kind` as a float node (1 = directional)
+ */
+export function punctualAttenuation(slot, dirTo, dist, isDir) {
+  // `pow(d, decay)`, not `d·d`: `decay` is three's exponent and the engine
+  // exposes it per light (0 = no falloff at all, which is what `d^0 = 1` gives
+  // here). Floored at three's own 0.01, NOT at 1 — see the header.
+  const decay = slot.decay != null ? float(slot.decay) : float(2);
+  const atten = mix(float(1).div(dist.pow(decay).max(0.01)), float(1), isDir).toVar();
+  // three's PointLight/SpotLight `distance` cutoff (0 = infinite). GI must die
+  // exactly where the renderer's own direct light does, or the mismatch reads
+  // as light being "cut" at a circle.
+  if (slot.range) {
+    const range = float(slot.range);
+    const ratio = dist.div(range.max(1e-4)).clamp(0, 1);
+    const r2 = ratio.mul(ratio);
+    const win = r2.mul(r2).oneMinus().clamp(0, 1);
+    atten.mulAssign(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
+  }
+  if (slot.coneCos != null) {
+    // `axis` points FROM the light toward its target and `dirTo` points from
+    // the receiver toward the light, so the angle cosine three takes as
+    // `dot(lightDirection, spotAxis)` is the dot against `-dirTo` here.
+    atten.mulAssign(smoothstep(
+      float(slot.coneCos),
+      float(slot.penumbraCos),
+      dirTo.negate().dot(vec3(slot.axis)),
+    ));
+  }
+  return atten;
+}
+
+/**
+ * A slot's CONE term alone at a world point, or null when the slot carries no
+ * cone (every kind but spot, and slots built before the fields existed).
+ *
+ * For gating work that a spot cannot pay for: outside the cone the light is
+ * exactly zero, so its shadow — the most expensive per-pixel trace this module
+ * runs — has nothing to occlude. The screen chain's `createGiLightShadowPass`
+ * hangs its whole slot block on this; a null means "no cone, gate nothing" and
+ * leaves that block's condition byte-identical to before.
+ */
+export function spotReachAt(slot, P) {
+  // Presence, not truthiness — `coneCos` is 0 for a 90° cone (see
+  // `punctualAttenuation`'s own guard).
+  if (slot.coneCos == null) return null;
+  const isDir = float(slot.kind);
+  const rel = vec3(slot.vector).sub(P);
+  const dirTo = mix(rel.div(rel.length().max(1e-4)), vec3(slot.vector), isDir);
+  return smoothstep(
+    float(slot.coneCos),
+    float(slot.penumbraCos),
+    dirTo.negate().dot(vec3(slot.axis)),
+  );
+}
+
+/**
+ * The whole punctual bundle at a world point: which way the light is, how far,
+ * and what fraction of it survives the falloff and the cone.
+ *
+ * `vector` holds the world POSITION for a point/spot slot and the normalized
+ * direction TOWARD the light for a directional one; `kind` selects between them
+ * (the convention `cascadeGather`, `analyticDirectAt` and the screen chain all
+ * share — reusing it rather than re-deriving is what keeps SRC's hits agreeing
+ * with the screen chain's pixels).
+ */
+/**
+ * THE MAPPED SUN'S VISIBILITY AT A WORLD POINT — a texel, not a ray.
+ *
+ * three's own shadow coordinate, replicated exactly (`ShadowNode`'s
+ * `setupShadowCoord`): `pos = M × (P + n·normalBias)`, `/w`, y flipped, z ±
+ * bias by the depth convention, in-frustum when uv ∈ [0,1] and z ∈ [0,1]. The
+ * map is read with `textureLoad` — a comparison sampler is fragment-only — and
+ * compared with the same sense the material's sampler uses (LessEqual, or
+ * GreaterEqual under reversed depth). Cascades run near → far and the first
+ * one containing the point wins.
+ *
+ * ⭐ RETURNS −1 WHEN NO CASCADE COVERS THE POINT, and that is the contract:
+ * the caller must fall back to whatever it did before rather than treating −1
+ * as "shadowed". Every consumer clamps, so a silent −1 would read as black.
+ *
+ * ── WHY THIS LIVES HERE (2026-09-09) ────────────────────────────────────────
+ * It was written inside `srcShade.js`'s kernel builder, closed over that
+ * scope's `P`/`n`, and therefore unreachable from the reflection hit shade —
+ * which was tracing the static BVH for the SAME sun's visibility instead.
+ * Measured on Sponza at ultra: that BVH pair is **`bvhHitShade` 3.57 ms
+ * against 1.22 ms without it**, ~19 % of GI's whole budget, spent computing a
+ * second opinion about a shadow the frame had already rasterised into a
+ * 4096² map. One definition, two consumers — the same rule the hit shading
+ * formula itself follows.
+ *
+ * @param {object|null} sunShadow  GISystem's per-frame bundle (matrices,
+ *   biases, normalBiases, sizes, count, slot, reversed, `bind(c, texel)`).
+ * @param {*} P  world position node
+ * @param {*} n  world normal node (the normal bias is applied along it)
+ * @returns {*|null} a float node in {0, 1}, or −1 outside every cascade;
+ *   null when there is no bundle at all (the caller keeps its old path).
+ */
+export function sunShadowVisibilityAt(sunShadow, P, n) {
+  if (!sunShadow) return null;
+  const v = float(-1).toVar();
+  const comp = ["x", "y", "z", "w"];
+  for (let c = 0; c < sunShadow.matrices.length; c++) {
+    If(v.lessThan(0).and(int(c).lessThan(sunShadow.count)), () => {
+      const nb = sunShadow.normalBiases[comp[c]];
+      const bias = sunShadow.biases[comp[c]];
+      const size = sunShadow.sizes[comp[c]];
+      const pos = sunShadow.matrices[c].mul(vec4(P.add(n.mul(nb)), 1)).toVar();
+      const coord = pos.xyz.div(pos.w).toVar();
+      const u = coord.x.toVar();
+      const w = float(1).sub(coord.y).toVar();
+      const z = (sunShadow.reversed ? coord.z.sub(bias) : coord.z.add(bias)).toVar();
+      const inside = u.greaterThanEqual(0).and(u.lessThanEqual(1))
+        .and(w.greaterThanEqual(0)).and(w.lessThanEqual(1))
+        .and(z.greaterThanEqual(0)).and(z.lessThanEqual(1));
+      If(inside, () => {
+        const texel = ivec2(
+          u.mul(size).clamp(0, size.sub(1)),
+          w.mul(size).clamp(0, size.sub(1)),
+        );
+        const d = float(sunShadow.bind(c, texel)).toVar();
+        v.assign(sunShadow.reversed
+          ? select(z.greaterThanEqual(d), float(1), float(0))
+          : select(z.lessThanEqual(d), float(1), float(0)));
+      });
+    });
+  }
+  return v;
+}
+
+export function punctualTermsAt(slot, P) {
+  const isDir = float(slot.kind).toVar();
+  const rel = vec3(slot.vector).sub(P).toVar();
+  const dist = rel.length().max(1e-4).toVar();
+  const dirTo = mix(rel.div(dist), vec3(slot.vector), isDir).toVar();
+  return { isDir, dirTo, dist, atten: punctualAttenuation(slot, dirTo, dist, isDir) };
+}
+
+/**
+ * Analytic (directional/point/spot) direct irradiance at an arbitrary world
+ * point, from the shared GI light slots. UNSHADOWED by design.
  *
  * This exists for shading a REFLECTION HIT. A primary surface never needs it —
  * three's own lighting already evaluates the scene's real lights there, with
@@ -1653,24 +1841,11 @@ export function analyticDirectAt(lightSlots, P, N, shadowFn = null, oneSided = f
     return analyticDirectAtRolled(lightSlots, P, N, shadowFn, oneSided);
   }
   const total = vec3(0).toVar();
-  for (const slot of lightSlots) {
+  for (const [slotIndex, slot] of lightSlots.entries()) {
     If(slot.active.greaterThan(0.5), () => {
-      const isDir = float(slot.kind).toVar();
-      const rel = vec3(slot.vector).sub(P).toVar();
-      const pointDist = rel.length().max(1e-4).toVar();
-      // `vector` holds: point → world position, directional → the normalized
-      // direction TOWARD the light (cascadeGather.js uses the same convention).
-      const dirTo = mix(rel.div(pointDist), vec3(slot.vector), isDir).toVar();
-      let atten = mix(float(1).div(pointDist.mul(pointDist).max(1)), float(1), isDir);
-      // three's PointLight `distance` cutoff (0 = infinite) — GI must die
-      // where the renderer's own direct light does.
-      if (slot.range) {
-        const range = float(slot.range);
-        const ratio = pointDist.div(range.max(1e-4)).clamp(0, 1);
-        const r2 = ratio.mul(ratio);
-        const win = r2.mul(r2).oneMinus().clamp(0, 1);
-        atten = atten.mul(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
-      }
+      // Direction, distance and three's falloff+cone, from the one model every
+      // GI consumer shares (see `punctualAttenuation`'s header).
+      const { isDir, dirTo, dist: pointDist, atten } = punctualTermsAt(slot, P);
       // See the `oneSided` note on the signature: `.abs()` is the FIELD-CELL
       // convention (a cell straddling a wall must light from either side);
       // `.max(0)` is the SURFACE convention, and a face-forwarded hit normal is
@@ -1682,7 +1857,12 @@ export function analyticDirectAt(lightSlots, P, N, shadowFn = null, oneSided = f
       // carries its shadow instead of full flat light. Absent → this graph
       // is byte-identical to before the parameter existed.
       const lit = vec3(slot.color).mul(atten).mul(cosH);
-      total.addAssign(shadowFn ? lit.mul(float(shadowFn(dirTo, isDir, pointDist, cosH)).clamp(0, 1)) : lit);
+      // 5th arg = WHICH SLOT (2026-09-09). A shadowFn that can answer more
+      // cheaply for one particular light — the reflection hit shade reading
+      // the mapped sun's shadow map instead of tracing the BVH — cannot tell
+      // which light it is being asked about without it. Extra arguments are
+      // ignored by every callback that does not take them, so this is additive.
+      total.addAssign(shadowFn ? lit.mul(float(shadowFn(dirTo, isDir, pointDist, cosH, int(slotIndex))).clamp(0, 1)) : lit);
     });
   }
   return total;
@@ -2645,19 +2825,9 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
               if (light.lightSlots?.length) {
                 for (const slot of light.lightSlots) {
                   If(slot.active.greaterThan(0.5), () => {
-                    const isDir = float(slot.kind).toVar();
-                    const rel = vec3(slot.vector).sub(hitPoint).toVar();
-                    const pointDist = rel.length().max(1e-4).toVar();
-                    const dirTo = mix(rel.div(pointDist), vec3(slot.vector), isDir).toVar();
-                    let atten = mix(float(1).div(pointDist.mul(pointDist).max(1)), float(1), isDir);
-                    // Match three's PointLight `distance` cutoff (0 = infinite).
-                    if (slot.range) {
-                      const range = float(slot.range);
-                      const ratio = pointDist.div(range.max(1e-4)).clamp(0, 1);
-                      const r2 = ratio.mul(ratio);
-                      const win = r2.mul(r2).oneMinus().clamp(0, 1);
-                      atten = atten.mul(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
-                    }
+                    // three's falloff + cone, shared with every other GI
+                    // consumer (see `punctualAttenuation`'s header).
+                    const { dirTo, atten } = punctualTermsAt(slot, hitPoint);
                     const cosH = dirTo.dot(hitN).abs().toVar();
                     // Analytic lights are UNSHADOWED at reflection hits on
                     // purpose: shadowing them cost up to 4 extra traces per
@@ -2856,28 +3026,33 @@ function pickSlotField(slots, field, i, kind) {
 export function analyticDirectAtRolled(lightSlots, P, N, shadowFn, oneSided = false) {
   const total = vec3(0).toVar();
   const hasRange = lightSlots[0]?.range != null;
+  const hasDecay = lightSlots[0]?.decay != null;
+  const hasSpot = lightSlots[0]?.coneCos != null;
   Loop({ start: int(0), end: int(lightSlots.length), type: "int", condition: "<" }, ({ i }) => {
+    // The slot, rebuilt from picked fields — `punctualTermsAt` reads every one
+    // of them through `float()`/`vec3()`, so a table of picked vars stands in
+    // for the uniform slot and the two forms cannot drift apart. Absent fields
+    // stay absent (the helper gates on them), which is what keeps a fixture's
+    // hand-built slot and a spot-less scene emitting the same graph as before.
+    const picked = {
+      kind: pickSlotField(lightSlots, "kind", i, "float"),
+      vector: pickSlotField(lightSlots, "vector", i, "vec3"),
+    };
     const active = pickSlotField(lightSlots, "active", i, "float");
-    const kind = pickSlotField(lightSlots, "kind", i, "float");
-    const vector = pickSlotField(lightSlots, "vector", i, "vec3");
     const color = pickSlotField(lightSlots, "color", i, "vec3");
-    const range = hasRange ? pickSlotField(lightSlots, "range", i, "float") : null;
+    if (hasRange) picked.range = pickSlotField(lightSlots, "range", i, "float");
+    if (hasDecay) picked.decay = pickSlotField(lightSlots, "decay", i, "float");
+    if (hasSpot) {
+      picked.axis = pickSlotField(lightSlots, "axis", i, "vec3");
+      picked.coneCos = pickSlotField(lightSlots, "coneCos", i, "float");
+      picked.penumbraCos = pickSlotField(lightSlots, "penumbraCos", i, "float");
+    }
     If(active.greaterThan(0.5), () => {
-      const isDir = float(kind).toVar();
-      const rel = vector.sub(P).toVar();
-      const pointDist = rel.length().max(1e-4).toVar();
-      const dirTo = mix(rel.div(pointDist), vector, isDir).toVar();
-      let atten = mix(float(1).div(pointDist.mul(pointDist).max(1)), float(1), isDir);
-      if (range) {
-        const ratio = pointDist.div(range.max(1e-4)).clamp(0, 1);
-        const r2 = ratio.mul(ratio);
-        const win = r2.mul(r2).oneMinus().clamp(0, 1);
-        atten = atten.mul(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
-      }
+      const { isDir, dirTo, dist: pointDist, atten } = punctualTermsAt(picked, P);
       const cosH = (oneSided ? dirTo.dot(N).max(0) : dirTo.dot(N).abs()).toVar();
       const lit = vec3(color).mul(atten).mul(cosH).toVar();
       If(lit.x.max(lit.y).max(lit.z).greaterThan(0), () => {
-        total.addAssign(lit.mul(float(shadowFn(dirTo, isDir, pointDist, cosH)).clamp(0, 1)));
+        total.addAssign(lit.mul(float(shadowFn(dirTo, isDir, pointDist, cosH, i)).clamp(0, 1)));
       });
     });
   });

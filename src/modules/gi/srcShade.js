@@ -90,7 +90,7 @@
 import { If, Loop, float, int, ivec2, mix, select, step, uint, vec3, vec4 } from "three/tsl";
 import { MAX_LOOP_ALBEDO } from "./srcConfig.js";
 import { binMorton, dirToBin, hashKey } from "./srcMathTsl.js";
-import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
+import { emitterSlotFactor, emitterSurfaceT, punctualTermsAt } from "./giLight.js";
 import { waterCausticAboveNode, waterCausticGainNode } from "../../engine/vfx/waterCaustics.js";
 import { waterInsideNode, waterRimDistanceNode } from "../../engine/vfx/waterShape.js";
 
@@ -203,13 +203,14 @@ function emitterTermsAt(slot, P, n, margin) {
 /**
  * One `giLight.js` LIGHT SLOT's irradiance at a hit, plus what a shadow ray
  * toward it needs. The engine's punctual lights — `analyticDirectAt`'s subject,
- * up to `MAX_GI_LIGHTS` of them, point and directional in one array.
+ * up to `MAX_GI_LIGHTS` of them, directional, point and spot in one array.
  *
- * `vector` holds the world POSITION for a point light and the normalized
+ * `vector` holds the world POSITION for a point/spot light and the normalized
  * direction TOWARD the light for a directional one; `kind` selects between them
  * (the same convention `cascadeGather` and `analyticDirectAt` use, and reusing
  * it rather than re-deriving is what keeps SRC's hits agreeing with the screen
- * chain's pixels).
+ * chain's pixels). A spot is a point slot carrying `axis`/`coneCos`/
+ * `penumbraCos` besides — see `punctualAttenuation`.
  *
  * ⚠ **THE COSINE IS CLAMPED HERE, NOT ABSOLUTE.** `analyticDirectAt` takes
  * `dot(dirTo, N).abs()` because it shades a FIELD CELL, which has no definite
@@ -223,23 +224,10 @@ function emitterTermsAt(slot, P, n, margin) {
  * the camera or off screen entirely.
  */
 function lightTermsAt(slot, P, n, margin, maxRay) {
-  const isDir = float(slot.kind).toVar();
-  const rel = vec3(slot.vector).sub(P).toVar();
-  const dist = rel.length().max(1e-4).toVar();
-  const dirTo = mix(rel.div(dist), vec3(slot.vector), isDir).toVar();
-  // Inverse-square for a point light, none for a directional. `max(1)` is
-  // `analyticDirectAt`'s own guard against a receiver inside the source.
-  const atten = mix(float(1).div(dist.mul(dist).max(1)), float(1), isDir).toVar();
-  if (slot.range) {
-    // three's PointLight `distance` cutoff (0 = infinite). GI must die exactly
-    // where the renderer's own direct light does, or the mismatch reads as light
-    // being "cut" at a circle.
-    const range = float(slot.range);
-    const ratio = dist.div(range.max(1e-4)).clamp(0, 1);
-    const r2 = ratio.mul(ratio);
-    const win = r2.mul(r2).oneMinus().clamp(0, 1);
-    atten.mulAssign(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
-  }
+  // Direction, distance, three's windowed `decay` falloff and the spot cone —
+  // `giLight.js`'s one punctual model, shared with `analyticDirectAt` and the
+  // mirror-hit block so a hit and a reflected hit cannot disagree about a lamp.
+  const { isDir, dirTo, dist, atten } = punctualTermsAt(slot, P);
   const cos = dirTo.dot(n).max(0).toVar();
   const active = float(slot.active ?? 1);
   return {

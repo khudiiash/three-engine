@@ -54,11 +54,59 @@ defineOp({
   description:
     "DEV: set one GI build-time hatch (a `__gi…` global), persist it in localStorage (`gi.devFlags.v1`, applied when the GI module loads) and queue a GI rebuild. Hatches read at SCREEN-CHAIN creation (e.g. `__giIrrTemporal`) need an editor.reload to take effect; the flag survives it. Drive an A/B from an agent session — e.g. `__giIrrTemporal` false to bypass the irradiance temporal filter, `__giMergeLos` false, `__giGatherNormalWeight` false, `__giBvhSimplify` false. Read-back: the value now set and whether a rebuild was queued. Only names starting with `__gi` are accepted; pass value null to delete the flag (restores the default).",
   params: {
-    name: { type: "string", description: "The global's name, must start with `__gi`." },
+    name: { type: "string", description: "The global's name, must start with `__gi`. OMIT it to LIST every flag currently persisted, changing nothing." },
     value: { description: "true / false / number / string, or null to delete." },
     rebuild: { type: "boolean", default: true, description: "Queue a GI rebuild so build-time hatches take effect (default true)." },
   },
   async run({ name, value = null, rebuild = true }) {
+    // ── LISTING IS THE DEFAULT WHEN NO NAME IS GIVEN ────────────────────────
+    //
+    // These flags PERSIST in localStorage across reloads and across sessions,
+    // and nothing but a boot line ever showed them. An A/B arm set weeks ago
+    // therefore reads as engine behaviour: `__giWorldIdle = false` was found
+    // live on the user's editor (2026-09-09) still disabling the converged
+    // world-idle sleep that has been default-on since 2026-09-02, with no way
+    // to see it short of scrolling to the first second of the console. A
+    // switch that can silently change what every measurement means has to be
+    // readable without changing anything.
+    if (name === undefined || name === null || name === "") {
+      let store = {};
+      try { store = JSON.parse(localStorage.getItem("gi.devFlags.v1") || "{}"); } catch { /* storage unavailable */ }
+      // The LIVE value too: a flag set from the console this session is not in
+      // the store, and one in the store that the module never applied is not
+      // live. Reporting only one of them is how a stale arm stays invisible.
+      //
+      // ⚠ SCALARS ONLY for the live half. The `__gi` namespace is shared with
+      // live DIAGNOSTIC channels — `__giPipelineTimings` is an array of every
+      // pipeline compiled this session, `__giLightTreeLive` a whole tree
+      // snapshot — and serialising those turned a flag listing into a 4 MB
+      // reply. A hatch is a switch; anything that is not a scalar is not one,
+      // and a persisted entry is listed whatever its shape because the store
+      // is the thing this op exists to expose.
+      const scalar = (v) => v === null || ["boolean", "number", "string"].includes(typeof v);
+      const names = new Set([
+        ...Object.keys(store),
+        ...Object.keys(globalThis).filter(
+          (key) => /^__gi[A-Za-z0-9_]*$/.test(key) && scalar(globalThis[key]),
+        ),
+      ]);
+      const flags = [...names].sort().map((key) => {
+        const live = globalThis[key];
+        return {
+          name: key,
+          persisted: key in store ? store[key] : null,
+          live: live === undefined ? null : (scalar(live) ? live : `<${typeof live}>`),
+          onlyLive: !(key in store),
+        };
+      });
+      return {
+        flags,
+        count: flags.length,
+        note: flags.length
+          ? "Every one of these overrides a shipped default. `persisted` survives reloads (localStorage `gi.devFlags.v1`); pass the name with value null to clear it."
+          : "No GI dev flags are set — the module is running its shipped defaults.",
+      };
+    }
     if (typeof name !== "string" || !/^__gi[A-Za-z0-9_]*$/.test(name)) {
       throw new Error("profile.giFlag: `name` must be a `__gi…` global");
     }
@@ -1617,6 +1665,11 @@ defineOp({
     clear: { type: "boolean", default: false, description: "Empty the ledger after reading, so the next read measures one action." },
   },
   run({ limit = 20, sinceMs = 0, clear = false }) {
+    // `stalls` and each block's `gpuLoad`: a block with no engine span and no
+    // GPU call in it is the main thread waiting on the GPU process, whose
+    // command thread executes a SYNCHRONOUS pipeline creation in order — the
+    // 21.5 s block of 2026-09-09. `wgsl`: whether the shader text this boot
+    // created is byte-stable against the last boot (the disk cache's key).
     const report = freeze.read({
       limit: Math.max(1, Math.min(100, Math.round(limit))),
       sinceMs: Math.max(0, Number(sinceMs) || 0),
@@ -1627,6 +1680,49 @@ defineOp({
       note: report.observing
         ? "`owners` are SELF time — a nested span's ms are not also charged to its parent. `(unattributed)` is real time in code nothing marks yet; a large one is a missing mark, not an absence of work. `gpu` counts synchronous pipeline/shader-module creation inside the block: that work never appears in a JS profile because the driver parses WGSL on the calling thread. In `nodeBuildCauses`, `first compile` and `material key` are work that had to happen; a named input (`lights`, `fog`, `environment`, `shadowMap`, `context`) is a WAVE — three keys its node-builder cache partly on that scene-wide state, so one of them moving re-mints every material in the scene at once."
         : "The long-task observer is NOT running (no PerformanceObserver, or `longtask` is unsupported here). Spans are still recorded, so profile.boot works, but nothing is attributing blocks.",
+    };
+  },
+});
+
+defineOp({
+  name: "profile.flag",
+  description:
+    "DEV: set or read one engine A/B hatch — a `globalThis.__…` boolean/number/string such as `__asyncRenderPipelinesStandIn`, `__asyncRenderPipelinesBuildBudgetMs`, `__wgslCanonical`, `__ambientGlowFrameCopy`, `__lightCastShadowInPlace`, `__giBvhWorker`. Session-only (not persisted; profile.giFlag persists the `__gi…` ones). Omit `value` to read. Most hatches are read at the moment the work happens, so a flag set now governs the next edit/render; a few are read once at install (the header of the module that owns the hatch says which).",
+  params: {
+    name: { type: "string", required: true, description: "The global's name; must start with `__`." },
+    value: { type: ["boolean", "number", "string", "null"], description: "The value to set; null deletes the flag; omit to read." },
+  },
+  run({ name, value }) {
+    if (typeof name !== "string" || !name.startsWith("__")) throw new Error("profile.flag: `name` must be a `__…` global");
+    if (value !== undefined) {
+      if (value === null) delete globalThis[name];
+      else globalThis[name] = value;
+    }
+    return { name, value: globalThis[name] ?? null };
+  },
+});
+
+defineOp({
+  name: "profile.wgsl",
+  readOnly: true,
+  description:
+    "The shader text this boot handed the driver, module by module, scored against the PREVIOUS boot — the receipt for whether the browser's compiled-shader disk cache can serve a boot at all. Chromium keys that cache on the WGSL text, and three names unnamed storage buffers after a process-wide node id (`NodeBuffer_55143`), so the same graph produced different text every boot and the 80-second GI kernels compiled from scratch each time. The engine now canonicalises those names before `createShaderModule` (`__wgslCanonical = false` reverts). Without arguments: the module table (label, kB, raw/canonical hash, whether the last boot had the same text raw / canonically). With `index`: that module's canonical text, for diffing two boots when a module is still `stillUnstable` in profile.freezes.wgsl — pipe it to a file through the CLI bridge, it is tens of kB.",
+  params: {
+    index: { type: "number", description: "Return this module's text instead of the table." },
+    limit: { type: "number", default: 200, description: "Rows of the table (max 1000)." },
+  },
+  run({ index, limit = 200 }) {
+    const registry = freeze.wgsl;
+    if (!registry) return { modules: 0, note: "No shader module has been created yet, or the GPU ledger is not installed on this renderer." };
+    if (index !== undefined && index !== null) {
+      const m = registry.module(Math.max(0, Math.round(Number(index))));
+      if (!m) throw new Error(`profile.wgsl: no module at index ${index} (${registry.modules.length} recorded)`);
+      return m.code === null ? { ...m, note: "text not kept — the session's kept-text budget was spent; hashes only" } : m;
+    }
+    return {
+      summary: registry.summary(),
+      modules: registry.list().slice(-Math.max(1, Math.min(1000, Math.round(limit)))),
+      note: "`rawSeenLastBoot` is what the disk cache would have hit WITHOUT the rename, `canonSeenLastBoot` with it. A module unseen either way is text that still moves between boots: dump it with `index` on two boots and diff.",
     };
   },
 });

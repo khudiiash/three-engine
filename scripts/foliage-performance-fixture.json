@@ -1,0 +1,239 @@
+{
+  "width": 1300,
+  "height": 724,
+  "settings": {
+    "background": "#202329",
+    "ambientColor": "#ffffff",
+    "ambientIntensity": 0.3,
+    "environment": {
+      "cubemap": "",
+      "background": true,
+      "lighting": true,
+      "intensity": 1,
+      "rotation": 0,
+      "blur": 0
+    },
+    "fog": {
+      "type": "none",
+      "color": "#202329",
+      "near": 10,
+      "far": 80,
+      "density": 0.02
+    },
+    "wind": {
+      "vector": [
+        0,
+        0,
+        2
+      ],
+      "gust": 0,
+      "gustFrequency": 1
+    },
+    "toneMapping": "neutral",
+    "exposure": 1,
+    "shadows": true,
+    "renderer": {
+      "antialias": true,
+      "samples": 4,
+      "transparent": false
+    },
+    "shadow": {
+      "type": "PCFSoftShadowMap",
+      "autoUpdate": true,
+      "needsUpdate": false
+    },
+    "performance": {
+      "maxDevicePixelRatio": 2,
+      "renderScale": 1,
+      "dynamicResolution": false,
+      "targetFps": 60,
+      "adaptiveQuality": false,
+      "volumeStepScale": 1,
+      "autoBatching": true,
+      "staticMerging": false,
+      "shadowMerging": false,
+      "renderBundles": false,
+      "occlusionCulling": false
+    }
+  },
+  "camera": {
+    "position": [
+      23.42465585794818,
+      1.7077664494355618,
+      7.870709591118043
+    ],
+    "target": [
+      19.82879207199334,
+      0.578407211666562,
+      7.275976040584888
+    ],
+    "fov": 60
+  },
+  "foliage": [
+    {
+      "name": "Grass Scatter",
+      "transform": {
+        "position": [
+          0,
+          0,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "props": {
+        "enabled": true,
+        "species": "grass",
+        "distribution": "scatter",
+        "surface": "61gzvaavdI",
+        "density": 3,
+        "maxInstances": 10000,
+        "seed": 1,
+        "height": 0.65,
+        "width": 0.65,
+        "leafColor": "#64863a",
+        "barkColor": "#526331",
+        "flowerColor": "#efd275",
+        "minSpacing": 0.15,
+        "minSlope": 0,
+        "maxSlope": 50,
+        "minAltitude": -10000,
+        "maxAltitude": 10000,
+        "alignToNormal": true,
+        "minScale": 0.8,
+        "maxScale": 1.2,
+        "wind": true,
+        "windStrength": 0.2,
+        "windSpeed": 1,
+        "windDirection": 35,
+        "interaction": false,
+        "interactionStrength": 0.5,
+        "interactionRadius": 1,
+        "lodNear": 12,
+        "lodFar": 30,
+        "maxDistance": 65,
+        "chunkSize": 24,
+        "castShadow": true,
+        "receiveShadow": true
+      }
+    },
+    {
+      "name": "Oak Scatter",
+      "transform": {
+        "position": [
+          0,
+          0,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "props": {
+        "enabled": true,
+        "species": "oak",
+        "distribution": "scatter",
+        "surface": "61gzvaavdI",
+        "density": 0.015,
+        "maxInstances": 10000,
+        "seed": 1,
+        "height": 8,
+        "width": 6,
+        "leafColor": "#52732b",
+        "barkColor": "#65513a",
+        "flowerColor": "#efd275",
+        "minSpacing": 4,
+        "minSlope": 0,
+        "maxSlope": 40,
+        "minAltitude": -10000,
+        "maxAltitude": 10000,
+        "alignToNormal": false,
+        "minScale": 0.8,
+        "maxScale": 1.2,
+        "wind": true,
+        "windStrength": 0.2,
+        "windSpeed": 1,
+        "windDirection": 35,
+        "interaction": false,
+        "interactionStrength": 0.5,
+        "interactionRadius": 1,
+        "lodNear": 35,
+        "lodFar": 90,
+        "maxDistance": 350,
+        "chunkSize": 24,
+        "castShadow": true,
+        "receiveShadow": true
+      }
+    },
+    {
+      "name": "Wildflowers Scatter",
+      "transform": {
+        "position": [
+          0,
+          0,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "props": {
+        "enabled": true,
+        "species": "wildflowers",
+        "distribution": "scatter",
+        "surface": "61gzvaavdI",
+        "density": 0.8,
+        "maxInstances": 10000,
+        "seed": 1,
+        "height": 0.8,
+        "width": 0.6,
+        "leafColor": "#507539",
+        "barkColor": "#567239",
+        "flowerColor": "#eac5e6",
+        "minSpacing": 0.3,
+        "minSlope": 0,
+        "maxSlope": 50,
+        "minAltitude": -10000,
+        "maxAltitude": 10000,
+        "alignToNormal": true,
+        "minScale": 0.8,
+        "maxScale": 1.2,
+        "wind": true,
+        "windStrength": 0.2,
+        "windSpeed": 1,
+        "windDirection": 35,
+        "interaction": false,
+        "interactionStrength": 0.5,
+        "interactionRadius": 1,
+        "lodNear": 15,
+        "lodFar": 35,
+        "maxDistance": 80,
+        "chunkSize": 24,
+        "castShadow": true,
+        "receiveShadow": true
+      }
+    }
+  ]
+}

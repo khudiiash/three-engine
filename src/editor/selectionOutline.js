@@ -53,11 +53,12 @@ import { freeze } from "../engine/freezeLedger.js";
  *
  * COST, measured on a 400-mesh scene at 1400x900 (submit time per frame, the
  * number the stats overlay calls "GPU"): 3.3ms with nothing selected, 4.5ms
- * with one object, 5.2ms with a hundred, 6.8ms with a 400-mesh subtree. So the
+ * with one object, 5.2ms with a hundred, 6.8ms with a 400-mesh model. So the
  * floor is ~1.2ms — three extra render calls (mask, dilate, composite) plus the
  * output blit each one costs — and it grows only with how much of the scene is
- * actually selected. Nothing is allocated or rendered when the selection is
- * empty.
+ * actually selected (each entity contributes its OWN geometry; child entities
+ * are pruned — see collectMeshes). Nothing is allocated or rendered when the
+ * selection is empty.
  *
  * KNOWN LIMITS, deliberate:
  *   - The outline is not occluded. A selected object behind a wall still shows
@@ -90,7 +91,7 @@ const ACTIVE_BIT = 1 << SELECTION_ACTIVE_LAYER;
 const _size = new THREE.Vector2();
 
 const state = vmSingleton("selectionOutline", () => ({
-  /** @type {THREE.Object3D[]} Roots whose subtrees are outlined. */
+  /** @type {THREE.Object3D[]} Selected entities' `object3D`s — each outlined for its OWN geometry only (see collectMeshes). */
   roots: [],
   /** @type {THREE.Object3D|null} The active root — drawn in the lighter colour. */
   activeRoot: null,
@@ -135,8 +136,10 @@ const state = vmSingleton("selectionOutline", () => ({
 /**
  * Sets what the outline traces.
  *
- * @param {THREE.Object3D[]} roots Subtree roots to outline (usually one
- *   `entity.object3D` per selected entity).
+ * @param {THREE.Object3D[]} roots Roots to outline (usually one
+ *   `entity.object3D` per selected entity). Each root is traced for the
+ *   entity's OWN renderables only — child entities are pruned, not outlined
+ *   (see collectMeshes).
  * @param {THREE.Object3D|null} [activeRoot] The root drawn in the active
  *   colour — Blender's "active object", i.e. the last one clicked.
  */
@@ -163,21 +166,47 @@ export function setSelectionOutlineEnabled(enabled) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Collects the drawable meshes under `root`.
+ * Collects the drawable meshes of ONE selected entity — its own renderables,
+ * never its children's.
+ *
+ * THE OWNERSHIP PRUNE. Every entity stamps its own `object3D` with its id
+ * (Entity), and every render component stamps the renderables it owns with the
+ * same id (MeshComponent, SpriteComponent, InstancerComponent, VfxComponent,
+ * …; ModelComponent stamps its whole GLB subtree). So walking down from a
+ * selected root, the first node carrying a FOREIGN stamp is a child entity's
+ * `object3D`, and everything below it belongs to that child. The walk cuts
+ * there instead of descending. Outlining a deep hierarchy used to trace every
+ * descendant — you clicked the parent and got a ring around each child, and
+ * the mask pass paid for all of it every frame. A child entity only enters the
+ * mask when it is selected on its own merits.
+ *
+ * An owned model's GLB subtree shares the root's stamp and stays fully
+ * outlined: it IS the entity's geometry (import creates ONE entity per GLB, so
+ * there are no child entities inside it to skip). Unstamped nodes descend —
+ * nothing in the engine owns them, so they may still be this entity's
+ * renderables, and a missing stamp must never silently blank the outline.
  *
  * Editor-only subtrees are skipped WHOLE (an early return inside `traverse`
  * would still visit their children): a light's cone helper or a camera's body
  * model would otherwise inflate the silhouette of the entity it belongs to.
  */
 function collectMeshes(root, active, out, seen) {
-  if (!root) return;
-  if (root.userData?.editorOnly || root.userData?.batchProxy) return;
-  if (root.layers.isEnabled(EDITOR_LAYER)) return;
-  if (root.isMesh && !root.isSprite && !seen.has(root)) {
-    seen.add(root);
-    out.push({ mesh: root, active });
+  walkOwnedMeshes(root, root?.userData?.entityId ?? null, active, out, seen);
+}
+
+function walkOwnedMeshes(node, rootId, active, out, seen) {
+  if (!node) return;
+  if (node.userData?.editorOnly || node.userData?.batchProxy) return;
+  if (node.layers.isEnabled(EDITOR_LAYER)) return;
+  if (rootId !== null) {
+    const stamp = node.userData?.entityId;
+    if (stamp != null && stamp !== rootId) return; // a child entity — its subtree is not ours to outline
   }
-  for (const child of root.children) collectMeshes(child, active, out, seen);
+  if (node.isMesh && !node.isSprite && !seen.has(node)) {
+    seen.add(node);
+    out.push({ mesh: node, active });
+  }
+  for (const child of node.children) walkOwnedMeshes(child, rootId, active, out, seen);
 }
 
 function refreshEntries() {
@@ -420,6 +449,42 @@ export function updateSelectionOutlineMask({ renderer, scene, camera, width, hei
   // nested override render is the empty-fragment-struct pipeline trap, and
   // this is cheap insurance against a light ever landing on a mask layer.
   const prevShadows = renderer.shadowMap.enabled;
+
+  // ⭐⭐⭐ KEEP THE LIGHTS COLLECTED, OR THIS PASS RE-MINTS THE WHOLE SCENE.
+  //
+  // The mask render narrows `camera.layers.mask` to a single bit so only the
+  // selected meshes draw. But three's render-list `finish()` sets the scene's
+  // SHARED lights node from the camera-filtered light set —
+  // `lightsNode.setLights(lighting.enabled ? cameraVisibleLights : [])` — and
+  // no scene light is on the mask bit, so this narrowing empties that node.
+  // Every render object's DYNAMIC cache key folds `lightsNode.getCacheKey()`
+  // (three does this for every material that is not a shadow-pass material —
+  // an unlit `Background.material` included), so emptying the node here and
+  // letting the main pass refill it flips that key full↔empty every frame and
+  // re-mints every material in the scene TWICE per frame. Measured on the
+  // user's Foliage scene, live: selecting one entity took `Background.material`
+  // from ~15 rebuilds/s to `lights+dynHalf` ×4635 — the whole editor froze on
+  // it, and it read as a mystery `material key: ?` storm until the ledger was
+  // taught to name the two cache-key halves.
+  //
+  // The fix keeps the light SET the node holds identical across the mask and
+  // the main render: widen every scene light onto the mask bits so the
+  // narrowed camera still gathers it. The mask override materials are unlit,
+  // so a collected-but-unused light changes nothing they draw; the point is
+  // only that `setLights` receives the same list it will hold in the main
+  // pass, so no lit material's key ever moves. Restored in the `finally`.
+  // `globalThis.__outlineKeepLights = false` reverts to the flipping behaviour
+  // for an A/B.
+  const litMask = SELECTED_BIT | ACTIVE_BIT;
+  const widenedLights = [];
+  if (globalThis.__outlineKeepLights !== false) {
+    scene.traverse((obj) => {
+      if (obj.isLight && (obj.layers.mask & litMask) !== litMask) {
+        widenedLights.push([obj, obj.layers.mask]);
+        obj.layers.mask |= litMask;
+      }
+    });
+  }
   try {
     renderer.shadowMap.enabled = false;
     renderer.setRenderTarget(state.maskTarget);
@@ -452,6 +517,7 @@ export function updateSelectionOutlineMask({ renderer, scene, camera, width, hei
     state.quad.render(renderer);
   } finally {
     camera.layers.mask = prevCameraMask;
+    for (const [light, mask] of widenedLights) light.layers.mask = mask;
     for (const { mesh, mask, visible } of stamped) {
       mesh.layers.mask = mask;
       mesh.visible = visible;

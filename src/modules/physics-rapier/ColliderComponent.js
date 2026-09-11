@@ -654,7 +654,8 @@ function buildHeightfieldWireframe(entity) {
   const terrain = entity?.getComponent?.("terrain");
   if (!terrain?.heightsArray || typeof terrain.heightAtLocal !== "function") return null;
   const size = terrain.props?.size ?? 50;
-  const segments = Math.min(32, Math.max(2, terrain.resolution ?? 32));
+  // Match the live height buffer, including clamped/fractional authored input.
+  const segments = Math.min(32, terrain._gridResolution);
   const plane = new THREE.PlaneGeometry(size, size, segments, segments);
   plane.rotateX(-Math.PI / 2);
   const pos = plane.getAttribute("position");

@@ -50,66 +50,152 @@ export function invalidateShaderTextureCache(path = null) {
  *  (e.g. "uv", "time") used when unwired and no value set. */
 const i = (key, type, def = null, src = null, extra = null) => ({ key, type, default: def, src, ...extra });
 
-/** Input sockets exposed by the Material Output node — Blender-style. Three
- *  pins, mirroring Blender's `Material Output`:
+/**
+ * ── The Material Output IS the three.js material ────────────────────────────
  *
- *   - `surface` (type `surface`) — fed by a shader node (Principled BSDF,
- *     Emission, …). Those nodes don't compile to a single TSL value; they
- *     return a *surface bundle* `{ __surface: { <materialSlot>: tslNode } }`
- *     that the compiler unpacks into the material's `*Node` slots. This is
- *     why the per-channel pins (Color, Roughness, Metalness, …) live on the
- *     BSDF node now, not on the Output — exactly like Blender.
- *   - `volume` (type `volume`) — the Volume pin: a node wired into it is a
- *     `Fn({positionRay}) -> vec4` suitable for `VolumeNodeMaterial.scatteringNode`.
- *     The material-asset layer instantiates a `VolumeNodeMaterial` (volume
- *     wired) or a `MeshPhysicalNodeMaterial` (surface only) accordingly.
- *   - `displacement` (type `vec3`) — offsets/replaces vertex position via
- *     `positionNode`.
+ * One socket per `*Node` slot the selected material class actually reads, so a
+ * graph reads the way TSL reads when written by hand:
  *
- *  `slot` is the single material property a socket maps to, or `null` for
- *  `surface` (which expands to many slots via the bundle).
+ *     material.colorNode      ←  Output ▸ Color
+ *     material.roughnessNode  ←  Output ▸ Roughness
+ *     material.clearcoatNode  ←  Output ▸ Clearcoat
+ *
+ * There is no BSDF middleman and no `surface` bundle. The old Blender-shaped
+ * graphs (`Principled BSDF → Output.surface`) are rewritten into direct wires
+ * by `migrateGraph` on load, so every .mat already on disk renders identically.
  */
-export const OUTPUT_SLOTS = [
-  { key: "surface", slot: null, type: "surface" },
-  { key: "volume", slot: null, type: "volume" },
-  { key: "displacement", slot: "positionNode", type: "vec3" },
-];
 
-/** Every material `*Node` a compiled graph can populate — the union of all
- *  surface-bundle slots plus volume/displacement. Callers reset these to null
- *  before applying a fresh compile so a stale slot never leaks across edits. */
-export const MATERIAL_NODE_SLOTS = [
-  "colorNode", "roughnessNode", "metalnessNode", "emissiveNode", "opacityNode",
-  "iorNode", "specularIntensityNode", "specularColorNode", "anisotropyNode",
-  "sheenNode", "sheenRoughnessNode", "clearcoatNode", "clearcoatRoughnessNode",
-  "transmissionNode", "thicknessNode", "normalNode", "aoNode", "positionNode",
-];
+/** Material classes the Output can instantiate, keyed by the `material` param.
+ *  `ctor` is the `three/webgpu` export name, used by the code generator; the
+ *  real constructors live in `MATERIAL_CTORS` in materialAsset.js. */
+export const MATERIAL_CLASSES = {
+  physical: { label: "Physical", ctor: "MeshPhysicalNodeMaterial" },
+  standard: { label: "Standard", ctor: "MeshStandardNodeMaterial" },
+  basic: { label: "Basic", ctor: "MeshBasicNodeMaterial" },
+  lambert: { label: "Lambert", ctor: "MeshLambertNodeMaterial" },
+  phong: { label: "Phong", ctor: "MeshPhongNodeMaterial" },
+  toon: { label: "Toon", ctor: "MeshToonNodeMaterial" },
+  matcap: { label: "Matcap", ctor: "MeshMatcapNodeMaterial" },
+  normal: { label: "Normal", ctor: "MeshNormalNodeMaterial" },
+  sprite: { label: "Sprite", ctor: "SpriteNodeMaterial" },
+  points: { label: "Points", ctor: "PointsNodeMaterial" },
+  volume: { label: "Volume", ctor: "VolumeNodeMaterial" },
+};
 
-/** Build a surface bundle from a shader node's resolved inputs. `def.surfaceSlots`
- *  maps input keys → material `*Node` names; only non-null inputs are emitted
- *  (so wire-only channels like clearcoat/transmission stay unset unless the
- *  user wires them — three's `useClearcoat`/`useTransmission`/… getters turn
- *  the expensive lighting path ON the instant their node is non-null, even at
- *  0, so leaving them null is what keeps a plain material cheap). `def.emitterBase`
- *  forces a black, rough, non-metal base (Emission). `def.emissive` combines a
- *  color × strength input pair into `emissiveNode`. */
-function buildSurface(def, ins) {
-  const m = {};
-  if (def.emitterBase) {
-    m.colorNode = TSL.vec3(0);
-    m.roughnessNode = TSL.float(1);
-    m.metalnessNode = TSL.float(0);
-  }
-  for (const [inKey, slot] of Object.entries(def.surfaceSlots ?? {})) {
-    if (ins[inKey] != null) m[slot] = ins[inKey];
-  }
-  if (def.emissive) {
-    const c = ins[def.emissive.color];
-    const s = ins[def.emissive.strength];
-    if (c != null) m.emissiveNode = s != null ? TSL.mul(c, s) : c;
-  }
-  return { __surface: m };
+export const DEFAULT_MATERIAL_CLASS = "physical";
+
+/** The material class a graph asks for, from either graph shape.
+ *
+ *  Pre-`material` graphs selected the class by WIRING — anything in the Output
+ *  Volume socket meant a VolumeNodeMaterial — so that is read here as well.
+ *  Answering identically before and after `migrateGraph` is what lets the
+ *  asset layer decide the class without first having to migrate. */
+export function materialClassOf(graph) {
+  const output = graph?.nodes?.find((n) => n.type === "output");
+  if (!output) return DEFAULT_MATERIAL_CLASS;
+  const key = output.props?.material;
+  if (key && MATERIAL_CLASSES[key]) return key;
+  const volumeWired = (graph.edges ?? []).some(
+    (e) => e.target === output.id && e.targetHandle === "volume",
+  );
+  return volumeWired ? "volume" : DEFAULT_MATERIAL_CLASS;
 }
+
+// Which classes read which slot. Taken from three's own class hierarchy:
+// NodeMaterial declares the base slots, MeshStandardNodeMaterial adds
+// emissive/roughness/metalness, MeshPhysicalNodeMaterial adds the rest.
+const MESH = ["physical", "standard", "basic", "lambert", "phong", "toon", "matcap", "normal"];
+const EVERY = [...MESH, "sprite", "points"];
+const STD = ["physical", "standard"];
+const PHYS = ["physical"];
+
+/** One Material Output socket.
+ *
+ *  ⚠ A `null` default means WIRE-ONLY, and that is load-bearing, not tidiness:
+ *  three's `useClearcoat` / `useTransmission` / `useIridescence` / `useSheen` /
+ *  `useAnisotropy` getters switch their expensive lighting path ON the instant
+ *  the node is non-null — *even when it evaluates to 0* — so a channel nobody
+ *  wired must stay null or every material in the scene pays for it. Only the
+ *  channels a plain PBR surface already pays for carry an inline default. */
+const s = (key, slot, type, sect, def = null, on = EVERY) => ({ key, slot, type, sect, default: def, on });
+
+export const OUTPUT_SLOT_SPECS = [
+  // --- Surface ---
+  s("color", "colorNode", "color", "Surface", "#ffffff"),
+  s("opacity", "opacityNode", "float", "Surface", 1),
+  s("emissive", "emissiveNode", "color", "Surface", "#000000", MESH),
+  s("alphaTest", "alphaTestNode", "float", "Surface"),
+
+  // --- PBR ---
+  s("roughness", "roughnessNode", "float", "PBR", 0.5, STD),
+  s("metalness", "metalnessNode", "float", "PBR", 0, STD),
+  s("ao", "aoNode", "float", "PBR", 1, MESH),
+  s("ior", "iorNode", "float", "PBR", 1.5, PHYS),
+  s("specularIntensity", "specularIntensityNode", "float", "PBR", 0.5, PHYS),
+  s("specularColor", "specularColorNode", "color", "PBR", "#ffffff", PHYS),
+  s("anisotropy", "anisotropyNode", "vec2", "PBR", null, PHYS),
+
+  // --- Phong ---
+  s("shininess", "shininessNode", "float", "Phong", 30, ["phong"]),
+  s("specular", "specularNode", "color", "Phong", "#111111", ["phong"]),
+
+  // --- Clearcoat ---
+  s("clearcoat", "clearcoatNode", "float", "Clearcoat", null, PHYS),
+  s("clearcoatRoughness", "clearcoatRoughnessNode", "float", "Clearcoat", null, PHYS),
+  s("clearcoatNormal", "clearcoatNormalNode", "vec3", "Clearcoat", null, PHYS),
+
+  // --- Sheen ---
+  s("sheen", "sheenNode", "color", "Sheen", null, PHYS),
+  s("sheenRoughness", "sheenRoughnessNode", "float", "Sheen", null, PHYS),
+
+  // --- Iridescence ---
+  s("iridescence", "iridescenceNode", "float", "Iridescence", null, PHYS),
+  s("iridescenceIOR", "iridescenceIORNode", "float", "Iridescence", null, PHYS),
+  s("iridescenceThickness", "iridescenceThicknessNode", "float", "Iridescence", null, PHYS),
+
+  // --- Transmission ---
+  s("transmission", "transmissionNode", "float", "Transmission", null, PHYS),
+  s("thickness", "thicknessNode", "float", "Transmission", null, PHYS),
+  s("attenuationDistance", "attenuationDistanceNode", "float", "Transmission", null, PHYS),
+  s("attenuationColor", "attenuationColorNode", "color", "Transmission", null, PHYS),
+  s("dispersion", "dispersionNode", "float", "Transmission", null, PHYS),
+
+  // --- Geometry ---
+  // `position` is three's `positionNode` — the vertex position itself, which
+  // is what displacement is in TSL (offset `positionLocal` and wire it here).
+  s("normal", "normalNode", "vec3", "Geometry", null, MESH),
+  s("position", "positionNode", "vec3", "Geometry"),
+
+  // --- Sprite / Points ---
+  s("rotation", "rotationNode", "float", "Sprite", null, ["sprite"]),
+  s("scale", "scaleNode", "vec2", "Sprite", null, ["sprite"]),
+  s("size", "sizeNode", "float", "Points", null, ["points"]),
+
+  // --- Advanced ---
+  // `mask` discards the fragment, `backdrop*` composites behind the lit
+  // colour, `env` replaces the environment lookup. All wire-only: each one
+  // changes how the whole surface resolves, never a channel of it.
+  s("env", "envNode", "color", "Advanced", null, MESH),
+  s("backdrop", "backdropNode", "color", "Advanced", null, MESH),
+  s("backdropAlpha", "backdropAlphaNode", "float", "Advanced", null, MESH),
+  s("mask", "maskNode", "float", "Advanced"),
+
+  // --- Volume ---
+  // Not a `*Node` slot: the Volume nodes compile to a raymarch bundle the
+  // material-asset layer feeds to VolumeNodeMaterial's lighting model.
+  { key: "volume", slot: null, type: "volume", sect: "Volume", default: null, on: ["volume"] },
+];
+
+/** The sockets one material class exposes, in table order. */
+export function outputSlotsFor(materialClass = DEFAULT_MATERIAL_CLASS) {
+  const cls = MATERIAL_CLASSES[materialClass] ? materialClass : DEFAULT_MATERIAL_CLASS;
+  return OUTPUT_SLOT_SPECS.filter((spec) => spec.on.includes(cls));
+}
+
+/** Every material `*Node` slot a compiled graph may populate. Callers reset
+ *  these to null before applying a fresh compile so a slot the user just
+ *  unwired never leaks across the edit. */
+export const MATERIAL_NODE_SLOTS = OUTPUT_SLOT_SPECS.map((spec) => spec.slot).filter(Boolean);
 
 const VOLUME_STEPS_DEFAULT = 32;
 
@@ -452,65 +538,25 @@ export const NODE_TYPES = {
     },
   },
 
-  // --- shaders (surface) ---
-  // Blender-style: these are the nodes you wire into Material Output's
-  // `Surface` socket. They carry the per-channel inputs (Color, Roughness, …)
-  // and compile to a surface bundle (see `buildSurface`). The "cheap" channels
-  // have inline-editable defaults; the expensive ones (normal, anisotropy,
-  // clearcoat*, sheen*, transmission, thickness) are wire-only so they don't
-  // switch on their lighting path unless the user explicitly connects them.
-  principledBsdf: {
-    label: "Principled BSDF",
-    cat: "shader",
-    out: "surface",
-    inputs: [
-      i("color", "color", "#ffffff"),
-      i("roughness", "float", 0.5),
-      i("metalness", "float", 0),
-      i("ior", "float", 1.5),
-      i("specularIntensity", "float", 0.5),
-      i("specularColor", "color", "#ffffff"),
-      i("emissive", "color", "#000000"),
-      i("emissiveStrength", "float", 1),
-      i("opacity", "float", 1),
-      i("ao", "float", 1),
-      i("normal", "vec3"),
-      i("anisotropy", "float"),
-      i("clearcoat", "float"),
-      i("clearcoatRoughness", "float"),
-      i("sheen", "color"),
-      i("sheenRoughness", "float"),
-      i("transmission", "float"),
-      i("thickness", "float"),
-    ],
-    surfaceSlots: {
-      color: "colorNode", roughness: "roughnessNode", metalness: "metalnessNode",
-      ior: "iorNode", specularIntensity: "specularIntensityNode", specularColor: "specularColorNode",
-      opacity: "opacityNode", ao: "aoNode", normal: "normalNode", anisotropy: "anisotropyNode",
-      clearcoat: "clearcoatNode", clearcoatRoughness: "clearcoatRoughnessNode",
-      sheen: "sheenNode", sheenRoughness: "sheenRoughnessNode",
-      transmission: "transmissionNode", thickness: "thicknessNode",
-    },
-    emissive: { color: "emissive", strength: "emissiveStrength" },
-    build: ({ def, ins }) => buildSurface(def, ins),
-  },
-  emission: {
-    label: "Emission",
-    cat: "shader",
-    out: "surface",
-    inputs: [
-      i("color", "color", "#ffffff"),
-      i("strength", "float", 1),
-    ],
-    emitterBase: true,
-    emissive: { color: "color", strength: "strength" },
-    build: ({ def, ins }) => buildSurface(def, ins),
-  },
-
   // --- output ---
+  // The material itself. `material` picks the three.js node-material class and
+  // the socket list follows from it (`outputSlotsFor`) — a Physical output
+  // shows clearcoat/sheen/iridescence/transmission, a Points output shows
+  // Size, a Volume output shows only the Volume bundle pin.
+  //
+  // The registry keeps the FULL socket union in `inputs` so a wire is never
+  // dropped by a class the user is only passing through; the panel and the
+  // compiler both narrow it with `outputSlotsFor(materialClassOf(graph))`.
   output: {
     label: "Material Output", cat: "output",
-    inputs: OUTPUT_SLOTS.map((s) => i(s.key, s.type)),
+    params: [{
+      key: "material",
+      label: "Material",
+      type: "select",
+      default: DEFAULT_MATERIAL_CLASS,
+      options: Object.entries(MATERIAL_CLASSES).map(([value, c]) => ({ value, label: c.label })),
+    }],
+    inputs: OUTPUT_SLOT_SPECS.map((spec) => i(spec.key, spec.type, spec.default, null, { sect: spec.sect })),
     outputs: [],
   },
 };
@@ -518,7 +564,7 @@ export const NODE_TYPES = {
 export const CATEGORY_LABELS = {
   value: "Values", attribute: "Attributes", osc: "Time & Oscillators", math: "Math",
   vector: "Vector", noise: "Noise", texture: "Texture", color: "Color", utility: "Utility",
-  shader: "Shaders", volume: "Volume", advanced: "Advanced", output: "Output",
+  volume: "Volume", advanced: "Advanced", output: "Output",
 };
 
 export function nodeDefaults(type) {
@@ -617,14 +663,16 @@ export function matchStockPbr(graph) {
   // `color` + `multiply` are here for THE BASE-COLOUR FACTOR — see the branch
   // in the edge loop below for why admitting them matters far more than it
   // looks, and why it is exact rather than an approximation.
-  const counts = { texture: 0, normalMap: 0, principledBsdf: 0, output: 0, color: 0, multiply: 0 };
+  const counts = { texture: 0, normalMap: 0, output: 0, color: 0, multiply: 0 };
   for (const n of nodes) {
     if (!(n.type in counts)) return null;
     counts[n.type]++;
   }
-  if (counts.principledBsdf !== 1 || counts.output !== 1 || counts.normalMap > 1) return null;
+  if (counts.output !== 1 || counts.normalMap > 1) return null;
   if (counts.multiply > 1 || counts.color > 1) return null;
-  const bsdf = nodes.find((n) => n.type === "principledBsdf");
+  // Only a Physical output is a stock PBR material. Every other class has its
+  // own property set and would need its own expression.
+  if (materialClassOf(graph) !== DEFAULT_MATERIAL_CLASS) return null;
   const output = nodes.find((n) => n.type === "output");
   const nm = nodes.find((n) => n.type === "normalMap") ?? null;
   const mul = nodes.find((n) => n.type === "multiply") ?? null;
@@ -635,7 +683,6 @@ export function matchStockPbr(graph) {
   if ((mul === null) !== (colorConst === null)) return null;
 
   // Classify every edge; anything unrecognized disqualifies the graph.
-  let surfaceWired = false;
   let colorTex = null;
   let normalFeed = null; // texture node feeding the normalMap node
   let normalWired = false;
@@ -644,17 +691,12 @@ export function matchStockPbr(graph) {
   let alphaTex = null; // texture node whose .a feeds opacity
   let mulTex = null; // colour texture feeding the multiply
   let mulColorWired = false; // the constant colour feeding the multiply
-  let mulToColor = false; // multiply -> bsdf.color
+  let mulToColor = false; // multiply -> output.color
   const texUses = new Map(); // texture node -> use count
   for (const e of edges) {
     const src = byId.get(e.source);
     const dst = byId.get(e.target);
     if (!src || !dst) return null;
-    if (src === bsdf && dst === output && e.targetHandle === "surface") {
-      if (surfaceWired) return null;
-      surfaceWired = true;
-      continue;
-    }
     // The canonical glTF ORM/ARM packing — one texture whose green channel is
     // roughness and whose blue channel is metalness. This is not an
     // approximation of the graph, it is the SAME arithmetic: three composes
@@ -669,7 +711,7 @@ export function matchStockPbr(graph) {
     // wired `ao` through it would move the lookup, not just re-spell it.
     if (
       src.type === "texture" &&
-      dst === bsdf &&
+      dst === output &&
       ((e.sourceHandle === "g" && e.targetHandle === "roughness") ||
         (e.sourceHandle === "b" && e.targetHandle === "metalness"))
     ) {
@@ -692,13 +734,13 @@ export function matchStockPbr(graph) {
     // texture's alpha has no stock slot — three's `alphaMap` reads `.g`, not
     // `.a` — so routing one through `map` would sample a different channel of
     // a different image.
-    if (src.type === "texture" && e.sourceHandle === "a" && dst === bsdf && e.targetHandle === "opacity") {
+    if (src.type === "texture" && e.sourceHandle === "a" && dst === output && e.targetHandle === "opacity") {
       if (alphaTex) return null;
       alphaTex = src;
       texUses.set(src, (texUses.get(src) ?? 0) + 1);
       continue;
     }
-    if (src.type === "texture" && e.sourceHandle === "out" && dst === bsdf && e.targetHandle === "color") {
+    if (src.type === "texture" && e.sourceHandle === "out" && dst === output && e.targetHandle === "color") {
       if (colorTex || mulToColor) return null;
       colorTex = src;
       texUses.set(src, (texUses.get(src) ?? 0) + 1);
@@ -710,7 +752,7 @@ export function matchStockPbr(graph) {
       texUses.set(src, (texUses.get(src) ?? 0) + 1);
       continue;
     }
-    if (src === nm && dst === bsdf && e.targetHandle === "normal") {
+    if (src === nm && dst === output && e.targetHandle === "normal") {
       if (normalWired) return null;
       normalWired = true;
       continue;
@@ -720,7 +762,7 @@ export function matchStockPbr(graph) {
     // Exact, not an approximation, and by the same argument the ORM branch
     // above makes: three composes `diffuseColor = material.color * texture(map)`
     // (a vec4 multiply), which is precisely what `tex.out -> multiply` and
-    // `color.out -> multiply -> bsdf.color` emit here. The stock path just
+    // `color.out -> multiply -> output.color` emit here. The stock path just
     // spells it with `material.color` instead of a uniform node.
     //
     // ⭐⭐ WHY THIS TINY GAP MATTERED SO MUCH. Every glTF import writes this
@@ -746,7 +788,7 @@ export function matchStockPbr(graph) {
     //
     // ⚠ Kept as narrow as the ORM branch: ONE multiply, ONE constant colour,
     // the multiply's two operands being exactly that texture and that constant,
-    // and its output going only to `bsdf.color`. Anything else falls through to
+    // and its output going only to `output.color`. Anything else falls through to
     // the compile path, where it still renders correctly — just not stock.
     if (mul && dst === mul && (e.targetHandle === "a" || e.targetHandle === "b")) {
       if (src.type === "texture" && e.sourceHandle === "out") {
@@ -762,7 +804,7 @@ export function matchStockPbr(graph) {
       }
       return null;
     }
-    if (mul && src === mul && dst === bsdf && e.targetHandle === "color") {
+    if (mul && src === mul && dst === output && e.targetHandle === "color") {
       // A direct `texture -> color` wire and this chain are two spellings of
       // the same slot; both would mean two sources for one input.
       if (mulToColor || colorTex) return null;
@@ -774,11 +816,10 @@ export function matchStockPbr(graph) {
   // Half a chain is not expressible: the multiply must have BOTH operands and
   // must be what feeds the colour, or the constant has nowhere to go.
   if (mul && !(mulTex && mulColorWired && mulToColor)) return null;
-  if (!surfaceWired) return null;
   // A normalMap node must be a complete texture → normal chain, every texture
   // must be consumed by at least one recognized role, and none may have a
   // wired UV (an edge INTO a texture was already rejected above — every
-  // allowed edge targets bsdf, nm, or output).
+  // allowed edge targets nm or the output).
   //
   // "At least one" rather than "exactly one": an ORM map legitimately feeds
   // both roughness and metalness, and every edge reaching this point has
@@ -787,7 +828,7 @@ export function matchStockPbr(graph) {
   // See the opacity branch: only the COLOUR texture's alpha is expressible,
   // because the stock path gets it through `map` and nothing else. With the
   // factor chain the colour texture is the multiply's operand — same texture,
-  // one node further from the bsdf, and it still lands in `map` below.
+  // one node further from the output, and it still lands in `map` below.
   const baseTex = colorTex ?? mulTex;
   if (alphaTex && alphaTex !== baseTex) return null;
   for (const n of nodes) {
@@ -798,24 +839,31 @@ export function matchStockPbr(graph) {
 
   // Constants: props ?? registry default, straight from the same specs the
   // compiler reads, so the two paths can never drift on a default.
-  const specs = NODE_TYPES.principledBsdf.inputs;
+  const specs = outputSlotsFor(DEFAULT_MATERIAL_CLASS);
   const valueOf = (key) => {
     const spec = specs.find((s) => s.key === key);
-    return bsdf.props?.[key] ?? spec?.default ?? null;
+    return output.props?.[key] ?? spec?.default ?? null;
   };
   // Wire-only channels (default null): a stored prop value would compile to a
-  // live uniform on the graph path, which stock props cannot express.
+  // live uniform on the graph path, which stock props cannot express. The
+  // direct-slot Output widened this set a long way past the handful the BSDF
+  // carried — clearcoat, sheen, iridescence, transmission, dispersion,
+  // backdrop, mask and the rest of the Physical table all land here.
   for (const spec of specs) {
     if (spec.default !== null) continue;
     if (spec.key === "normal") continue; // handled structurally above
-    if (bsdf.props?.[spec.key] != null) return null;
+    if (output.props?.[spec.key] != null) return null;
   }
   const opacity = valueOf("opacity");
   const ao = valueOf("ao");
   if (opacity !== 1 || ao !== 1) return null;
+  // Emission is a single slot now: the old strength multiply survives
+  // migration as an explicit Multiply node, which this matcher already refuses
+  // to classify on any channel but colour. Anything but black stays on the
+  // compile path, because the GI module guards area-light wash through
+  // `emissiveNode` and `material.emissiveMap` would bypass that guard.
   const emissive = new THREE.Color(valueOf("emissive") ?? "#000000");
-  const emissiveStrength = valueOf("emissiveStrength") ?? 1;
-  if ((emissive.r > 0 || emissive.g > 0 || emissive.b > 0) && emissiveStrength !== 0) return null;
+  if (emissive.r > 0 || emissive.g > 0 || emissive.b > 0) return null;
 
   return {
     // A DIRECT wired color input is the texture ALONE on the graph path (no
@@ -883,8 +931,8 @@ async function compileShaderGraphInner(graph, { taps, uvNode = null } = {}) {
 
   // Known up-front so position sources can resolve to the raymarch sample while
   // building the volume subtree (see `builtin`).
-  const outputId = graph.nodes.find((n) => n.type === "output")?.id;
-  const isVolume = outputId != null && edges.some((e) => e.target === outputId && e.targetHandle === "volume");
+  const materialClass = materialClassOf(graph);
+  const isVolume = materialClass === "volume";
 
   const source = (name) => (name === "uv" && uvNode ? uvNode : builtin(name, isVolume));
 
@@ -931,20 +979,22 @@ async function compileShaderGraphInner(graph, { taps, uvNode = null } = {}) {
   const mutations = {};
   const outputNode = graph.nodes.find((n) => n.type === "output");
   if (outputNode) {
-    for (const slot of OUTPUT_SLOTS) {
-      const edge = edges.find((e) => e.target === outputNode.id && e.targetHandle === slot.key);
-      if (!edge) continue;
-      const node = build(edge.source, edge.sourceHandle);
+    // Only the sockets this material class actually reads: wires left over
+    // from another class stay in the saved graph (so switching back restores
+    // them) but must not reach a material that would ignore — or worse,
+    // misread — the slot.
+    for (const spec of outputSlotsFor(materialClass)) {
+      // Same resolution as any other node input: the wire if there is one,
+      // else the inline value as a live uniform the editor can patch without
+      // a rebuild, else nothing at all (wire-only channels stay null).
+      const node = inputNode(outputNode, spec);
       if (node == null) continue;
-      if (slot.key === "surface") {
-        if (node.__surface) Object.assign(mutations, node.__surface);
-        else mutations.colorNode = node;
-      } else if (slot.key === "volume") {
+      if (spec.key === "volume") {
         // Volume bundle → consumed by the material-asset layer to drive a
         // VolumeNodeMaterial (scatteringNode / scatteringEmissiveNode / steps).
         if (node.__volume) mutations.__volume = node.__volume;
       } else {
-        mutations[slot.slot] = node;
+        mutations[spec.slot] = node;
       }
     }
   }
@@ -952,27 +1002,183 @@ async function compileShaderGraphInner(graph, { taps, uvNode = null } = {}) {
   const tapNodes = {};
   if (taps) for (const id of taps) tapNodes[id] = build(id, null);
 
-  // `isVolume` (computed up-front) — the Output's Volume socket being wired
-  // selects the volume material class.
-  return { mutations, uniforms, taps: tapNodes, isVolume };
+  return { mutations, uniforms, taps: tapNodes, materialClass, isVolume: materialClass === "volume" };
 }
 
 // --- Migration ------------------------------------------------------------
-// The Output is Blender-style (Surface / Volume / Displacement) with first-class
-// shader nodes (Principled BSDF, Emission) feeding Surface, so modern graphs
-// compile directly with no rewrite.
-//
-// The one thing that does need rewriting: a Texture wired STRAIGHT into a
-// `normal` input. A normal map stores a tangent-space vector packed into 0..1
+
+/** The Blender-style shader nodes the graph used to require between the value
+ *  nodes and the Output. They are no longer authorable — the Output carries
+ *  every channel directly — but every .mat on disk still names them, so their
+ *  shape has to survive here to be rewritten on load.
+ *
+ *  `slots` maps a BSDF input key to the Output socket key it becomes. Both
+ *  were already named after the material slot, so the map is nearly identity;
+ *  it exists so a rename on either side stays a one-line change. */
+const LEGACY_SHADERS = {
+  principledBsdf: {
+    slots: {
+      color: "color", roughness: "roughness", metalness: "metalness", ior: "ior",
+      specularIntensity: "specularIntensity", specularColor: "specularColor",
+      opacity: "opacity", ao: "ao", normal: "normal", anisotropy: "anisotropy",
+      clearcoat: "clearcoat", clearcoatRoughness: "clearcoatRoughness",
+      sheen: "sheen", sheenRoughness: "sheenRoughness",
+      transmission: "transmission", thickness: "thickness",
+    },
+    emissive: { color: "emissive", strength: "emissiveStrength", colorDefault: "#000000" },
+  },
+  emission: {
+    // An Emission shader was a black, fully-rough, non-metal base whose only
+    // light is its own — spelled out here as the constants it always meant.
+    slots: {},
+    base: { color: "#000000", roughness: 1, metalness: 0 },
+    emissive: { color: "color", strength: "strength", colorDefault: "#ffffff" },
+  },
+};
+
+/**
+ * Rewrite a legacy `<shader> -> Output.surface` graph into direct Output wires.
+ *
+ * Every BSDF input becomes the Output socket of the same name: a wired input
+ * moves its edge, an inline value moves to `output.props`. The one input with
+ * no slot of its own is `emissiveStrength` — three applies `emissiveIntensity`
+ * to `material.emissive` but NOT to `emissiveNode` (NodeMaterial assigns the
+ * node straight through), so a strength other than 1 has to stay in the graph
+ * as an explicit Multiply or the emission would silently change brightness.
+ */
+function migrateSurfaceShaders(graph) {
+  const nodes = graph.nodes ?? [];
+  const edges = graph.edges ?? [];
+  const output = nodes.find((n) => n.type === "output");
+  if (!output) return graph;
+  // Only a shader wired into the (now retired) `surface` socket is legacy.
+  const surfaceEdge = edges.find((e) => e.target === output.id && e.targetHandle === "surface");
+  const shader = surfaceEdge && nodes.find((n) => n.id === surfaceEdge.source);
+  const legacy = shader && LEGACY_SHADERS[shader.type];
+  if (!legacy) return graph;
+
+  const outNodes = nodes.filter((n) => n !== shader);
+  const outEdges = [];
+  const props = { ...output.props, ...(legacy.base ?? {}) };
+  const usedIds = new Set(nodes.map((n) => n.id));
+  const freshId = (base) => {
+    let id = base;
+    while (usedIds.has(id)) id = id + "_";
+    usedIds.add(id);
+    return id;
+  };
+
+  // Inline values first: a wired input overrides nothing here, and an unwired
+  // one keeps the number the user set on the BSDF.
+  for (const [inKey, slotKey] of Object.entries(legacy.slots)) {
+    const v = shader.props?.[inKey];
+    if (v != null) props[slotKey] = v;
+  }
+
+  for (const e of edges) {
+    if (e === surfaceEdge) continue;
+    if (e.target !== shader.id) {
+      outEdges.push(e);
+      continue;
+    }
+    const slotKey = legacy.slots[e.targetHandle];
+    // An edge into a channel with no slot of its own (the emissive pair, handled
+    // below) is left out here rather than mis-wired.
+    if (slotKey) outEdges.push({ ...e, target: output.id, targetHandle: slotKey });
+  }
+
+  // --- emissive x strength ---
+  const { color: cKey, strength: sKey, colorDefault } = legacy.emissive;
+  const colorEdge = edges.find((e) => e.target === shader.id && e.targetHandle === cKey);
+  const strengthEdge = edges.find((e) => e.target === shader.id && e.targetHandle === sKey);
+  const colorValue = shader.props?.[cKey] ?? colorDefault;
+  const strengthValue = shader.props?.[sKey] ?? 1;
+
+  // With both halves constant the multiply can be done here, exactly, as long
+  // as the product still fits in a colour — which covers every dimming, and
+  // covers a BLACK emissive at any strength at all. That case is not obscure:
+  // glTF writes `emissiveStrength` on materials that emit nothing, and a graph
+  // carrying a Multiply node is one three's stock-PBR matcher cannot express,
+  // so folding here is what keeps those materials on the shared-program path.
+  const folded = !colorEdge && !strengthEdge ? scaleHex(colorValue, strengthValue) : null;
+
+  if (folded != null) {
+    props.emissive = folded;
+  } else if (!strengthEdge && strengthValue === 1) {
+    // Strength is exactly 1: the emissive colour passes through untouched.
+    if (colorEdge) outEdges.push({ ...colorEdge, target: output.id, targetHandle: "emissive" });
+    else props.emissive = colorValue;
+  } else {
+    const x = shader.position?.x ?? 0;
+    const y = shader.position?.y ?? 0;
+    const mulId = freshId(shader.id + "_emissiveStrength");
+    outNodes.push({ id: mulId, type: "multiply", props: {}, position: { x: x + 120, y: y + 40 } });
+    if (colorEdge) {
+      outEdges.push({ ...colorEdge, target: mulId, targetHandle: "a" });
+    } else {
+      const colorId = freshId(shader.id + "_emissive");
+      outNodes.push({ id: colorId, type: "color", props: { value: colorValue }, position: { x: x - 60, y } });
+      outEdges.push({ source: colorId, sourceHandle: "out", target: mulId, targetHandle: "a" });
+    }
+    if (strengthEdge) {
+      outEdges.push({ ...strengthEdge, target: mulId, targetHandle: "b" });
+    } else {
+      const floatId = freshId(shader.id + "_emissiveStrengthValue");
+      outNodes.push({ id: floatId, type: "float", props: { value: strengthValue }, position: { x: x - 60, y: y + 90 } });
+      outEdges.push({ source: floatId, sourceHandle: "out", target: mulId, targetHandle: "b" });
+    }
+    outEdges.push({ source: mulId, sourceHandle: "out", target: output.id, targetHandle: "emissive" });
+    // The Output's own inline emissive must not linger: the wire wins in the
+    // compiler, but a stale prop would resurface the moment someone unplugs
+    // the multiply.
+    delete props.emissive;
+  }
+
+  return {
+    ...graph,
+    nodes: outNodes.map((n) => (n === output ? { ...output, props } : n)),
+    edges: outEdges,
+  };
+}
+
+/** `hex * scale` as a hex string, or null when the product would clip. Linear
+ *  in the stored (sRGB-hex) numbers on purpose: that is the same arithmetic
+ *  `emissiveNode = color.mul(strength)` performed on the uniform, so the folded
+ *  constant renders identically rather than merely closely. */
+function scaleHex(hex, scale) {
+  if (typeof hex !== "string" || typeof scale !== "number" || !Number.isFinite(scale) || scale < 0) return null;
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const out = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((c) => (c / 255) * scale);
+  if (out.some((c) => c > 1)) return null;
+  return `#${out.map((c) => Math.round(c * 255).toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** A Volume node wired into the Output used to BE the material-class switch;
+ *  the class is now an explicit `material` param. Carry the old wiring over. */
+function migrateVolumeClass(graph) {
+  const output = graph.nodes?.find((n) => n.type === "output");
+  if (!output || output.props?.material) return graph;
+  const wired = (graph.edges ?? []).some((e) => e.target === output.id && e.targetHandle === "volume");
+  if (!wired) return graph;
+  return {
+    ...graph,
+    nodes: graph.nodes.map((n) => (n === output ? { ...n, props: { ...n.props, material: "volume" } } : n)),
+  };
+}
+
+// A Texture wired STRAIGHT into a `normal` input is the other thing that needs
+// rewriting. A normal map stores a tangent-space vector packed into 0..1
 // texels — feeding those raw RGB values in as a normal vector produces normals
 // that all point roughly +Z-ish in the wrong space, so lighting collapses and
 // the surface goes dark. It has to pass through a Normal Map node, which
-// unpacks (texel·2−1) and applies the TBN transform.
+// unpacks (texel*2-1) and applies the TBN transform.
 //
 // Older importers emitted the direct wire; the generator now inserts the node
 // itself (see pbrMaterialGraph.js), but .mat files already on disk still carry
 // the broken edge and would never be regenerated. Repair them on load.
-export function migrateGraph(graph) {
+function migrateNormalMaps(graph) {
   if (!graph?.nodes?.length) return graph;
   const byId = new Map(graph.nodes.map((n) => [n.id, n]));
   const edges = graph.edges ?? [];
@@ -999,6 +1205,15 @@ export function migrateGraph(graph) {
     next.push({ source: id, sourceHandle: "out", target: edge.target, targetHandle: "normal" });
   }
   return { ...graph, nodes, edges: next };
+}
+
+/** Bring any graph the project has ever written up to the current shape.
+ *  Idempotent, and ordered: the normal-map repair rewires by target HANDLE, so
+ *  it must run while the handles are still whatever the file stored; the class
+ *  param has to be set before the shader rewrite folds the surface edge away. */
+export function migrateGraph(graph) {
+  if (!graph?.nodes?.length) return graph;
+  return migrateSurfaceShaders(migrateVolumeClass(migrateNormalMaps(graph)));
 }
 
 // --- Code generation --------------------------------------------------------
@@ -1081,48 +1296,30 @@ export function generateTslCode(graph) {
         : num(value);
   };
 
-  // Emit `material.<slot> = <expr>;` for every channel a Surface shader node
-  // drives (mirrors `buildSurface`).
-  const emitSurface = (src) => {
-    const sdef = NODE_TYPES[src.type];
-    if (sdef.emitterBase) {
-      assignments.push(`material.colorNode = ${use("vec3")}(0);`);
-      assignments.push(`material.roughnessNode = ${use("float")}(1);`);
-      assignments.push(`material.metalnessNode = ${use("float")}(0);`);
-    }
-    for (const [inKey, matSlot] of Object.entries(sdef.surfaceSlots ?? {})) {
-      const expr = inputExpr(src, inKey);
-      if (expr != null) assignments.push(`material.${matSlot} = ${expr};`);
-    }
-    if (sdef.emissive) {
-      const c = inputExpr(src, sdef.emissive.color);
-      const s = inputExpr(src, sdef.emissive.strength);
-      if (c != null) assignments.push(`material.emissiveNode = ${s != null ? `${use("mul")}(${c}, ${s})` : c};`);
-    }
-  };
-
   const assignments = [];
   const output = graph.nodes.find((n) => n.type === "output");
+  const materialClass = materialClassOf(graph);
   if (output) {
-    for (const slot of OUTPUT_SLOTS) {
-      const edge = edges.find((e) => e.target === output.id && e.targetHandle === slot.key);
-      if (!edge) continue;
-      const src = nodeById.get(edge.source);
-      const sdef = src && NODE_TYPES[src.type];
-      if (slot.key === "surface" && (sdef?.surfaceSlots || sdef?.emitterBase || sdef?.emissive)) {
-        emitSurface(src);
-      } else {
-        const matSlot = slot.key === "surface" ? "colorNode" : slot.slot;
-        assignments.push(`material.${matSlot} = ${emit(edge.source, edge.sourceHandle)};`);
+    for (const spec of outputSlotsFor(materialClass)) {
+      // A Volume output is a raymarch bundle, not an assignable slot — three
+      // wants two callbacks on VolumeNodeMaterial, which no expression here
+      // can spell. Say so rather than emit something that will not run.
+      if (spec.key === "volume") {
+        const wired = edges.find((e) => e.target === output.id && e.targetHandle === "volume");
+        if (wired) assignments.push("// Volume: see VolumeNodeMaterial.scatteringNode / scatteringEmissiveNode");
+        continue;
       }
+      const expr = inputExpr(output, spec.key);
+      if (expr != null) assignments.push(`material.${spec.slot} = ${expr};`);
     }
   }
   if (!assignments.length) return "// nothing wired to the Material Output";
 
+  const ctor = MATERIAL_CLASSES[materialClass].ctor;
   return [
     `import { ${[...imports].sort().join(", ")} } from 'three/tsl';`,
     "",
-    "// const material = new THREE.MeshPhysicalNodeMaterial();",
+    `// const material = new THREE.${ctor}();`,
     ...lines,
     "",
     ...assignments,

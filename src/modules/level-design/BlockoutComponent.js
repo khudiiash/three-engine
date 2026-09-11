@@ -47,6 +47,7 @@ export class BlockoutComponent extends Component {
   static type = "blockout";
   static label = "Blockout";
   static tags = ["level", "blockout", "3d", "world"];
+  static structuralProps = ["shape", "size", "openings", "steps", "open", "sides", "footprint", "holes"];
   static defaults = {
     shape: "wall",
     /**
@@ -58,6 +59,9 @@ export class BlockoutComponent extends Component {
     size: [4, 3, 0.2],
     /** Walls only: [{ offset, width, height, sill }] holes along the length. */
     openings: [],
+    role: "",
+    footprint: [],
+    holes: [],
     /** Stairs: step count. 0 = derive from the rise (~18 cm risers). */
     steps: 0,
     /** Stairs: open treads instead of a solid staircase. */
@@ -117,12 +121,13 @@ export class BlockoutComponent extends Component {
     }
     this.geometry?.dispose();
     this.geometry = null;
-    releaseBlockoutMaterial(this.greyboxMaterial);
+    this.releaseAppearance(this.greyboxMaterial);
     this.greyboxMaterial = null;
     this.mesh = null;
   }
 
   onPropChanged(key) {
+    if (key === "role") return;
     if (key === "color") {
       this.refreshMaterial();
       return;
@@ -195,23 +200,26 @@ export class BlockoutComponent extends Component {
       // The Mesh component's own async load will land on the same instance;
       // this is what makes the switch immediate rather than one frame late.
       this.mesh.material = (path && getMaterialInstance(path)) || getDefaultMaterial();
-      releaseBlockoutMaterial(this.greyboxMaterial);
+      this.releaseAppearance(this.greyboxMaterial);
       this.greyboxMaterial = null;
       return;
     }
     // Claim the material before assigning it. MeshComponent finishes its own
     // async material pass a microtask after attach and would otherwise reset
     // every piece to the default white — see its #applyMaterialSlots.
-    this.mesh.userData.materialOwner = "blockout";
-    const color = this.props.color || BLOCKOUT_COLORS[this.props.shape] || "#9aa7b8";
-    const next = acquireBlockoutMaterial(color);
+    this.mesh.userData.materialOwner = this.type;
+    const next = this.acquireAppearance(this.appearanceColor());
     const previous = this.greyboxMaterial;
     this.greyboxMaterial = next;
     this.mesh.material = next;
     // Released after acquiring the replacement: the two are usually the same
     // interned instance, and releasing first would dispose it at zero users.
-    if (previous && previous !== next) releaseBlockoutMaterial(previous);
+    if (previous) this.releaseAppearance(previous);
   }
+
+  appearanceColor() { return this.props.color || BLOCKOUT_COLORS[this.props.shape] || "#9aa7b8"; }
+  acquireAppearance(color) { return acquireBlockoutMaterial(color); }
+  releaseAppearance(material) { releaseBlockoutMaterial(material); }
 
   /* ---- Internals -------------------------------------------------------- */
 
@@ -220,6 +228,8 @@ export class BlockoutComponent extends Component {
   #previewing() {
     let node = this.entity;
     while (node) {
+      const architecture = node.getComponent?.("architecture");
+      if (architecture) return !!architecture.props.preview && !!this.entity.getComponent("mesh")?.props.material;
       const level = node.getComponent?.("level");
       if (level) return !!level.props.preview;
       node = node.parent;

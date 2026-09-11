@@ -174,6 +174,7 @@ import {
 } from "../texture/history.js";
 import { rasterizeTextStroke } from "../texture/text.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * The texture editor: paint, layers, selections, save.
  *
@@ -2902,7 +2903,7 @@ function ToolOptions(props) {
       )}
       {tool === "text" && (
         <>
-          <select
+          <Select
             className="select-field texture-font-select"
             value={props.textFont}
             title="Project fonts are registered under a generated family, so a texture looks the same on every machine"
@@ -2920,7 +2921,7 @@ function ToolOptions(props) {
                 ))}
               </optgroup>
             )}
-          </select>
+          </Select>
           <Slider Icon={Type} title="Font size" value={props.textSize} min={6} max={400} step={1} onChange={props.onTextSize} />
           <button
             className={`tx-icon-btn${props.textBold ? " active" : ""}`}

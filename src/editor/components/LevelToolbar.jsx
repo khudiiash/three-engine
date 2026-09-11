@@ -36,6 +36,7 @@ import {
 } from "../levelTool.js";
 import { addCollidersToLevel, ensureLevelAndFloor, physicsAvailable } from "../levelBuild.js";
 
+import { Select } from "../fields/Select.jsx";
 /**
  * The blockout tool palette, floating over the viewport.
  *
@@ -208,7 +209,7 @@ export function LevelToolbar() {
           they stay on the bar. Everything else lives behind the gear — a
           palette that covers a third of the viewport is worse than one extra
           click on the settings you touch once a session. */}
-      <select
+      <Select
         className="level-toolbar-select"
         value={GRID_STEPS.includes(settings.grid) ? settings.grid : "custom"}
         onChange={(e) => {
@@ -221,7 +222,7 @@ export function LevelToolbar() {
           <option key={step} value={step}>{`${step} m`}</option>
         ))}
         {!GRID_STEPS.includes(settings.grid) && <option value="custom">{`${settings.grid} m`}</option>}
-      </select>
+      </Select>
 
       <div className="level-toolbar-storey" title={`Drawing at ${elevation.toFixed(2)} m — U / J change storey`}>
         <button className="level-toolbar-step" title="Storey down (J)" onClick={() => stepElevation(-1)}>
