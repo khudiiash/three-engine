@@ -209,6 +209,9 @@ export function resolveMaterialSurface(materialInput, meshName = "", depth = 0) 
     const color = { r: 0, g: 0, b: 0 };
     const emissive = { r: 0, g: 0, b: 0 };
     let n = 0;
+    // One member still waiting on a texture mean makes the whole average
+    // provisional — see `pending` at the return below.
+    let pending = false;
     for (const member of members) {
       if (!member || member === material) continue;
       const m = resolveMaterialSurface(member, meshName, depth + 1);
@@ -217,6 +220,7 @@ export function resolveMaterialSurface(materialInput, meshName = "", depth = 0) 
       emissive.r += (m.emissive?.r ?? 0) * k;
       emissive.g += (m.emissive?.g ?? 0) * k;
       emissive.b += (m.emissive?.b ?? 0) * k;
+      pending ||= m.pending === true;
       n++;
     }
     if (n > 0) {
@@ -224,17 +228,34 @@ export function resolveMaterialSurface(materialInput, meshName = "", depth = 0) 
         color: { r: color.r / n, g: color.g / n, b: color.b / n },
         emissive: { r: emissive.r / n, g: emissive.g / n, b: emissive.b / n },
         emissiveIntensity: 1,
+        pending,
       };
     }
   }
   let color = constantColorOf(material?.colorNode) ?? material?.color ?? white;
   // A/B escape hatch, dev/harness only.
-  const mapAverage = globalThis.__giNoTextureTint
-    ? null
-    : textureAverageColor(material?.map ?? textureValueOf(material?.colorNode));
+  const colorTexture = globalThis.__giNoTextureTint ? null : (material?.map ?? textureValueOf(material?.colorNode));
+  const mapAverage = textureAverageColor(colorTexture);
   if (mapAverage) {
     color = { r: color.r * mapAverage.r, g: color.g * mapAverage.g, b: color.b * mapAverage.b };
   }
+  // ── "PENDING" IS A DIFFERENT ANSWER FROM "WHITE" ─────────────────────────
+  //
+  // A texture whose mean is not available yet — still decoding, or compressed
+  // and queued on the GPU averager — makes `textureAverageColor` return null,
+  // and this function then answers with the CONSTANT factor alone. For a
+  // Sponza curtain that is `#cacaca`: a near-white bounce from a scarlet
+  // banner.
+  //
+  // Every consumer is expected to ask again, and the static path does: the
+  // fingerprint scan revisits each material every pass and re-uploads the
+  // palette when the mean lands. The MOVER path did not. `dynamicObjects`'
+  // `writeSurface` early-outs on a stamp of `material.id:version:promoted`,
+  // none of which moves when a texture average arrives — so the first resolve
+  // won, and an adopted cloth, character or crate kept bouncing white for the
+  // life of the scene. Saying "pending" out loud is what lets that stamp
+  // refuse to settle (user, 2026-09-11: "it reflects white light ... not
+  // taking the color of the cloth").
   // ── BOUNCE CHROMA vs TWO KNOWN APPROXIMATION ERRORS ──────────────────────
   //
   // This ONE colour is the entire bounce answer for every ray that lands on
@@ -359,7 +380,24 @@ export function resolveMaterialSurface(materialInput, meshName = "", depth = 0) 
       );
     }
   }
-  return { color, emissive, emissiveIntensity };
+  // ── "PENDING" IS A DIFFERENT ANSWER FROM "WHITE" ─────────────────────────
+  //
+  // A texture whose mean is not available yet — still decoding, or compressed
+  // and queued on the GPU averager — makes `textureAverageColor` return null,
+  // and this function then answers with the CONSTANT factor alone. For a
+  // Sponza curtain that is `#cacaca`: a near-white bounce off a scarlet banner.
+  //
+  // Every consumer is expected to ask again, and the static path does — the
+  // fingerprint scan revisits each material every pass and re-uploads the
+  // palette when the mean lands. The MOVER path did not. `dynamicObjects`'
+  // `writeSurface` early-outs on a stamp of `material.id:version:promoted`,
+  // and none of those moves when a texture average arrives, so the first
+  // resolve won and an adopted cloth, character or crate kept bouncing white
+  // for the life of the scene. Saying "pending" out loud is what lets that
+  // stamp refuse to settle (user, 2026-09-11: "it reflects white light for
+  // some reason, not taking the color of the cloth").
+  const pending = (!!colorTexture && !mapAverage) || (!!emissiveTexture && !emissiveTexAvg);
+  return { color, emissive, emissiveIntensity, pending };
 }
 
 /**

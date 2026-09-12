@@ -65,6 +65,18 @@ export function releaseComputeNodes(renderer, nodes, harvest = null) {
   // GI rebuild on Bistro (measured 2026-08-17: heap 3223 → 4625 MB across one
   // quality change with only the first two caches cleared).
   const nodeCache = renderer._nodes;
+  // ── A RELEASED NODE MUST NEVER BE REPLAYED (2026-09-11) ─────────────────
+  // The async compute-pipeline wrapper (GISystem `installAsyncComputePipelines`)
+  // queues a node whose pipeline has not landed and dispatches it again when
+  // it does. The cloth arena releases its step kernels here every time it
+  // grows a generation, and a queued OLD kernel replayed after that bound the
+  // retired generation's attributes — "Binding size for [Buffer arena:posA]
+  // is zero", then an invalid bind group on every submit until the materials
+  // re-minted. The mark is set before the cache early-return below so a
+  // renderer without caches (a fixture) still retires the node.
+  for (const node of nodes) {
+    if (node && typeof node === "object") node.__giReleased = true;
+  }
   if (!bindings && !pipelines && !nodeCache) return 0;
   let released = 0;
   for (const node of nodes) {

@@ -214,7 +214,14 @@ export function createReflectionProbeCapture({
         // `.level(0)` is REQUIRED, not style: this is a compute kernel, and
         // implicit-derivative sampling is illegal there (same rule the BVH
         // atlas lookup in bvhScene.js follows).
-        out.assign(vec3(env.node.sample(equirectUV(rd)).level(0).xyz).mul(env.intensity).mul(intensity));
+        const raw = vec3(env.node.sample(equirectUV(rd)).level(0).xyz).toVar();
+        // §11.53b — same sun ceiling as giLight's mirror tap; a probe that
+        // sees the open sky must not book the sun disc the diffuse sky lost.
+        if (env.ceiling) {
+          const lum = raw.dot(vec3(0.2126, 0.7152, 0.0722));
+          raw.assign(raw.mul(float(1).min(float(env.ceiling).div(lum.max(1e-6)))));
+        }
+        out.assign(raw.mul(env.intensity).mul(intensity));
       }
     });
     // EMA against the probe's own history row (read here, WRITTEN by the

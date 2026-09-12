@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { getLoadedEnvironment, loadEnvironmentAsset } from "./environmentAsset.js";
 import { collectFreezableCasters } from "./shadowFreeze.js";
+import { applyOutputTransform } from "./outputTransform.js";
 
 /**
  * Per-scene environment/rendering settings, serialized inside the scene JSON
@@ -261,6 +262,79 @@ export function applyQualityCeiling(settings, quality) {
 }
 
 /**
+ * The quality preset a PORTABLE device (phone, tablet) is held to, whatever
+ * the build asked for. A build's preset is one global choice — the user's
+ * Sponza ships "high" (DPR 2, render scale 1) — and on a phone that is a
+ * 1704×786 canvas of MSAA 4× raster, a 2048² VSM shadow map with two blur
+ * passes and every screen-space pass at that size, on a GPU 6-8× slower than
+ * the laptop it was measured on (20 fps, 2026-09-11). "medium" (DPR 1.5,
+ * render scale 0.85, dynamic resolution on) is the same reduced tier the GI
+ * module already applies to its own work on these devices.
+ */
+export const MOBILE_QUALITY_CEILING = "medium";
+
+/**
+ * The largest shadow map a PORTABLE device renders, per axis — OFF (0).
+ * A 1024² cap was tried on 2026-09-11 (the user's iPhone read its 2048² sun
+ * map at 2.4 ms of a 45 ms frame) and rejected the same evening: "1k shadows
+ * look extremely awful" — PCF at a third of the texels reads as blocks on a
+ * phone screen held close. The authored size ships everywhere; the mechanism
+ * stays as an explicit A/B only: `__engineShadowMapCap = 1024` (0 = off).
+ */
+export const MOBILE_SHADOW_MAP_MAX = 0;
+
+/** `size` capped for a portable device; unchanged elsewhere. */
+export function capShadowMapSize(size, nav = globalThis.navigator, runtime = globalThis) {
+  const pin = Number(runtime?.__engineShadowMapCap);
+  const cap = Number.isFinite(pin) ? pin : (isPortableDevice(nav) ? MOBILE_SHADOW_MAP_MAX : 0);
+  // MOBILE_SHADOW_MAP_MAX is 0 today (see above): without a pin this is a no-op.
+  const n = Number(size) || 0;
+  return cap > 0 ? Math.min(n, cap) : n;
+}
+
+/**
+ * Whether this navigator is a phone or tablet — the same test the GI module
+ * uses for its device tier (`giConfig.js`'s `giDeviceTierCeiling`, kept
+ * import-free so its pure tests stay pure). `userAgentData.mobile` is the
+ * only non-heuristic answer; the UA regex covers the engines without it, and
+ * the touch-points clause catches iPadOS's desktop UA.
+ */
+export function isPortableDevice(nav = globalThis.navigator) {
+  if (!nav) return false;
+  const ua = String(nav.userAgent ?? "");
+  return nav.userAgentData?.mobile === true
+    || /Android|iPhone|iPod|Mobile|Windows Phone/i.test(ua)
+    || (/Macintosh/.test(ua) && (nav.maxTouchPoints ?? 0) > 1);
+}
+
+/**
+ * The preset the PLAYER should run under on this device: the build's own
+ * preset, lowered to `mobile` (Build settings → Mobile preset) on a portable
+ * device when one is set. A preset only ever lowers, so a "low" build stays
+ * low everywhere; an unknown or missing name is passed through untouched (an
+ * older editor's build still runs). `override` (e.g. `?quality=high` in a
+ * harness) wins outright.
+ *
+ * ⛔ NOT automatic (2026-09-11, same day it shipped automatic): applying
+ * "medium" to every phone silently made the user's iPhone build "pixelated
+ * as if pixel ratio was 1 or lower" — the preset forces dynamic resolution
+ * ON, and against the scene's 120 fps target the controller drove the
+ * canvas to its floor. A look change nobody asked for is a regression
+ * whatever it saves; the phone cap is an authored choice, off by default.
+ */
+export function deviceQualityCeiling(quality, nav = globalThis.navigator, override = null, mobile = null) {
+  if (typeof override === "string" && QUALITY_PRESETS[override]) return override;
+  const cap = typeof mobile === "string" && QUALITY_PRESETS[mobile] ? mobile : null;
+  if (!cap || !isPortableDevice(nav)) return quality ?? null;
+  const order = Object.keys(QUALITY_PRESETS);
+  const built = order.indexOf(quality);
+  const capIndex = order.indexOf(cap);
+  // An unknown preset (or none) on a phone gets the mobile preset.
+  if (built < 0) return cap;
+  return built <= capIndex ? quality : cap;
+}
+
+/**
  * Live quality knobs read by hot shader-update callbacks (e.g. the
  * volumetric lighting model's per-frame step-count uniform). A mutable
  * module-level object — NOT serialized — so shader `onRenderUpdate`
@@ -282,10 +356,26 @@ export const TONE_MAPPINGS = {
   neutral: THREE.NeutralToneMapping,
 };
 
+/**
+ * The shadow filter, for the whole scene. THE ONLY PLACE IT IS SET.
+ *
+ * It used to be settable here AND per light (`LightComponent.shadowMapType`),
+ * which is one control too many for a value that is not per-light: three reads
+ * `renderer.shadowMap.type` and **never** `light.shadow.type` (r185 — see the
+ * note in LightComponent.onPropChanged), so the per-light dropdown moved a
+ * field nothing sampled. Lights now read this setting; the retired prop is
+ * still honoured as a fallback so scenes authored against it keep their look.
+ *
+ * `PCSSShadowMap` is not one of three's renderer constants — it is a per-light
+ * `filterNode` (`PCSSShadowFilter`, directional lights only) that LightComponent
+ * installs when this names it. The renderer constant below it is what the rest
+ * of the pipeline falls back to.
+ */
 export const SHADOW_TYPES = {
   BasicShadowMap: THREE.BasicShadowMap,
   PCFShadowMap: THREE.PCFShadowMap,
   PCFSoftShadowMap: THREE.PCFSoftShadowMap,
+  PCSSShadowMap: THREE.PCFShadowMap,
   VSMShadowMap: THREE.VSMShadowMap,
 };
 
@@ -355,7 +445,9 @@ export function rendererConstructorOptions(settings) {
     // adapter lacks the "timestamp-query" feature (WebGPUBackend.js:294),
     // so this is safe to request unconditionally. Overhead is negligible
     // (two GPU timestamps + one tiny resolve buffer per pass).
-    trackTimestamp: true,
+    // `__engineTrackTimestamp = false` (dev) prices that claim on a build:
+    // ~40 passes a frame each carry two timestamp writes and a resolve.
+    trackTimestamp: globalThis.__engineTrackTimestamp !== false,
   };
 }
 
@@ -580,8 +672,12 @@ export function applySettingsToScene(settings, scene, ambientLight, renderer) {
   }
 
   if (renderer) {
-    renderer.toneMapping = TONE_MAPPINGS[settings.toneMapping] ?? THREE.NeutralToneMapping;
-    renderer.toneMappingExposure = settings.exposure ?? 1;
+    // Through outputTransform.js: on the inline path the renderer itself
+    // stays at "none" and the materials carry the transform (see that file).
+    applyOutputTransform(renderer, {
+      toneMapping: TONE_MAPPINGS[settings.toneMapping] ?? THREE.NeutralToneMapping,
+      exposure: settings.exposure ?? 1,
+    });
     // Shadows: master switch + per-renderer type/autoUpdate. The map type is
     // expensive (it reallocates internal target textures when changed), but
     // `setMapType` handles that without re-creating the renderer.

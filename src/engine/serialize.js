@@ -215,10 +215,18 @@ function sameProp(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-/** True when every prop the snapshot names already holds that value live. */
+/**
+ * True when every prop the snapshot names already holds that value live.
+ *
+ * Compared against the DESKTOP value (`getBaseProp`), not `props[key]`: a
+ * snapshot is `toJSON`'s base values, while `props` holds what a platform
+ * layer put there (componentVariants.js). Comparing the two directly read
+ * every phone-overridden key as "changed during play" and Stop un-applied
+ * the phone layout.
+ */
 function propsAlreadyMatch(existing, props) {
   for (const [key, value] of Object.entries(props ?? {})) {
-    if (!sameProp(existing.props[key], value)) return false;
+    if (!sameProp(existing.getBaseProp(key), value)) return false;
   }
   return true;
 }
@@ -246,9 +254,14 @@ function reconcileComponents(entity, wanted, resetStateful = true) {
       }
       continue;
     }
+    // Base values, restored as base values (see propsAlreadyMatch). Then the
+    // platform layers are re-applied: a script that wrote an overridden key
+    // during play changed the effective slot, which the base compare cannot
+    // see, and the idempotent re-apply is what puts the layer's value back.
     for (const [key, value] of Object.entries(props ?? {})) {
-      if (!sameProp(existing.props[key], value)) existing.setProp(key, value);
+      if (!sameProp(existing.getBaseProp(key), value)) existing.setBaseProp(key, value);
     }
+    if (existing.variants) existing.applyPlatformLayers(existing.platformLayers);
   }
 }
 

@@ -131,7 +131,27 @@ export const EditorApi = {
     types: () => sync("component.types"),
     add: (id, type, props = {}) => sync("component.add", { id, type, props }),
     remove: (id, type) => sync("component.remove", { id, type }),
-    setProp: (id, type, key, value) => sync("component.setProp", { id, type, key, value }),
+    /** `variant`: which per-platform config the write lands in — omit for the
+     *  desktop value, "mobile" / "portrait" / "landscape" for that set, or
+     *  "current" for the one the editor's platform preview is editing. */
+    setProp: (id, type, key, value, variant) =>
+      sync("component.setProp", variant ? { id, type, key, value, variant } : { id, type, key, value }),
+    /** The component's desktop values, its override sets, and what is applied. */
+    variants: (id, type) => sync("component.variants", { id, type }),
+    /** Add/replace one per-platform config (`props` = the keys that differ; `{}` = empty), or remove it with `null`. */
+    setVariant: (id, type, variant, props) => sync("component.setVariant", { id, type, variant, props }),
+    /** Drop one key from a per-platform config so it inherits again. */
+    clearVariantProp: (id, type, variant, key) => sync("component.clearVariantProp", { id, type, variant, key }),
+  },
+
+  // ---- platform preview -----------------------------------------------------
+
+  /** Which per-platform component configs the editor previews and edits:
+   *  "desktop" (the base), "mobile" (the shared phone set alone), "portrait"
+   *  or "landscape". See `Editor.components.setProp`'s `variant`. */
+  platform: {
+    get: () => callOp("platform.get"),
+    set: (target) => callOp("platform.set", { target }),
   },
 
   // ---- selection ------------------------------------------------------------

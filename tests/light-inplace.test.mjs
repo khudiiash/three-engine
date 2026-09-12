@@ -163,9 +163,17 @@ test("changing kind still replaces the light", () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* (d) map size disposes the map exactly once                                  */
+/* (d) map size resizes through three, and NEVER disposes in the prop setter    */
 
-test("a map size change keeps the light and disposes the shadow map exactly once", () => {
+// ⛔ THIS TEST USED TO ASSERT THE OPPOSITE (mapDisposes === 1) and that was the
+// bug: `shadow.map.dispose()` destroys the GPU texture synchronously from an
+// Inspector write, while the command buffer the renderer already submitted
+// still references it — `[Texture] used in submit while destroyed` on every
+// shadow-map-size edit. The dispose was never needed: three resizes the map
+// itself in `ShadowNode.renderShadow` (r185, ShadowNode.js:704) via
+// `shadowMap.setSize(...)`, and `RenderTarget.setSize` disposes only on a real
+// size change, inside the renderer between passes.
+test("a map size change keeps the light, resizes through three, and disposes nothing", () => {
   const engine = makeEngine();
   const { component } = makeLight(engine, { kind: "directional", castShadow: true });
   const light = component.light;
@@ -173,13 +181,19 @@ test("a map size change keeps the light and disposes the shadow map exactly once
   let lightDisposes = 0;
   light.shadow.map = { dispose: () => { mapDisposes++; } };
   light.dispose = () => { lightDisposes++; };
+  light.shadow.needsUpdate = false;
 
   component.setProp("shadowMapWidth", 1024);
   assert.equal(component.light, light);
   assert.equal(light.shadow.mapSize.width, 1024);
   assert.equal(light.shadow.mapSize.height, 2048);
-  assert.equal(mapDisposes, 1, "the map is disposed once so three reallocates it at the new size");
+  assert.equal(mapDisposes, 0, "the in-flight shadow texture is never destroyed from a prop write");
   assert.equal(lightDisposes, 0, "the light itself is never disposed for a size change");
+  assert.equal(
+    light.shadow.needsUpdate,
+    true,
+    "the shadow is asked to re-render so three picks up the new mapSize even when frozen",
+  );
 });
 
 /* -------------------------------------------------------------------------- */

@@ -182,6 +182,8 @@ function sceneHasDeformingCaster(scene) {
  * anything that carries its own `shadow.camera` (that is what a map is rendered
  * from) and rejects anything whose map a custom node owns.
  */
+import { shadowUpdateDue, shadowUpdateStride } from "./shadowUpdateStride.js";
+
 export function collectFreezableCasters(scene) {
   const casters = [];
   scene.traverse((object) => {
@@ -190,6 +192,9 @@ export function collectFreezableCasters(scene) {
     if (object.castShadow !== true) return;
     const shadow = object.shadow;
     if (!shadow?.camera) return;
+    // Clipmaps certify their own completed static/combined captures, including
+    // material and deformation changes that this whole-scene key cannot see.
+    if (shadow.clipmapCacheOwned === true) return;
     // Case 1: a custom node owns the render and never reads `autoUpdate`.
     // Freezing here would be a false receipt, not an optimisation. The CSM
     // parent light is excluded by exactly this — its cascades are found
@@ -288,6 +293,7 @@ export class ShadowFreezeSystem {
       this.reason = "a skinned or morphing mesh is present — no matrix this walk can read moves when its shadow should";
       this.managedLights = 0;
       this.#releaseAll();
+      this.#applyUpdateStride(scene);
       return;
     }
 
@@ -491,6 +497,44 @@ export class ShadowFreezeSystem {
    * very next frame. Raising `needsUpdate` as well would add nothing and can
    * throw — see the note in `update()`.
    */
+  /**
+   * A portable device re-renders its maps every Nth frame
+   * (shadowUpdateStride.js) when nothing here can freeze them — the
+   * deforming-caster case above, which is every scene with a character in
+   * it. Owns `autoUpdate` the same way the freeze does and hands it back the
+   * moment the stride returns to 1 (a pin change; a desktop never enters).
+   */
+  #applyUpdateStride(scene) {
+    const stride = shadowUpdateStride();
+    if (stride <= 1) {
+      if (this._strideLights?.size) {
+        for (const light of this._strideLights) if (light.shadow) light.shadow.autoUpdate = true;
+        this._strideLights.clear();
+      }
+      this.updateStride = 1;
+      return;
+    }
+    const frame = this.engine.renderer?.info?.frame ?? (this._strideFrame = (this._strideFrame ?? 0) + 1);
+    const due = shadowUpdateDue(frame, stride);
+    const lights = collectFreezableCasters(scene);
+    this._strideLights ??= new Set();
+    for (const light of lights) {
+      const shadow = light.shadow;
+      if (!shadow || this._owned.has(light)) continue;
+      shadow.autoUpdate = false;
+      // Set on due frames, CLEARED on the others: three clears `needsUpdate`
+      // itself only when the depth texture's version survived the render
+      // (ShadowNode.updateBefore), and on the user's iPhone it did not — the
+      // flag stayed up, every frame rendered, and two lit render calls a
+      // frame rendered it twice (the ledger read `ShadowMap × 2.00` with the
+      // stride armed). The stride owns the flag now, both ways.
+      shadow.needsUpdate = due;
+      this._strideLights.add(light);
+    }
+    this.updateStride = stride;
+    this.updateStrideDue = due;
+  }
+
   #releaseAll(restoreAutoUpdate = true) {
     if (!this._owned.size) return;
     for (const light of this._owned) {
@@ -504,6 +548,10 @@ export class ShadowFreezeSystem {
   }
 
   dispose() {
+    if (this._strideLights?.size) {
+      for (const light of this._strideLights) if (light.shadow) light.shadow.autoUpdate = true;
+      this._strideLights.clear();
+    }
     this._deformOff?.();
     this._deformOff = null;
     this.#releaseAll();

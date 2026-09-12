@@ -26,6 +26,9 @@ import {
   AddComponentCommand,
   RemoveComponentCommand,
   SetComponentPropCommand,
+  SetComponentVariantCommand,
+  ClearComponentVariantPropCommand,
+  editLayerOf,
 } from "../../commands/componentCommands.js";
 import { SetTransformCommand } from "../../commands/transformCommands.js";
 import { getComponentClass, getComponentTypes } from "../../../engine/index.js";
@@ -55,9 +58,35 @@ export function describeEntity(entity) {
     transform: entity.getTransform(),
     components: [...entity.components.values()].map((component) => ({
       type: component.type,
+      // The EFFECTIVE values — what the viewport shows under the editor's
+      // platform preview. When a per-platform config is applied, `props`
+      // includes its overrides and `baseProps` carries the desktop values
+      // that would be saved; `platformLayers` names the applied cascade.
       props: { ...component.props },
+      ...(component.variants && component.platformLayers?.length
+        ? { baseProps: component.baseProps, platformLayers: [...component.platformLayers] }
+        : {}),
     })),
   };
+}
+
+const VARIANT_NAMES = ["mobile", "portrait", "landscape"];
+
+function mustGetComponent(id, type) {
+  const entity = mustGet(id);
+  const component = entity.components.get(type);
+  if (!component) throw new Error(`Entity "${entity.name}" has no "${type}" component`);
+  return { entity, component };
+}
+
+/** Which per-platform config a `variant` argument names; `null` = the base. */
+function resolveVariantArg(variant, component) {
+  if (variant === undefined || variant === null || variant === "desktop") return null;
+  if (variant === "current") return editLayerOf(component);
+  if (!VARIANT_NAMES.includes(variant)) {
+    throw new Error(`Unknown variant "${variant}". Use desktop, mobile, portrait, landscape, or current.`);
+  }
+  return variant;
 }
 
 defineOp({
@@ -350,7 +379,8 @@ defineOp({
   name: "component.setProp",
   undoable: true,
   description:
-    "Set one property on an entity's component. The key must be a property the type actually declares (component.types lists them) and, for a 'select' property, the value must be one of its options — both are refused rather than stored, because a props object accepts anything and a bad write would otherwise look like it succeeded.",
+    "Set one property on an entity's component. The key must be a property the type actually declares (component.types lists them) and, for a 'select' property, the value must be one of its options — both are refused rather than stored, because a props object accepts anything and a bad write would otherwise look like it succeeded. " +
+    "Every component can carry up to three PER-PLATFORM configs — partial override sets named 'mobile' (any phone or tablet), 'portrait' and 'landscape' (on top of mobile, by how the phone is held) — that the runtime cascades over the desktop values. `variant` says which set this write lands in: omit it (or 'desktop') for the desktop value, name a set to write it (creating it if needed), or 'current' for the set the editor's platform preview is editing (platform.get). Keys the set does not name inherit from below. See component.variants.",
   params: {
     id: { type: "string", required: true },
     type: { type: "string", required: true },
@@ -359,13 +389,79 @@ defineOp({
       description:
         "The value itself — a number, boolean, array or object as the property requires. NOT its JSON text: \"7.5\" and \"[1, 2, 3]\" are strings and are refused.",
     },
+    variant: {
+      type: "string",
+      enum: ["desktop", "mobile", "portrait", "landscape", "current"],
+      description: "Which per-platform config to write. Default 'desktop' — the base value.",
+    },
   },
-  run({ id, type, key, value }) {
-    const entity = mustGet(id);
-    const component = entity.components.get(type);
-    if (!component) throw new Error(`Entity "${entity.name}" has no "${type}" component`);
+  run({ id, type, key, value, variant }) {
+    const { entity, component } = mustGetComponent(id, type);
     const next = preparePropValue(type, key, value, component);
-    commandBus.execute(new SetComponentPropCommand(id, type, key, next));
+    const layer = resolveVariantArg(variant, component);
+    commandBus.execute(new SetComponentPropCommand(id, type, key, next, undefined, { layer: layer ?? "desktop" }));
+    return describeEntity(entity);
+  },
+});
+
+defineOp({
+  name: "component.variants",
+  readOnly: true,
+  description:
+    "Read a component's per-platform configs: the desktop values (`base`), each override set it carries (`variants.mobile` / `.portrait` / `.landscape`, partial — only the keys that differ), the layers the editor's preview currently applies, the set an unqualified edit lands in (`editLayer`, null = desktop), and the resulting effective values (`effective`, what the viewport shows).",
+  params: {
+    id: { type: "string", required: true },
+    type: { type: "string", required: true },
+  },
+  run({ id, type }) {
+    const { component } = mustGetComponent(id, type);
+    const { variants, ...base } = component.baseProps;
+    const { variants: _v, ...effective } = component.props;
+    return {
+      base,
+      variants: variants ?? {},
+      platformLayers: [...(component.platformLayers ?? [])],
+      editLayer: editLayerOf(component) ?? null,
+      effective,
+    };
+  },
+});
+
+defineOp({
+  name: "component.setVariant",
+  undoable: true,
+  description:
+    "Add, replace or remove one whole per-platform config on a component. `props` is the set's contents — only the keys that should differ from the desktop values ({} adds an empty set the next component.setProp with that `variant` fills in); null removes the set and the component falls back to the desktop values on that platform. Every key is validated like component.setProp.",
+  params: {
+    id: { type: "string", required: true },
+    type: { type: "string", required: true },
+    variant: { type: "string", required: true, enum: ["mobile", "portrait", "landscape"] },
+    props: { type: "object", description: "The override set, or omit/null to remove it." },
+  },
+  run({ id, type, variant, props }) {
+    const { entity, component } = mustGetComponent(id, type);
+    if (!VARIANT_NAMES.includes(variant)) throw new Error(`Unknown variant "${variant}". Use mobile, portrait or landscape.`);
+    const delta = props === null || props === undefined ? null : preparePropsObject(type, props, component);
+    commandBus.execute(new SetComponentVariantCommand(id, type, variant, delta));
+    return describeEntity(entity);
+  },
+});
+
+defineOp({
+  name: "component.clearVariantProp",
+  undoable: true,
+  description:
+    "Drop one key from a per-platform config so it inherits again (from 'mobile' for an orientation set, else from the desktop value). The set itself stays; component.setVariant with null removes it.",
+  params: {
+    id: { type: "string", required: true },
+    type: { type: "string", required: true },
+    variant: { type: "string", required: true, enum: ["mobile", "portrait", "landscape"] },
+    key: { type: "string", required: true },
+  },
+  run({ id, type, variant, key }) {
+    const { entity, component } = mustGetComponent(id, type);
+    if (!component.props.variants?.[variant]) throw new Error(`"${type}" on "${entity.name}" has no ${variant} config`);
+    commandBus.execute(new ClearComponentVariantPropCommand(id, type, variant, key));
     return describeEntity(entity);
   },
 });

@@ -1,6 +1,19 @@
 import { engine } from "../engineInstance.js";
 import { getComponentClass } from "../../engine/index.js";
 import { createSimulationGraph, setSimulationGraphProp } from "../../engine/vfx/simulationGraph.js";
+import { VARIANT_EXCLUDED_KEYS, editLayerFor, isVariantKey, platformLayers, targetToPlatform } from "../../engine/componentVariants.js";
+import { getPlatformTarget, PLATFORM_TARGET_LABELS } from "../store/platformStore.js";
+
+/**
+ * Where an inspector edit of `component` lands right now: the topmost
+ * override set the editor's preview target activates that the component
+ * actually HAS, or `null` for the desktop values. See componentVariants.js
+ * (`editLayerFor`) — a component with no sets always edits its base, so a
+ * phone preview never grows a config on a light by accident.
+ */
+export function editLayerOf(component, target = getPlatformTarget()) {
+  return editLayerFor(component?.props?.variants, platformLayers(targetToPlatform(target)));
+}
 
 const AUTO_COLLIDER_SOURCE_TYPES = ["mesh", "model", "objModel", "splineMesh"];
 
@@ -26,7 +39,10 @@ export class RemoveComponentCommand {
     this.entityId = entityId;
     this.type = type;
     const component = engine.getEntity(entityId)?.getComponent(type);
-    this.props = component ? { ...component.props } : {};
+    // The DESKTOP values (with the variant sets inside), not the effective
+    // ones a platform preview may have applied: undo re-adds the component
+    // from these as its base.
+    this.props = component ? { ...(component.baseProps ?? component.props) } : {};
     // Removing a generated Collider writes collision=none to its render
     // source. Keep those prior modes in the same history entry so undo restores
     // both halves of that intentional, persistent deletion.
@@ -54,18 +70,42 @@ export class RemoveComponentCommand {
 }
 
 export class SetComponentPropCommand {
-  /** `label` overrides the undo-history entry — useful when one prop backs
-   *  several distinct user actions (the scripts list is added to, reordered,
-   *  toggled and removed from, all by writing `scripts`). */
-  constructor(entityId, type, key, value, label) {
+  /**
+   * `label` overrides the undo-history entry — useful when one prop backs
+   * several distinct user actions (the scripts list is added to, reordered,
+   * toggled and removed from, all by writing `scripts`).
+   *
+   * `options.layer` says WHICH of the component's per-platform configs the
+   * write lands in (componentVariants.js): a variant name writes that set,
+   * `"desktop"` writes the base, and the default — `undefined` — follows the
+   * editor's preview target through `editLayerOf`, so an inspector edit or a
+   * viewport drag made while looking at the portrait layout changes the
+   * portrait layout. Undo restores exactly that layer: a key the set did not
+   * name before goes back to inheriting, not to an explicit `undefined`.
+   */
+  constructor(entityId, type, key, value, label, options = {}) {
     this.entityId = entityId;
     this.type = type;
     this.key = key;
     this.value = value;
-    this.oldValue = engine.getEntity(entityId)?.getComponent(type)?.props[key];
     this.label = label ?? `Set ${key}`;
+    const component = engine.getEntity(entityId)?.getComponent(type);
+    const wanted = options.layer;
+    // The variants prop itself and the editor-only meta keys (viewOnly,
+    // editorEnabled, …) always go to the base — no set may carry them.
+    const layer = VARIANT_EXCLUDED_KEYS.has(key) || wanted === "desktop"
+      ? null
+      : isVariantKey(wanted) ? wanted : editLayerOf(component);
+    this.layer = layer && component?.setVariantProp ? layer : null;
+    if (this.layer) {
+      const set = component.props.variants?.[this.layer] ?? {};
+      this.hadOverride = Object.prototype.hasOwnProperty.call(set, key);
+      this.oldValue = this.hadOverride ? set[key] : undefined;
+      this.label = label ?? `Set ${key} (${PLATFORM_TARGET_LABELS[this.layer]})`;
+      return;
+    }
+    this.oldValue = component?.getBaseProp ? component.getBaseProp(key) : component?.props[key];
     if (type === "cloth" || type === "water") {
-      const component = engine.getEntity(entityId)?.getComponent(type);
       const graph = component?.props.graph;
       if (key === "graph") {
         // Undo the first graph edit to the old flat settings, not their newly
@@ -79,11 +119,80 @@ export class SetComponentPropCommand {
     }
   }
 
+  #component() {
+    return engine.getEntity(this.entityId)?.getComponent(this.type);
+  }
+
   do() {
-    engine.getEntity(this.entityId)?.getComponent(this.type)?.setProp(this.key, this.value);
+    const component = this.#component();
+    if (!component) return;
+    if (this.layer) component.setVariantProp(this.layer, this.key, this.value);
+    else if (component.setBaseProp) component.setBaseProp(this.key, this.value);
+    else component.setProp(this.key, this.value);
   }
 
   undo() {
-    engine.getEntity(this.entityId)?.getComponent(this.type)?.setProp(this.key, this.oldValue);
+    const component = this.#component();
+    if (!component) return;
+    if (this.layer) {
+      if (this.hadOverride) component.setVariantProp(this.layer, this.key, this.oldValue);
+      else component.clearVariantProp(this.layer, this.key);
+    } else if (component.setBaseProp) component.setBaseProp(this.key, this.oldValue);
+    else component.setProp(this.key, this.oldValue);
+  }
+}
+
+/**
+ * Adds, replaces or removes one whole per-platform config set: `delta` is the
+ * set's contents (`{}` for a fresh, empty one — the inspector toggle), `null`
+ * removes it. Undo puts back whatever the set held before.
+ */
+export class SetComponentVariantCommand {
+  constructor(entityId, type, layer, delta, label) {
+    if (!isVariantKey(layer)) throw new Error(`Unknown platform variant "${layer}"`);
+    this.entityId = entityId;
+    this.type = type;
+    this.layer = layer;
+    this.delta = delta === null || delta === undefined ? null : structuredClone(delta);
+    const previous = engine.getEntity(entityId)?.getComponent(type)?.props.variants?.[layer];
+    this.previous = previous ? structuredClone(previous) : null;
+    const name = PLATFORM_TARGET_LABELS[layer];
+    const what = getComponentClass(type)?.label ?? type;
+    this.label = label ?? (this.delta === null ? `Remove ${name} config from ${what}` : this.previous ? `Set ${name} config on ${what}` : `Add ${name} config to ${what}`);
+  }
+
+  do() {
+    engine.getEntity(this.entityId)?.getComponent(this.type)?.setVariant(this.layer, this.delta);
+  }
+
+  undo() {
+    engine.getEntity(this.entityId)?.getComponent(this.type)?.setVariant(this.layer, this.previous);
+  }
+}
+
+/**
+ * Drops one key from a per-platform set so it inherits again ("Revert to
+ * Desktop value" on an overridden inspector row). Undo restores the override.
+ */
+export class ClearComponentVariantPropCommand {
+  constructor(entityId, type, layer, key, label) {
+    if (!isVariantKey(layer)) throw new Error(`Unknown platform variant "${layer}"`);
+    this.entityId = entityId;
+    this.type = type;
+    this.layer = layer;
+    this.key = key;
+    const set = engine.getEntity(entityId)?.getComponent(type)?.props.variants?.[layer] ?? {};
+    this.hadOverride = Object.prototype.hasOwnProperty.call(set, key);
+    this.oldValue = this.hadOverride ? structuredClone(set[key]) : undefined;
+    this.label = label ?? `Revert ${key} to Desktop value`;
+  }
+
+  do() {
+    engine.getEntity(this.entityId)?.getComponent(this.type)?.clearVariantProp(this.layer, this.key);
+  }
+
+  undo() {
+    if (!this.hadOverride) return;
+    engine.getEntity(this.entityId)?.getComponent(this.type)?.setVariantProp(this.layer, this.key, this.oldValue);
   }
 }

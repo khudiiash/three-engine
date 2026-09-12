@@ -301,6 +301,15 @@ const payloadWord = (bin) => uint(bin).mul(uint(PAYLOAD_WORDS));
  * unpacked. `cen` is the §11.28 radiance-centroid code riding word 2's high
  * half (0 = the bin's own centre).
  */
+// ── §11.59 THE COUNTERS ARE OPT-OUT (2026-09-11) ────────────────────────────
+// Every ray (and every shaded hit, in srcSecondary.js) bumps eight to twelve
+// GLOBAL atomics on the same few words — the receipts `profile.giPasses`
+// prints (rays, hits, clamped, tsum/tmax, far, movers…). Same-address atomics
+// serialise at the L2 whatever the GPU; on the phone they are paid by every
+// frame's transport whether anyone reads them or not. `__giSrcStats = false`
+// (build-time) compiles them out; the receipt fields then read 0.
+const srcStatsOn = () => globalThis.__giSrcStats !== false;
+
 export function readPayload(payload, bin) {
   const o = payloadWord(bin).toVar();
   const rg = unpackHalf2x16(payload.element(o)).toVar();
@@ -652,7 +661,7 @@ const T_FIXED = 1024;
 export function createSrcShadeCounters(bins) {
   const { stats } = bins;
   const bump = (word) => (amount) => {
-    atomicAdd(stats.element(uint(word)), uint(amount));
+    if (srcStatsOn()) atomicAdd(stats.element(uint(word)), uint(amount));
   };
   return {
     shaded: bump(STAT_SHADED),
@@ -1540,9 +1549,9 @@ export function createSrcDepositFrame(store, bins, {
             }
             const far = stratum.or(need.greaterThan(0.5));
             goFar.assign(select(far, float(1), float(0)));
-            atomicAdd(stats.element(uint(STAT_FAR)), select(far, uint(1), uint(0)));
-            atomicAdd(stats.element(uint(STAT_FAR_NEED)), select(far.and(stratum.not()), uint(1), uint(0)));
-            atomicAdd(stats.element(uint(STAT_CAPPED_MISS)), select(far, uint(0), uint(1)));
+            if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_FAR)), select(far, uint(1), uint(0)));
+            if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_FAR_NEED)), select(far.and(stratum.not()), uint(1), uint(0)));
+            if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_CAPPED_MISS)), select(far, uint(0), uint(1)));
             If(far.not(), () => { Break(); });
           });
         });
@@ -1577,7 +1586,7 @@ export function createSrcDepositFrame(store, bins, {
         ? hit.and(float(r.insideMover).greaterThan(0.5)).toVar()
         : null;
       if (insideMover) {
-        atomicAdd(stats.element(uint(STAT_INSIDE_MOVER)), select(insideMover, uint(1), uint(0)));
+        if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_INSIDE_MOVER)), select(insideMover, uint(1), uint(0)));
       }
 
       // WHICH CASCADE OWNS THIS HIT. `splitCascade`'s running-sum form: no loop,
@@ -1635,7 +1644,7 @@ export function createSrcDepositFrame(store, bins, {
         if (r.dynObj != null) {
           If(hit.and(float(r.dynObj).greaterThanEqual(0)), () => {
             sec.emitter.assign(float(-2));
-            atomicAdd(stats.element(uint(STAT_MOVER_HITS)), uint(1));
+            if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_MOVER_HITS)), uint(1));
           });
         }
       }
@@ -1691,17 +1700,17 @@ export function createSrcDepositFrame(store, bins, {
             .toUint().shiftRight(uint(SUM_SHIFT)).toVar()
           : null;
 
-        atomicAdd(stats.element(uint(STAT_RAYS)), uint(1));
-        atomicAdd(stats.element(uint(STAT_HITS)), select(hit, uint(1), uint(0)));
-        atomicAdd(stats.element(uint(STAT_CLAMPED)), select(clamped, uint(1), uint(0)));
-        atomicMax(stats.element(uint(STAT_MAXL)), fx[0].max(fx[1]).max(fx[2]));
+        if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_RAYS)), uint(1));
+        if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_HITS)), select(hit, uint(1), uint(0)));
+        if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_CLAMPED)), select(clamped, uint(1), uint(0)));
+        if (srcStatsOn()) atomicMax(stats.element(uint(STAT_MAXL)), fx[0].max(fx[1]).max(fx[2]));
       } else {
-        atomicAdd(stats.element(uint(STAT_RAYS)), uint(1));
-        atomicAdd(stats.element(uint(STAT_HITS)), select(hit, uint(1), uint(0)));
+        if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_RAYS)), uint(1));
+        if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_HITS)), select(hit, uint(1), uint(0)));
       }
       const tfx = select(hit, d.max(0).mul(T_FIXED), float(0)).toUint().toVar();
-      atomicAdd(stats.element(uint(STAT_TSUM)), tfx);
-      atomicMax(stats.element(uint(STAT_TMAX)), tfx);
+      if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_TSUM)), tfx);
+      if (srcStatsOn()) atomicMax(stats.element(uint(STAT_TMAX)), tfx);
 
       // The scatter itself. Unrolled over cascades because `binGridWidth` and
       // `binCount` are compile-time per level — the bin grid is a different
@@ -1715,7 +1724,7 @@ export function createSrcDepositFrame(store, bins, {
         // into block 0 would corrupt the bins of a probe that is working.
         If(blk.equal(uint(SLOT_EMPTY)).and(chain[c].notEqual(uint(SLOT_EMPTY)))
           .and(int(c).lessThanEqual(ownReach)), () => {
-          atomicAdd(stats.element(uint(STAT_NOBLOCK)), uint(1));
+          if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_NOBLOCK)), uint(1));
         });
         If(blk.notEqual(uint(SLOT_EMPTY)).and(int(c).lessThanEqual(ownReach)), () => {
           const b = dirToBin(dir, info.width).toVar();
@@ -1775,7 +1784,7 @@ export function createSrcDepositFrame(store, bins, {
             }
           });
           atomicAdd(scratch.element(slot.add(uint(BIN_COUNT))), uint(DEPOSIT_SCALE));
-          atomicAdd(stats.element(uint(STAT_DEPOSITS)), uint(1));
+          if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_DEPOSITS)), uint(1));
           // ── the block's evidence, beside its bins ──────────────────────
           //
           // CLEAR (transmittance-only) deposits carry ZERO luma but still add
@@ -1855,7 +1864,7 @@ export function createSrcDepositFrame(store, bins, {
             put(SEC_DIR + 2, floatBitsToUint(dir.z));
             If(sec.emitter.lessThan(-1.5), () => { atomicAdd(stats.element(uint(STAT_MOVER_RECORDS)), uint(1)); });
           }).Else(() => {
-            atomicAdd(stats.element(uint(STAT_SEC_OVERFLOW)), uint(1));
+            if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_SEC_OVERFLOW)), uint(1));
           });
         });
       }
@@ -1981,8 +1990,8 @@ export function createSrcDepositFrame(store, bins, {
         .add(float(atomicLoad(scratch.element(b.add(uint(BIN_B))))))
         .greaterThan(0).toVar();
       If(lit, () => {
-        atomicAdd(stats.element(uint(STAT_SUN_LIVE)), uint(1));
-        atomicAdd(stats.element(uint(STAT_SUN_NORMAL)), select(normalPresent(nw), uint(1), uint(0)));
+        if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_SUN_LIVE)), uint(1));
+        if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_SUN_NORMAL)), select(normalPresent(nw), uint(1), uint(0)));
       });
       If(normalPresent(nw), () => {
         const { direction, irradiance } = sunClose();

@@ -313,6 +313,27 @@ export function BuildPanel() {
             ))}
           </Select>
         </Row>
+        <Row
+          label="Mobile preset"
+          hint={
+            "The ceiling phones and tablets get instead of the preset above; \"Same\" ships them the " +
+            "same build. A lower preset caps pixel ratio and render scale and turns dynamic resolution " +
+            "on, so it trades sharpness for frame rate — check it on the device."
+          }
+        >
+          <Select
+            className="text-field"
+            value={build.mobileQuality ?? "same"}
+            onChange={(e) => patch({ mobileQuality: e.target.value })}
+          >
+            <option value="same">Same as preset</option>
+            {Object.entries(QUALITY_PRESETS).map(([id, preset]) => (
+              <option key={id} value={id}>
+                {preset.label}
+              </option>
+            ))}
+          </Select>
+        </Row>
       </div>
 
       <div className="inspector-section">

@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { Play, Square, Pause, StepForward, Maximize2, Volume2, VolumeX, RectangleHorizontal } from "../icons/index.jsx";
+import { Play, Square, Pause, StepForward, Maximize2, Volume2, VolumeX, RectangleHorizontal, RectangleVertical, Monitor, Smartphone } from "../icons/index.jsx";
+import { usePlatformStore, PLATFORM_TARGET_LABELS } from "../store/platformStore.js";
+import { PLATFORM_TARGETS } from "../../engine/componentVariants.js";
 import { usePlayStore } from "../store/playStore.js";
 import { toggle as togglePlay, togglePaused, stepFrame } from "../playMode.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
@@ -97,7 +99,30 @@ export function GamePanel() {
   const [maximizeOnPlay, setMaximizeOnPlay] = useState(() => readPref(MAXIMIZE_STORAGE_KEY, false));
   const [muted, setMuted] = useState(false);
   const [aspectOpen, setAspectOpen] = useState(false);
+  const [platformOpen, setPlatformOpen] = useState(false);
   const [hasCanvas, setHasCanvas] = useState(false);
+  // The platform preview (store/platformStore.js): which per-platform config
+  // every component shows. Choosing an ORIENTATION here also picks a matching
+  // aspect preset when the current one is the wrong way round, so "Portrait"
+  // shows a portrait frame with the portrait layout in it rather than a
+  // portrait layout squeezed into 16:9. Desktop / bare Mobile leave the
+  // aspect alone — a phone in landscape is whatever aspect the author set.
+  const platformTarget = usePlatformStore((s) => s.target);
+  const setPlatformTarget = usePlatformStore((s) => s.setTarget);
+  const choosePlatform = (target) => {
+    setPlatformTarget(target);
+    setPlatformOpen(false);
+    const current = ASPECTS.find((a) => a.id === aspectId) ?? ASPECTS[0];
+    const isPortrait = !!current.aspect && current.aspect < 1;
+    if (target === "portrait" && !isPortrait) {
+      setAspectId("9:16");
+      writePref(ASPECT_STORAGE_KEY, "9:16");
+    } else if (target === "landscape" && isPortrait) {
+      setAspectId("16:9");
+      writePref(ASPECT_STORAGE_KEY, "16:9");
+    }
+  };
+  const PlatformIcon = { desktop: Monitor, mobile: Smartphone, portrait: RectangleVertical, landscape: RectangleHorizontal }[platformTarget] ?? Monitor;
   const [rendered, setRendered] = useState(null);
   const preset = ASPECTS.find((a) => a.id === aspectId) ?? ASPECTS[0];
 
@@ -220,6 +245,35 @@ export function GamePanel() {
           </>
         )}
         <div className="game-toolbar-sep" />
+        <div className="dropdown-wrap">
+          <button
+            className={`toolbar-btn icon-only${platformOpen ? " active" : ""}${platformTarget !== "desktop" ? " is-active" : ""}`}
+            title={`Platform preview: ${PLATFORM_TARGET_LABELS[platformTarget]} — which per-platform component configs the scene shows`}
+            onClick={() => setPlatformOpen((v) => !v)}
+          >
+            <PlatformIcon size={13} />
+          </button>
+          {platformOpen && (
+            <>
+              <div className="dropdown-overlay" onClick={() => setPlatformOpen(false)} />
+              <div className="dropdown-menu">
+                {PLATFORM_TARGETS.map((target) => (
+                  <button
+                    key={target}
+                    className="dropdown-item layers-item"
+                    onClick={() => choosePlatform(target)}
+                  >
+                    <span className="layers-item-label">
+                      <span className={`layers-dot ${target === platformTarget ? "on" : "off"}`} />
+                      {PLATFORM_TARGET_LABELS[target]}
+                      {target === "mobile" ? " (any orientation)" : ""}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
         <div className="dropdown-wrap">
           <button
             className={`toolbar-btn icon-only${aspectOpen ? " active" : ""}`}

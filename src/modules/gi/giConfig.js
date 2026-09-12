@@ -391,8 +391,18 @@ const BY_TIER = {
   // Half-res resolve. GI-traced light shadows and AO are computed at this
   // resolution, so their edges blend across silhouettes when upsampled — "bad
   // corners" under a bright sun. Ultra pays ~4× the resolve to remove it.
-  low: { resolveScale: 0.5, exactReflections: false },
-  medium: { resolveScale: 0.5, exactReflections: false },
+  // `resolveMaxPixels` (2026-09-11): the pixel CEILING is a tier property
+  // too. One 1.6 M ceiling for every tier meant the presets stopped changing
+  // anything past ~1440p — on the user's 2872×1532 browser canvas low, medium
+  // and high all resolved 1.1 M pixels and ultra 1.6 M, so "changing GI
+  // quality does not change fps". Every screen pass and the transport's
+  // population are per-resolve-pixel (measured: halving the ceiling took
+  // 5.8 ms off a 17.5 ms compute frame), so the ceiling IS the preset's cost
+  // on a large screen. Below the ceiling nothing changes: a 1570×962 editor
+  // viewport resolves 0.38 M at low–high and 0.75 M at ultra, under every
+  // value here. The position-validated bilateral reconstructs the edges.
+  low: { resolveScale: 0.5, exactReflections: false, resolveMaxPixels: 400_000 },
+  medium: { resolveScale: 0.5, exactReflections: false, resolveMaxPixels: 600_000 },
   // HIGH TAKES EXACT REFLECTIONS TOO (2026-08-22, with §14 R-A). The old
   // "ultra only" line was priced when hit shading lived inside the resolve
   // (the 66 ms register-pressure receipt); in its own pass, high's half-res
@@ -403,7 +413,7 @@ const BY_TIER = {
   // oct-tile magnification limit) — at high it either gets the exact arm or
   // it gets mush. Low/medium stay probes-only: that is still the
   // 100-200ms-workload protection for the tiers defined as cheap.
-  high: { resolveScale: 0.5, exactReflections: true },
+  high: { resolveScale: 0.5, exactReflections: true, resolveMaxPixels: 900_000 },
   // Ultra keeps twice HIGH's screen-sample budget (0.7071² / 0.5² = 2), but
   // no longer traces every physical display pixel. Bistro's 1.6M-pixel full
   // resolve spent 25–40 ms in screen-sized GI work alone; the position/normal
@@ -412,8 +422,34 @@ const BY_TIER = {
   // reflection pixels. This is the tier's bounded performance contract: more
   // samples than HIGH, full world/probe/ray quality, never an unbounded 1:1
   // screen-space bill.
-  ultra: { resolveScale: Math.SQRT1_2, exactReflections: true },
+  ultra: { resolveScale: Math.SQRT1_2, exactReflections: true, resolveMaxPixels: 1_600_000 },
 };
+
+/**
+ * The resolve ceiling on a PORTABLE device (the device tier ceiling is set —
+ * a phone or an Apple WebKit). The user's iPhone ran the Sponza build at
+ * 20 fps: at the mobile "low" ceiling a 1704×786 canvas still resolves
+ * 0.33 M GI pixels, and the screen chain that costs ~2.5 ms on a laptop 4070
+ * at that size is the whole frame on a phone GPU. `__giResolveMaxPixels`
+ * still overrides.
+ */
+const GI_MOBILE_RESOLVE_MAX_PIXELS = 250_000;
+/** The world transport's ceiling on a portable device, Hz (see `worldUpdateHz` below). */
+const GI_MOBILE_WORLD_UPDATE_HZ = 15;
+/**
+ * The transport's ray budget on a portable device, as a scale on the tier's
+ * ceiling and per-probe cap (see `worldRayScale` below). 0.35 is the scale
+ * §11.9 already applies under camera motion — the budget the temporal
+ * accumulation is known to average without visible noise.
+ */
+const GI_MOBILE_WORLD_RAY_SCALE = 0.35;
+
+/** The lower of two tier names (null = no ceiling). */
+function minTier(a, b) {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return GI_QUALITY_LEVELS.indexOf(a) <= GI_QUALITY_LEVELS.indexOf(b) ? a : b;
+}
 
 /**
  * The settled configuration for a component's props.
@@ -427,11 +463,25 @@ const BY_TIER = {
  * opinion — a consumer that wants a different value has to come here and say so
  * where everyone can see it.
  */
-export function resolveGiConfig(props, runtime = globalThis) {
-  const ceiling = giDeviceTierCeiling(runtime);
-  const bounceLevel = giTermLevel(props?.bounce, 1);
-  const aoLevel = giTermLevel(props?.ao, 1);
-  const reflectionsLevel = giTermLevel(props?.reflections, 1);
+export function resolveGiConfig(props, runtime = globalThis, { qualityCeiling = null } = {}) {
+  const deviceCeiling = giDeviceTierCeiling(runtime);
+  // The BUILD's quality preset (`engine.config.quality`, set by the player
+  // from the export's `player.quality`) is a ceiling on the GI tiers exactly
+  // as `applyQualityCeiling` makes it one on the renderer: a preset can only
+  // make a build cheaper than authored, and "ultra" is "as authored". The
+  // editor passes nothing here.
+  const buildCeiling = TIERS.has(qualityCeiling) && qualityCeiling !== "ultra" ? qualityCeiling : null;
+  const ceiling = minTier(deviceCeiling, buildCeiling);
+  // Runtime pins on the three rails, for an A/B without a scene edit
+  // (`?flags={"__giReflectionsLevel":0}` on a phone, `profile.giFlag` in the
+  // editor). A pin is read exactly like the authored value; unset = authored.
+  const pinLevel = (name, authored) => {
+    const v = Number(runtime?.[name]);
+    return Number.isFinite(v) && runtime?.[name] !== null ? giTermLevel(v, 1) : authored;
+  };
+  const bounceLevel = pinLevel("__giBounceLevel", giTermLevel(props?.bounce, 1));
+  const aoLevel = pinLevel("__giAoLevel", giTermLevel(props?.ao, 1));
+  const reflectionsLevel = pinLevel("__giReflectionsLevel", giTermLevel(props?.reflections, 1));
   const authoredBounce = giTermTier(bounceLevel) ?? "low";
   const authoredAo = giTermTier(aoLevel) ?? "low";
   const authoredReflections = giTermTier(reflectionsLevel) ?? "low";
@@ -448,7 +498,35 @@ export function resolveGiConfig(props, runtime = globalThis) {
     ...CONSTANT,
     ...BY_TIER[bounceQuality],
     resolveScale: BY_TIER[screenQuality].resolveScale,
+    // The pixel ceiling follows the SCREEN tier (the one that sizes the
+    // resolve), and a portable device gets the mobile ceiling under it.
+    resolveMaxPixels: deviceCeiling
+      ? Math.min(BY_TIER[screenQuality].resolveMaxPixels, GI_MOBILE_RESOLVE_MAX_PIXELS)
+      : BY_TIER[screenQuality].resolveMaxPixels,
     exactReflections: reflectionsLevel > 0 && BY_TIER[reflectionsQuality].exactReflections,
+    // ── THE WORLD CHAIN ON A PHONE IS A BURST, NOT A RATE (2026-09-11) ──
+    // The transport's ~70 kernels land in ONE frame. On the user's iPhone the
+    // Sponza build read 55 fps until the chain's pipelines finished compiling
+    // and 30 from then on: every chain frame overran 16.7 ms and the browser
+    // halved requestAnimationFrame. A phone-shaped ledger on the desktop
+    // prices one low-tier chain at ~1.35 ms of RTX 4070 — about a frame's
+    // worth on a phone GPU. So on the device tier the chain is (a) capped at
+    // 15 Hz whatever the light-motion drive asks (a sun moves slowly; 15 Hz
+    // is the rate the drive settles to at rest anyway) and (b) split at the
+    // deposit's trace into two frames (§11.45, opt-in elsewhere because it
+    // trades chains-per-second). `__giWorldSplit` / `__giWorldUpdateHz`
+    // still override either way.
+    worldUpdateHz: deviceCeiling ? GI_MOBILE_WORLD_UPDATE_HZ : null,
+    worldSplit: !!deviceCeiling,
+    // (c) THE RAYS THEMSELVES (2026-09-11, the phone's own ledger via
+    // `?hud=1`): on the user's iPhone one low-tier chain dispatch read ~19 ms
+    // of GPU — a third of a 45 ms frame at 15 Hz — and three quarters of a
+    // chain is the trace + shade, which are per-ray. The rate cap and the
+    // split only move that burst around; this shrinks it. Applied as the
+    // §11.9 motion scale is (uniform writes on the ceiling and the per-probe
+    // cap, no rebuild), so the steady state is the same field converged from
+    // fewer rays per tick. `__giMobileRayScale` pins (1 = off).
+    worldRayScale: deviceCeiling ? GI_MOBILE_WORLD_RAY_SCALE : 1,
     bounceLevel,
     aoLevel,
     reflectionsLevel,
@@ -467,8 +545,11 @@ export function resolveGiConfig(props, runtime = globalThis) {
     if (!warnedClamp) {
       warnedClamp = true;
       console.info(
-        `[gi] one or more GI term qualities were clamped to ${ceiling} for this device ` +
-        `(mobile/Apple WebKit tier ceiling — __giDeviceTier = null removes it)`,
+        deviceCeiling && ceiling === deviceCeiling
+          ? `[gi] one or more GI term qualities were clamped to ${ceiling} for this device ` +
+            `(mobile/Apple WebKit tier ceiling — __giDeviceTier = null removes it)`
+          : `[gi] one or more GI term qualities were clamped to ${ceiling} by the build's quality preset ` +
+            `(Build settings → Quality; "ultra" ships the scene as authored)`,
       );
     }
   }

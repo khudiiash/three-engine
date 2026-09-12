@@ -3,18 +3,13 @@
 // SpotLight/DirectionalLight members), a follow-up.
 import * as THREE from "three/webgpu";
 import { PCFShadowFilter, float } from "three/tsl";
-import { CSMShadowNode } from "three/addons/csm/CSMShadowNode.js";
+import { EngineCSMShadowNode } from "../csmShadowNode.js";
+import { ClipmapShadowNode } from "../clipmapShadowNode.js";
 import { Component } from "./Component.js";
 import { PCSSShadowFilter } from "../pcssShadowFilter.js";
 import { SHADOW_PROXY_LAYER } from "../editorLayers.js";
+import { capShadowMapSize } from "../sceneSettings.js";
 
-const SHADOW_TYPE_OPTIONS = [
-  "BasicShadowMap",
-  "PCFShadowMap",
-  "PCFSoftShadowMap",
-  "PCSSShadowMap",
-  "VSMShadowMap",
-];
 const _ownerWorld = new THREE.Matrix4();
 const _inverseOwnerWorld = new THREE.Matrix4();
 const _worldRotation = new THREE.Quaternion();
@@ -37,7 +32,7 @@ const _worldUp = new THREE.Vector3(0, 1, 0);
 const SHADOW_SNAP_COVERAGE_FRACTION = 0.1;
 
 export class LightComponent extends Component {
-  /** Runtime CSMShadowNode — distinct from the authored boolean `props.csm`. */
+  /** Runtime directional cascade owner (CSM or clipmaps). */
   #csm = null;
   /** Last snapped shadow-origin / light direction — skip matrix writes when unchanged. */
   #lastSnapCentre = new THREE.Vector3(Number.NaN, Number.NaN, Number.NaN);
@@ -53,6 +48,8 @@ export class LightComponent extends Component {
    * `#castShadowInPlace` for the one case that must fall back to a rebuild.
    */
   #castShadowFlipFrame = -1;
+  /** Last shadow-filter name resolved from scene settings; see `#shadowTypeName`. */
+  #lastShadowTypeName = null;
 
   static type = "light";
   static label = "Light";
@@ -74,16 +71,19 @@ export class LightComponent extends Component {
     decay: 2, // physical light decay (point/spot). 0 = classic inverse-square-free.
     penumbra: 0, // spot: 0..1 softness at the cone edge
     castShadow: false,
-    // map = three.js shadow maps (+CSM); gi = the GI module traces shadows from
-    // the occupancy field (no shadow map allocated; falls back to maps
-    // automatically if the GI module is absent).
+    // map = ordinary maps / CSM; clipmap = experimental world-aligned grids;
+    // gi = software-traced shadows owned by the optional GI module.
     shadowMode: "map",
     // Angular DIAMETER of the source in degrees — Blender's sun "Angle" parity
     // (0.53° ≈ the real sun). Drives the GI penumbra softness for this light;
     // also used by gi shadow mode.
     sourceAngle: 0.53,
     // Shadow-map settings (per-light). Mirrors three.js Light.shadow.* fields.
-    shadowMapType: "PCFSoftShadowMap",
+    // ⚠ `shadowMapType` IS RETIRED (2026-09-11) — the shadow FILTER is a scene
+    // setting (Scene Settings → Shadows → Map type), because three reads
+    // `renderer.shadowMap.type` and never the per-light field. It is absent
+    // from the schema and from these defaults so nothing writes it; a value
+    // left in an older scene is still read as a fallback by `#shadowTypeName`.
     shadowMapWidth: 2048,
     shadowMapHeight: 2048,
     shadowBias: -0.0005,
@@ -108,6 +108,11 @@ export class LightComponent extends Component {
     csmSplitLambda: 0.9,
     csmLightMargin: 200,
     csmFade: true,
+    clipmapLevels: 3,
+    clipmapNearSize: 20, // full world-space width of the finest square
+    clipmapScale: 4,
+    clipmapLightMargin: 200,
+    clipmapCache: true,
     // Directional shadow maps always recentre on the active camera (editor
     // orbit camera in edit mode, the play-mode camera during play). The
     // camera pose drives the orthographic frustum every pre-render so the
@@ -129,7 +134,8 @@ export class LightComponent extends Component {
     // traced by the GI module, so without it the dropdown offers only "map"
     // (a scene saved in gi mode shows "gi (missing)" rather than silently
     // rewriting the prop).
-    { key: "shadowMode", label: "Shadow Source", type: "select", options: ["map", "gi"], optionModules: { gi: "gi" }, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+    { key: "shadowMode", label: "Shadow Source", type: "select", options: ["map", "clipmap", "gi"], optionModules: { gi: "gi" }, showIf: (p) => p.kind === "directional" && p.castShadow, section: "Shadow" },
+    { key: "shadowMode", label: "Shadow Source", type: "select", options: ["map", "gi"], optionModules: { gi: "gi" }, showIf: (p) => (p.kind === "point" || p.kind === "spot") && p.castShadow, section: "Shadow" },
     // Angular size shapes the GI penumbra in BOTH modes (gi traces it directly;
     // map mode still feeds it to the GI bounce), so it is never gated on mode.
     // Up to 90° (Blender sun parity): beyond ~20° the softness comes from the
@@ -139,7 +145,6 @@ export class LightComponent extends Component {
     // Shadow-map controls. Master switch (castShadow) gates the rest via showIf
     // so the inspector stays tidy when shadows are off; `shadowMode === "gi"`
     // hides them too because no shadow map is rendered in that mode.
-    { key: "shadowMapType", label: "Map Type", type: "select", options: SHADOW_TYPE_OPTIONS, showIf: (p) => p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi", section: "Shadow" },
     { key: "shadowMapWidth", label: "Map Width", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
     { key: "shadowMapHeight", label: "Map Height", type: "number", min: 16, step: 256, showIf: (p) => (p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
     { key: "shadowBias", label: "Bias", type: "number", step: 0.0005, showIf: (p) => (p.kind !== "ambient" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
@@ -149,16 +154,21 @@ export class LightComponent extends Component {
     { key: "shadowRadius", label: "Radius / Light Size", type: "number", min: 0, step: 0.25, showIf: (p) => p.kind !== "ambient" && p.castShadow && (p.shadowMode !== "gi" || p.kind === "point" || p.kind === "spot"), section: "Shadow" },
     { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
     { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
-    { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm && p.shadowMode !== "gi"), section: "Shadow" },
-    { key: "shadowCamSnap", label: "Recentre Snap", type: "number", min: 0, step: 0.1, showIf: (p) => p.kind === "directional" && p.castShadow && !p.csm && p.shadowMode !== "gi", section: "Shadow" },
+    { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => ((p.kind === "directional" || p.kind === "spot") && p.castShadow && !p.csm && p.shadowMode !== "gi" && p.shadowMode !== "clipmap"), section: "Shadow" },
+    { key: "shadowCamSnap", label: "Recentre Snap", type: "number", min: 0, step: 0.1, showIf: (p) => p.kind === "directional" && p.castShadow && !p.csm && p.shadowMode !== "gi" && p.shadowMode !== "clipmap", section: "Shadow" },
     { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => (p.kind === "point" && p.castShadow && p.shadowMode !== "gi"), section: "Shadow" },
-    { key: "csm", label: "Cascaded Shadows", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow && p.shadowMode !== "gi", section: "Shadow" },
-    { key: "csmCascades", label: "Cascades", type: "number", min: 2, max: 4, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
-    { key: "csmMaxFar", label: "CSM Max Far", type: "number", min: 1, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
-    { key: "csmMode", label: "Split Mode", type: "select", options: ["practical", "uniform", "logarithmic"], showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
-    { key: "csmSplitLambda", label: "Near Detail", type: "number", min: 0, max: 1, step: 0.05, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.csmMode === "practical" && p.shadowMode !== "gi", section: "CSM" },
-    { key: "csmLightMargin", label: "Light Margin", type: "number", min: 0, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
-    { key: "csmFade", label: "Cascade Fade", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi", section: "CSM" },
+    { key: "csm", label: "Cascaded Shadows", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow && p.shadowMode !== "gi" && p.shadowMode !== "clipmap", section: "Shadow" },
+    { key: "csmCascades", label: "Cascades", type: "number", min: 2, max: 4, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi" && p.shadowMode !== "clipmap", section: "CSM" },
+    { key: "csmMaxFar", label: "CSM Max Far", type: "number", min: 1, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi" && p.shadowMode !== "clipmap", section: "CSM" },
+    { key: "csmMode", label: "Split Mode", type: "select", options: ["practical", "uniform", "logarithmic"], showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi" && p.shadowMode !== "clipmap", section: "CSM" },
+    { key: "csmSplitLambda", label: "Near Detail", type: "number", min: 0, max: 1, step: 0.05, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.csmMode === "practical" && p.shadowMode !== "gi" && p.shadowMode !== "clipmap", section: "CSM" },
+    { key: "csmLightMargin", label: "Light Margin", type: "number", min: 0, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi" && p.shadowMode !== "clipmap", section: "CSM" },
+    { key: "csmFade", label: "Cascade Fade", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow && p.csm && p.shadowMode !== "gi" && p.shadowMode !== "clipmap", section: "CSM" },
+    { key: "clipmapLevels", label: "Levels", type: "number", min: 2, max: 4, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.shadowMode === "clipmap", section: "Clipmaps (experimental)" },
+    { key: "clipmapNearSize", label: "Near Coverage", type: "number", min: 1, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.shadowMode === "clipmap", section: "Clipmaps (experimental)" },
+    { key: "clipmapScale", label: "Level Scale", type: "number", min: 2, max: 8, step: 1, showIf: (p) => p.kind === "directional" && p.castShadow && p.shadowMode === "clipmap", section: "Clipmaps (experimental)" },
+    { key: "clipmapLightMargin", label: "Depth Padding", type: "number", min: 0, step: 10, showIf: (p) => p.kind === "directional" && p.castShadow && p.shadowMode === "clipmap", section: "Clipmaps (experimental)" },
+    { key: "clipmapCache", label: "Cache Static Casters", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow && p.shadowMode === "clipmap", section: "Clipmaps (experimental)" },
   ];
 
   onAttach() {
@@ -170,6 +180,8 @@ export class LightComponent extends Component {
     this.unsubPreRender = null;
     this.unsubRendererRebuilt?.();
     this.unsubRendererRebuilt = null;
+    this.unsubShadowTypeSetting?.();
+    this.unsubShadowTypeSetting = null;
     // Clears shadow.shadowNode only when it is OUR CSM node. A gi-mode light
     // carries the GI module's node in that slot; blanking it here would be
     // meddling with another module's state, and it is unnecessary — the light
@@ -239,7 +251,8 @@ export class LightComponent extends Component {
       key === "shadowMode" ||
       key === "csm" ||
       key === "csmCascades" ||
-      key === "csmFade"
+      key === "csmFade" ||
+      key === "clipmapLevels"
     ) {
       this.onDetach();
       this.#buildLight();
@@ -250,8 +263,21 @@ export class LightComponent extends Component {
       if (key === "castShadow") this.entity?.engine?.emit?.("hierarchy-changed");
       return;
     }
+    if (key.startsWith("clipmap")) {
+      if (this.#csm?.isClipmapShadowNode) {
+        const config = this.#clipmapConfig();
+        this.#csm.nearSize = config.nearSize;
+        this.#csm.scale = config.scale;
+        this.#csm.lightMargin = config.lightMargin;
+        this.#csm.cacheEnabled = config.cache;
+        this.#syncCSMShadowDepth();
+        this.#csm.invalidateCache();
+        this.#updateCSMFrustums(true);
+      }
+      return;
+    }
     if (key === "csmMode" || key === "csmMaxFar" || key === "csmSplitLambda") {
-      if (this.#csm) {
+      if (this.#csm && !this.#csm.isClipmapShadowNode) {
         this.#csm.maxFar = Math.max(1, this.props.csmMaxFar);
         this.#configureCSMSplits();
       }
@@ -285,6 +311,10 @@ export class LightComponent extends Component {
       return;
     }
     this.#applyShadowProp(key);
+    if (this.#csm?.isClipmapShadowNode && key.startsWith("shadow")) {
+      this.#syncCSMShadowDepth();
+      this.#csm.invalidateCache();
+    }
     // shadowRadius doubles as the point light's GI source radius — republish
     // after every non-rebuild change so the contract can never go stale.
     this.#publishGIShadowContract();
@@ -397,6 +427,22 @@ export class LightComponent extends Component {
     // to the origin and resets parent scale so directional lights can only
     // be re-aimed via rotation. The shadow camera recentres on whichever
     // camera is currently active so the user never leaves the frustum.
+    // The shadow FILTER lives in scene settings now (see `#shadowTypeName`), so
+    // the light has to notice when it changes — nothing writes a prop on this
+    // component any more. Rebuild through the same path the retired structural
+    // prop used: the filter is compiled into the shadow branch, and swapping it
+    // on a live ShadowNode leaves the old one cached (the reason `shadowMapType`
+    // was structural in the first place). Guarded on the resolved NAME so the
+    // many unrelated `settings-changed` emissions cost one string compare.
+    this.#lastShadowTypeName = this.#shadowTypeName();
+    this.unsubShadowTypeSetting = this.entity.engine.on("settings-changed", () => {
+      const next = this.#shadowTypeName();
+      if (next === this.#lastShadowTypeName) return;
+      this.#lastShadowTypeName = next;
+      if (!this.light) return;
+      this.onDetach();
+      this.#buildLight();
+    });
     if (this.light.isDirectionalLight) {
       this.unsubPreRender = this.entity.engine.onPreRender(() => {
         const moved = this.#syncDirectionalTransform();
@@ -648,6 +694,28 @@ export class LightComponent extends Component {
 
   // Map shadow-type name → three.js constant. Built lazily and reused.
   static #shadowTypeMap = null;
+  /**
+   * The shadow filter this light should use — read from the SCENE, which is
+   * the one place it is configured (Scene Settings → Shadows → Map type).
+   *
+   * There were two controls for this and only one of them could ever work:
+   * three reads `renderer.shadowMap.type` and never `light.shadow.type`
+   * (r185; see the note in `onPropChanged`), so the per-light "Map Type"
+   * dropdown wrote a field nothing sampled, while quietly steering the two
+   * things that ARE per-light — the CSM `PCFShadowFilter` and the directional
+   * `PCSSShadowFilter`. Those now follow the scene setting too, so the
+   * dropdown and the picture finally agree.
+   *
+   * `props.shadowMapType` survives only as a fallback for scenes authored
+   * before the control was retired: their look is preserved until the scene
+   * setting is touched. It is no longer in the schema, so nothing writes it.
+   */
+  #shadowTypeName() {
+    const authored = this.entity?.engine?.settings?.shadow?.type;
+    if (typeof authored === "string" && authored) return authored;
+    return this.props.shadowMapType ?? "PCFSoftShadowMap";
+  }
+
   static #getShadowTypeMap() {
     if (!this.#shadowTypeMap) {
       this.#shadowTypeMap = {
@@ -664,7 +732,7 @@ export class LightComponent extends Component {
   #isCSMUsable() {
     return (
       this.light?.isDirectionalLight === true &&
-      this.props.csm === true &&
+      (this.props.shadowMode === "clipmap" || this.props.csm === true) &&
       this.props.castShadow === true &&
       // gi mode owns shadow.shadowNode; there is exactly one slot, so a CSM
       // node would fight the GI module's for it. Gating here (rather than at
@@ -675,10 +743,25 @@ export class LightComponent extends Component {
     );
   }
 
+  #clipmapConfig() {
+    const finite = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+    return {
+      levels: THREE.MathUtils.clamp(Math.round(finite(this.props.clipmapLevels, 3)), 2, 4),
+      nearSize: Math.max(1, finite(this.props.clipmapNearSize, 20)),
+      scale: THREE.MathUtils.clamp(finite(this.props.clipmapScale, 4), 2, 8),
+      lightMargin: Math.max(0, finite(this.props.clipmapLightMargin, 200)),
+      cache: this.props.clipmapCache !== false,
+    };
+  }
+
   #syncCSMShadowDepth() {
     if (!this.light?.isDirectionalLight || !this.light.shadow) return;
     const useCSM = this.#isCSMUsable();
-    const far = useCSM
+    const clipmap = this.props.shadowMode === "clipmap" && useCSM ? this.#clipmapConfig() : null;
+    const far = clipmap
+      ? Math.max(this.props.shadowCamFar,
+          clipmap.nearSize * clipmap.scale ** (clipmap.levels - 1) + clipmap.lightMargin * 2)
+      : useCSM
       ? Math.max(
           this.props.shadowCamFar,
           this.props.csmMaxFar + this.props.csmLightMargin * 2,
@@ -715,22 +798,26 @@ export class LightComponent extends Component {
     this.#syncCSMShadowDepth();
     if (!this.#csm) {
       if (
-        this.props.shadowMapType === "PCFShadowMap" ||
-        this.props.shadowMapType === "PCFSoftShadowMap"
+        this.#shadowTypeName() === "PCFShadowMap" ||
+        this.#shadowTypeName() === "PCFSoftShadowMap"
       ) {
         // CSMShadowNode clones this filter during its lazy graph setup. It
         // must be present on the source before construction; changing a clone
         // after its ShadowNode has compiled would leave the old filter cached.
         this.light.shadow.filterNode = PCFShadowFilter;
       }
-      this.#csm = new CSMShadowNode(this.light, {
-        cascades: Math.min(4, Math.max(2, Math.round(this.props.csmCascades))),
-        maxFar: Math.max(1, this.props.csmMaxFar),
-        mode: this.props.csmMode === "practical" ? "custom" : this.props.csmMode,
-        lightMargin: Math.max(0, this.props.csmLightMargin),
-      });
-      this.#csm.fade = this.props.csmFade === true;
-      this.#configureCSMSplits();
+      if (this.props.shadowMode === "clipmap") {
+        this.#csm = new ClipmapShadowNode(this.light, this.#clipmapConfig());
+      } else {
+        this.#csm = new EngineCSMShadowNode(this.light, {
+          cascades: Math.min(4, Math.max(2, Math.round(this.props.csmCascades))),
+          maxFar: Math.max(1, this.props.csmMaxFar),
+          mode: this.props.csmMode === "practical" ? "custom" : this.props.csmMode,
+          lightMargin: Math.max(0, this.props.csmLightMargin),
+        });
+        this.#csm.fade = this.props.csmFade === true;
+        this.#configureCSMSplits();
+      }
     }
     this.light.shadow.shadowNode = this.#csm;
     // `autoUpdate`, not `needsUpdate` — see `shadowFreeze.js`'s header. A fresh
@@ -757,7 +844,7 @@ export class LightComponent extends Component {
   }
 
   #configureCSMSplits() {
-    if (!this.#csm) return;
+    if (!this.#csm || this.#csm.isClipmapShadowNode) return;
     if (this.props.csmMode !== "practical") {
       this.#csm.mode = this.props.csmMode;
       return;
@@ -785,10 +872,29 @@ export class LightComponent extends Component {
     const baseRadius = Math.max(0, this.props.shadowRadius);
     const baseBias = this.props.shadowBias;
     const baseNormalBias = Math.max(0, this.props.shadowNormalBias);
+    const clipmap = this.#csm.isClipmapShadowNode === true;
     for (let i = 0; i < this.#csm.lights.length; i++) {
       const shadow = this.#csm.lights[i].shadow;
       const t = i / last;
       let changed = false;
+      if (clipmap) {
+        const source = this.light.shadow;
+        // PCSS/VSM also read radius from the sampled level's shadow. The
+        // source light has no map in clipmap mode, so updating it alone is inert.
+        if (shadow.radius !== baseRadius) {
+          shadow.radius = baseRadius;
+          changed = true;
+        }
+        if (!shadow.mapSize.equals(source.mapSize)) {
+          shadow.mapSize.copy(source.mapSize);
+          changed = true;
+        }
+        if (shadow.camera.near !== source.camera.near) {
+          shadow.camera.near = source.camera.near;
+          shadow.camera.updateProjectionMatrix();
+          changed = true;
+        }
+      }
 
       // ⚠ THE DEPTH PASS MUST SEE THE SHADOW-MERGE PROXIES, AND BY DEFAULT IT
       // CANNOT. three's `ShadowNode.updateShadow` reads:
@@ -815,8 +921,8 @@ export class LightComponent extends Component {
       // detached far shadows and triangular light wedges at closed corners.
       // Use less bias in the high-resolution near maps and never exceed the
       // user's requested bias in the far map.
-      const bias = baseBias * THREE.MathUtils.lerp(0.35, 1, t);
-      const normalBias = baseNormalBias * THREE.MathUtils.lerp(0.2, 1, t);
+      const bias = baseBias * (clipmap ? 1 : THREE.MathUtils.lerp(0.35, 1, t));
+      const normalBias = baseNormalBias * (clipmap ? 1 : THREE.MathUtils.lerp(0.2, 1, t));
       if (shadow.bias !== bias) {
         shadow.bias = bias;
         changed = true;
@@ -827,8 +933,8 @@ export class LightComponent extends Component {
       }
 
       if (
-        this.props.shadowMapType === "PCFShadowMap" ||
-        this.props.shadowMapType === "PCFSoftShadowMap"
+        this.#shadowTypeName() === "PCFShadowMap" ||
+        this.#shadowTypeName() === "PCFSoftShadowMap"
       ) {
         // PCFSoft's built-in WebGPU filter ignores LightShadow.radius. Use
         // the radius-aware PCF filter so near cascades stay contact-sharp and
@@ -837,7 +943,7 @@ export class LightComponent extends Component {
           shadow.filterNode = PCFShadowFilter;
           changed = true;
         }
-        const radius = baseRadius * THREE.MathUtils.lerp(0.3, 2.5, t ** 1.5);
+        const radius = baseRadius * (clipmap ? 1 : THREE.MathUtils.lerp(0.3, 2.5, t ** 1.5));
         if (shadow.radius !== radius) {
           shadow.radius = radius;
           changed = true;
@@ -853,15 +959,10 @@ export class LightComponent extends Component {
     if (!this.#isCSMUsable() || !this.#csm) return;
     const camera = this.entity.engine.camera;
     if (!camera) return;
-    camera.updateMatrixWorld(true);
-    if (this.#csm.mainFrustum === null) return;
-    if (this.#csm.camera !== camera) {
-      this.#csm.camera = camera;
-      force = true;
-    }
-    this.#csm.lightMargin = Math.max(0, this.props.csmLightMargin);
+    this.#csm.lightMargin = Math.max(0, this.props.shadowMode === "clipmap"
+      ? this.props.clipmapLightMargin : this.props.csmLightMargin);
     this.#syncCSMCascadeShadows();
-    if (force || this.#csm.camera === camera) this.#csm.updateFrustums();
+    this.#csm.prepare(camera, { force });
   }
 
   #configureShadow() {
@@ -873,8 +974,9 @@ export class LightComponent extends Component {
     // SHADOW_PROXY_LAYER switched off.
     s.camera?.layers.enable(SHADOW_PROXY_LAYER);
     // mapSize is a Vector2 — set both axes separately; for point lights both
-    // must match (cube faces are square).
-    s.mapSize.set(shadowMapWidth, shadowMapHeight);
+    // must match (cube faces are square). A portable device caps both axes
+    // (sceneSettings' MOBILE_SHADOW_MAP_MAX); the authored size is untouched.
+    s.mapSize.set(capShadowMapSize(shadowMapWidth), capShadowMapSize(shadowMapHeight));
     s.bias = this.props.shadowBias;
     s.normalBias = this.props.shadowNormalBias;
     s.radius = this.props.shadowRadius;
@@ -898,11 +1000,12 @@ export class LightComponent extends Component {
       s.needsUpdate = true;
     }
     const typeMap = LightComponent.#getShadowTypeMap();
-    if (this.props.shadowMapType in typeMap) {
-      s.type = typeMap[this.props.shadowMapType];
+    const shadowTypeName = this.#shadowTypeName();
+    if (shadowTypeName in typeMap) {
+      s.type = typeMap[shadowTypeName];
     }
     s.filterNode =
-      this.props.shadowMapType === "PCSSShadowMap" &&
+      shadowTypeName === "PCSSShadowMap" &&
       this.light.isDirectionalLight
         ? PCSSShadowFilter
         : undefined;
@@ -931,8 +1034,25 @@ export class LightComponent extends Component {
     switch (key) {
       case "shadowMapWidth":
       case "shadowMapHeight":
-        s.mapSize.set(this.props.shadowMapWidth, this.props.shadowMapHeight);
-        s.map?.dispose?.();
+        // ⛔ DO NOT DISPOSE THE MAP HERE. `s.map.dispose()` destroys the GPU
+        // texture SYNCHRONOUSLY, from an Inspector prop write that lands at an
+        // arbitrary point relative to the frame — while the command buffer the
+        // renderer already submitted still references it. That is the
+        // `[Texture] used in submit while destroyed` error a shadow-map-size
+        // change threw on every edit (user, 2026-09-11).
+        //
+        // It is also redundant: three resizes the map itself, at the only safe
+        // moment. `ShadowNode.renderShadow` (three r185, ShadowNode.js:704)
+        // calls `shadowMap.setSize(shadow.mapSize.width, …)` immediately before
+        // it renders the shadow, and `RenderTarget.setSize`
+        // (core/RenderTarget.js:295) disposes ONLY when the size actually
+        // changed — inside the renderer, between passes, not mid-frame from a
+        // UI callback. So setting `mapSize` is the whole edit; `needsUpdate`
+        // just makes the re-render happen on the next frame instead of whenever
+        // the light next happens to redraw (it matters when shadows are frozen,
+        // where `autoUpdate` is false and nothing else would ask).
+        s.mapSize.set(capShadowMapSize(this.props.shadowMapWidth), capShadowMapSize(this.props.shadowMapHeight));
+        s.needsUpdate = true;
         break;
       case "shadowBias":
         s.bias = this.props.shadowBias;
@@ -945,9 +1065,10 @@ export class LightComponent extends Component {
         break;
       case "shadowMapType": {
         const map = LightComponent.#getShadowTypeMap();
-        s.type = map[this.props.shadowMapType] ?? THREE.PCFSoftShadowMap;
+        const typeName = this.#shadowTypeName();
+        s.type = map[typeName] ?? THREE.PCFSoftShadowMap;
         s.filterNode =
-          this.props.shadowMapType === "PCSSShadowMap" &&
+          typeName === "PCSSShadowMap" &&
           this.light.isDirectionalLight
             ? PCSSShadowFilter
             : undefined;

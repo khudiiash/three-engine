@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <link rel="icon" href="data:,">
+  <title>CSM transform, camera motion and freeze GPU regression</title>
+  <style>body{margin:0;background:#151515;color:#ddd;font:13px monospace}canvas{display:block}pre{white-space:pre-wrap}</style>
+</head>
+<body>
+<canvas id="view"></canvas><pre id="log"></pre>
+<script type="module">
+import * as THREE from "three/webgpu";
+import { CSMShadowNode } from "three/addons/csm/CSMShadowNode.js";
+import { LightComponent } from "/src/engine/components/LightComponent.js";
+import { ShadowFreezeSystem } from "/src/engine/shadowFreeze.js";
+import { EventEmitter } from "/src/engine/EventEmitter.js";
+import { readRenderTargetImage } from "/src/engine/renderTargetImage.js";
+
+// node scripts/run-gpu-page.mjs http://127.0.0.1:<port>/scripts/csm-gpu-smoke.html 70000
+// ?old=1 restores upstream local-space fitting / render-time-only cascade
+// placement on the very same component. It is expected to FAIL these gates.
+// No animation loop or isolated kernel replay: each capture is a real frame.
+const oldPath = new URLSearchParams(location.search).get("old") === "1";
+const width = 386, height = 256; // Deliberately requires WebGPU row unpadding.
+const reports = {};
+const log = (label, data) => {
+  reports[label] = data;
+  const line = `${label}: ${JSON.stringify(data)}`;
+  document.querySelector("#log").textContent += `${line}\n`;
+  console.log(line);
+};
+const require = (condition, message) => { if (!condition) throw new Error(message); };
+const fail = error => {
+  globalThis.__GI_SMOKE_RESULT__ = { pass: false, oldPath, reports, error: error?.stack ?? String(error) };
+  console.error("GI-SMOKE FAIL", error?.stack ?? String(error));
+};
+addEventListener("error", event => fail(event.error ?? event.message));
+addEventListener("unhandledrejection", event => fail(event.reason));
+
+function compare(a, b) {
+  let sum = 0, changed = 0, max = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    let pixelMax = 0;
+    for (let c = 0; c < 3; c++) {
+      const d = Math.abs(a[i + c] - b[i + c]);
+      sum += d;
+      pixelMax = Math.max(pixelMax, d);
+      max = Math.max(max, d);
+    }
+    if (pixelMax > 2) changed++;
+  }
+  return { mean: sum / (a.length * 0.75), changed, max };
+}
+
+function makeRig(renderer, parented) {
+  const engine = new EventEmitter();
+  engine.renderer = renderer;
+  engine.scene = new THREE.Scene();
+  engine.scene.background = new THREE.Color(0.07, 0.07, 0.07);
+  engine.settings = { shadow: { autoUpdate: true } };
+  engine.camera = new THREE.PerspectiveCamera(57, width / height, 0.2, 90);
+  engine.camera.position.set(11, 9, 17);
+  engine.camera.lookAt(0, 0, -5);
+  engine.scene.add(engine.camera);
+  engine.onPreRender = fn => engine.on("pre-render", fn);
+  const target = new THREE.RenderTarget(width, height, {
+    type: THREE.UnsignedByteType, format: THREE.RGBAFormat,
+    minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+    depthBuffer: true, samples: 0,
+  });
+  target.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  const material = new THREE.MeshStandardNodeMaterial({ color: 0xb8b8b8, roughness: 1 });
+  const geometries = [];
+  let shadowDraws = 0;
+  const addMesh = (geometry, x, y, z, cast = true) => {
+    geometries.push(geometry);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.set(x, y, z);
+    mesh.castShadow = cast;
+    mesh.receiveShadow = true;
+    // Native ShadowNode calls this after renderObject in the actual map pass.
+    mesh.onAfterShadow = () => { shadowDraws++; };
+    engine.scene.add(mesh);
+    return mesh;
+  };
+  const ground = addMesh(new THREE.PlaneGeometry(100, 100), 0, 0, -12, false);
+  ground.rotation.x = -Math.PI / 2;
+  addMesh(new THREE.BoxGeometry(2.1, 4, 2.3), -4, 2, 0).rotation.y = 0.22;
+  addMesh(new THREE.BoxGeometry(1.1, 6, 1.2), 3, 3, -6).rotation.y = -0.4;
+  addMesh(new THREE.BoxGeometry(4, 2, 2), -2, 1, -14);
+  addMesh(new THREE.BoxGeometry(2, 8, 2), 7, 4, -25);
+  addMesh(new THREE.BoxGeometry(8, 3, 1), -9, 1.5, -31);
+  engine.scene.add(new THREE.AmbientLight(0xffffff, 0.18));
+
+  const parent = new THREE.Group();
+  const owner = new THREE.Group();
+  const parentRotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.17, 0.73, -0.12));
+  const localRotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.95, -0.45, 0.13));
+  engine.scene.add(parent);
+  parent.add(owner);
+  if (parented) {
+    parent.position.set(8.3, -2.1, 4.7);
+    parent.quaternion.copy(parentRotation);
+    parent.scale.setScalar(1.7);
+    owner.quaternion.copy(localRotation);
+  } else {
+    owner.quaternion.copy(parentRotation).multiply(localRotation);
+  }
+  engine.scene.updateMatrixWorld(true);
+  const component = new LightComponent({
+    kind: "directional", intensity: 2.2, castShadow: true,
+    shadowMode: "map", csm: true, csmCascades: 3, csmMaxFar: 70,
+    csmLightMargin: 35, csmFade: true, csmSplitLambda: 0.65,
+    shadowMapType: "PCFShadowMap", shadowMapWidth: 1024, shadowMapHeight: 1024,
+    shadowCamNear: 0.1, shadowCamFar: 150,
+    shadowBias: -0.00005, shadowNormalBias: 0.015, shadowRadius: 0.6,
+  });
+  component.entity = { id: parented ? "parented-sun" : "flat-sun", object3D: owner, engine };
+  component.onAttach();
+  const csm = component.light.shadow.shadowNode;
+  require(csm instanceof CSMShadowNode, "Production light did not install CSM");
+  if (oldPath) {
+    csm.prepare = function(camera) {
+      if (!this.mainFrustum) return;
+      this.camera = camera;
+      this.updateFrustums();
+    };
+    csm.updateBefore = CSMShadowNode.prototype.updateBefore;
+  }
+  const freeze = new ShadowFreezeSystem(engine);
+  async function frame({ force = false, pixels = true } = {}) {
+    // Match Engine: finalized scene/view transforms, component preRender,
+    // freeze decision, then the real render. No extra cascade preparation.
+    engine.scene.updateMatrixWorld(true);
+    engine.emit("pre-render");
+    freeze.update();
+    if (force) for (const light of csm.lights) light.shadow.autoUpdate = true;
+    const before = shadowDraws;
+    renderer.setRenderTarget(target);
+    renderer.render(engine.scene, engine.camera);
+    await renderer.backend.device.queue.onSubmittedWorkDone();
+    return {
+      pixels: pixels ? await readRenderTargetImage(renderer, target, width, height) : null,
+      shadowDraws: shadowDraws - before,
+    };
+  }
+  async function settle() {
+    for (let i = 0; i < 7; i++) await frame({ pixels: false });
+    return frame();
+  }
+  return { engine, component, csm, freeze, frame, settle, dispose() {
+    freeze.dispose();
+    component.onDetach();
+    target.dispose();
+    material.dispose();
+    geometries.forEach(geometry => geometry.dispose());
+  } };
+}
+
+let renderer;
+const rigs = [];
+try {
+  renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view"), antialias: false });
+  renderer.setSize(width, height, false);
+  renderer.setPixelRatio(1);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFShadowMap;
+  renderer.toneMapping = THREE.NoToneMapping;
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+  // ShadowFreeze's successful-render receipt deliberately uses this counter.
+  renderer.info.autoReset = false;
+  await renderer.init();
+  require(renderer.backend.isWebGPUBackend === true, "A real WebGPU backend is required");
+  const device = renderer.backend.device;
+  const errors = [];
+  device.addEventListener("uncapturederror", event => errors.push(event.error.message));
+  device.pushErrorScope("validation");
+
+  const flat = makeRig(renderer, false);
+  rigs.push(flat);
+  const flatFrame = await flat.settle();
+  require(flat.csm.lights.length === 3, "Three cascades must be initialized");
+
+  // Prove pixels actually contain shadows, so two empty maps cannot pass parity.
+  for (const light of flat.csm.lights) light.shadow.intensity = 0;
+  const noShadows = await flat.frame();
+  for (const light of flat.csm.lights) light.shadow.intensity = 1;
+  const restored = await flat.frame();
+  const signal = compare(restored.pixels, noShadows.pixels);
+  log("shadowSignal", signal);
+  require(signal.changed > 150 && signal.mean > 0.1, "Fixture must contain a substantial visible shadow pattern");
+
+  const transformed = makeRig(renderer, true);
+  rigs.push(transformed);
+  const transformedFrame = await transformed.settle();
+  const parentParity = compare(flatFrame.pixels, transformedFrame.pixels);
+  log("parentTransformParity", parentParity);
+  require(parentParity.mean < 0.08 && parentParity.changed < 50,
+    "A translated, rotated, scaled light parent changed the world-equivalent shadows");
+
+  const held = await transformed.frame();
+  const forced = await transformed.frame({ force: true });
+  const frozenParity = compare(held.pixels, forced.pixels);
+  log("stationaryFreeze", { heldDraws: held.shadowDraws, forcedDraws: forced.shadowDraws,
+    managedMaps: transformed.freeze.managedLights, ...frozenParity });
+  require(held.shadowDraws === 0 && forced.shadowDraws >= 3, "Stationary freeze must avoid real shadow-map draws");
+  require(frozenParity.max === 0, "Stationary frozen shadows differ from an actual map refresh");
+
+  // Start each yaw from fully frozen maps. The FIRST frame after turning must
+  // match forced fresh maps at that same pose; a second-frame-only heal fails.
+  for (const yaw of [-0.28, 0.33, -0.47]) {
+    await transformed.settle();
+    transformed.engine.camera.rotateY(yaw);
+    transformed.engine.camera.updateMatrixWorld(true);
+    const first = await transformed.frame();
+    const fresh = await transformed.frame({ force: true });
+    const delta = compare(first.pixels, fresh.pixels);
+    log(`cameraYaw${yaw}`, { firstDraws: first.shadowDraws, freshDraws: fresh.shadowDraws, ...delta });
+    require(first.shadowDraws > 0, "Camera rotation must wake the maps before its first render");
+    require(delta.max === 0, "Camera rotation showed stale or inconsistent CSM shadows for one frame");
+  }
+
+  await device.queue.onSubmittedWorkDone();
+  const scopedError = await device.popErrorScope();
+  if (scopedError) errors.push(scopedError.message);
+  require(errors.length === 0, `WebGPU validation errors: ${errors.join("; ")}`);
+  require(!globalThis.__GI_SMOKE_RESULT__ || globalThis.__GI_SMOKE_RESULT__.pass !== false,
+    "An asynchronous error occurred during the fixture");
+  globalThis.__GI_SMOKE_RESULT__ = { pass: true, oldPath, reports };
+  console.log("GI-SMOKE PASS", JSON.stringify({ oldPath, reports }));
+} catch (error) {
+  fail(error);
+} finally {
+  for (const rig of rigs) rig.dispose();
+  renderer?.dispose();
+}
+</script>
+</body>
+</html>

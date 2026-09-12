@@ -59,6 +59,7 @@ import {
   sunSplitArmed,
 } from "./srcConfig.js";
 import { loopAlbedoCeiling } from "./srcConfig.js";
+import { giRateCompensatedAlpha } from "./giCadence.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX, gatherNormalBias, gatherPlaneDepth, gatherSmoothWeights, unpackProbeKey, worldKeysEnabled } from "./srcMath.js";
 import { hashKey, packProbeKey } from "./srcMathTsl.js";
@@ -270,6 +271,11 @@ export function createSrcProbeSystem({
   // prior of last resort (srcSeed's header). Null in every fixture.
   farField = null,
   lighting = null, surfaces = null, sceneMotion = null, trackMotion = null,
+  // §11.55: `() => Hz` — the world chain's live update rate, so the temporal
+  // α can hold its PER-SECOND decay when GISystem runs the transport below
+  // the full rate (giCadence's drive-scaled rate). Null (every fixture) keeps
+  // the per-update α exactly as written.
+  worldRate = null,
   // §10: `{ dyn }` — the dynamic-object set that owns the static BVH8. When
   // given, the transport traces the BVH (srcBvhTrace.js) instead of the
   // occupancy pyramid, and hits are attributed by slot (`surfaces.surfaceAtHit`).
@@ -755,12 +761,16 @@ export function createSrcProbeSystem({
   const VIS_CACHE_CAP = 1 << 18;
   const visCacheKU = uniform(VIS_CACHE_K, "uint");
   const visCacheSpacingU = uniform(spacing0 * VIS_CACHE_SPACING_MUL);
-  // ⛔ OPT-IN, NOT DEFAULT (§11.46). This cache changed the PICTURE — the
-  // user's "lost its colour and atmosphere" — and every perf and stability
-  // receipt it had was blind to that. The unanimity rule below should make
-  // it exact, but "should" is not a receipt: it goes back on only after a
-  // look check on the user's own scene. `__giSrcVisCache = true` arms it.
-  const visCacheOn = globalThis.__giSrcVisCache === true;
+  // ⭐ DEFAULT ON since 2026-09-12 — after the look check §11.46 asked for.
+  // It shipped opt-in because its first form changed the PICTURE ("lost its
+  // colour and atmosphere"); the unanimity rule below made it exact, and on
+  // 2026-09-11/12 the user compared the Sponza corridors and atrium with it
+  // off and on ("looks fine to me after rearm"). Receipt: shade 75 → 41 ns
+  // per hit at a third of visibility queries served, still converging — the
+  // one traversal saving the phone (18× slower at BVH work than the desktop)
+  // gets without a look change. `__giSrcVisCache = false` is the pre-§11.44
+  // kernel.
+  const visCacheOn = globalThis.__giSrcVisCache !== false;
   const visKeys = visCacheOn ? instancedArray(new Uint32Array(VIS_CACHE_CAP), "uint").toAtomic() : null;
   const visRows = visCacheOn ? instancedArray(new Uint32Array(VIS_CACHE_CAP * VIS_CACHE_ROWS), "uint") : null;
   let visCacheClearFrames = 0;
@@ -2653,7 +2663,21 @@ export function createSrcProbeSystem({
       // motion-only root for an A/B.
       const lightRootRelax = globalThis.__giSrcLightRootRelax !== false ? lightTerm : 0;
       const rootS = 1 + (Math.max(1, rayStride) - 1) * (1 - Math.max(tr, sustained, lightRootRelax));
-      const keep = (1 - alpha) ** (1 / rootS);
+      // §11.55: OPT-IN (`__giSrcRateAlpha = true`) — below the full world rate
+      // lift the α so the field's decay PER SECOND is what it was at 30 Hz.
+      // Measured on Sponza with the sun rotating (profile.flicker, same
+      // session, camera still): reversals per pixel-frame identical (0.0017
+      // vs 0.0018 at 30 Hz) but the p95 one-frame step 0.35× vs 0.20× of the
+      // image mean — fewer, larger updates. The no-steps gate outranks the
+      // lag, and the lag a slow light earns is small in DEGREES (at 2°/s a
+      // 2 s time constant is ~4° of indirect light behind the sun), so the
+      // shipped default keeps the per-update α and lets a slow sun be
+      // tracked slowly. A fast light drives the rate back to 30 Hz anyway.
+      const rateHz = typeof worldRate === "function" ? Number(worldRate()) : Number.NaN;
+      const alphaAtRate = globalThis.__giSrcRateAlpha === true
+        ? giRateCompensatedAlpha(alpha, rateHz)
+        : alpha;
+      const keep = (1 - alphaAtRate) ** (1 / rootS);
       if (keepU.value !== keep) keepU.value = keep;
       // §11.13: the far duty follows motion — the camera's sustained motion
       // or an open light window — between its rest and motion values.

@@ -17,7 +17,14 @@
       globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
 
       try {
-        const rayHitMode = new URLSearchParams(location.search).get("mode") ?? "hybrid-brick-box";
+        const clipmapArm = new URLSearchParams(location.search).get("clipmap") === "1";
+        // This arm verifies actual GI texture consumers as well as native
+        // rendering, so its defaults must build the SRC hit-shading graph.
+        const rayHitMode = new URLSearchParams(location.search).get("mode")
+          ?? (clipmapArm ? "hybrid-plane" : "hybrid-brick-box");
+        if (clipmapArm && new URLSearchParams(location.search).get("lightshadow") === "1") {
+          throw new Error("clipmap=1 and lightshadow=1 select different shadow sources; run separately");
+        }
         const ACTIVE_MODES = {
           "occupancy-legacy": 0,
           "hybrid-brick-box": 1,
@@ -123,7 +130,11 @@
         // limit on a device created at exactly that limit — the audit below
         // walks them, and anything over the line fails pipeline creation, which
         // surfaces as a validation error rather than as a wrong picture.
-        const srcArm = new URLSearchParams(location.search).get("src") === "1";
+        const srcParameter = new URLSearchParams(location.search).get("src");
+        const srcArm = srcParameter === "1" || (clipmapArm && srcParameter === null);
+        if (clipmapArm && (!srcArm || !planeMode)) {
+          throw new Error("clipmap=1 requires SRC hit shading; use src=1 and mode=hybrid-plane (the clipmap defaults)");
+        }
         // `?irrfallback=1` runs a synthetic five-pixel temporal resolve before
         // the scene arm: an UNKNOWN pixel beside a known coplanar/same-normal
         // receiver must borrow it, while an equally close perpendicular face
@@ -191,6 +202,17 @@
         if (engine.getBackendName() !== "WebGPU") throw new Error(`WebGPU unavailable (${engine.getBackendName()})`);
         globalThis.__GI_SMOKE_RENDERER__ = engine.renderer;
         const device = engine.renderer.backend.device;
+        const clipmapShaderAudit = { modules: 0, bytes: 0 };
+        if (clipmapArm) {
+          const createShaderModule = device.createShaderModule;
+          device.createShaderModule = function (descriptor) {
+            if (descriptor.code?.includes("clipmapShadow")) {
+              clipmapShaderAudit.modules++;
+              clipmapShaderAudit.bytes += descriptor.code.length;
+            }
+            return createShaderModule.call(this, descriptor);
+          };
+        }
         const validationErrors = [];
         device.addEventListener?.("uncapturederror", (event) => {
           validationErrors.push(event.error?.message ?? String(event.error));
@@ -294,7 +316,22 @@
         // silently drops the whole compute batch, so this is the compile gate
         // for the shadow variant that no CPU suite can provide.
         const lightShadowArm = new URLSearchParams(location.search).get("lightshadow") === "1";
-        if (lightShadowArm) {
+        if (clipmapArm) {
+          engine.renderer.shadowMap.enabled = true;
+          floor.castShadow = floor.receiveShadow = true;
+          wall.castShadow = wall.receiveShadow = true;
+          const sunEnt = engine.createEntity({ name: "Smoke Clipmap Sun" });
+          sunEnt.object3D.quaternion.setFromUnitVectors(
+            new THREE.Vector3(0, 0, -1), new THREE.Vector3(-2, -4, -2).normalize(),
+          );
+          const sunComp = sunEnt.addComponent("light", {
+            kind: "directional", color: "#ffffff", intensity: 2,
+            castShadow: true, shadowMode: "clipmap", shadowMapType: "PCFShadowMap",
+            shadowMapWidth: 512, shadowMapHeight: 512,
+            clipmapLevels: 3, clipmapNearSize: 20, clipmapScale: 4, clipmapCache: true,
+          });
+          globalThis.__GI_SMOKE_SUN__ = { ent: sunEnt, comp: sunComp };
+        } else if (lightShadowArm) {
           engine.renderer.shadowMap.enabled = true;
           const sunEnt = engine.createEntity({ name: "Smoke Sun" });
           const sunComp = sunEnt.addComponent("light", {
@@ -347,7 +384,7 @@
         // validated, and the eye check would be the first thing to find out.
         // A global rather than a property: the debug view cannot change the lit
         // image, so it is a developer instrument (giConfig's `giDebugView`).
-        globalThis.__giDebugView = srcArm ? "src-probes" : (hybridMode ? "occupancy" : "off");
+        globalThis.__giDebugView = srcArm ? "src-probes" : (clipmapArm ? "off" : (hybridMode ? "occupancy" : "off"));
 
         const gi = engine.createEntity({ name: "GI Smoke" });
         // ONE PROPERTY. The volume, densities, reflections, AO and ray-hit mode
@@ -375,6 +412,10 @@
           if (!system?.state || engine.renderSuspended || validationErrors.length) continue;
           settled++;
           stats = await system.readRayHitStats();
+          if (clipmapArm && system._fieldReadyOnce && clipmapShaderAudit.modules
+            && globalThis.__GI_SMOKE_SUN__?.comp?.light?.shadow?.shadowNode?._shadowNodes
+              ?.every((node) => node._combinedReceipt)
+            && system.state.sunShadow?.count?.value === 3) break;
           if (stats?.rays > 0 &&
             (!hybridMode || stats.brickSteps > 0) &&
             (!planeMode || stats.planeTests > 0) &&
@@ -710,7 +751,10 @@
 
         // ── ?src=1 assertions ────────────────────────────────────────────
         let srcReport = null;
-        if (srcArm) {
+        // Clipmap mode gates shadow sampling and composed GPU bindings. The
+        // legacy src=1 arm retains its independent transport/tile assertions.
+        if (clipmapArm) console.log("GI-SMOKE NOTE clipmap integration gate: SRC transport/tile numerical assertions are not run; use src=1 without clipmap for that suite");
+        if (srcArm && !clipmapArm) {
           const src = state?.screen?.srcProbes;
           if (!src) throw new Error("src arm: __giSrcProbes was set but no probe system was built");
           // POLL until the tallies are live, don't read once. The dynobj arm
@@ -1228,7 +1272,7 @@
         // binding audit, the dynobj arm and the validation check behind it.
         // `?requirerays=1` still pins the demand on explicitly.
         const raysRequired =
-          srcArm || new URLSearchParams(location.search).get("requirerays") === "1";
+          (!clipmapArm && srcArm) || new URLSearchParams(location.search).get("requirerays") === "1";
         const countersFed = stats?.dispatched !== false && (stats?.rays ?? 0) > 0;
         if (!countersFed && raysRequired) {
           throw new Error(
@@ -1237,14 +1281,14 @@
             (srcArm ? " despite ?src=1, so the scaffold ray pass never dispatched" : ""),
           );
         }
-        if (!countersFed) {
+        if (!countersFed && !clipmapArm) {
           console.log(
             "GI-SMOKE NOTE traversal counters unfed (SRC is the only profiled tracer and this " +
             "arm has it compiled out) — the mode-specific step/plane/triangle assertions are SKIPPED",
           );
         }
         // Gated on SRC's RUNG, not the engine's mode — see `srcPlaneTrace`.
-        if (countersFed) {
+        if (countersFed && !clipmapArm) {
           if (srcPlaneTrace && !stats.brickSteps) {
             throw new Error("hybrid local-brick traversal counters stayed at zero");
           }
@@ -1274,7 +1318,7 @@
         // these reads the traversal counters, and structural zeros are not
         // measured zeros. `skip=0`'s "still executed N coarse levels" would
         // even PASS on unfed counters, which is worse than failing.
-        if (countersFed) {
+        if (countersFed && !clipmapArm) {
           // ── A RATE, NOT AN ABSOLUTE ZERO, AND THE MEASUREMENT THAT FORCED IT ──
           //
           // This was `!== 0` for the dense backend, whose profiled rays were
@@ -1351,6 +1395,76 @@
             `GI-SMOKE DYNAMIC tail=${dynamicAlloc.dynamicAllocated}/${dynamicAlloc.dynamicCapacity} ` +
             `dynTris=${dynamicAlloc.dynamicTriangles ?? 0}/${dynamicAlloc.dynamicTriangleCapacity ?? 0} overflow=0`,
           );
+        }
+        let clipmapReport = null;
+        if (clipmapArm) {
+          const sunLight = globalThis.__GI_SMOKE_SUN__?.comp?.light;
+          const clipmap = sunLight?.shadow?.shadowNode;
+          if (!clipmap?.isClipmapShadowNode || clipmap.lights.length !== 3) {
+            throw new Error("clipmap arm: production LightComponent did not install three clipmap levels");
+          }
+          if (sunLight.userData.giShadowMode !== "map" || !clipmapShaderAudit.modules) {
+            throw new Error("clipmap arm: native clipmap WGSL never compiled or GI replaced its shadow source");
+          }
+          const ready = () => clipmap._shadowNodes.every((node) => node._combinedReceipt)
+            && engine.modules.get("gi")?.system?.state?.sunShadow?.count?.value === 3;
+          const mapDeadline = performance.now() + 5_000;
+          while (!ready() && performance.now() < mapDeadline && !validationErrors.length) {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+          }
+          const shadows = sunLight.userData.giShadowMaps();
+          const bundle = engine.modules.get("gi")?.system?.state?.sunShadow;
+          if (shadows.length !== 3 || bundle?.count?.value !== 3) {
+            throw new Error(`clipmap arm: GI did not adopt all native maps (${shadows.length}/${bundle?.count?.value ?? 0})`);
+          }
+          for (let i = 0; i < shadows.length; i++) {
+            const shadow = shadows[i];
+            const node = clipmap._shadowNodes[i];
+            const depth = shadow.map?.depthTexture;
+            if (shadow !== clipmap.lights[i].shadow || shadow.map !== node.shadowMap
+              || !depth || !engine.renderer.backend.get(depth).texture || !node._combinedReceipt
+              || shadow.map.width !== 512 || shadow.map.height !== 512) {
+              throw new Error(`clipmap arm: level ${i} has no completed native 512px combined map`);
+            }
+            if (bundle.bound[i] !== depth || !bundle.nodes[i].length
+              || bundle.nodes[i].some((node) => node.value !== depth)) {
+              throw new Error(`clipmap arm: GI level ${i} is sampling a placeholder or a split cache texture`);
+            }
+          }
+          engine.stop();
+          const T = await import("three/tsl");
+          const { sunShadowVisibilityAt } = await import("/src/modules/gi/giLight.js");
+          const visibility = T.instancedArray(new Float32Array(3), "float");
+          const sample = T.Fn(() => {
+            visibility.element(0).assign(sunShadowVisibilityAt(bundle, T.vec3(-3, -0.9, 0), T.vec3(0, 1, 0)));
+            visibility.element(1).assign(sunShadowVisibilityAt(bundle, T.vec3(0, -0.9, 0), T.vec3(0, 1, 0)));
+            visibility.element(2).assign(sunShadowVisibilityAt(bundle, T.vec3(10000), T.vec3(0, 1, 0)));
+          })().compute(1);
+          const priorSync = engine.renderer.backend.__giSyncCompute;
+          let samples;
+          try {
+            engine.renderer.backend.__giSyncCompute = true;
+            await engine.renderer.computeAsync(sample);
+            samples = Array.from(new Float32Array(await engine.renderer.getArrayBufferAsync(visibility.value)));
+          } finally {
+            engine.renderer.backend.__giSyncCompute = priorSync;
+            visibility.value.dispose?.();
+            sample.dispose?.();
+          }
+          if (samples[0] !== 0 || samples[1] !== 1 || samples[2] !== -1) {
+            throw new Error(`clipmap arm: production GI sampler returned ${JSON.stringify(samples)}, expected shadow/lit/outside = [0,1,-1]`);
+          }
+          clipmapReport = {
+            scope: "shadow sampling and binding integration; SRC transport correctness is not asserted",
+            levels: shadows.length, mapSize: 512, shaderModules: clipmapShaderAudit.modules,
+            shaderBytes: clipmapShaderAudit.bytes, giMaps: bundle.count.value,
+            visibility: samples,
+            holds: clipmap._shadowNodes.map((node) => node.stats.holds),
+            staticCasters: clipmap.cache.stats.staticCasters, movingCasters: clipmap.cache.stats.movingCasters,
+            boundNodes: bundle.nodes.slice(0, 3).map((nodes) => nodes.length),
+          };
+          if (validationErrors.length) throw new Error(validationErrors.join("\n"));
+          console.log("GI-SMOKE CLIPMAP", JSON.stringify(clipmapReport));
         }
         if (lightShadowArm) {
           // The claim is only proven by the artifacts it leaves: a custom
@@ -1743,8 +1857,13 @@
           surfaceAlloc,
           bindingAudit,
           srcProbes: srcReport,
+          ...(clipmapArm ? { clipmap: clipmapReport } : {}),
         };
-        console.log(
+        if (clipmapArm) console.log(
+          `GI-SMOKE PASS storage=8 clipmap=3x512 visibility=${clipmapReport.visibility.join(",")} ` +
+          `nativeShaders=${clipmapReport.shaderModules} giMaps=${clipmapReport.giMaps}`,
+        );
+        else console.log(
           `GI-SMOKE PASS storage=8 mode=${rayHitMode} rays=${stats.rays} ` +
           `avgMacro=${stats.averageMacroSteps.toFixed(2)} avgBrick=${stats.averageBrickSteps.toFixed(2)} ` +
           `maxMacro=${stats.maxMacroSteps} maxBrick=${stats.maxBrickSteps} ` +

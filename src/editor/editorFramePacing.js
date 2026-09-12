@@ -1,6 +1,6 @@
 // @ts-check
 import { engine } from "./engineInstance.js";
-import { oncePerVm } from "./singleton.js";
+import { oncePerVm, vmSingleton } from "./singleton.js";
 import { editorFrameRateFor, shouldSuspendViewport } from "./framePolicy.js";
 import { onAssetInvalidated } from "./assetLoader.js";
 import { useHistoryStore } from "./commands/CommandBus.js";
@@ -133,12 +133,44 @@ function viewportFocused() {
 }
 
 /**
+ * True when the editor WINDOW is the one the OS has in the foreground.
+ *
+ * `document.hasFocus()` is the only primitive that answers this. `document.
+ * hidden` does not: a Tauri/WebView2 window sitting behind Chrome is not
+ * hidden, it is unfocused, so `visibilitychange` never fires and the viewport
+ * kept drawing while the user measured an exported build on the same GPU.
+ *
+ * Defaults to focused when the API is missing (a headless harness), matching
+ * `viewportFocused`'s "nothing is competing" fallback — never freeze forever
+ * because a probe was unavailable.
+ */
+function appFocused() {
+  if (typeof document === "undefined") return true;
+  return typeof document.hasFocus === "function" ? document.hasFocus() : true;
+}
+
+/**
  * Stops the viewport rendering whenever nobody is looking at it, and shares the
  * main thread when it is rendering something heavy.
  *
  * Installed once after the engine exists. It never limits Play mode and it
  * never slows direct canvas gestures such as orbiting or a transform drag.
  */
+/**
+ * The pacer's last decision and every input it read — `profile.frameStats`
+ * reports it as `viewportPacing`. "The viewport still does not pause when
+ * unfocused" (2026-09-11) had no receipt: the answer lives in six booleans
+ * inside a closure, and the user could only see the fps. Now the receipt
+ * names which input kept it awake — a hold (the docked profiler), a change
+ * still settling (`catchingUp`), a pin (a GI rebuild, a scene streaming in),
+ * or the window simply still being in front.
+ */
+export function getEditorFramePacingState() {
+  return pacingState.last;
+}
+
+const pacingState = vmSingleton("editorFramePacing.state", () => ({ last: null }));
+
 export function installEditorFramePacing() {
   if (!oncePerVm("editorFramePacing.install")) return;
 
@@ -251,10 +283,29 @@ export function installEditorFramePacing() {
     // `__editorKeepRendering` is the HARNESS hatch: headless suites are never
     // focused, so without it every probe reads a sleeping engine ("GI never
     // built" with no error anywhere — the signature that burned a session).
+    // ⛔ `!model.root` WAS A PIN THAT COULD NEVER RELEASE (fixed 2026-09-11).
+    //
+    // "freeze unfocused never working on my sponza. It is always rendering."
+    // A pinned viewport calls `wake()` every sample and can never suspend, and
+    // this predicate latched ON permanently for three ordinary states, because
+    // `root` is null in all of them and only a SUCCESSFUL load ever sets it:
+    //   - a model whose GLB failed to load (`#load` catches, logs, leaves
+    //     `root` null — see ModelComponent.js:100),
+    //   - a DETACHED model: a disabled entity detaches its components
+    //     (`Entity.reconcileActivity`) and `onDetach` nulls `root` while
+    //     `props.path` stays set,
+    //   - a model on an entity that never attached at all.
+    // One such entity anywhere in the scene held the whole editor at full rate
+    // for the session. Sponza carries a character prefab, which is why it bit
+    // there and not on a bare scene.
+    //
+    // `assetLoadsPending` is the flag that actually means "streaming": set from
+    // `props.path` in `onAttach` and cleared in a `.finally()`, so it releases
+    // on failure exactly as it does on success. The mesh arm below already used
+    // it; the model arm now asks the same question.
     const sceneStreaming = () => {
       for (const entity of engine.entities?.values?.() ?? []) {
-        const model = entity.getComponent?.("model");
-        if (model?.props?.path && !model.root) return true;
+        if (entity.getComponent?.("model")?.assetLoadsPending) return true;
         if (entity.getComponent?.("mesh")?.assetLoadsPending) return true;
       }
       return false;
@@ -277,20 +328,43 @@ export function installEditorFramePacing() {
     // field, the freshly decoded mesh) — give it a normal catch-up window.
     if (pinned) wake();
 
+    const inputs = {
+      playing: engine.playing,
+      visible: viewportVisible(),
+      focused: viewportFocused(),
+      appFocused: appFocused(),
+      freeze: isViewportFreezeEnabled(),
+      held: isViewportHeldAwake(),
+    };
     const idle =
       !pinned &&
       !animationAuditionActive() &&
-      shouldSuspendViewport({
-        playing: engine.playing,
-        visible: viewportVisible(),
-        focused: viewportFocused(),
-        freeze: isViewportFreezeEnabled(),
-        held: isViewportHeldAwake(),
-      });
+      shouldSuspendViewport(inputs);
     // A change still settling keeps the loop alive even when nobody is looking
     // directly: the alternative is a viewport that is only correct for whoever
     // happens to be watching it at the time.
-    const catchingUp = performance.now() < dirtyUntil;
+    //
+    // ⚠ NOT WHEN THE WINDOW ITSELF IS IN THE BACKGROUND (2026-09-11). A scene
+    // whose sun rotates in the editor (Sponza's Rotator runs in edit mode)
+    // fires a wake event EVERY frame, so `catchingUp` never lapsed and the
+    // viewport kept drawing at the catch-up rate behind the browser the user
+    // was measuring a build in — GI world chain and all. Nobody can see a
+    // background window catch up; it catches up the instant focus returns
+    // (`focus`/`focusin` call apply, which wakes). Holds and pins still win:
+    // a detached profiler window and a boot that must finish are real.
+    const windowAway = inputs.freeze && !inputs.appFocused;
+    const catchingUp = performance.now() < dirtyUntil && !windowAway;
+    pacingState.last = {
+      ...inputs,
+      pinned,
+      idle,
+      catchingUp,
+      windowAway,
+      audition: animationAuditionActive(),
+      suspended,
+      frameLimitFps: applied,
+      at: performance.now(),
+    };
 
     // A live drag on the geometry editor's canvas owns the main thread. The
     // geometry editor renders through its own canvas and requestAnimationFrame
@@ -486,6 +560,13 @@ export function installEditorFramePacing() {
   window.addEventListener("focusin", apply, true);
   window.addEventListener("pointerdown", apply, true);
   document.addEventListener("visibilitychange", apply);
+  // The WINDOW gaining or losing the OS foreground. `visibilitychange` does not
+  // fire for this in a desktop webview (the window is unfocused, not hidden),
+  // so without these two the viewport only noticed at the next 250 ms sample —
+  // and on `blur` it has to notice now, because the whole point is to hand the
+  // GPU to whatever the user just switched to. See `appFocused`.
+  window.addEventListener("blur", apply);
+  window.addEventListener("focus", apply);
   engine.on("play-changed", apply);
   engine.on("animation-audition-changed", () => {
     wake();

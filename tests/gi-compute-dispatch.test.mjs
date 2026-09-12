@@ -117,3 +117,65 @@ test("a repeated dispatch of the same node stays quiet and keeps working", () =>
   assert.equal(renderer.dispatched.length, 3, "every dispatch still reaches the renderer");
   assert.equal(freeze._stackName.length, 0);
 });
+
+// ── §11.56: built kernels dispatch as one compute pass ─────────────────────
+test("built nodes in a list go to the renderer as ONE array, in order; unbuilt ones split the group", () => {
+  const renderer = stubRenderer();
+  const a = node("a"), b = node("b"), c = node("c");
+  // First pass: all unbuilt → three singles (each builds alone, in its span).
+  giCompute(renderer, [a, b, c]);
+  assert.deepEqual(renderer.dispatched.map((n) => Array.isArray(n) ? n.map((m) => m.name) : n.name), ["a", "b", "c"]);
+  // Second pass: all built → one array call carrying the same order.
+  renderer.dispatched.length = 0;
+  giCompute(renderer, [a, b, c]);
+  assert.equal(renderer.dispatched.length, 1, "one renderer.compute call for three built nodes");
+  assert.ok(Array.isArray(renderer.dispatched[0]));
+  assert.deepEqual(renderer.dispatched[0].map((n) => n.name), ["a", "b", "c"]);
+  assert.ok(Number.isInteger(renderer.dispatched[0].id), "the group array carries an id (three keys its timestamp UID on context.id)");
+  // The same composition reuses the same array object (stable pass data).
+  const first = renderer.dispatched[0];
+  renderer.dispatched.length = 0;
+  giCompute(renderer, [a, b, c]);
+  assert.equal(renderer.dispatched[0], first);
+  // A new node in the middle splits the group: [a] | d (single, unbuilt) | [b, c].
+  const d = node("d");
+  renderer.dispatched.length = 0;
+  giCompute(renderer, [a, d, b, c]);
+  assert.deepEqual(
+    renderer.dispatched.map((n) => Array.isArray(n) ? n.map((m) => m.name) : n.name),
+    ["a", "d", ["b", "c"]],
+  );
+  assert.equal(freeze._stackName.length, 0);
+});
+
+test("a single built node still dispatches as a node, not a one-element array", () => {
+  const renderer = stubRenderer();
+  const solo = node("solo");
+  giCompute(renderer, solo);
+  giCompute(renderer, solo);
+  assert.equal(renderer.dispatched.length, 2);
+  assert.ok(!Array.isArray(renderer.dispatched[1]));
+});
+
+test("`__giComputeGroups = false` restores one call per node", () => {
+  const renderer = stubRenderer();
+  const a = node("a"), b = node("b");
+  giCompute(renderer, [a, b]);
+  globalThis.__giComputeGroups = false;
+  try {
+    renderer.dispatched.length = 0;
+    giCompute(renderer, [a, b]);
+    assert.deepEqual(renderer.dispatched.map((n) => n.name), ["a", "b"]);
+  } finally {
+    delete globalThis.__giComputeGroups;
+  }
+});
+
+test("a throw inside a group still reports the group and leaves the span stack clean", () => {
+  const boom = new Error("bind group invalid");
+  const a = node("a"), b = node("b");
+  giCompute(stubRenderer(), [a, b]);
+  const renderer = stubRenderer((n) => { if (Array.isArray(n)) throw boom; });
+  assert.throws(() => giCompute(renderer, [a, b]), (e) => e === boom);
+  assert.equal(freeze._stackName.length, 0);
+});

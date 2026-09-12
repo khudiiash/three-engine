@@ -855,6 +855,18 @@ export function createSrcGlossyGather(gatherAt, { readPixel, width, height, came
   const histPos = mkTex("giSrcGlossyHistPos", THREE.FloatType);
   const capU = uniform(cap);
   const widthU = width;
+  // ── THE REFLECTED RAY'S FIRST PROBE, NOT THE SURFACE'S (2026-09-11) ──────
+  // The phone's curtain hems glowed warm-white with the reflection rail at
+  // any level above zero and went dark at zero: the glossy term read the
+  // lattice at P, i.e. the probe of the hem's OWN cell — at 5-10 m that is a
+  // cascade-1/2 cell of 0.9-1.8 m straddling the arcade, whose view along R
+  // is the sunlit atrium. A reflected ray leaves P along R, so the radiance
+  // it carries is the lattice's radiance along R FROM WHERE THE RAY IS, one
+  // cell out: sampling at P + R·δ puts the lookup on the ray's side of any
+  // wall the cell straddles. δ is a live uniform in metres (GISystem drives
+  // it: one cascade-0 spacing, `__giGlossyRayOffset` pins; 0 reproduces the
+  // previous graph exactly).
+  const rayOffsetU = uniform(0);
 
   const compute = Fn(() => {
     const i = instanceIndex.toVar();
@@ -869,7 +881,8 @@ export function createSrcGlossyGather(gatherAt, { readPixel, width, height, came
       const R = reflect(P.sub(vec3(camera)).normalize(), N).toVar();
       // ÷π: cosine-hemisphere irradiance → the outgoing-radiance scale the
       // specular slot multiplies by F (§12.71b's convention, unchanged).
-      E.assign(vec3(gatherAt(P, N, R).irradiance).mul(1 / Math.PI));
+      const Ps = P.add(R.mul(float(rayOffsetU))).toVar();
+      E.assign(vec3(gatherAt(Ps, N, R).irradiance).mul(1 / Math.PI));
       // The firefly clamp — soft luminance cap, hue-preserving.
       const lum = E.x.mul(0.2126).add(E.y.mul(0.7152)).add(E.z.mul(0.0722)).toVar();
       E.mulAssign(float(capU).div(lum.max(capU)));
@@ -887,6 +900,8 @@ export function createSrcGlossyGather(gatherAt, { readPixel, width, height, came
     /** The resolve's glossy input: one texture sample, no storage bindings. */
     node: texture(target),
     cap: capU,
+    /** Metres along R the lookup is taken from (live; GISystem drives it). */
+    rayOffset: rayOffsetU,
     width,
     height,
     dispose() {

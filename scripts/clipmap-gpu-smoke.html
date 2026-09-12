@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><link rel="icon" href="data:,">
+  <title>Cached shadow clipmaps: GPU regression and CSM comparison</title>
+  <style>body{margin:0;background:#151515;color:#ddd;font:13px monospace}canvas{display:block}pre{white-space:pre-wrap}</style>
+</head>
+<body><canvas id="view"></canvas><pre id="log"></pre>
+<script type="module">
+import * as THREE from "three/webgpu";
+import { positionLocal, uniform, vec3 } from "three/tsl";
+import { LightComponent } from "/src/engine/components/LightComponent.js";
+import { ShadowFreezeSystem } from "/src/engine/shadowFreeze.js";
+import { EventEmitter } from "/src/engine/EventEmitter.js";
+import { readRenderTargetImage } from "/src/engine/renderTargetImage.js";
+
+// Run with scripts/run-gpu-page.mjs and an exclusive GPU. This reports measured
+// shadow draws and summed render-pass GPU timestamps, never a synthetic FPS
+// estimate. Texture copies, queue gaps and query readback are not timed passes.
+// Both arms use the same scene, camera, filter and 3 x 1024 shadow-map setting.
+// CSM and clipmaps allocate resolution differently, so their pixel equality is
+// tested only at world points away from shadow boundaries. Cache/fresh parity
+// within one arm is byte-exact, including the first frame after each mutation.
+// ?cache=0 is the negative control: full-scene map holds still work, but the
+// second-mover static-raster savings gate must FAIL without the split cache.
+const width = 386, height = 256; // Exercise production WebGPU row unpadding.
+const cacheUnderTest = new URLSearchParams(location.search).get("cache") !== "0";
+const reports = {}, resources = [];
+const log = (name, data) => {
+  reports[name] = data;
+  const line = `${name}: ${JSON.stringify(data)}`;
+  document.querySelector("#log").textContent += `${line}\n`;
+  console.log(line);
+};
+const require = (value, message) => { if (!value) throw new Error(message); };
+const fail = error => {
+  globalThis.__GI_SMOKE_RESULT__ = { pass: false, reports, error: error?.stack ?? String(error) };
+  console.error("GI-SMOKE FAIL", error?.stack ?? String(error));
+};
+addEventListener("error", event => fail(event.error ?? event.message));
+addEventListener("unhandledrejection", event => fail(event.reason));
+
+function compare(a, b) {
+  let changed = 0, maximum = 0, sum = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    let dPixel = 0;
+    for (let c = 0; c < 3; c++) {
+      const d = Math.abs(a[i + c] - b[i + c]);
+      sum += d; maximum = Math.max(maximum, d); dPixel = Math.max(dPixel, d);
+    }
+    if (dPixel > 2) changed++;
+  }
+  return { changed, max: maximum, mean: sum / (a.length * 0.75) };
+}
+function requireSingleFullRefresh(result, label, levels) {
+  log(label, { shadowDraws: result.shadowDraws, shadowPasses: result.shadowPasses,
+    textureCopies: result.textureCopies, cacheStats: result.cacheStats });
+  require(result.shadowPasses.length === levels && result.shadowPasses.every(count => count === 1),
+    `${label}: each level must rasterize exactly one native shadow pass`);
+  require(result.textureCopies.length === 0, `${label}: moving or all-static maps must not copy cache textures`);
+  require(result.cacheStats.every(stats => stats.fullRenders === 1
+    && stats.staticRenders === 0 && stats.movingRenders === 0 && stats.copies === 0),
+  `${label}: changed maps must bypass static capture/overlay work`);
+}
+const median = values => {
+  const finite = values.filter(Number.isFinite).sort((a, b) => a - b);
+  return finite.length ? finite[Math.floor(finite.length / 2)] : null;
+};
+function sampleWorld(pixels, camera, point) {
+  const ndc = new THREE.Vector3(...point).project(camera);
+  require(Math.abs(ndc.x) < 0.98 && Math.abs(ndc.y) < 0.98 && ndc.z >= 0 && ndc.z <= 1,
+    `World sample outside camera: ${point}`);
+  const x = Math.round((ndc.x * 0.5 + 0.5) * width - 0.5);
+  const y = Math.round((-ndc.y * 0.5 + 0.5) * height - 0.5);
+  let sum = 0;
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const i = ((y + dy) * width + x + dx) * 4;
+    sum += (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
+  }
+  return sum / 9;
+}
+
+function makeRig(renderer, mode, { cache = true } = {}) {
+  const engine = new EventEmitter();
+  engine.renderer = renderer;
+  engine.scene = new THREE.Scene();
+  engine.scene.background = new THREE.Color(0.045, 0.045, 0.045);
+  engine.settings = { shadow: { autoUpdate: true } };
+  engine.camera = new THREE.PerspectiveCamera(57, width / height, 0.2, 100);
+  engine.camera.position.set(0, 6, 9);
+  engine.camera.lookAt(0, 0, -2);
+  engine.scene.add(engine.camera);
+  engine.onPreRender = fn => engine.on("pre-render", fn);
+  const target = new THREE.RenderTarget(width, height, {
+    type: THREE.UnsignedByteType, format: THREE.RGBAFormat, depthBuffer: true,
+    minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, samples: 0,
+  });
+  target.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  const materials = [new THREE.MeshStandardNodeMaterial({ color: 0xb8b8b8, roughness: 1 })];
+  const geometries = [], skeletons = [];
+  let shadowDraws = 0;
+  const addMesh = (name, geometry, x, y, z, material = materials[0], cast = true) => {
+    geometries.push(geometry);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = name;
+    mesh.position.set(x, y, z);
+    mesh.castShadow = cast;
+    mesh.receiveShadow = true;
+    mesh.userData.giMobility = "static";
+    engine.scene.add(mesh);
+    return mesh;
+  };
+  const floor = addMesh("ground", new THREE.PlaneGeometry(180, 180), 0, 0, -15, materials[0], false);
+  floor.rotation.x = -Math.PI / 2;
+  const mover = addMesh("moving box", new THREE.BoxGeometry(2, 3, 2), 0, 1.5, -6);
+  mover.userData.giMobility = "dynamic";
+  addMesh("middle box", new THREE.BoxGeometry(3, 5, 3), -7, 2.5, -15);
+  addMesh("far box", new THREE.BoxGeometry(4, 8, 4), 10, 4, -35);
+  addMesh("translation coverage box", new THREE.BoxGeometry(2, 4, 2), 12, 2, -5);
+  const offscreen = addMesh("offscreen overhead caster", new THREE.BoxGeometry(2, 0.6, 2), 3.5, 9, 1);
+  const maskBytes = new Uint8Array(16 * 16 * 4);
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+    const i = (y * 16 + x) * 4;
+    maskBytes[i] = maskBytes[i + 1] = maskBytes[i + 2] = 255;
+    maskBytes[i + 3] = ((x >> 2) + (y >> 2)) % 2 ? 255 : 0;
+  }
+  const maskedAlpha = maskBytes.slice();
+  const mask = new THREE.DataTexture(maskBytes, 16, 16, THREE.RGBAFormat, THREE.UnsignedByteType);
+  mask.minFilter = mask.magFilter = THREE.NearestFilter;
+  mask.generateMipmaps = false;
+  mask.needsUpdate = true;
+  const leafMaterial = new THREE.MeshStandardNodeMaterial({ color: 0xb8b8b8,
+    map: mask, alphaTest: 0.5, side: THREE.DoubleSide, roughness: 1 });
+  materials.push(leafMaterial);
+  const cutout = addMesh("offscreen alpha cutout", new THREE.PlaneGeometry(3, 3), -3.5, 9, 1, leafMaterial);
+  cutout.rotation.x = -Math.PI / 2;
+  engine.scene.add(new THREE.AmbientLight(0xffffff, 0.16));
+  const owner = new THREE.Group();
+  owner.rotation.x = -Math.PI / 2; // Vertical sun: offscreen roof shadows land below it.
+  engine.scene.add(owner);
+  engine.scene.updateMatrixWorld(true);
+  const component = new LightComponent({
+    kind: "directional", intensity: 2.0, castShadow: true,
+    shadowMode: mode, csm: mode === "map", csmCascades: 3, csmMaxFar: 70,
+    csmLightMargin: 35, csmFade: true, csmSplitLambda: 0.65,
+    clipmapLevels: 3, clipmapNearSize: 20, clipmapScale: 4, clipmapLightMargin: 35, clipmapCache: cache,
+    shadowMapType: "PCFShadowMap", shadowMapWidth: 1024, shadowMapHeight: 1024,
+    shadowCamNear: 0.1, shadowCamFar: 180,
+    shadowBias: -0.00005, shadowNormalBias: 0.015, shadowRadius: 0.6,
+  });
+  component.entity = { id: `${mode}-sun`, object3D: owner, engine };
+  component.onAttach();
+  const node = component.light.shadow.shadowNode;
+  require(node?.prepare && node?.lights, `Production ${mode} light did not install its shadow node`);
+  if (mode === "clipmap") require(/clipmap/i.test(node.constructor.name), "Clipmap mode silently fell back to CSM/maps");
+  const freeze = new ShadowFreezeSystem(engine);
+  function addDeformedCaster() {
+    const offset = uniform(0);
+    const material = new THREE.MeshStandardNodeMaterial({ color: 0xb8b8b8, roughness: 1, side: THREE.DoubleSide });
+    material.positionNode = positionLocal.add(vec3(offset, 0, 0));
+    materials.push(material);
+    const mesh = addMesh("GPU displaced caster", new THREE.PlaneGeometry(1.5, 2), 0, 9, 1, material);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.userData.vfxSimulation = "fixture";
+    engine.emit("hierarchy-changed");
+    return { offset, mesh };
+  }
+  function addSkinnedCaster() {
+    const geometry = new THREE.BoxGeometry(2, 0.4, 2);
+    const positions = geometry.attributes.position;
+    const indices = [], weights = [];
+    for (let i = 0; i < positions.count; i++) {
+      const blend = (positions.getX(i) + 1) / 2;
+      indices.push(0, 1, 0, 0); weights.push(1 - blend, blend, 0, 0);
+    }
+    geometry.setAttribute("skinIndex", new THREE.Uint16BufferAttribute(indices, 4));
+    geometry.setAttribute("skinWeight", new THREE.Float32BufferAttribute(weights, 4));
+    geometries.push(geometry);
+    const mesh = new THREE.SkinnedMesh(geometry, materials[0]);
+    mesh.name = "skinned caster"; mesh.position.set(0, 9, -2); mesh.castShadow = true;
+    const root = new THREE.Bone(), tip = new THREE.Bone();
+    root.add(tip); mesh.add(root); engine.scene.add(mesh);
+    const skeleton = new THREE.Skeleton([root, tip]); skeletons.push(skeleton);
+    mesh.updateMatrixWorld(true); mesh.bind(skeleton);
+    engine.emit("hierarchy-changed");
+    return { mesh, tip };
+  }
+  async function frame({ force = false, pixels = true } = {}) {
+    engine.scene.updateMatrixWorld(true);
+    engine.emit("pre-render");
+    freeze.update();
+    if (force) {
+      // The public node hook can invalidate an optional split static/dynamic
+      // cache as well; every forced oracle must actually rasterize fresh maps.
+      node.invalidateCache?.();
+      for (const light of node.lights) light.shadow.autoUpdate = true;
+    }
+    const beforeShadow = shadowDraws;
+    const beforeDraw = renderer.info.render.drawCalls;
+    const beforeStats = node._shadowNodes.map(level => ({ ...level.stats }));
+    const drawByCaster = {};
+    const shadowCameras = new Set(node.lights.map(light => light.shadow.camera));
+    const shadowPasses = node.lights.map(() => 0), textureCopies = [];
+    const shadowLevels = new Map(node.lights.map((light, index) => [light.shadow.camera, index]));
+    const originalDraw = renderer.backend.draw;
+    const originalBeginRender = renderer.backend.beginRender;
+    const originalCopyTexture = renderer.backend.copyTextureToTexture;
+    // Observe the actual backend draw, without installing mesh callbacks.
+    // Unknown mesh callbacks intentionally classify a caster as animated in
+    // the production cache, so onAfterShadow instrumentation changes the test.
+    renderer.backend.draw = function(renderObject, info) {
+      const before = info.render.drawCalls;
+      const result = originalDraw.call(this, renderObject, info);
+      const count = info.render.drawCalls - before;
+      if (shadowCameras.has(renderObject.camera) && count > 0) {
+        shadowDraws += count;
+        const name = renderObject.object.name;
+        drawByCaster[name] = (drawByCaster[name] ?? 0) + count;
+      }
+      return result;
+    };
+    renderer.backend.beginRender = function(context) {
+      const result = originalBeginRender.call(this, context);
+      const index = shadowLevels.get(context.camera);
+      if (index !== undefined) shadowPasses[index]++;
+      return result;
+    };
+    renderer.backend.copyTextureToTexture = function(source, destination, ...args) {
+      const result = originalCopyTexture.call(this, source, destination, ...args);
+      textureCopies.push({ source: source.name, destination: destination.name,
+        depth: source.isDepthTexture === true });
+      return result;
+    };
+    renderer.setRenderTarget(target);
+    try { renderer.render(engine.scene, engine.camera); }
+    finally {
+      renderer.backend.draw = originalDraw;
+      renderer.backend.beginRender = originalBeginRender;
+      renderer.backend.copyTextureToTexture = originalCopyTexture;
+    }
+    await renderer.backend.device.queue.onSubmittedWorkDone();
+    let gpuMs = null, gpuPasses = [];
+    if (renderer.backend.device.features.has("timestamp-query")) {
+      // Three returns only the last :f frame's sum. Snapshot the exact pending
+      // UIDs from THIS fixture render and sum their freshly resolved values so
+      // every shadow pass is counted even if nested renders acquire other IDs.
+      const pool = renderer.backend.timestampQueryPool?.render;
+      const pending = [...(pool?.queryOffsets?.keys() ?? [])];
+      const fresh = pending.every(uid => !pool.timestamps.has(uid));
+      await renderer.resolveTimestampsAsync("render");
+      if (fresh && pending.length > 0 && pending.every(uid => pool.timestamps.has(uid))) {
+        gpuPasses = pending.map(uid => ({ uid, milliseconds: pool.timestamps.get(uid) }));
+        if (gpuPasses.every(pass => Number.isFinite(pass.milliseconds) && pass.milliseconds >= 0)) {
+          gpuMs = gpuPasses.reduce((sum, pass) => sum + pass.milliseconds, 0);
+        }
+      }
+    }
+    return { pixels: pixels ? await readRenderTargetImage(renderer, target, width, height) : null,
+      shadowDraws: shadowDraws - beforeShadow, drawByCaster,
+      draws: renderer.info.render.drawCalls - beforeDraw, gpuMs, gpuPasses,
+      shadowPasses, textureCopies,
+      cacheStats: node._shadowNodes.map((level, i) => Object.fromEntries(
+        Object.entries(level.stats ?? {}).map(([key, value]) => [key, value - (beforeStats[i]?.[key] ?? 0)]))) };
+  }
+  async function settle() {
+    for (let i = 0; i < 7; i++) await frame({ pixels: false });
+    return frame();
+  }
+  return { engine, component, node, freeze, owner, mover, offscreen, cutout, mask, maskedAlpha,
+    frame, settle, addDeformedCaster, addSkinnedCaster,
+    dispose() {
+      freeze.dispose(); component.onDetach(); target.dispose(); mask.dispose();
+      skeletons.forEach(skeleton => skeleton.dispose());
+      geometries.forEach(geometry => geometry.dispose()); materials.forEach(material => material.dispose());
+    } };
+}
+
+async function freshParity(rig, label, first, requireRefresh = true) {
+  const fresh = await rig.frame({ force: true });
+  const parity = compare(first.pixels, fresh.pixels);
+  log(label, { firstShadowDraws: first.shadowDraws, freshShadowDraws: fresh.shadowDraws, ...parity });
+  require(fresh.shadowDraws > 0, `${label}: forced freshness oracle did not rasterize any shadow geometry`);
+  if (requireRefresh) require(first.shadowDraws > 0, `${label}: changed shadow inputs were not rasterized`);
+  require(parity.max === 0, `${label}: first frame differs from a genuinely fresh shadow render`);
+  return fresh;
+}
+async function withoutShadows(rig) {
+  for (const light of rig.node.lights) light.shadow.intensity = 0;
+  const result = await rig.frame();
+  for (const light of rig.node.lights) light.shadow.intensity = 1;
+  return result;
+}
+
+let renderer;
+try {
+  renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view"), antialias: false, trackTimestamp: true });
+  renderer.setSize(width, height, false); renderer.setPixelRatio(1);
+  renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFShadowMap;
+  renderer.toneMapping = THREE.NoToneMapping; renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+  renderer.info.autoReset = false;
+  await renderer.init();
+  require(renderer.backend.isWebGPUBackend, "A real WebGPU device is required");
+  const device = renderer.backend.device, validation = [];
+  device.addEventListener("uncapturederror", event => validation.push(event.error.message));
+  device.pushErrorScope("validation");
+  const clip = makeRig(renderer, "clipmap", { cache: cacheUnderTest }), csm = makeRig(renderer, "map");
+  resources.push(clip, csm);
+  const initialClip = await clip.frame();
+  requireSingleFullRefresh(initialClip, "initialAllStaticCost", 3);
+  require(clip.node._shadowNodes.every(level => level._staticMap === null),
+    "An all-static scene must not allocate redundant static-cache maps");
+  let clipped = await clip.settle(), cascaded = await csm.settle();
+  require(clip.node.lights.length === 3 && csm.node.lights.length === 3, "Both arms must initialize three levels");
+  log("configuration", { viewport: [width, height], shadowMap: [1024, 1024], levels: 3,
+    cacheUnderTest,
+    clipmapNode: clip.node.constructor.name, csmNode: csm.node.constructor.name,
+    timestampQuery: device.features.has("timestamp-query"),
+    timingScope: "sum of freshly resolved render-pass queries; excludes texture copies, queue gaps and readback" });
+  const unshadowed = await withoutShadows(clip);
+  clipped = await clip.frame();
+  const signal = compare(clipped.pixels, unshadowed.pixels);
+  log("shadowSignal", signal);
+  require(signal.changed > 150 && signal.mean > 0.1, "Clipmaps must produce a substantial visible shadow pattern");
+  const points = [[3.5, 0.005, 1], [6, 0.005, 1], [-6, 0.005, 0], [1.8, 0.005, -3], [4, 0.005, -4]];
+  const worldSamples = points.map(point => {
+    const a = sampleWorld(clipped.pixels, clip.engine.camera, point);
+    const b = sampleWorld(cascaded.pixels, csm.engine.camera, point);
+    return { point, clipmap: a, csm: b, difference: Math.abs(a - b) };
+  });
+  log("worldSampleComparison", worldSamples);
+  require(worldSamples.every(sample => sample.difference < 8), "CSM and clipmaps disagree away from shadow boundaries");
+  require(worldSamples[1].clipmap - worldSamples[0].clipmap > 25, "Offscreen occluder must shadow its visible ground sample");
+
+  const still = await clip.settle();
+  await freshParity(clip, "stationaryFreshParity", still, false);
+  require(still.shadowDraws === 0, "Stationary clipmaps must reuse their maps");
+  const baseQuaternion = clip.engine.camera.quaternion.clone();
+  const yawStats = { clipmap: [], csm: [] };
+  for (let step = 0; step < 8; step++) {
+    for (const [name, rig] of [["clipmap", clip], ["csm", csm]]) {
+      rig.engine.camera.quaternion.copy(baseQuaternion);
+      rig.engine.camera.rotateY(Math.sin((step + 1) * 0.7) * 0.2);
+      const first = await rig.frame();
+      yawStats[name].push({ shadowDraws: first.shadowDraws, draws: first.draws,
+        gpuMs: first.gpuMs, gpuPasses: first.gpuPasses });
+      if (first.gpuMs !== null && first.shadowDraws > 0) {
+        require(first.gpuPasses.length > 1, "Shadow raster timing must include shadow and main render passes");
+      }
+      if (name === "clipmap") {
+        require(first.shadowDraws === 0, "Pure camera yaw must not rasterize fixed-world clipmap shadows");
+        if (step === 0 || step === 7) await freshParity(rig, `yawFreshParity${step}`, first, false);
+      }
+    }
+  }
+  const summary = Object.fromEntries(Object.entries(yawStats).map(([name, values]) => [name, {
+    frames: values.length, shadowDraws: values.reduce((sum, item) => sum + item.shadowDraws, 0),
+    totalDraws: values.reduce((sum, item) => sum + item.draws, 0),
+    medianRenderPassGpuMs: median(values.map(item => item.gpuMs)), framesMeasured: values,
+  }]));
+  log("cameraYawAB", summary);
+  require(summary.clipmap.shadowDraws === 0 && summary.csm.shadowDraws > 0,
+    "Yaw comparison must demonstrate actual map-draw savings against current CSM");
+
+  clip.engine.camera.quaternion.copy(baseQuaternion);
+  await clip.settle();
+  clip.engine.camera.position.x += 12;
+  const translated = await clip.frame();
+  requireSingleFullRefresh(translated, "allStaticOriginChangeCost", 3);
+  require(clip.node._shadowNodes.every(level => level._staticMap === null),
+    "Camera translation in an all-static scene must not allocate redundant cache maps");
+  await freshParity(clip, "translationFreshParity", translated);
+  const translatedNoShadow = await withoutShadows(clip);
+  const translatedSignal = compare(translated.pixels, translatedNoShadow.pixels);
+  log("translatedCoverage", translatedSignal);
+  require(translatedSignal.changed > 80, "Translated camera must retain visible shadow coverage");
+  clip.engine.camera.position.x -= 12;
+  await clip.settle();
+
+  clip.mover.position.x += 2.75;
+  const moved = await clip.frame();
+  await freshParity(clip, "movingCasterFreshParity", moved);
+  // Same clipmap projection and resources per level, but without the static /
+  // dynamic cache: an independent full-scene depth raster is the cache oracle.
+  const uncached = makeRig(renderer, "clipmap", { cache: false });
+  resources.push(uncached);
+  uncached.engine.camera.position.copy(clip.engine.camera.position);
+  uncached.engine.camera.quaternion.copy(clip.engine.camera.quaternion);
+  uncached.mover.position.copy(clip.mover.position);
+  await uncached.settle();
+  const fullSceneMoved = await uncached.frame({ force: true });
+  const cacheParity = compare(moved.pixels, fullSceneMoved.pixels);
+  log("movingCasterFullSceneParity", { cachedShadowDraws: moved.shadowDraws,
+    fullSceneShadowDraws: fullSceneMoved.shadowDraws, ...cacheParity });
+  require(fullSceneMoved.shadowDraws > 0, "Uncached reference must render shadow casters");
+  require(cacheParity.max === 0, "Split cached shadows disagree with an uncached full-scene render after caster motion");
+  // Promotion may rebuild static depth once. The NEXT translation must reuse
+  // the static environment while rasterizing only the genuinely moved caster.
+  clip.mover.position.x += 0.8;
+  uncached.mover.position.copy(clip.mover.position);
+  const movedAgain = await clip.frame();
+  const fullSceneAgain = await uncached.frame({ force: true });
+  const againParity = compare(movedAgain.pixels, fullSceneAgain.pixels);
+  log("secondMoverCacheReuse", { cachedDraws: movedAgain.shadowDraws,
+    cachedCasters: movedAgain.drawByCaster, fullSceneDraws: fullSceneAgain.shadowDraws,
+    fullSceneCasters: fullSceneAgain.drawByCaster, textureCopies: movedAgain.textureCopies,
+    cacheStats: movedAgain.cacheStats, ...againParity });
+  require((movedAgain.drawByCaster["moving box"] ?? 0) > 0, "Second mover translation must render the mover");
+  require(Object.keys(movedAgain.drawByCaster).every(name => name === "moving box"),
+    "Second mover translation unnecessarily re-rasterized stationary shadow casters");
+  require(movedAgain.shadowDraws < fullSceneAgain.shadowDraws,
+    "Stable mover caching must save actual shadow raster draws against the full-scene control");
+  require(againParity.max === 0, "Second mover translation differs from full-scene shadow rasterization");
+  require(movedAgain.textureCopies.length > 0 && movedAgain.textureCopies.every(copy => copy.depth),
+    "Opaque shadow cache restoration must copy depth only, with no unused color copy");
+  clip.mover.position.x = 0;
+  await clip.settle();
+  clip.owner.rotation.x += 0.19;
+  const sunMoved = await clip.frame();
+  await freshParity(clip, "sunDirectionFreshParity", sunMoved);
+  clip.owner.rotation.x -= 0.19;
+  clipped = await clip.settle();
+
+  // A continuously moving sun invalidates the projection every frame. Splitting
+  // those maps doubles scene traversals and adds full-map copies without reuse.
+  // Keep the promoted mover present so this cannot pass via the all-static gate.
+  uncached.mover.position.copy(clip.mover.position);
+  uncached.engine.camera.position.copy(clip.engine.camera.position);
+  uncached.engine.camera.quaternion.copy(clip.engine.camera.quaternion);
+  const stableSunAngle = clip.owner.rotation.x;
+  const rotatingSunFrames = [];
+  for (let step = 0; step < 4; step++) {
+    clip.owner.rotation.x = uncached.owner.rotation.x = stableSunAngle + (step + 1) * 0.07;
+    const movingSun = await clip.frame();
+    const fullMovingSun = await uncached.frame({ force: true });
+    requireSingleFullRefresh(movingSun, `rotatingSunCost${step}`, 3);
+    const parity = compare(movingSun.pixels, fullMovingSun.pixels);
+    rotatingSunFrames.push({ step, shadowDraws: movingSun.shadowDraws,
+      fullSceneDraws: fullMovingSun.shadowDraws, shadowPasses: movingSun.shadowPasses,
+      textureCopies: movingSun.textureCopies.length, cacheStats: movingSun.cacheStats, ...parity });
+    require(parity.max === 0, "Continuously rotating sun differs from uncached full-scene shadows");
+  }
+  log("rotatingSunFullSceneParity", rotatingSunFrames);
+  clip.owner.rotation.x = uncached.owner.rotation.x = stableSunAngle;
+  clipped = await clip.settle();
+
+  // Both special casters are outside the view. Their on/off differences can
+  // therefore only be shadows landing on the visible scene, never caster RGB.
+  const frustum = new THREE.Frustum().setFromProjectionMatrix(
+    new THREE.Matrix4().multiplyMatrices(clip.engine.camera.projectionMatrix, clip.engine.camera.matrixWorldInverse),
+    THREE.WebGPUCoordinateSystem);
+  require(!frustum.intersectsObject(clip.offscreen) && !frustum.intersectsObject(clip.cutout),
+    "Offscreen controls must actually lie outside the camera frustum");
+  clip.offscreen.castShadow = false;
+  const offscreenOff = await clip.frame();
+  const offscreenSignal = compare(clipped.pixels, offscreenOff.pixels);
+  log("offscreenCasterPixels", offscreenSignal);
+  require(offscreenSignal.changed > 100, "An offscreen caster must change real visible shadow pixels");
+  await freshParity(clip, "offscreenDisableFreshParity", offscreenOff);
+  clip.offscreen.castShadow = true;
+  const masked = await clip.settle();
+  // Keep alphaTest and shader structure fixed; the texture version must
+  // naturally invalidate the cache on the FIRST frame, without a manual kick.
+  for (let i = 3; i < clip.mask.image.data.length; i += 4) clip.mask.image.data[i] = 255;
+  clip.mask.needsUpdate = true;
+  const solid = await clip.frame();
+  const alphaSignal = compare(masked.pixels, solid.pixels);
+  log("alphaCutoutPixels", alphaSignal);
+  require(alphaSignal.changed > 100 && alphaSignal.mean > 0.1, "Alpha holes must survive the real shadow raster pass");
+  await freshParity(clip, "alphaVersionFreshParity", solid);
+  clip.mask.image.data.set(clip.maskedAlpha); clip.mask.needsUpdate = true;
+  const restoredMask = await clip.frame();
+  const alphaRestoration = compare(masked.pixels, restoredMask.pixels);
+  log("alphaRestoration", alphaRestoration);
+  require(alphaRestoration.max === 0, "Restoring cutout alpha must restore the exact shadow image");
+
+  // A material-space GPU displacement leaves CPU vertices and transforms
+  // unchanged. The cache must treat it as animated and preserve native TSL.
+  uncached.mover.position.copy(clip.mover.position);
+  uncached.engine.camera.position.copy(clip.engine.camera.position);
+  uncached.engine.camera.quaternion.copy(clip.engine.camera.quaternion);
+  const deform = clip.addDeformedCaster(), deformControl = uncached.addDeformedCaster();
+  const beforeDeform = await clip.settle();
+  await uncached.settle();
+  deform.offset.value = deformControl.offset.value = 1.1;
+  const displaced = await clip.frame(), fullDisplaced = await uncached.frame({ force: true });
+  const deformSignal = compare(beforeDeform.pixels, displaced.pixels);
+  const deformParity = compare(displaced.pixels, fullDisplaced.pixels);
+  log("gpuDeformation", { changedPixels: deformSignal.changed, cachedCasters: displaced.drawByCaster,
+    fullSceneDraws: fullDisplaced.shadowDraws, ...deformParity });
+  require(deformSignal.changed > 50, "Uniform-driven GPU deformation must change real shadow pixels");
+  require((displaced.drawByCaster["GPU displaced caster"] ?? 0) > 0, "GPU deformation must re-rasterize its caster");
+  require(deformParity.max === 0, "Cached deformed shadow differs from native uncached full-scene rasterization");
+
+  const skin = clip.addSkinnedCaster(), skinControl = uncached.addSkinnedCaster();
+  const beforeSkin = await clip.settle();
+  await uncached.settle();
+  skin.tip.position.x = skinControl.tip.position.x = 1.2;
+  const skinned = await clip.frame(), fullSkinned = await uncached.frame({ force: true });
+  const skinSignal = compare(beforeSkin.pixels, skinned.pixels);
+  const skinParity = compare(skinned.pixels, fullSkinned.pixels);
+  log("skinnedDeformation", { changedPixels: skinSignal.changed, cachedCasters: skinned.drawByCaster,
+    fullSceneDraws: fullSkinned.shadowDraws, ...skinParity });
+  require(skinSignal.changed > 50, "Bone animation must change real shadow pixels with unchanged CPU vertices");
+  require((skinned.drawByCaster["skinned caster"] ?? 0) > 0, "Bone animation must render its skinned shadow caster");
+  require(skinParity.max === 0, "Cached skinned shadow differs from uncached full-scene rasterization");
+
+  await device.queue.onSubmittedWorkDone();
+  const scopedError = await device.popErrorScope();
+  if (scopedError) validation.push(scopedError.message);
+  require(validation.length === 0, `WebGPU validation errors: ${validation.join("; ")}`);
+  require(globalThis.__GI_SMOKE_RESULT__?.pass !== false, "An asynchronous error occurred during the GPU fixture");
+  globalThis.__GI_SMOKE_RESULT__ = { pass: true, reports };
+  console.log("GI-SMOKE PASS", JSON.stringify(reports));
+} catch (error) {
+  fail(error);
+} finally {
+  resources.forEach(resource => resource.dispose());
+  renderer?.dispose();
+}
+</script></body></html>

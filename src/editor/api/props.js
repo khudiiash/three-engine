@@ -40,7 +40,9 @@
 import { getComponentClass } from "../../engine/index.js";
 
 /** Props every component has, regardless of what its class declares. */
-const UNIVERSAL_PROPS = new Set(["enabled"]);
+// `variants` — the per-platform override sets (componentVariants.js) — is a
+// prop every component may carry and none declares.
+const UNIVERSAL_PROPS = new Set(["enabled", "variants"]);
 
 /**
  * A schema descriptor's `options`, resolved.

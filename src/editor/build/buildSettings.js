@@ -36,6 +36,10 @@ export const BUILD_DEFAULTS = {
   target: "web",
   // See QUALITY_PRESETS in engine/sceneSettings.js. A ceiling, never a raise.
   quality: "ultra",
+  // The ceiling a PHONE or TABLET gets instead, or "same" for the one above.
+  // Off by default: a lower preset forces dynamic resolution on and the
+  // player looks it (2026-09-11) — it is the author's call, per build.
+  mobileQuality: "same",
   // Project-relative image used as the page favicon, the loading-screen logo
   // and the desktop app icon.
   icon: "",

@@ -483,7 +483,7 @@ export function ProjectSettingsPanel() {
     if (abs) setMain(projectRelative(rootPath, abs));
   };
 
-  const { editor, scripts, rendering, game, physics, screenshot } = settings;
+  const { editor, scripts, game, physics, screenshot } = settings;
   const mainValue = normalizeMainPath(mainDirty ? mainDraft : mainScene);
   const mainMissing = !!mainValue && mainValid === false;
 
@@ -678,21 +678,14 @@ export function ProjectSettingsPanel() {
       </Section>
 
       <Section id="project.viewport" title="Viewport">
-        <Row
-          label="Pixel ratio cap"
-          hint="Upper bound on devicePixelRatio. Lower it to render fewer pixels on a HiDPI display."
-        >
-          <Num
-            value={rendering.pixelRatioCap}
-            min={0.5}
-            max={4}
-            step={0.25}
-            onChange={(v) => patch("rendering", { pixelRatioCap: v })}
-          />
-        </Row>
+        {/* "Pixel ratio cap" used to live here and did nothing: the renderer
+            took min(this, the scene's maxDevicePixelRatio), so it only acted
+            when it was the stricter of the two. It is now set in ONE place —
+            Scene Settings → Performance → Max Device Pixel Ratio — which is
+            also the one the quality presets clamp and the build ships. */}
         <Row
           label="Freeze unfocused"
-          hint="Stop drawing the viewport while another panel has focus; it wakes whenever something it draws changes. Applies immediately and is stored per machine, not in the project."
+          hint="Stop drawing the viewport while another panel has focus — or while the whole editor window is behind another app, so testing a build in a browser gets the GPU to itself. It wakes whenever something it draws changes. Applies immediately and is stored per machine, not in the project."
         >
           <Toggle checked={freezeUnfocused} onChange={setViewportFreezeEnabled} />
         </Row>

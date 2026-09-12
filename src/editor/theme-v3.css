@@ -23,7 +23,7 @@
   --bg-3: transparent;
   --inset: transparent;
   --fill-1: #111;
-  --fill-2: #111`;
+  --fill-2: #111;
   --border: #111;
   --border-strong: transparent;
   --text: #e6eeeb;
@@ -4523,4 +4523,88 @@ input.number-field,
 .dock-container .assets-panel,
 .dock-container .shader-graph-panel {
   background-color: transparent !important;
+}
+
+/* ── Per-platform configs (componentVariants.js): the section toggles ──────
+   Desktop · Mobile · Portrait · Landscape as one pill in the component
+   header. `.has` = the component carries that set; `.editing` = the layer an
+   edit lands in for the current preview target. Shown on hover like the
+   other header actions, and always once the component has a set. */
+.platform-toggle {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  margin-left: auto;
+  margin-right: 4px;
+  padding: 1px;
+  gap: 1px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  opacity: 0;
+  transition: opacity 0.12s var(--ease);
+}
+.inspector-section:hover .platform-toggle,
+.platform-toggle:focus-within,
+.platform-toggle.has-configs {
+  opacity: 1;
+}
+.platform-toggle + .section-actions {
+  margin-left: 0;
+}
+.platform-seg {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-dim);
+  opacity: 0.45;
+  cursor: pointer;
+}
+.platform-seg.has {
+  opacity: 1;
+}
+.platform-seg:hover {
+  opacity: 1;
+  color: var(--text);
+  background: var(--bg-2);
+}
+.platform-seg.editing {
+  opacity: 1;
+  color: var(--accent);
+  background: var(--bg-2);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+/* A row overridden in the config being edited: an accent tick on the left
+   and a revert button after the label. */
+.field-row.platform-overridden::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 5px;
+  bottom: 5px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  opacity: 0.8;
+}
+.field-row.platform-overridden .field-label {
+  color: var(--text);
+}
+.field-row .platform-revert {
+  width: 14px;
+  height: 14px;
+  min-width: 0;
+  margin-left: 4px;
+  padding: 0;
+  vertical-align: middle;
+  opacity: 0;
+}
+.field-row.platform-overridden:hover .platform-revert,
+.field-row .platform-revert:focus-visible {
+  opacity: 1;
 }

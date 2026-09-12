@@ -2959,8 +2959,15 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
           reflected.y,
           reflected.z.mul(cr).sub(reflected.x.mul(sr)),
         );
-        const envRad = vec3(light.giEnvMiss.node.sample(equirectUV(rd)).rgb)
-          .mul(float(light.giEnvMiss.intensity));
+        let envRaw = vec3(light.giEnvMiss.node.sample(equirectUV(rd)).rgb);
+        // §11.53b — the sun ceiling the sky tables book, applied to this tap
+        // (see GISystem's sky poll). Scales the whole colour so the chroma
+        // stays the map's; 1e30 (no sun / extraction off) is a no-op.
+        if (light.giEnvMiss.ceiling) {
+          const lum = envRaw.dot(vec3(0.2126, 0.7152, 0.0722));
+          envRaw = envRaw.mul(float(1).min(float(light.giEnvMiss.ceiling).div(lum.max(1e-6))));
+        }
+        const envRad = envRaw.mul(float(light.giEnvMiss.intensity));
         spec = mix(spec, envRad.add(glow).mul(light.intensityUniform), envW);
       }
       if (light._mirrorOut) {

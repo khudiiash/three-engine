@@ -1,6 +1,9 @@
 import { installFramebufferCopyFormats } from "./renderTargetImage.js";
 import * as THREE from "three/webgpu";
 import { installAsyncRenderPipelines } from "./asyncRenderPipelines.js";
+import { installGpuTimestampRetention } from "./gpuTimestampRetention.js";
+import { drsBudgetMs } from "./dynamicResolution.js";
+import { installDirectOutput, withRealOutput } from "./outputTransform.js";
 
 // Keep Three's URL-level FileLoader results for the lifetime of the engine.
 // Large scenes reuse texture/model URLs across components and scene reloads;
@@ -49,6 +52,7 @@ import { DecalSystem } from "./vfx/DecalSystem.js";
 import { AssetRegistry } from "./assets/AssetRegistry.js";
 import { EventRegistry } from "./events/EventRegistry.js";
 import { math } from "./math/index.js";
+import { platformLayers } from "./componentVariants.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -274,6 +278,19 @@ export class Engine extends EventEmitter {
     // `Component._viewOnlyActive`. The main loop ticks this set directly
     // rather than scanning every entity's component map each frame.
     this.viewOnlyComponents = new Set();
+    // ── Platform context (componentVariants.js) ────────────────────────────
+    // Which of a component's per-platform configs apply: `platform` is set
+    // once by whoever boots the engine (the player from the user agent, the
+    // editor from its preview target), `orientation` follows the canvas
+    // shape through `setSize` unless an override pins it. `platform` is the
+    // RESOLVED context scripts read; `_platformOverride` (the editor's
+    // preview) wins over both when set. `variantComponents` is every
+    // component carrying at least one override set — the only ones a
+    // context change has to visit, kept by `Component._syncVariantRegistry`.
+    this.platform = { platform: "desktop", orientation: "landscape" };
+    this._platformBase = { platform: "desktop", orientation: "landscape" };
+    this._platformOverride = null;
+    this.variantComponents = new Set();
     // Merges repeated (geometry, material) pairs into instanced draw calls.
     // Driven from #tick's pre-render phase, gated by settings.performance.
     this.batching = new BatchSystem(this);
@@ -905,6 +922,7 @@ export class Engine extends EventEmitter {
         this._rendererBuiltWith = opts;
         this.#applyRendererSize();
         await this.renderer.init();
+        this.#installOutputTransform();
         // Another rebuild started while we were awaiting init(). It owns
         // `this.renderer` now and will run its own post-init wiring — skip
         // ours so we don't run configureTextureAssetLoader / start the
@@ -1159,6 +1177,22 @@ export class Engine extends EventEmitter {
     return errors;
   }
 
+  /**
+   * Inline output transform (outputTransform.js): the scene draws straight
+   * onto the canvas instead of through three's offscreen frame buffer +
+   * full-screen quad. Opt-in per host (`config.directOutput`; the player
+   * turns it on), `__engineDirectOutput = false` vetoes. Called after EVERY
+   * renderer construction — `init()` and the rebuild path both make one.
+   */
+  #installOutputTransform() {
+    if (!this.renderer) return;
+    if (this.config?.directOutput !== true || globalThis.__engineDirectOutput === false) return;
+    installDirectOutput(this.renderer, {
+      toneMapping: this.renderer.toneMapping,
+      outputColorSpace: this.renderer.outputColorSpace,
+    });
+  }
+
   async init(canvas) {
     // Re-init (viewport rebuild / dev HMR): retire the old renderer first so
     // its still-running animation loop can't render through the new,
@@ -1192,6 +1226,7 @@ export class Engine extends EventEmitter {
     this.#applyRendererSize();
     await this.renderer.init();
     freeze.bootStage(null);
+    this.#installOutputTransform();
     this.#watchDevice();
     // Every synchronous pipeline/shader-module creation from here on is a
     // named span in the freeze ledger. Installed on the DEVICE (not the
@@ -1654,7 +1689,9 @@ export class Engine extends EventEmitter {
           // the default renderer.render() avoids a redundant scene draw
         // (and the WebGPU validation errors that follow from manual
         // setRenderTarget calls).
-          override.render(this);
+          // The override's pipeline reads the REAL tone mapping for its own
+          // output pass (three swaps them around its quad itself).
+          withRealOutput(this.renderer, () => override.render(this));
         } else {
           this.renderer.render(this.scene, this.camera);
         }
@@ -1790,6 +1827,7 @@ export class Engine extends EventEmitter {
   #resolveGpuTimestamps() {
     const renderer = this.renderer;
     if (!renderer?.backend?.trackTimestamp || this._gpuTimestampInFlight) return;
+    installGpuTimestampRetention(renderer);
     const readback = Promise.all([
       renderer.resolveTimestampsAsync("render"),
       renderer.resolveTimestampsAsync("compute"),
@@ -1838,8 +1876,11 @@ export class Engine extends EventEmitter {
       }
       return;
     }
-    const budgetMs = 1000 / (perf.targetFps > 0 ? perf.targetFps : 60);
     const r = this.stats.readout;
+    // The display's rate is the PEAK callback rate the host has handed us;
+    // see dynamicResolution.js for why a phone must not be asked for 120.
+    if (r.callbackFps > (this._drsPeakCallbackFps ?? 0)) this._drsPeakCallbackFps = r.callbackFps;
+    const budgetMs = drsBudgetMs(perf.targetFps, this._drsPeakCallbackFps ?? 0);
     // Prefer real GPU time; a CPU-bound frame shouldn't drive resolution
     // down (it wouldn't help). frameMs is the honest fallback when the
     // adapter has no timestamp queries.
@@ -2098,6 +2139,10 @@ export class Engine extends EventEmitter {
     if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
     this._width = width;
     this._height = height;
+    // A taller-than-wide canvas is a portrait device; the per-platform
+    // configs follow (a no-op while the editor's preview override pins it).
+    this._platformBase.orientation = height > width ? "portrait" : "landscape";
+    this.#resolvePlatform();
     if (!this.renderer) return;
     this.#scheduleRendererResize();
     if (this.camera?.isPerspectiveCamera) {
@@ -2108,6 +2153,63 @@ export class Engine extends EventEmitter {
     // PostprocessComponent's beauty RT). The render loop walks the set
     // every time; cheap, no bookkeeping needed.
     for (const o of this.renderOverrides) o.handleResize?.(width, height);
+  }
+
+  // ── Platform context ─────────────────────────────────────────────────────
+
+  /**
+   * The override layers the current platform applies to every component's
+   * props — `[]` on desktop, `["mobile", "portrait"]` on an upright phone.
+   * See componentVariants.js.
+   */
+  get platformLayers() {
+    return platformLayers(this.platform);
+  }
+
+  /**
+   * Sets the device this engine runs on. `platform` is "desktop" or "mobile";
+   * `orientation` may be given to pin it, otherwise it keeps following the
+   * canvas shape. The player calls this once at boot from the user agent.
+   */
+  setPlatform({ platform, orientation } = {}) {
+    if (platform === "desktop" || platform === "mobile") this._platformBase.platform = platform;
+    if (orientation === "portrait" || orientation === "landscape") this._platformBase.orientation = orientation;
+    this.#resolvePlatform();
+  }
+
+  /**
+   * The editor's preview: a full context that wins over the device and the
+   * canvas shape (`null` clears it). `orientation: null` means "the phone
+   * with no orientation layer" — the shared `mobile` set on its own.
+   */
+  setPlatformOverride(context) {
+    this._platformOverride = context
+      ? {
+          platform: context.platform === "mobile" ? "mobile" : "desktop",
+          orientation:
+            context.orientation === "portrait" || context.orientation === "landscape" ? context.orientation : null,
+        }
+      : null;
+    this.#resolvePlatform();
+  }
+
+  /**
+   * Recomputes `this.platform` and, when its layers changed, re-resolves every
+   * component that carries override sets and announces "platform-changed".
+   * Cheap when nothing moved — `setSize` calls it on every resize.
+   */
+  #resolvePlatform() {
+    const next = this._platformOverride ?? this._platformBase;
+    const before = platformLayers(this.platform).join("/");
+    const after = platformLayers(next).join("/");
+    const same = this.platform.platform === next.platform && this.platform.orientation === next.orientation;
+    if (same) return;
+    this.platform = { platform: next.platform, orientation: next.orientation };
+    if (before !== after) {
+      const layers = platformLayers(this.platform);
+      for (const component of this.variantComponents) component.applyPlatformLayers(layers);
+    }
+    this.emit("platform-changed", { ...this.platform, layers: platformLayers(this.platform) });
   }
 
   createEntity({ id, name = "Entity", parent = null } = {}) {

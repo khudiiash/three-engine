@@ -325,7 +325,7 @@ declare module "engine" {
    * A prop that reuses one of these names (e.g. Spline's curve `type`) stays
    * on `props` only.
    */
-  type ComponentReservedKeys = "entity" | "type" | "props" | "enabled" | "viewOnly";
+  type ComponentReservedKeys = "entity" | "type" | "props" | "enabled" | "viewOnly" | "variants";
 
   /**
    * Events every component gets for free, fired by the base `Component`
@@ -359,10 +359,76 @@ declare module "engine" {
     enabled: boolean;
     /** Whether frustum gating is active for this component. */
     readonly viewOnly: boolean;
-    props: P & { enabled?: boolean; viewOnly?: boolean };
+    /**
+     * The EFFECTIVE values — what the scene shows. On a phone, keys named by
+     * the component's `mobile` / `portrait` / `landscape` config sets hold
+     * those values here; `baseProps` has the desktop ones. See
+     * {@link ComponentVariants}.
+     */
+    props: P & { enabled?: boolean; viewOnly?: boolean; variants?: ComponentVariants<P> };
     setEnabled(value: boolean): void;
+    /**
+     * Sets the effective value of `key` — the one the scene shows from now
+     * on. While a platform config overrides `key`, the desktop value kept for
+     * saving is untouched, and the next platform change (the phone rotates)
+     * re-resolves from the authored sets.
+     */
     setProp(key: string, value: unknown): void;
+
+    // ---- Per-platform configs ------------------------------------------
+    /**
+     * The override sets this component carries, or null. Up to three, each a
+     * partial props object: `mobile` (any phone or tablet), `portrait` and
+     * `landscape` (applied on top of `mobile` by how the phone is held). The
+     * engine cascades the active ones into `props`; keys a set does not name
+     * inherit from below. Authored in the inspector's platform toggles.
+     */
+    readonly variants: ComponentVariants<P> | null;
+    hasVariant(layer: PlatformVariant): boolean;
+    /** The override layers applied right now: `[]` on desktop, `["mobile", "portrait"]` on an upright phone. */
+    readonly platformLayers: readonly PlatformVariant[];
+    /** The desktop value of `key` — `props[key]` unless a platform config overrides it. */
+    getBaseProp(key: string): unknown;
+    /** The props as they would be saved: every overridden key at its desktop value. */
+    readonly baseProps: P & { enabled?: boolean; viewOnly?: boolean; variants?: ComponentVariants<P> };
+    /** Writes the DESKTOP value of `key`; the scene keeps showing an active override. */
+    setBaseProp(key: string, value: unknown): void;
+    /** Writes `key` into one config set (created if missing); visible when that layer is active. */
+    setVariantProp(layer: PlatformVariant, key: string, value: unknown): void;
+    /** Drops `key` from one set so it inherits again. */
+    clearVariantProp(layer: PlatformVariant, key: string): void;
+    /** Replaces one whole set (`{}` = an empty one, `null` removes it). */
+    setVariant(layer: PlatformVariant, delta: Partial<P> | null): void;
+    removeVariant(layer: PlatformVariant): void;
   } & Omit<P, ComponentReservedKeys> & TypedEmitter<ComponentEventMap & E>;
+
+  /** A per-platform config set name — see `ComponentBase.variants`. */
+  export type PlatformVariant = "mobile" | "portrait" | "landscape";
+
+  /**
+   * A component's per-platform configs: partial override sets the runtime
+   * cascades over the desktop `props` — `mobile` for any phone or tablet,
+   * then `portrait` or `landscape` on top by how it is held. A HUD element
+   * that is 100 px on desktop and 60 px on a phone carries
+   * `{ mobile: { size: [60, 60] } }`; a component that should exist only on
+   * phones is authored `enabled: false` with `{ mobile: { enabled: true } }`.
+   * Which platform this is comes from `engine.platform`.
+   */
+  export type ComponentVariants<P extends object = object> = {
+    [K in PlatformVariant]?: Partial<P> & { enabled?: boolean };
+  };
+
+  /**
+   * The device the engine runs on, as the per-platform configs see it. The
+   * player sets `platform` from the user agent at boot; `orientation` follows
+   * the canvas shape (so it tracks rotation). In the editor both come from
+   * the platform preview toggles. `null` orientation is the editor's bare
+   * "Mobile" preview: the shared set with no orientation layer.
+   */
+  export interface PlatformContext {
+    platform: "desktop" | "mobile";
+    orientation: "portrait" | "landscape" | null;
+  }
 
   /** `entity.getComponent("model")` / `findComponents("model")`. */
   export interface ModelComponent extends ComponentBase<{
@@ -1487,6 +1553,7 @@ declare module "engine" {
     decay: number;
     penumbra: number;
     castShadow: boolean;
+    shadowMode: "map" | "clipmap" | "gi";
     shadowMapType: string;
     shadowMapWidth: number;
     shadowMapHeight: number;
@@ -1506,6 +1573,12 @@ declare module "engine" {
     csmSplitLambda: number;
     csmLightMargin: number;
     csmFade: boolean;
+    clipmapLevels: number;
+    /** Full world-space width of the finest shadow square. */
+    clipmapNearSize: number;
+    clipmapScale: number;
+    clipmapLightMargin: number;
+    clipmapCache: boolean;
   }> {
     /** The underlying three.js light instance (`DirectionalLight` / `PointLight` / `SpotLight` / `AmbientLight`). */
     light: unknown;
@@ -3179,6 +3252,12 @@ declare module "engine" {
     "component-added": [event: { entityId: string; componentType: string }];
     "component-removed": [event: { entityId: string; componentType: string; component: ComponentBase<any> }];
     "component-changed": [event: { entityId: string | undefined; componentType: string; key: string }];
+    /**
+     * The platform context changed — the phone rotated, or the editor's
+     * preview target moved — and every component's per-platform configs
+     * were re-resolved. `layers` is the cascade now applied.
+     */
+    "platform-changed": [event: PlatformContext & { layers: PlatformVariant[] }];
     "physics-collider-cooked": [entity: Entity];
     "script-loaded": [script: Script];
     "model-loaded": [entity: Entity];
@@ -3294,6 +3373,24 @@ declare module "engine" {
     config: EngineConfig;
     settings: SceneSettings;
     input: InputManager;
+    /**
+     * The device this engine runs on, as the per-platform component configs
+     * see it (see {@link ComponentVariants}). `platform-changed` fires when it
+     * moves — the phone rotated — so a script that lays out its own HUD can
+     * react:
+     *
+     *     if (this.engine.platform.platform === "mobile") this.showTouchHints();
+     *     this.engine.on("platform-changed", ({ orientation }) => this.relayout(orientation));
+     */
+    readonly platform: Readonly<PlatformContext>;
+    /** The override layers the platform applies: `[]` on desktop, `["mobile", "portrait"]` on an upright phone. */
+    readonly platformLayers: readonly PlatformVariant[];
+    /**
+     * Sets the device (the player does this at boot from the user agent; a
+     * script would only do it to force a phone layout for a test).
+     * `orientation` pins it; omitted, it keeps following the canvas shape.
+     */
+    setPlatform(context: { platform?: "desktop" | "mobile"; orientation?: "portrait" | "landscape" }): void;
     /**
      * Gameplay math — clamping, angle blending, frame-rate-independent
      * smoothing, seeded randomness, noise, ray tests, aiming. Stateless and

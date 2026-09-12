@@ -30,6 +30,29 @@ import { octahedralUV } from "./srcOctahedral.js";
  * cascade sharp/soft/rough mix uses) and lerp two tiles.
  */
 export const MAX_REFLECTION_PROBES = 8;
+
+/**
+ * The scene-AABB fallback probe (§16 R1b, GISystem `#deriveAutoReflProbes`)
+ * is a box-projected capture from the content box's centre: it models the
+ * scene as ONE convex room whose walls are the box faces. Past room scale
+ * that model is wrong in a way no blur hides — the user's Sponza (30 m
+ * across, a courtyard ringed by two-storey arcades, curtains and columns)
+ * passed the old 48 m Bistro-derived bound, and every gold curtain hem in
+ * a shaded arcade then reflected the SUNLIT COURTYARD the probe saw from
+ * the atrium's centre, straight through the walls between ("reflectives
+ * ignore the lighting around them, only see the sun behind them", the
+ * phone HUD's `__giReflectionProbes:false` arm went dark, 2026-09-12).
+ * 20 m is a hall, not a street: anything larger has structure inside the
+ * box, and the field / exact reflection paths own that scale.
+ */
+export const AUTO_PROBE_MAX_SPAN_M = 20;
+
+/** Whether one box-projected fallback probe may stand in for this content box. */
+export function autoProbeSpanOk(box, maxSpan = AUTO_PROBE_MAX_SPAN_M) {
+  if (!box?.min || !box?.max) return false;
+  const span = Math.max(box.max.x - box.min.x, box.max.z - box.min.z);
+  return Number.isFinite(span) && span > 0 && span <= maxSpan;
+}
 // 256, NOT 128 (2026-08-21, "on high it reflects just some random mess"):
 // a large FLAT mirror magnifies a small angular window of the octahedral
 // tile across the whole surface — at 128² (~2°/texel) that reads as soft

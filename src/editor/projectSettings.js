@@ -70,9 +70,17 @@ export const PROJECT_SETTINGS_DEFAULTS = {
   // with the user's CLIs machine-wide, so enabling the bridge is a fact about
   // the person, not the project — and storing it per-project meant every new
   // project came up disabled. See `mcpPrefs.js`.
-  rendering: {
-    pixelRatioCap: 2, // upper bound on devicePixelRatio
-  },
+  // ⚠ `rendering.pixelRatioCap` WAS RETIRED (2026-09-11). There were two caps
+  // on the same number — this one and the scene's
+  // `performance.maxDevicePixelRatio` — and the renderer took `min(project,
+  // scene)`, so the project control could only ever act when it was the
+  // STRICTER of the two. With the usual scene value of 1.5 and this at 2 it did
+  // nothing at all, which is what it looked like ("Viewport pixel ratio on
+  // project settings does nothing, viewport takes pixel ratio from scene
+  // settings"). The scene setting is the one that stays: it is per-scene, it
+  // ships in the build, and it is the knob the quality presets already clamp
+  // (`applyQualityCeiling`). Scene Settings → Performance → Max Device Pixel
+  // Ratio is now the only place it is set.
   game: {
     title: "", // exported page title; empty = project name
     // Namespaces save slots + preferences so two games served from the same
@@ -119,6 +127,9 @@ export function getProjectSettings() {
     editor: mergeSection(PROJECT_SETTINGS_DEFAULTS.editor, saved.editor),
     screenshot: mergeSection(PROJECT_SETTINGS_DEFAULTS.screenshot, saved.screenshot),
     scripts: mergeSection(PROJECT_SETTINGS_DEFAULTS.scripts, saved.scripts),
+    // No defaults left in this section (see the retired `pixelRatioCap` note),
+    // but the passthrough stays so an existing project.json keeps its stored
+    // block instead of having it quietly dropped on the next save.
     rendering: mergeSection(PROJECT_SETTINGS_DEFAULTS.rendering, saved.rendering),
     game: mergeSection(PROJECT_SETTINGS_DEFAULTS.game, saved.game),
     physics: mergeSection(PROJECT_SETTINGS_DEFAULTS.physics, saved.physics),
@@ -206,8 +217,10 @@ export async function applyProjectSettings(settings = getProjectSettings()) {
   // rendererReady (not just renderer): init() assigns the renderer before
   // its backend resolves, and touching it in that window breaks the loop.
   if (engine.rendererReady) {
-    const dpr = window.devicePixelRatio ?? 1;
-    engine.setPixelRatio(Math.min(dpr, settings.rendering.pixelRatioCap ?? dpr));
+    // The device ratio itself; the CAP is the scene's `maxDevicePixelRatio`,
+    // applied in `Engine.#applyRendererSize`. See the note on the retired
+    // `rendering.pixelRatioCap` above.
+    engine.setPixelRatio(window.devicePixelRatio ?? 1);
     // Re-apply the current size so the new pixel ratio takes effect.
     const canvas = engine.renderer.domElement;
     if (canvas?.clientWidth) engine.setSize(canvas.clientWidth, canvas.clientHeight);

@@ -1,8 +1,23 @@
 import * as THREE from "three/webgpu";
 import { getEntityBoundingSphere } from "../viewFrustum.js";
 import { EventEmitter } from "../EventEmitter.js";
+import {
+  VARIANTS_PROP,
+  VARIANT_EXCLUDED_KEYS,
+  isVariantKey,
+  normalizeVariants,
+  resolveVariantOverrides,
+  samePropValue,
+} from "../componentVariants.js";
 
 const _scratchSphere = new THREE.Sphere();
+
+/**
+ * Marks, in `_variantBase`, a key the base props did not have before a
+ * variant set it — restoring such a key means deleting it, not writing
+ * `undefined` into props.
+ */
+const ABSENT = Symbol("variant-base-absent");
 
 /**
  * Keys that are part of the Component API itself — never mirrored as prop
@@ -18,6 +33,9 @@ const RESERVED_PROP_KEYS = new Set([
   "editorEnabled",
   "viewOnly",
   "constructor",
+  // The per-platform override sets (componentVariants.js). Edited through
+  // `setVariantProp` / `removeVariant`, never as `comp.variants = …`.
+  VARIANTS_PROP,
 ]);
 
 /**
@@ -87,7 +105,7 @@ const STRUCTURAL_PROPS = new Map([
   // shadow camera), so nothing leaves or enters the graph; the material
   // re-mint it costs is three's own and rides `component-changed`. The rare
   // fallback that still swaps the light emits `hierarchy-changed` itself.
-  ["light", ["kind", "shadowMode", "shadowMapType", "csm", "csmCascades", "csmFade"]],
+  ["light", ["kind", "shadowMode", "shadowMapType", "csm", "csmCascades", "csmFade", "clipmapLevels"]],
   // Instancing count/mode/source add and remove InstancedMesh objects.
   ["instancer", ["mode", "count", "pathEntity"]],
   // The impostor bakes a billboard from another entity and swaps it in.
@@ -282,6 +300,18 @@ export class Component extends EventEmitter {
     // Cached viewOnly boolean (resolved against the entity's own flag once
     // per `setProp` cycle). Avoids re-reading the entity every frame.
     this._viewOnlyActive = viewGatedBy(this);
+    // ── Per-platform configs (componentVariants.js) ──────────────────────
+    // `props.variants` holds the authored override sets; `_variantBase` the
+    // DESKTOP value of every key a currently applied layer has replaced in
+    // `props` (null while nothing is applied); `_platformLayers` the layer
+    // list last applied, so a variant edit can re-resolve the same context.
+    // An empty or malformed `variants` is dropped here so "has variants" is
+    // always `!!props.variants`.
+    const variants = normalizeVariants(this.props[VARIANTS_PROP]);
+    if (variants) this.props[VARIANTS_PROP] = variants;
+    else delete this.props[VARIANTS_PROP];
+    this._variantBase = null;
+    this._platformLayers = [];
     // Mirror every authored prop as `comp.intensity` / `comp.intensity = 2`
     // (routed through setProp). Scripts shouldn't have to dig into `.props`.
     installPropAccessors(this);
@@ -498,8 +528,25 @@ export class Component extends EventEmitter {
     return this.onPropChanged === Component.prototype.onPropChanged;
   }
 
-  setProp(key, value) {
+  /**
+   * Writes the EFFECTIVE value of `key` — what `props[key]` reads and what the
+   * scene shows. This is `setProp` for every ordinary key, and the one place
+   * the platform-variant machinery writes through as well, so a value that
+   * arrives from a `mobile` set reacts (onPropChanged, the two engine events,
+   * the local "changed") exactly as one typed into the inspector would.
+   * `silent` skips the reaction and the events: the pre-attach apply in
+   * `Entity.addComponent`, where `onAttach` is about to read the props anyway.
+   */
+  #commit(key, value, silent = false) {
     if (key === "enabled" || key === "editorEnabled") {
+      // Silent = not attached yet (Entity.addComponent, before onAttach):
+      // store the flag only. `Entity.#attachComponent` derives `_enabled`
+      // from the props and decides whether to build from it; running the
+      // setter here would call onDetach on a component that was never built.
+      if (silent) {
+        this.props[key] = value !== false;
+        return;
+      }
       // Routing through the setters so the onEnable/onDisable hooks fire
       // and `_enabled` stays in sync. Skip the generic onPropChanged
       // (which would detach/reattach and tear down three.js state).
@@ -528,6 +575,7 @@ export class Component extends EventEmitter {
       this.props.viewOnly = !!value;
       this._viewOnlyActive = viewGatedBy(this);
       this._inView = null;
+      if (silent) return;
       const engine = this.entity?.engine;
       engine?.emit?.("component-changed", {
         entityId: this.entity?.id,
@@ -538,6 +586,7 @@ export class Component extends EventEmitter {
       return;
     }
     this.props[key] = value;
+    if (silent) return;
     // Detached (the entity is disabled): store the prop, react on re-attach.
     // Gated here rather than in each subclass's onPropChanged, several of
     // which re-run `this.onAttach()` themselves.
@@ -567,8 +616,234 @@ export class Component extends EventEmitter {
     this.emit("changed", key);
   }
 
+  /**
+   * Sets a prop — the value the scene shows from now on. While a platform
+   * layer overrides `key` (a phone preview in the editor, a phone at runtime)
+   * this writes the EFFECTIVE slot only: the desktop value kept aside for
+   * `toJSON` is untouched, and the next context change (the phone rotates)
+   * re-resolves from the authored sets. Editors that mean "change the desktop
+   * value" or "change the mobile value" call `setBaseProp` / `setVariantProp`.
+   */
+  setProp(key, value) {
+    if (key === VARIANTS_PROP) {
+      this.setVariants(value);
+      return;
+    }
+    this.#commit(key, value);
+  }
+
+  // ── Per-platform configs ────────────────────────────────────────────────
+  // See componentVariants.js for the model. In short: `props` holds the
+  // effective values, `props.variants` the authored override sets, and
+  // `_variantBase` the desktop value of every key a layer currently replaces.
+
+  /** The authored override sets, or null when this component has none. */
+  get variants() {
+    return this.props[VARIANTS_PROP] ?? null;
+  }
+
+  /** @param {string} layer */
+  hasVariant(layer) {
+    return !!this.props[VARIANTS_PROP]?.[layer];
+  }
+
+  /** The layers applied right now (`[]` on desktop). */
+  get platformLayers() {
+    return this._platformLayers;
+  }
+
+  /**
+   * The layers a variant edit should resolve against: the engine's current
+   * ones. A component that had no sets is not in the engine's registry and
+   * so never heard about a platform change — its cached list is only right
+   * for a component that has been applied at least once.
+   */
+  #currentLayers() {
+    return this.entity?.engine?.platformLayers ?? this._platformLayers;
+  }
+
+  /**
+   * The desktop value of `key` — `props[key]` unless a layer overrides it, in
+   * which case the value kept aside for saving. `undefined` for a key the
+   * base does not have.
+   */
+  getBaseProp(key) {
+    const base = this._variantBase;
+    if (base && Object.prototype.hasOwnProperty.call(base, key)) {
+      return base[key] === ABSENT ? undefined : base[key];
+    }
+    return this.props[key];
+  }
+
+  /** The props as they would be saved: every overridden key at its desktop value. */
+  get baseProps() {
+    const out = { ...this.props };
+    const base = this._variantBase;
+    if (base) {
+      for (const key of Object.keys(base)) {
+        if (base[key] === ABSENT) delete out[key];
+        else out[key] = base[key];
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Writes the DESKTOP value of `key`. When no layer overrides it this is
+   * `setProp`; when one does, only the kept-aside base changes and the scene
+   * keeps showing the layer's value — the inspector under a phone preview
+   * editing a desktop field must not move the phone layout.
+   */
+  setBaseProp(key, value) {
+    if (key === VARIANTS_PROP) {
+      this.setVariants(value);
+      return;
+    }
+    const base = this._variantBase;
+    if (base && Object.prototype.hasOwnProperty.call(base, key)) {
+      base[key] = value;
+      this.#notifyVariantEdit(key);
+      return;
+    }
+    this.#commit(key, value);
+  }
+
+  /**
+   * Writes `key` into the `layer` override set, creating the set if needed,
+   * and re-resolves the applied context so the scene reflects it when that
+   * layer is active. Refuses the keys no layer may carry (see
+   * VARIANT_EXCLUDED_KEYS) and unknown layer names.
+   */
+  setVariantProp(layer, key, value) {
+    if (!isVariantKey(layer)) throw new Error(`Unknown platform variant "${layer}"`);
+    if (VARIANT_EXCLUDED_KEYS.has(key)) throw new Error(`"${key}" cannot vary per platform`);
+    const variants = { ...(this.props[VARIANTS_PROP] ?? {}) };
+    variants[layer] = { ...(variants[layer] ?? {}), [key]: value };
+    this.props[VARIANTS_PROP] = variants;
+    this.#syncVariantRegistry();
+    this.applyPlatformLayers(this.#currentLayers());
+    this.#notifyVariantEdit(key);
+  }
+
+  /**
+   * Removes `key` from the `layer` set so it inherits from the layer below
+   * (or the desktop value) again. A set left empty stays — the author chose
+   * to have a phone config; `removeVariant` is the explicit way out.
+   */
+  clearVariantProp(layer, key) {
+    const set = this.props[VARIANTS_PROP]?.[layer];
+    if (!set || !Object.prototype.hasOwnProperty.call(set, key)) return;
+    const variants = { ...this.props[VARIANTS_PROP] };
+    const { [key]: _dropped, ...rest } = set;
+    variants[layer] = rest;
+    this.props[VARIANTS_PROP] = variants;
+    this.applyPlatformLayers(this.#currentLayers());
+    this.#notifyVariantEdit(key);
+  }
+
+  /**
+   * Replaces one whole override set (`delta` = `{}` creates an empty one,
+   * `null` removes it). The undo unit for "add a mobile config" / "remove it".
+   */
+  setVariant(layer, delta) {
+    if (!isVariantKey(layer)) throw new Error(`Unknown platform variant "${layer}"`);
+    const variants = { ...(this.props[VARIANTS_PROP] ?? {}) };
+    if (delta === null || delta === undefined) delete variants[layer];
+    else variants[layer] = { ...delta };
+    this.setVariants(variants);
+  }
+
+  /** @param {string} layer */
+  removeVariant(layer) {
+    if (!this.hasVariant(layer)) return;
+    this.setVariant(layer, null);
+  }
+
+  /**
+   * Replaces every override set at once — the `variants` prop write behind
+   * undo/redo, prefab apply and `setProp("variants", …)`. Normalised, so a
+   * write of `{}` leaves no key behind.
+   */
+  setVariants(variants) {
+    const next = normalizeVariants(variants);
+    if (next) this.props[VARIANTS_PROP] = next;
+    else delete this.props[VARIANTS_PROP];
+    this.#syncVariantRegistry();
+    this.applyPlatformLayers(this.#currentLayers());
+    this.#notifyVariantEdit(VARIANTS_PROP);
+  }
+
+  /**
+   * Resolves `layers` (see `platformLayers` in componentVariants.js) over the
+   * authored sets and writes the result into `props`: keys leaving the
+   * cascade get their desktop value back, keys entering it have that value
+   * kept aside first. Idempotent — calling it again with the same layers
+   * repairs any drift (a script wrote an overridden key; play-stop restored
+   * the base) — and a no-op for a component with no sets. `silent` skips the
+   * reaction (the pre-attach apply; `onAttach` reads the props right after).
+   */
+  applyPlatformLayers(layers, silent = false) {
+    this._platformLayers = Array.isArray(layers) ? layers : [];
+    const next = resolveVariantOverrides(this.props[VARIANTS_PROP], this._platformLayers);
+    const base = this._variantBase ?? {};
+    // Keys the cascade no longer names: put the desktop value back.
+    for (const key of Object.keys(base)) {
+      if (Object.prototype.hasOwnProperty.call(next, key)) continue;
+      const value = base[key];
+      delete base[key];
+      if (value === ABSENT) {
+        if (Object.prototype.hasOwnProperty.call(this.props, key)) {
+          delete this.props[key];
+          if (!silent) this.#notifyVariantEdit(key);
+        }
+        continue;
+      }
+      if (!samePropValue(this.props[key], value)) this.#commit(key, value, silent);
+    }
+    // Keys it names: keep the desktop value aside once, then write the layer's.
+    for (const [key, value] of Object.entries(next)) {
+      if (!Object.prototype.hasOwnProperty.call(base, key)) {
+        base[key] = Object.prototype.hasOwnProperty.call(this.props, key) ? this.props[key] : ABSENT;
+      }
+      if (!samePropValue(this.props[key], value)) this.#commit(key, value, silent);
+    }
+    this._variantBase = Object.keys(base).length ? base : null;
+  }
+
+  /**
+   * A variant edit that did not move the effective value still changed what
+   * will be saved and what the inspector shows for another layer — tell the
+   * precise listeners (the mirror, the inspector row) without the scene-wide
+   * event.
+   */
+  #notifyVariantEdit(key) {
+    const engine = this.entity?.engine;
+    engine?.emit?.("component-changed", {
+      entityId: this.entity?.id,
+      componentType: this.type,
+      key,
+    });
+    this.emit("changed", key);
+  }
+
+  /**
+   * Keeps `engine.variantComponents` — the set the engine walks on a platform
+   * change — equal to "components that carry at least one override set".
+   * Called from `Entity.addComponent` too, once the entity is known.
+   */
+  _syncVariantRegistry() {
+    this.#syncVariantRegistry();
+  }
+
+  #syncVariantRegistry() {
+    const registry = this.entity?.engine?.variantComponents;
+    if (!registry) return;
+    if (this.props[VARIANTS_PROP]) registry.add(this);
+    else registry.delete(this);
+  }
+
   toJSON() {
-    return { type: this.type, props: { ...this.props } };
+    return { type: this.type, props: this.baseProps };
   }
 
   /**

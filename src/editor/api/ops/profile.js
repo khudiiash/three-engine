@@ -16,6 +16,7 @@
  */
 import { defineOp } from "../registry.js";
 import { isViewportFreezeEnabled } from "../../viewportFreeze.js";
+import { getEditorFramePacingState } from "../../editorFramePacing.js";
 import { readTexturePixelsGPU } from "../../../modules/gi/giScreen.js";
 import { engine } from "../../engineInstance.js";
 import { getViewportHandle } from "../../viewportHandle.js";
@@ -48,6 +49,166 @@ const SCREEN_PASSES = [
   "emitterShadowFilterPass",
   "bvhReflect",
 ];
+
+let gpuIsolationTimer = null;
+let gpuIsolationRestart = false;
+function releaseGpuIsolation() {
+  if (gpuIsolationTimer === null) return;
+  clearTimeout(gpuIsolationTimer);
+  gpuIsolationTimer = null;
+  engine.resumeSimulation("profile-gpu-isolation");
+  if (gpuIsolationRestart && !engine.loopActive) engine.start();
+  gpuIsolationRestart = false;
+}
+defineOp({
+  name: "profile.giGlossyStats",
+  readOnly: true,
+  description: "Luminance statistics of the GI screen targets a material reads for its reflection term versus its diffuse term: the glossy gather (the lattice along the reflected direction, per resolve pixel) against the irradiance target. Mean, p50, p95, max and the fraction of pixels above a luma threshold, from a 64×64 downsample. The receipt behind 'reflective surfaces look too bright': when p95 of the glossy target is many times the irradiance's, the reflection lobe is reading a small bright region the diffuse average does not.",
+  params: {
+    threshold: { type: "number", default: 1, description: "Luma above which a pixel counts as 'bright'." },
+  },
+  async run({ threshold = 1 } = {}) {
+    const system = engine.modules?.get?.("gi")?.system;
+    const screen = system?.state?.screen;
+    const glossy = screen?.srcProbes?.glossy?.target ?? null;
+    const irradiance = screen?.targets?.irradiance ?? null;
+    if (!glossy || !irradiance) throw new Error("GI screen targets are not live (glossy gather or irradiance missing).");
+    const { readTexturePixelsGPU } = await import("../../../modules/gi/giScreen.js");
+    const stats = async (tex) => {
+      const px = await readTexturePixelsGPU(engine.renderer, tex, 64);
+      if (!px?.length) return null;
+      const lum = [];
+      for (let i = 0; i < px.length; i += 4) {
+        if (px[i + 3] === 0) continue;
+        lum.push(0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]);
+      }
+      if (!lum.length) return null;
+      lum.sort((a, b) => a - b);
+      const q = (f) => lum[Math.min(lum.length - 1, Math.floor(f * lum.length))];
+      const mean = lum.reduce((t, v) => t + v, 0) / lum.length;
+      return {
+        pixels: lum.length,
+        mean: +mean.toFixed(4),
+        p50: +q(0.5).toFixed(4),
+        p95: +q(0.95).toFixed(4),
+        max: +lum[lum.length - 1].toFixed(4),
+        aboveThreshold: +(lum.filter((v) => v > threshold).length / lum.length).toFixed(4),
+      };
+    };
+    const g = await stats(glossy);
+    const e = await stats(irradiance);
+    // The reflection-probe textures a metal reads inside a probe box: the
+    // blurred atlas (what materials sample), the raw capture scratch and the
+    // EMA history — each summarized over the WHOLE texture (8 probe rows,
+    // unused rows are black) so the numbers compare 1:1 with the player HUD's
+    // `atlas(8-bit)` line, plus per-probe capture counters. The receipt for
+    // "probes carry the glow on the phone but read black on the desktop".
+    const gpu = system?._reflProbeGpu ?? null;
+    const recs = [...(system?._reflProbes?.values?.() ?? []), ...(system?._autoReflProbes ?? [])].map((rec) => ({
+      slot: rec.slot ?? null, rounds: rec.rounds ?? 0, dirty: !!rec.dirty,
+      capturedAgoFrames: rec.capturedAt >= 0 ? Math.max(0, (system?._frame ?? 0) - rec.capturedAt) : null,
+      center: rec.center ? [+rec.center.x.toFixed(2), +rec.center.y.toFixed(2), +rec.center.z.toFixed(2)] : null,
+    }));
+    const probes = gpu ? {
+      armed: !!screen?.reflProbes,
+      pinnedOff: globalThis.__giReflectionProbes === false,
+      shadowsPinnedOff: globalThis.__giProbeShadows === false,
+      atlas: await stats(gpu.atlas).catch((err) => `readback failed: ${err?.message ?? err}`),
+      scratch: gpu.scratch ? await stats(gpu.scratch).catch((err) => `readback failed: ${err?.message ?? err}`) : null,
+      history: gpu.history ? await stats(gpu.history).catch((err) => `readback failed: ${err?.message ?? err}`) : null,
+      recs,
+    } : null;
+    return {
+      threshold,
+      glossy: g,
+      irradiance: e,
+      probes,
+      ratio: g && e ? { mean: +(g.mean / Math.max(e.mean, 1e-6)).toFixed(2), p95: +(g.p95 / Math.max(e.p95, 1e-6)).toFixed(2) } : null,
+      glossyCap: screen?.srcProbes?.glossy?.cap?.value ?? null,
+      rayOffset: screen?.srcProbes?.glossy?.rayOffset?.value ?? null,
+      note: "glossy = radiance the material mixes in for reflections (already /π); irradiance = the diffuse target (E, not /π). Compare glossy against irradiance/π for like units.",
+    };
+  },
+});
+
+defineOp({
+  name: "profile.giAoParity",
+  readOnly: true,
+  description: "Verify the live cached GTAO texture against fresh executions at identical inputs, byte for byte at native half-float resolution. Also changes AO strength temporarily to prove the fixture responds, then restores the exact original output. Pauses simulation during readback.",
+  params: {},
+  async run() {
+    const screen = engine.modules?.get("gi")?.system?.state?.screen;
+    const pass = screen?.vxaoPass;
+    const nodes = [...(screen?.aoComputes ?? [])];
+    if (!pass?.reusableGtao || !nodes.length) throw new Error("No reusable GTAO chain is active.");
+    const renderer = engine.renderer;
+    const backend = renderer.backend;
+    const width = pass.width, height = pass.height;
+    const format = backend.get(pass.target).textureDescriptorGPU?.format;
+    if (format !== "rgba16float") throw new Error(`Unexpected AO format: ${format}`);
+    const read = async () => {
+      const values = await backend.copyTextureToBuffer(pass.target, 0, 0, width, height, 0);
+      const bytes = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+      const pitch = Math.ceil(width * 8 / 256) * 256;
+      const tight = new Uint8Array(width * height * 8);
+      for (let y = 0; y < height; y++) tight.set(bytes.subarray(y * pitch, y * pitch + width * 8), y * width * 8);
+      return tight;
+    };
+    const differences = (a, b) => a.reduce((n, value, i) => n + (value !== b[i] ? 1 : 0), 0);
+    const run = () => { for (const node of nodes) renderer.compute(node); };
+    const restart = engine.loopActive;
+    engine.stop();
+    const release = engine.suspendSimulation("profile-gi-ao-parity");
+    const strength = screen.vxao.strength.value;
+    try {
+      const held = await read();
+      run();
+      const fresh = await read();
+      run();
+      const repeated = await read();
+      screen.vxao.strength.value = strength > 0 ? strength * 0.5 : 1;
+      run();
+      const changed = await read();
+      screen.vxao.strength.value = strength;
+      run();
+      const restored = await read();
+      const report = {
+        width, height, bytes: held.length,
+        heldVsFresh: differences(held, fresh),
+        freshVsRepeated: differences(fresh, repeated),
+        strengthChangedBytes: differences(fresh, changed),
+        restoredBytes: differences(fresh, restored),
+      };
+      return { ...report, pass: report.heldVsFresh === 0 && report.freshVsRepeated === 0 && report.restoredBytes === 0 && report.strengthChangedBytes > 0 };
+    } finally {
+      screen.vxao.strength.value = strength;
+      try { run(); } finally {
+        release();
+        if (restart && !engine.loopActive) engine.start();
+      }
+    }
+  },
+});
+
+defineOp({
+  name: "profile.gpuIsolation",
+  description: "Temporarily pause this editor's simulation and drawing while an external GPU regression runs on the same adapter. Automatically resumes after seconds; active=false resumes immediately. Does not edit the scene.",
+  params: {
+    active: { type: "boolean", default: true },
+    seconds: { type: "number", default: 180, description: "Safety timeout, 1–600 seconds." },
+  },
+  run({ active = true, seconds = 180 }) {
+    releaseGpuIsolation();
+    if (active) {
+      gpuIsolationRestart = engine.loopActive;
+      engine.stop();
+      engine.suspendSimulation("profile-gpu-isolation");
+      gpuIsolationTimer = setTimeout(releaseGpuIsolation,
+        Math.max(1, Math.min(600, Number(seconds) || 180)) * 1000);
+    }
+    return { isolated: gpuIsolationTimer !== null, simulationSuspended: engine.simulationSuspended, loopActive: engine.loopActive };
+  },
+});
 
 defineOp({
   name: "profile.giFlag",
@@ -771,6 +932,9 @@ defineOp({
       // The first thing to check against a big idleMs: an unfocused viewport
       // that has been told to stop drawing is the commonest cause by far.
       viewportFreezeWhenUnfocused: isViewportFreezeEnabled(),
+      // The pacer's last decision and inputs — which of them kept an
+      // unfocused viewport drawing (a hold, a pin, a settling change).
+      viewportPacing: getEditorFramePacingState(),
       cpuMs: +(r.workMs || r.frameMs).toFixed(2),
       // The whole frame interval and the part of it the loop did NOT execute
       // (vsync, the browser's frame callback, the editor's frame limiter).
@@ -824,6 +988,13 @@ defineOp({
       // cadence. A non-zero count here is the only way to tell "the view is
       // held and the GPU is idle" from "the gate never engaged".
       giHold: {
+        gtaoHeld: engine.modules?.get?.("gi")?.system?._gtaoHeld ?? false,
+        gtaoHeldFrames: engine.modules?.get?.("gi")?.system?._gtaoHeldFrames ?? 0,
+        computeSubmissions: engine.renderer?.backend?.__giComputeSubmitStats ?? null,
+        // §11.56: renderer.compute() CALLS vs nodes — built kernels go to
+        // three as one array (one pass, one timestamp pair) so `nodes/calls`
+        // is the pass-boundary saving; `singles` are unbuilt/pending nodes.
+        computeGroups: globalThis.__giComputeGroupStats ?? null,
         reflectHeldFrames: engine.modules?.get?.("gi")?.system?._bvhReflectHeldFrames ?? null,
         hitShadeHeldFrames: engine.modules?.get?.("gi")?.system?._bvhHitShadeHeldFrames ?? null,
         // §17 R7c's reflection history weight. ~0.9 means the reflection is a

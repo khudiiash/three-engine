@@ -1,5 +1,9 @@
 import { useRef, useState } from "react";
 import { commandBus } from "../commands/CommandBus.js";
+import { formatNumber, tidy } from "./numberFormat.js";
+
+// Re-exported: this module was formatNumber's home before it moved next door.
+export { formatNumber };
 
 /**
  * The inspector's number input. Two interaction modes on one control:
@@ -22,17 +26,6 @@ import { commandBus } from "../commands/CommandBus.js";
 
 const clamp = (v, min, max) =>
   Math.min(max ?? Infinity, Math.max(min ?? -Infinity, v));
-
-/** Trims float noise accumulated over many drag deltas (0.30000000000000004). */
-function tidy(value, step) {
-  const decimals = step >= 1 ? 0 : Math.min(5, Math.ceil(-Math.log10(step)) + 1);
-  return parseFloat(value.toFixed(decimals));
-}
-
-export function formatNumber(v) {
-  if (typeof v !== "number" || Number.isNaN(v)) return "0";
-  return String(Math.round(v * 1000) / 1000);
-}
 
 /** Movement in px before a press counts as a scrub instead of a click. */
 const DRAG_SLOP = 3;
@@ -114,7 +107,7 @@ export function NumberField({
   const [scrubbing, setScrubbing] = useState(false);
   const inputRef = useRef(null);
   const drag = useRef(null);
-  const text = draft !== null ? draft : mixed ? "" : formatNumber(value);
+  const text = draft !== null ? draft : mixed ? "" : formatNumber(value, step);
   const bounded = isBounded(min, max);
   const fillPct = bounded ? Math.max(0, Math.min(100, ((Number(value) || 0) - min) / (max - min) * 100)) : 0;
 
@@ -231,7 +224,7 @@ export function NumberField({
         setScrubbing(false);
       }}
       onChange={(e) => setDraft(e.target.value)}
-      onFocus={() => setDraft(mixed ? "" : formatNumber(value))}
+      onFocus={() => setDraft(mixed ? "" : formatNumber(value, step))}
       onBlur={() => {
         // A scrub blurs the field itself — don't let that path re-commit the
         // pre-drag text over the value the drag just wrote.

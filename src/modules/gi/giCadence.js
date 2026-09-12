@@ -55,3 +55,55 @@ export function shouldDispatchGiWorld({ due, frameGapMs, dispatchedPreviousFrame
   const slowFrame = Number(frameGapMs) > (1000 / rate) * 1.05;
   return !slowFrame || !dispatchedPreviousFrame;
 }
+
+/**
+ * §11.55 (2026-09-11) — THE WORLD RATE FOLLOWS THE LIGHT-MOTION DRIVE.
+ *
+ * Awake used to mean one rate: any drive above the rest threshold ran the
+ * transport at GI_WORLD_UPDATE_HZ, so a sun creeping round a 3-minute day
+ * (2°/s, drive ~0.35) paid the same 30 chains a second as a 1-minute day
+ * (drive ~1). Measured on the user's Sponza build at 2872×1532: the chain at
+ * 30 Hz is ~5.7 ms of a 22.7 ms GPU frame; at 15 Hz ~3.7 ms. The drive is
+ * already the transport's own measure of how fast the field is being
+ * invalidated (`srcSystem`'s α ramp), so the rate rides it: rest at the rest
+ * rate, the full rate only once the drive says the light is really moving,
+ * a smooth step between. Fractional rates are fine — the cadence is a
+ * wall-clock accumulator.
+ *
+ * The rate on its own would double the field's lag behind a slow sun, so the
+ * transport's α is rate-compensated (`giRateCompensatedAlpha`): the per-second
+ * decay is held constant, so t50/t90 in wall time do not move. What moves is
+ * the per-update variance (fewer updates carry the same evidence rate), and
+ * on the drive band this lands where the α ramp already runs (0.05-0.1).
+ * `__giWorldRateDrive = false` restores the binary awake rate for an A/B.
+ */
+export const GI_WORLD_DRIVE_LOW = 0.05;
+export const GI_WORLD_DRIVE_HIGH = 0.6;
+
+export function giWorldRateHz({
+  rested,
+  drive,
+  restHz = GI_WORLD_REST_HZ,
+  updateHz = GI_WORLD_UPDATE_HZ,
+  scaled = true,
+} = {}) {
+  if (rested) return restHz;
+  if (!scaled) return updateHz;
+  const d = Number(drive);
+  if (!Number.isFinite(d)) return updateHz;
+  const t = Math.min(1, Math.max(0, (d - GI_WORLD_DRIVE_LOW) / (GI_WORLD_DRIVE_HIGH - GI_WORLD_DRIVE_LOW)));
+  const s = t * t * (3 - 2 * t);
+  return restHz + (updateHz - restHz) * s;
+}
+
+/**
+ * The per-update α that gives the SAME per-second decay at `hz` as `alpha`
+ * gives at `baseHz`: (1 − α')^hz = (1 − α)^baseHz. Identity at or above the
+ * base rate, so the full-rate path is bit-for-bit what it was.
+ */
+export function giRateCompensatedAlpha(alpha, hz, baseHz = GI_WORLD_UPDATE_HZ) {
+  const a = Math.min(1, Math.max(0, Number(alpha) || 0));
+  const rate = Number(hz);
+  if (!(rate > 0) || !(baseHz > 0) || rate >= baseHz) return a;
+  return 1 - (1 - a) ** (baseHz / rate);
+}

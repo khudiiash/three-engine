@@ -221,6 +221,15 @@ import { STAT_SEC_LOD_BASE, STAT_SEC_LOD_LEVELS, STAT_SEC_LOD_MOVER_ROW, STAT_SE
  *   for the tallies that moved here with the lighting.
  * @param {number} options.capacity  hit-list entries — the dispatch width.
  */
+// ── §11.59 THE COUNTERS ARE OPT-OUT (2026-09-11) ────────────────────────────
+// Every ray (and every shaded hit, in srcSecondary.js) bumps eight to twelve
+// GLOBAL atomics on the same few words — the receipts `profile.giPasses`
+// prints (rays, hits, clamped, tsum/tmax, far, movers…). Same-address atomics
+// serialise at the L2 whatever the GPU; on the phone they are paid by every
+// frame's transport whether anyone reads them or not. `__giSrcStats = false`
+// (build-time) compiles them out; the receipt fields then read 0.
+const srcStatsOn = () => globalThis.__giSrcStats !== false;
+
 export function createSrcSecondaryFrame(store, bins, {
   shade = null,
   bounce = true,
@@ -396,11 +405,11 @@ export function createSrcSecondaryFrame(store, bins, {
       for (let j = 0; j < STAT_SEC_LOD_LEVELS; j++) {
         const base = STAT_SEC_LOD_BASE + j * STAT_SEC_LOD_WORDS;
         If(lod.equal(int(j)), () => {
-          atomicAdd(stats.element(uint(base)), dFx);
-          atomicAdd(stats.element(uint(base + 1)), bFx);
-          atomicAdd(stats.element(uint(base + 2)), eFx);
-          atomicAdd(stats.element(uint(base + 3)), uint(1));
-          atomicAdd(stats.element(uint(base + 4)), rFx);
+          if (srcStatsOn()) atomicAdd(stats.element(uint(base)), dFx);
+          if (srcStatsOn()) atomicAdd(stats.element(uint(base + 1)), bFx);
+          if (srcStatsOn()) atomicAdd(stats.element(uint(base + 2)), eFx);
+          if (srcStatsOn()) atomicAdd(stats.element(uint(base + 3)), uint(1));
+          if (srcStatsOn()) atomicAdd(stats.element(uint(base + 4)), rFx);
         });
       }
     }
@@ -445,8 +454,8 @@ export function createSrcSecondaryFrame(store, bins, {
       const st = vec3(sunTransfer).toVar();
       // The HIT-side rate — see `STAT_SUN_FACING`. Counted for every shaded
       // hit, facing or not, so the ratio has a denominator that means something.
-      atomicAdd(stats.element(uint(STAT_SUN_SHADED)), uint(1));
-      atomicAdd(stats.element(uint(STAT_SUN_FACING)), select(float(sunFacing).greaterThan(0), uint(1), uint(0)));
+      if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_SUN_SHADED)), uint(1));
+      if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_SUN_FACING)), select(float(sunFacing).greaterThan(0), uint(1), uint(0)));
       atomicAdd(
         scratch.element(slot.add(uint(BIN_SR))),
         st.x.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint(),
@@ -499,9 +508,9 @@ export function createSrcSecondaryFrame(store, bins, {
     }
 
     // ── the `Lmax` decision's instruments, which followed the conversion ────
-    atomicAdd(stats.element(uint(STAT_CLAMPED)), select(clamped, uint(1), uint(0)));
-    atomicMax(stats.element(uint(STAT_MAXL)), fx[0].max(fx[1]).max(fx[2]));
-    atomicAdd(stats.element(uint(STAT_SECONDARY)), uint(1));
+    if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_CLAMPED)), select(clamped, uint(1), uint(0)));
+    if (srcStatsOn()) atomicMax(stats.element(uint(STAT_MAXL)), fx[0].max(fx[1]).max(fx[2]));
+    if (srcStatsOn()) atomicAdd(stats.element(uint(STAT_SECONDARY)), uint(1));
     // The BOUNCE TERM ALONE at the ceiling — R4's loop gain running away. Not
     // the same event as `STAT_CLAMPED` above, which is the whole radiance.
     if (Lb) {

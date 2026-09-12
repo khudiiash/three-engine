@@ -183,9 +183,27 @@ export class UiTextComponent extends Component {
   #buildGlyphs(w, h, spec) {
     const { quads } = layoutGlyphs(this.font, w, h, this.props);
     const count = quads.length;
-    const positions = new Float32Array(count * 4 * 3);
-    const uvs = new Float32Array(count * 4 * 2);
-    const indices = new Uint32Array(count * 6);
+    // Replacing attributes on a live geometry orphans their GPU buffers:
+    // Three only releases the attributes still attached at disposal. A HUD
+    // counter updates several times a second, so retain its buffers whenever
+    // the glyph count fits exactly. A size change gets a new geometry, with
+    // the previous one disposed BEFORE its attributes can become unreachable.
+    let geometry = this.geometry;
+    const reuse = geometry.getAttribute("position")?.count === count * 4 &&
+      geometry.getAttribute("uv")?.count === count * 4 &&
+      geometry.index?.count === count * 6;
+    if (!reuse) {
+      geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(count * 4 * 3), 3));
+      geometry.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(count * 4 * 2), 2));
+      geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(count * 6), 1));
+      this.geometry.dispose();
+      this.geometry = geometry;
+      this.mesh.geometry = geometry;
+    }
+    const positions = geometry.getAttribute("position").array;
+    const uvs = geometry.getAttribute("uv").array;
+    const indices = geometry.index.array;
     const ox = spec.pivot[0] * w;
     const oy = spec.pivot[1] * h;
 
@@ -201,11 +219,12 @@ export class UiTextComponent extends Component {
       // glyph's top row is v0.
       uvs.set([q.u0, q.v0, q.u1, q.v0, q.u1, q.v1, q.u0, q.v1], i * 8);
       const v = i * 4;
-      indices.set([v, v + 2, v + 1, v, v + 3, v + 2], i * 6);
+      if (!reuse) indices.set([v, v + 2, v + 1, v, v + 3, v + 2], i * 6);
     }
-    this.geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    this.geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-    this.geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+    if (reuse) {
+      geometry.getAttribute("position").needsUpdate = true;
+      geometry.getAttribute("uv").needsUpdate = true;
+    }
     this.geometry.setDrawRange(0, count * 6);
     // Recomputed rather than left stale: the editor's Focus Selected framing
     // (and any Box3.setFromObject) reads these, and a bounding box left over

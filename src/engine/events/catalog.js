@@ -70,6 +70,7 @@ export const EVENT_SCOPES = {
  */
 export const RESERVED_EVENT_NAMES = [
   "hierarchy-changed",
+  "platform-changed",
   "renderer-rebuilt",
   "modules-changed",
   "settings-changed",

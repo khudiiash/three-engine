@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>GI compute command ordering</title>
+<canvas id="view" width="32" height="32"></canvas>
+<script type="module">
+import * as THREE from "three/webgpu";
+import { Fn, instanceIndex, instancedArray, ivec2, storage, texture, uint, uniform, vec4 } from "three/tsl";
+import { giCompute } from "/src/modules/gi/GISystem.js";
+import { withGiComputeSubmissionBatch } from "/src/engine/giComputeSubmissionBatch.js";
+
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const fail = (error) => {
+  console.error("GI-SMOKE FAIL", error?.stack ?? String(error));
+  globalThis.__GI_SMOKE_RESULT__ = { pass: false, error: error?.message ?? String(error) };
+};
+addEventListener("error", (event) => fail(event.error ?? event.message));
+addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+const exact = (actual, expected, label) => {
+  assert(actual.length === expected.length, `${label}: ${actual.length} words, expected ${expected.length}`);
+  for (let i = 0; i < expected.length; i++) {
+    assert(actual[i] === expected[i], `${label}[${i}]: ${actual[i]}, expected ${expected[i]}`);
+  }
+};
+const bounded = (promise, label) => {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label}: readback timed out`)), 12000); }),
+  ]).finally(() => clearTimeout(timer));
+};
+const named = (name, fn, count) => {
+  const node = Fn(fn)().compute(count);
+  node.name = `batch-smoke:${name}`;
+  return node;
+};
+
+try {
+  const renderer = new THREE.WebGPURenderer({
+    canvas: document.querySelector("canvas"),
+    requiredLimits: { maxStorageBuffersPerShaderStage: 8 },
+  });
+  await renderer.init();
+  assert(renderer.backend.isWebGPUBackend, "A real WebGPU backend is required");
+  renderer.setSize(32, 32, false);
+  renderer.toneMapping = THREE.NoToneMapping;
+  const device = renderer.backend.device;
+  const errors = [];
+  device.addEventListener("uncapturederror", (event) => {
+    errors.push(event.error.message);
+    fail(new Error(`WebGPU validation: ${event.error.message}`));
+  });
+  assert(device.limits.maxStorageBuffersPerShaderStage === 8, "Device must use the portable eight-buffer limit");
+
+  // An odd dispatch count exercises Three's bounds guard as well as ordering.
+  const N = 257;
+  const a = instancedArray(N, "uint");
+  const b = instancedArray(N, "uint");
+  const c = instancedArray(N, "uint");
+  const i = instanceIndex;
+  const seed = named("seed", () => a.element(i).assign(i.mul(uint(3)).add(uint(1))), N);
+  const neighbor = named("neighbor", () => b.element(i).assign(
+    a.element(i.add(uint(1)).mod(uint(N))).add(a.element(i).mul(uint(2)))), N);
+  const add = named("add", () => a.element(i).assign(b.element(i).add(uint(17))), N);
+  const multiply = named("multiply", () => b.element(i).assign(a.element(i).mul(uint(5)).add(uint(31))), N);
+  const finish = named("finish", () => c.element(i).assign(b.element(i).mod(uint(65521))), N);
+  const chain = [seed, neighbor, add, multiply, finish];
+  const bump = named("bump", () => a.element(i).addAssign(uint(100)), N);
+  const seeded = Array.from({ length: N }, (_, index) => index * 3 + 1);
+  const expectedChain = seeded.map((v, index) => ((seeded[(index + 1) % N] + v * 2 + 17) * 5 + 31) % 65521);
+  const bumped = seeded.map((v) => v + 100);
+
+  // Reusing THE SAME node and uniform buffer matters: different nodes can
+  // allocate different UBOs and conceal a missing queue.writeBuffer boundary.
+  const sharedValue = uniform(0, "uint");
+  const sharedSlot = uniform(0, "uint");
+  const uniformOutput = instancedArray(N * 3, "uint");
+  const sampleUniform = named("shared-uniform", () => {
+    uniformOutput.element(i.add(sharedSlot.mul(uint(N)))).assign(sharedValue.add(i));
+  }, N);
+
+  // The render sits between compute passes and samples their storage output.
+  // A later compute reads the rendered pixel back into a UINT buffer, so a
+  // reordered compute/render pair fails an exact array comparison too.
+  const renderValue = uniform(0, "uint");
+  const renderInput = instancedArray(1, "uint");
+  const writeRenderInput = named("render-input", () => renderInput.element(uint(0)).assign(renderValue), 1);
+  const renderReadOnly = storage(renderInput.value, "uint", 1).toReadOnly();
+  const material = new THREE.MeshBasicNodeMaterial();
+  material.colorNode = vec4(renderReadOnly.element(uint(0)).toFloat().div(255), 0, 0, 1);
+  material.toneMapped = false;
+  material.depthTest = false;
+  material.depthWrite = false;
+  const scene = new THREE.Scene();
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  scene.add(quad);
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 10);
+  camera.position.z = 1;
+  const target = new THREE.RenderTarget(16, 16, { depthBuffer: false });
+  target.texture.colorSpace = THREE.NoColorSpace;
+  const renderOutput = instancedArray(1, "uint");
+  const pixel = texture(target.texture);
+  const readRender = named("read-render", () => renderOutput.element(uint(0)).assign(
+    pixel.load(ivec2(8, 8)).r.mul(255).round().toUint()), 1);
+  const draw = () => {
+    const previous = renderer.getRenderTarget();
+    renderer.setRenderTarget(target);
+    try { renderer.render(scene, camera); }
+    finally { renderer.setRenderTarget(previous); }
+  };
+  const read = async (node, label) => new Uint32Array(await bounded(renderer.getArrayBufferAsync(node.value), label));
+  const map = async (buffer, label) => {
+    await bounded(buffer.mapAsync(GPUMapMode.READ), label);
+    const result = new Uint32Array(buffer.getMappedRange().slice(0));
+    buffer.unmap();
+    return result;
+  };
+
+  // Compile and allocate once before measuring a warm chain. Otherwise first
+  // uploads flush each pass and a completely inactive optimization can pass.
+  globalThis.__giComputeSubmitBatch = false;
+  giCompute(renderer, [...chain, bump, sampleUniform, writeRenderInput]);
+  draw();
+  giCompute(renderer, readRender);
+  await device.queue.onSubmittedWorkDone();
+
+  const results = [];
+  let reference = null;
+  for (const mode of [
+    { name: "original", batch: false },
+    { name: "submit-only", batch: true },
+  ]) {
+    globalThis.__giComputeSubmitBatch = mode.batch;
+    device.pushErrorScope("validation");
+    const outputs = {};
+    const stats = renderer.backend.__giComputeSubmitStats;
+    assert(stats, "Production submission wrapper must be installed");
+    const before = stats.savedSubmits;
+    giCompute(renderer, chain);
+    outputs.chain = Array.from(await read(c, `${mode.name} dependent chain`));
+    exact(outputs.chain, expectedChain, `${mode.name} dependent chain`);
+    const savings = {
+      submits: stats.savedSubmits - before,
+    };
+    if (mode.batch) assert(savings.submits >= 4, `${mode.name}: warm five-pass chain saved only ${savings.submits} submissions`);
+    else assert(savings.submits === 0, "Original arm accidentally batched commands");
+
+    const values = [7, 43, 109];
+    withGiComputeSubmissionBatch(renderer, () => {
+      for (let slot = 0; slot < values.length; slot++) {
+        sharedValue.value = values[slot];
+        sharedSlot.value = slot;
+        giCompute(renderer, sampleUniform);
+      }
+    });
+    outputs.uniforms = Array.from(await read(uniformOutput, `${mode.name} shared uniform`));
+    exact(outputs.uniforms, values.flatMap((value) => seeded.map((_, index) => value + index)), `${mode.name} shared uniform`);
+
+    const copied = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    withGiComputeSubmissionBatch(renderer, () => {
+      giCompute(renderer, seed);
+      const encoder = device.createCommandEncoder({ label: "external-copy-between-GI-passes" });
+      encoder.copyBufferToBuffer(renderer.backend.get(a.value).buffer, 0, copied, 0, N * 4);
+      device.queue.submit([encoder.finish()]);
+      giCompute(renderer, bump);
+    });
+    outputs.copy = Array.from(await map(copied, `${mode.name} external copy`));
+    exact(outputs.copy, seeded, `${mode.name} external copy before mutation`);
+    exact(await read(a, `${mode.name} after copy`), bumped, `${mode.name} source after mutation`);
+    copied.destroy();
+
+    let earlyRead, fence;
+    withGiComputeSubmissionBatch(renderer, () => {
+      giCompute(renderer, seed);
+      // Mapping begins before this scope returns. Deferring its copy until
+      // scopeEnd would map an unsubmitted buffer and read zeros or deadlock.
+      earlyRead = renderer.getArrayBufferAsync(a.value);
+      fence = device.queue.onSubmittedWorkDone();
+      giCompute(renderer, bump);
+    });
+    await bounded(fence, `${mode.name} in-scope fence`);
+    outputs.readback = Array.from(new Uint32Array(await bounded(earlyRead, `${mode.name} in-scope readback`)));
+    exact(outputs.readback, seeded, `${mode.name} in-scope readback before mutation`);
+    exact(await read(a, `${mode.name} after readback`), bumped, `${mode.name} source after readback`);
+
+    withGiComputeSubmissionBatch(renderer, () => {
+      renderValue.value = 73;
+      giCompute(renderer, writeRenderInput);
+      draw();
+      giCompute(renderer, readRender);
+      renderValue.value = 191;
+      giCompute(renderer, writeRenderInput);
+    });
+    outputs.render = Array.from(await read(renderOutput, `${mode.name} nested render`));
+    exact(outputs.render, [73], `${mode.name} compute-render-compute ordering`);
+    exact(await read(renderInput, `${mode.name} after render`), [191], `${mode.name} mutation after render`);
+
+    await device.queue.onSubmittedWorkDone();
+    const validation = await device.popErrorScope();
+    assert(!validation, `${mode.name}: WebGPU validation: ${validation?.message}`);
+    assert(errors.length === 0, errors.join("\n"));
+    if (reference) {
+      for (const key of Object.keys(outputs)) exact(outputs[key], reference[key], `${mode.name} versus original ${key}`);
+    } else reference = outputs;
+    results.push({ mode: mode.name, savings, wordsCompared: Object.values(outputs).reduce((n, array) => n + array.length, 0) });
+    console.log(`GI compute batch ${mode.name}: exact dependent/uniform/copy/readback/render outputs; saved ${savings.submits} submits`);
+  }
+  assert(globalThis.__GI_SMOKE_RESULT__?.pass !== false, "An asynchronous failure was reported");
+  globalThis.__GI_SMOKE_RESULT__ = { pass: true, portableStorageBuffers: 8, results };
+  console.log("GI-SMOKE PASS compute submission batching: exact command ordering in both modes");
+  renderer.dispose();
+} catch (error) { fail(error); }
+</script>
+</html>

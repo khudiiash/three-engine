@@ -2,6 +2,7 @@ import * as THREE from "three/webgpu";
 import { CLOTH_SOLVE_PASSES, clothSolveSplit, clothSubsteps, clothVelocityScale } from "./clothHealth.js";
 import { clothComputeBatch } from "./computeBatch.js";
 import { resolveClothWind, sceneWind } from "./clothWind.js";
+import { clothGiProxyCorners } from "./clothGiProxy.js";
 import { Fn, If, Break, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, texture, ivec2 } from "three/tsl";
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
 import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt, seaFoldNode } from "./waterSpectrum.js";
@@ -1841,10 +1842,19 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // The LID: the medium (scene.fogNode) treats it as the interface — no water
   // path to it from above, the whole path from below (waterMedium.js).
   if (kind === "water") mesh.userData.waterLid = true;
-  // GI reads this to sample a deformed surface on its own lattice; a mesh
-  // cloth has no lattice, so it is left off and GI treats it as ordinary
-  // geometry rather than indexing a grid that does not exist.
+  // GI reads this to sample a deformed surface on its own lattice. A mesh
+  // cloth has no lattice of its own, so it hands over a rest-pose sampling of
+  // one instead (`clothGiProxy.js`) — the arena path does the same, and this
+  // A/B arm must not light the scene differently from the shipping one.
+  //
+  // ⛔ Left OFF, this is not "GI treats it as ordinary geometry": the source
+  // mesh is skipped for `clothHidden` and this one for `vfxSimulation`, so the
+  // cloth is invisible to GI entirely — no traced shadow, no bounce, no colour.
   if (!meshCloth) mesh.userData.giGpuGrid = { positionAttribute, resolution: n };
+  else {
+    const corners = clothGiProxyCorners(positionAttribute.array, positionAttribute.count);
+    if (corners) mesh.userData.giGpuGrid = { positionAttribute, corners };
+  }
   if(waterSurfaceTexture)mesh.userData.waterSurfaceTexture=waterSurfaceTexture;
   mesh.userData.noBatch = true;
   mesh.userData.noMerge = true;

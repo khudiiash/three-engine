@@ -311,6 +311,24 @@ export function MenuBar() {
       // for someone who has already configured it (or is happy with defaults).
       { label: "Build Settings…", panel: "build", action: () => openPanel("build") },
       { label: "Build Game…", shortcut: "Ctrl+B", action: () => import("./exportGame.js").then((m) => m.exportGameWithToasts()) },
+      { separator: true },
+      // ⚠ THE CHORD IS NOT ALWAYS REACHABLE, AND THIS IS THE WAY IN WHEN IT IS
+      // NOT (2026-09-11). The default is Shift+Alt+S, and on Windows **Alt+Shift
+      // is the OS input-language switch** whenever more than one keyboard layout
+      // is installed — the shell eats the chord and the app is never told, which
+      // reads exactly like a broken shortcut ("shift + alt + S still not doing
+      // viewport screenshot"). Nothing in the page can intercept that, so the
+      // action needs a path that does not go through the keyboard at all. The
+      // chord is rebindable in Project Settings → Keybindings for anyone who
+      // wants one that does not collide.
+      {
+        label: "Screenshot Viewport",
+        shortcut: describeBinding(getBinding("editor.screenshot")),
+        action: () =>
+          import("./viewportScreenshot.js")
+            .then((m) => m.saveViewportScreenshot())
+            .catch((err) => console.error(`Screenshot failed: ${err}`)),
+      },
     ],
     Edit: [
       {

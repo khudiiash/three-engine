@@ -336,6 +336,12 @@ export class Entity extends EventEmitter {
     }
     component.entity = this;
     this.components.set(type, component);
+    // Per-platform configs (componentVariants.js): resolve the engine's
+    // current platform into the props BEFORE `onAttach`, silently, so a
+    // component with a `mobile` set is BUILT from its phone values on a phone
+    // rather than built from the desktop ones and rebuilt a moment later.
+    component._syncVariantRegistry?.();
+    if (component.variants) component.applyPlatformLayers(this.engine?.platformLayers ?? [], true);
     // An inactive entity's components are not attached (see the flags above);
     // `reconcileActivity` attaches them the moment the entity becomes active.
     if (this._componentsActive !== false) this.#attachComponent(component);
@@ -509,6 +515,8 @@ export class Entity extends EventEmitter {
     // Internal-only bookkeeping, deliberately absent from the public Engine
     // surface in engine.d.ts.
     /** @type {any} */ (this.engine).viewOnlyComponents?.delete(component);
+    // Same for the platform-variant registry (Engine.#applyPlatform).
+    /** @type {any} */ (this.engine).variantComponents?.delete(component);
     // Include the detached instance: systems reacting to a permanent removal
     // may need provenance that is no longer reachable through getComponent().
     // This remains an additive event field for existing listeners.

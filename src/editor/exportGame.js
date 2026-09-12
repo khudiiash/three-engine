@@ -518,10 +518,12 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     const scene = await readScene(plan.startScene);
     scene.player = {
       title,
-      pixelRatioCap: projectSettings.rendering.pixelRatioCap,
       // A ceiling over each scene's authored performance block. See
       // QUALITY_PRESETS in engine/sceneSettings.js.
       quality: build.quality ?? "ultra",
+      // The phone/tablet ceiling, applied by the player only on a portable
+      // device; "same" (the default) ships phones the preset above.
+      mobileQuality: build.mobileQuality ?? "same",
       // Saves: the namespace keeps two games on one origin (an itch.io page, a
       // shared dev server) from reading each other's slots, and must be derived
       // exactly as `applyProjectSettings` does it or a save written while

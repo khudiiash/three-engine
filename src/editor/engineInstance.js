@@ -72,6 +72,12 @@ async function loadEngine() {
       // be dropped.
       registerBuiltInComponents();
       const inst = new Engine();
+      // The editor decides the platform its scene previews as (Desktop until
+      // a component's platform toggle says otherwise — store/platformStore.js);
+      // pinned as an override so a narrow-docked viewport never reads as a
+      // phone held upright. Before any scene loads, so the first components
+      // resolve against it.
+      inst.setPlatformOverride({ platform: "desktop", orientation: null });
       // The runtime stays fs-agnostic; the editor supplies the actual
       // path -> URL resolution (Tauri fs read -> blob: URL) and script
       // loading so components can stay portable.

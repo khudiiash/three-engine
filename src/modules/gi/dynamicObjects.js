@@ -138,9 +138,80 @@ export const STATIC_MASK_WORD_BASE = 16;
 export const STATIC_MASK_WORDS = 16;
 const DEFAULT_MAX_OBJECTS = 16;
 
+// ── §11.57 MOVER CLUSTERS (2026-09-11) ───────────────────────────────────────
+// After the object blocks: a two-level acceleration over the movers. Every
+// trace used to visit EVERY adopted mover per ray — load its 4×4, transform
+// the ray, slab-test, self-exclusion — 34 times per ray on Sponza (10 cloth
+// grids + a character's bone capsules), ~2.8 ms of the build's frame. The CPU
+// now buckets the active movers into ≤ DYN_CLUSTER_MAX spatial groups each
+// frame (a 2×2×2 split of their union by centre), writes each group's union
+// box and member list here, and the kernel slab-tests the group boxes first,
+// descending only into the groups the ray segment crosses. The per-object
+// code is untouched — it is the same closure, called per member.
+//   +0            cluster count (f32)
+//   +1 .. +64     DYN_CLUSTER_MAX × [min.xyz, max.xyz, first, count] (f32)
+//   +65 ..        member slot indices (f32), maxObjects of them
+export const DYN_CLUSTER_MAX = 8;
+export const DYN_CLUSTER_STRIDE = 8;
+export function dynClusterWords(maxObjects = DEFAULT_MAX_OBJECTS) {
+  return 1 + DYN_CLUSTER_MAX * DYN_CLUSTER_STRIDE + maxObjects;
+}
+
 /** Header words for a given object capacity. */
 export function dynHeaderWords(maxObjects = DEFAULT_MAX_OBJECTS) {
-  return DYN_HEADER_RESERVED + maxObjects * OBJ_WORDS;
+  return DYN_HEADER_RESERVED + maxObjects * OBJ_WORDS + dynClusterWords(maxObjects);
+}
+
+/**
+ * Bucket mover boxes into at most `maxClusters` groups: a 2×2×2 split of the
+ * union of all boxes at its centre, each item placed by ITS centre, each
+ * group's box the union of its members (so a curtain straddling the split
+ * is fully covered by its own group). Pure, so `tests/gi-mover-clusters`
+ * can pin it. An item with an invalid box (NaN, inverted) gets an unbounded
+ * one — never culled, only ever conservative. Members are sorted by slot so
+ * the table is byte-stable for an unchanged scene.
+ * @param {Array<{slot:number, mn:number[], mx:number[]}>} items
+ */
+export function clusterMoverBoxes(items, maxClusters = DYN_CLUSTER_MAX) {
+  const BIG = 1e30;
+  const valid = (b) => Number.isFinite(b.mn[0]) && Number.isFinite(b.mn[1]) && Number.isFinite(b.mn[2])
+    && Number.isFinite(b.mx[0]) && Number.isFinite(b.mx[1]) && Number.isFinite(b.mx[2])
+    && b.mn[0] <= b.mx[0] && b.mn[1] <= b.mx[1] && b.mn[2] <= b.mx[2];
+  const boxes = items.map((it) => (valid(it) ? it : { slot: it.slot, mn: [-BIG, -BIG, -BIG], mx: [BIG, BIG, BIG] }));
+  if (!boxes.length) return { clusters: [], members: [] };
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (const b of boxes) {
+    for (let a = 0; a < 3; a++) {
+      const c = (b.mn[a] + b.mx[a]) * 0.5;
+      if (Number.isFinite(c)) { lo[a] = Math.min(lo[a], c); hi[a] = Math.max(hi[a], c); }
+    }
+  }
+  const mid = lo.map((v, a) => (Number.isFinite(v) && Number.isFinite(hi[a]) ? (v + hi[a]) * 0.5 : 0));
+  const buckets = new Map();
+  for (const b of boxes) {
+    let cell = 0;
+    for (let a = 0; a < 3; a++) {
+      const c = (b.mn[a] + b.mx[a]) * 0.5;
+      if (Number.isFinite(c) && c >= mid[a]) cell |= 1 << a;
+    }
+    cell %= Math.max(1, maxClusters);
+    let bucket = buckets.get(cell);
+    if (!bucket) buckets.set(cell, (bucket = { mn: [BIG, BIG, BIG], mx: [-BIG, -BIG, -BIG], slots: [] }));
+    for (let a = 0; a < 3; a++) {
+      bucket.mn[a] = Math.min(bucket.mn[a], b.mn[a]);
+      bucket.mx[a] = Math.max(bucket.mx[a], b.mx[a]);
+    }
+    bucket.slots.push(b.slot);
+  }
+  const clusters = [];
+  const members = [];
+  for (const cell of [...buckets.keys()].sort((a, b) => a - b)) {
+    const bucket = buckets.get(cell);
+    bucket.slots.sort((a, b) => a - b);
+    clusters.push({ mn: bucket.mn, mx: bucket.mx, first: members.length, count: bucket.slots.length });
+    members.push(...bucket.slots);
+  }
+  return { clusters, members };
 }
 
 // ═══════════════════════════════════════════════════════ CPU: classification
@@ -1816,6 +1887,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   // rebuild resets everything.
   const geoBlocks = new Map();
   let nextWord = HEADER_WORDS;
+  let gridRefitFrame = 0;
   const pendingComputes = [];
   // Persistent re-uploadable regions (createRegionUploader) — one pipeline
   // each, offered to the dispatcher only on the frames their bytes changed.
@@ -1826,6 +1898,39 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
 
   const wm = (i, w, v) => { if (mirror[i * OBJ_WORDS + DYN_HEADER_RESERVED + w] !== v) { mirror[i * OBJ_WORDS + DYN_HEADER_RESERVED + w] = v; headerDirty = true; } };
   const objWordBase = (i) => DYN_HEADER_RESERVED + i * OBJ_WORDS;
+  // §11.57 cluster table (see dynClusterWords): absolute header words.
+  const CLUSTER_BASE = DYN_HEADER_RESERVED + MAX * OBJ_WORDS;
+  const MEMBER_BASE = CLUSTER_BASE + 1 + DYN_CLUSTER_MAX * DYN_CLUSTER_STRIDE;
+  const wa = (w, v) => { if (mirror[w] !== v) { mirror[w] = v; headerDirty = true; } };
+  const clusterItems = [];
+  const writeClusterTable = () => {
+    clusterItems.length = 0;
+    for (let i = 0; i < MAX; i++) {
+      if (!slots[i]) continue;
+      const b = objWordBase(i);
+      if (!(mirror[b + 19] > 0)) continue;
+      clusterItems.push({
+        slot: i,
+        mn: [mirror[b + 24], mirror[b + 25], mirror[b + 26]],
+        mx: [mirror[b + 28], mirror[b + 29], mirror[b + 30]],
+      });
+    }
+    const { clusters, members } = clusterMoverBoxes(clusterItems, DYN_CLUSTER_MAX);
+    wa(CLUSTER_BASE, clusters.length);
+    for (let c = 0; c < DYN_CLUSTER_MAX; c++) {
+      const cb = CLUSTER_BASE + 1 + c * DYN_CLUSTER_STRIDE;
+      const cl = clusters[c];
+      if (cl) {
+        wa(cb, cl.mn[0]); wa(cb + 1, cl.mn[1]); wa(cb + 2, cl.mn[2]);
+        wa(cb + 3, cl.mx[0]); wa(cb + 4, cl.mx[1]); wa(cb + 5, cl.mx[2]);
+        wa(cb + 6, cl.first); wa(cb + 7, cl.count);
+      } else {
+        for (let k = 0; k < DYN_CLUSTER_STRIDE; k++) wa(cb + k, 0);
+      }
+    }
+    for (let j = 0; j < members.length; j++) wa(MEMBER_BASE + j, members[j]);
+    set.stats.clusters = clusters.length;
+  };
 
   const syncHeaderUniform = () => {
     for (let k = 0; k < headerVecCount; k++) {
@@ -1876,9 +1981,29 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     // (a brighter emissive elsewhere takes the slot), and the early-out below
     // would otherwise keep publishing the stale emissive forever.
     const stamp = `${material?.id ?? -1}:${material?.version ?? 0}:${promoted ? "P" : "-"}`;
-    if (entry.surfaceStamp === stamp) return false;
+    // ⭐ A PROVISIONAL ANSWER MUST NOT BE CACHED AS A FINAL ONE.
+    //
+    // `resolveMaterialSurface` multiplies the constant colour by the MEAN of
+    // the albedo map, and that mean is not always available on the first ask —
+    // a texture still decoding, or a compressed one queued on the GPU averager,
+    // both make it answer with the constant factor alone. On Sponza's curtains
+    // that constant is `#cacaca`, so the first resolve says "near white" about
+    // a scarlet banner.
+    //
+    // None of the three parts of the stamp above moves when the mean finally
+    // lands — a texture average changes no material id, no material version and
+    // no promotion — so before this guard the white stuck for the life of the
+    // scene while the STATIC palette next to it corrected itself on the next
+    // fingerprint scan. Same mesh, two different colours, depending only on
+    // whether it had ever moved. (user, 2026-09-11: "it reflects white light
+    // for some reason, not taking the color of the cloth".)
+    //
+    // Re-resolving while pending is a cache probe per mover per frame, and it
+    // stops the moment the mean arrives.
+    if (entry.surfaceStamp === stamp && entry.surfacePending !== true) return false;
     entry.surfaceStamp = stamp;
     const s = resolveMaterialSurface(mesh?.material, mesh?.name);
+    entry.surfacePending = s.pending === true;
     const i = entry.index;
     // Per-proxy override first (see `albedoOverride` in adopt): a bone
     // proxy's colour comes from the skin texture, not the (white) material.
@@ -1895,11 +2020,18 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     // Diagnostics only — the header mirror is closure-private, and "did the
     // mover's colour actually reach the GPU" is the first question every
     // bounce measurement asks.
-    entry.surface = {
+    const surface = {
       albedo: o ? [...o] : [s.color?.r ?? 1, s.color?.g ?? 1, s.color?.b ?? 1],
       emissive: [(s.emissive?.r ?? 0) * k, (s.emissive?.g ?? 0) * k, (s.emissive?.b ?? 0) * k],
     };
-    return true;
+    // A pending re-probe that resolved to the same numbers is not a change,
+    // and must not bill the caller a header re-upload every frame for as long
+    // as a texture takes to decode.
+    const same = entry.surface &&
+      entry.surface.albedo.every((v, n) => v === surface.albedo[n]) &&
+      entry.surface.emissive.every((v, n) => v === surface.emissive[n]);
+    entry.surface = surface;
+    return !same;
   };
 
   /**
@@ -1970,7 +2102,10 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     const bestObj = objId ? float(-1).toVar() : null;
     const penAcc = float(1).toVar();
 
-    Loop({ start: int(0), end: count, type: "int", condition: "<" }, ({ i }) => {
+    // §11.57: the per-object body is one closure, run per member of each
+    // cluster the ray crosses (default) or per object (`__giMoverClusters
+    // = false`, the flat scan this replaced — a build-time hatch).
+    const perObject = ({ i }) => {
       const ob = uint(DYN_HEADER_RESERVED).add(i.toUint().mul(uint(OBJ_WORDS))).toVar();
       const type = rf(ob.add(uint(19))).toVar();
       If(type.greaterThan(0.5), () => {
@@ -2169,7 +2304,39 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
           });
         });
       });
-    });
+    };
+    if (globalThis.__giMoverClusters === false) {
+      Loop({ start: int(0), end: count, type: "int", condition: "<" }, perObject);
+    } else {
+      // The group boxes are padded by the penumbra band's widest radius so
+      // an object the ray only PASSES NEAR — which still darkens `penAcc` —
+      // is never culled away; the pad is zero for a plain hit query.
+      const pad = penK != null
+        ? (penW != null ? float(t1).div(penK).max(penW) : float(t1).div(penK)).max(0).toVar()
+        : float(0);
+      const nzW = (c) => select(c.abs().lessThan(1e-9), select(c.greaterThanEqual(0), float(1e-9), float(-1e-9)), c);
+      const invW = vec3(float(1).div(nzW(d.x)), float(1).div(nzW(d.y)), float(1).div(nzW(d.z))).toVar();
+      const clusterCount = rf(uint(CLUSTER_BASE)).toInt().min(int(DYN_CLUSTER_MAX)).toVar();
+      Loop({ start: int(0), end: clusterCount, type: "int", condition: "<" }, ({ i: c }) => {
+        const cb = uint(CLUSTER_BASE + 1).add(c.toUint().mul(uint(DYN_CLUSTER_STRIDE))).toVar();
+        const mn = vec3(rf(cb), rf(cb.add(uint(1))), rf(cb.add(uint(2)))).sub(pad).toVar();
+        const mx = vec3(rf(cb.add(uint(3))), rf(cb.add(uint(4))), rf(cb.add(uint(5)))).add(pad).toVar();
+        const tA = mn.sub(o).mul(invW).toVar();
+        const tB = mx.sub(o).mul(invW).toVar();
+        const tn = tA.min(tB).toVar();
+        const tf = tA.max(tB).toVar();
+        const tEnter = tn.x.max(tn.y).max(tn.z).max(t0).toVar();
+        const tExit = tf.x.min(tf.y).min(tf.z).min(t1).toVar();
+        If(tEnter.lessThanEqual(tExit), () => {
+          const first = rf(cb.add(uint(6))).toInt().toVar();
+          const last = first.add(rf(cb.add(uint(7))).toInt()).toVar();
+          Loop({ start: first, end: last, type: "int", condition: "<" }, ({ i: j }) => {
+            const idx = rf(uint(MEMBER_BASE).add(j.toUint())).toInt().toVar();
+            perObject({ i: idx });
+          });
+        });
+      });
+    }
 
     return vec4(
       bestHit,
@@ -2183,6 +2350,8 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     enabled,
     maxObjects: MAX,
     headerWords: HEADER_WORDS,
+    /** Tests only: the CPU header mirror (`tests/gi-mover-clusters`). */
+    debugMirror() { return mirror; },
     poolCapacity,
     /** Bumped whenever any adopted transform changed — feeds the wake hash. */
     version: 0,
@@ -2426,7 +2595,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
           const geoKey = `gpu-grid:${mesh.geometry.id}`;
           geoBlock = geoBlocks.get(geoKey);
           if (!geoBlock) {
-            const gpu = createGpuGridBvh({ bits, absStart: baseWord + nextWord, positionAttribute: grid.positionAttribute, resolution: grid.resolution, arity });
+            const gpu = createGpuGridBvh({ bits, absStart: baseWord + nextWord, positionAttribute: grid.positionAttribute, resolution: grid.resolution, corners: grid.corners ?? null, arity });
             if (nextWord + gpu.wordCount > capacityWords) { set.stats.overflowRejected++; return false; }
             geoBlock = { rel: nextWord, nodeWords: gpu.nodeWords, words: gpu.wordCount, refs: 0, uploaded: false, gpu };
             nextWord += gpu.wordCount;
@@ -2662,6 +2831,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         // per mover per frame, against a node-graph walk that is not.
         if (writeSurface(entry)) changed = true;
       }
+      // §11.57: the mover clusters follow whatever this sync wrote — the
+      // swept boxes at words 24..30 of every PUBLISHED slot (type > 0).
+      writeClusterTable();
       if (changed) set.version++;
       if (headerDirty) syncHeaderUniform();
       return changed;
@@ -2680,8 +2852,17 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       if (headerDirty && headerCompute) out.push(headerCompute);
       for (const r of regionUploaders) if (r.handle.dirty) out.push(r.compute);
       for (const p of pendingComputes) out.push(p.compute);
+      // `__giGridRefitStride = N` (dev, default 1): refit each GPU-grid proxy
+      // every Nth frame, round-robin, once it has uploaded — the pricing arm
+      // for the per-cloth refit dispatches (one serial thread each).
+      const stride = Math.max(1, Math.round(Number(globalThis.__giGridRefitStride) || 1));
+      const phase = (gridRefitFrame++) % stride;
+      let n = 0;
       for (const entry of entries.values()) {
-        if (entry.geoBlock?.gpu) out.push(...entry.geoBlock.gpu.computes);
+        const block = entry.geoBlock;
+        if (!block?.gpu) continue;
+        if (stride > 1 && block.uploaded && (n++ % stride) !== phase) continue;
+        out.push(...block.gpu.computes);
       }
       return out;
     },

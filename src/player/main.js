@@ -11,6 +11,7 @@ import {
 } from "../engine/index.js";
 import { linkEngineImports } from "../engine/scriptRuntime.js";
 import "../modules/index.js"; // registers the built-in module catalog
+import { deviceQualityCeiling, isPortableDevice } from "../engine/sceneSettings.js";
 
 // Bundler tree-shaking would otherwise drop these side-effect registrations
 // — call explicitly so every built-in component is present before any scene
@@ -135,7 +136,46 @@ async function boot() {
         "open the localhost preview on this computer, or serve the LAN preview with a certificate trusted by this device.",
     );
   }
+  // A ring buffer of console errors and warnings from boot, for the HUD
+  // (`?hud=1`): a GI kernel that fails to build on a phone says so exactly
+  // once, in the console nobody can open there.
+  try {
+    const log = (globalThis.__playerLog ??= []);
+    for (const level of ["error", "warn"]) {
+      const raw = console[level].bind(console);
+      console[level] = (...args) => {
+        try {
+          const line = args.map((a) => (a instanceof Error ? a.message : typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+          log.push(`${level === "error" ? "E" : "W"} ${line.slice(0, 220)}`);
+          if (log.length > 40) log.shift();
+        } catch {}
+        raw(...args);
+      };
+    }
+    globalThis.addEventListener("error", (e) => { log.push(`E ${String(e?.message ?? e).slice(0, 220)}`); if (log.length > 40) log.shift(); });
+    globalThis.addEventListener("unhandledrejection", (e) => { log.push(`E ${String(e?.reason?.message ?? e?.reason ?? e).slice(0, 220)}`); if (log.length > 40) log.shift(); });
+  } catch {}
+  // `?flags={"__giReflectionsLevel":0}` — dev globals for an A/B on a device
+  // the harness cannot reach (the same knob `run-player-fps.mjs --flags`
+  // sets in headless Chrome). Applied before the modules load so build-time
+  // hatches take effect on the first build. Malformed JSON is ignored aloud.
+  try {
+    const raw = new URLSearchParams(location.search).get("flags");
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        Object.assign(globalThis, parsed);
+        console.info("[player] dev flags from the URL:", parsed);
+      }
+    }
+  } catch (error) {
+    console.warn("[player] ?flags= is not JSON:", error?.message ?? error);
+  }
   const engine = new Engine();
+  // The inline output transform (engine/outputTransform.js) — one full-res
+  // pass fewer per frame; the phone's ledger read three's output quad at 6 ms.
+  // `?flags={"__engineDirectOutput":false}` compares against three's path.
+  engine.config.directOutput = globalThis.__engineDirectOutput !== false;
   // (allowRuntimeSdfBake used to be forced off here — the SDF bake pipeline
   // was deleted 2026-08-02; GI voxelizes occupancy on the GPU at load.)
   // Debugging convenience, and the handle test harnesses drive the build
@@ -191,15 +231,41 @@ async function boot() {
   // `performance` block is clamped on the way in rather than applied at full
   // cost for a frame and then lowered. `Engine.applySettings` re-applies the
   // ceiling on every later scene load.
-  engine.config.quality = config.player?.quality ?? null;
+  // On a phone or tablet the preset is lowered to the build's MOBILE preset
+  // when one is authored (Build settings → Mobile preset; "same" = none). A
+  // `?quality=<preset>` on the URL overrides both, for A/Bs on the device.
+  const urlParams = new URLSearchParams(location.search);
+  engine.config.quality = deviceQualityCeiling(
+    config.player?.quality ?? null,
+    globalThis.navigator,
+    urlParams.get("quality"),
+    config.player?.mobileQuality ?? null,
+  );
+  // The platform the per-component configs resolve against (see
+  // engine/componentVariants.js): a phone or tablet applies each component's
+  // `mobile` set plus the `portrait` / `landscape` one for how it is held —
+  // the orientation follows the canvas size (`engine.setSize`), so it tracks
+  // rotation. Set BEFORE the scene loads so every component is built from its
+  // phone values rather than rebuilt into them. `?platform=mobile` (or
+  // `desktop`) forces it, for checking a phone layout on this computer.
+  const platformParam = urlParams.get("platform");
+  engine.setPlatform({
+    platform: platformParam === "mobile" || platformParam === "desktop"
+      ? platformParam
+      : isPortableDevice(globalThis.navigator) ? "mobile" : "desktop",
+  });
   // Saves: namespace + version before anything can call `engine.saves`, and
   // hydrate preferences so a title screen can read the saved volume on frame 1.
   engine.config.saveVersion = config.player?.saveVersion ?? 1;
   engine.saves.setNamespace(config.player?.saveId || config.player?.title || "default");
   await engine.prefs.hydrate();
-  if (config.player?.pixelRatioCap) {
-    engine.setPixelRatio(Math.min(window.devicePixelRatio ?? 1, config.player.pixelRatioCap));
-  }
+  // The device ratio; the CAP is the scene's `performance.maxDevicePixelRatio`,
+  // applied in `Engine.#applyRendererSize` and clamped further by the build's
+  // quality preset. The player used to ALSO apply a project-level
+  // `pixelRatioCap` and take the min of the two — two controls for one number,
+  // where the project one only ever acted when it happened to be stricter. See
+  // the retired-setting note in `editor/projectSettings.js`.
+  engine.setPixelRatio(window.devicePixelRatio ?? 1);
   // Live previews update in place instead of reloading: the injected client in
   // index.html (see editor/build/playerHtml.js) calls the hook this installs.
   // Published builds don't carry the flag, so they never grow the hook.
@@ -213,6 +279,12 @@ async function boot() {
   // `loadScene` honest.
   await engine.loadScene(START_SCENE, { setCamera: true });
   if (!engine.camera) engine.camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
+  // `?hud=1`: the on-device readout (fps, cpu/gpu, GI cadence, per-pass GPU
+  // ledger) for the phone the harness cannot reach. See player/hud.js.
+  if (new URLSearchParams(location.search).has("hud")) {
+    const { createPlayerHud } = await import("./hud.js");
+    createPlayerHud(engine);
+  }
 
   const resize = () => engine.setSize(window.innerWidth, window.innerHeight);
   window.addEventListener("resize", resize);

@@ -239,6 +239,13 @@ shape; hot reload picks up your edits without a restart.
   library imports are slow by nature, not hung.
 - **\`build_publish\` opens a browser window** for the user to log in the first
   time. Tell them to expect it; it cannot complete unattended.
+- **A component can carry per-platform configs.** Its props are the DESKTOP
+  values; \`mobile\`, \`portrait\` and \`landscape\` are partial override sets
+  the runtime cascades on a phone (orientation on top of mobile; keys a set
+  does not name inherit). \`component_setProp\` writes the desktop value unless
+  you pass \`variant\`; \`component_variants\` shows every set; \`platform_set\`
+  switches the editor's preview so \`viewport_screenshot\` shows the phone
+  layout. A phone-only element is \`enabled: false\` with \`mobile: { enabled: true }\`.
 
 ## When you are stuck
 

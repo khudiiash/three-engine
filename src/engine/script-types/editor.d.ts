@@ -33,6 +33,26 @@ declare module "editor" {
   export type { Gizmos };
 
   /** Serializable snapshot of an entity, as returned by the op layer. */
+  /** A per-platform config set name. */
+  export type PlatformVariant = "mobile" | "portrait" | "landscape";
+  /** What the editor can preview: the base, the bare phone set, or an orientation. */
+  export type PlatformTarget = "desktop" | PlatformVariant;
+  /** `components.setProp`'s `variant`: a set, the base, or whatever the preview edits. */
+  export type PlatformVariantArg = PlatformTarget | "current";
+
+  export interface ComponentVariantsInfo {
+    /** The desktop values. */
+    base: Record<string, unknown>;
+    /** Each override set the component carries — partial, only the keys that differ. */
+    variants: { [K in PlatformVariant]?: Record<string, unknown> };
+    /** The layers the editor's preview applies right now (`[]` on desktop). */
+    platformLayers: PlatformVariant[];
+    /** The set an unqualified edit lands in; `null` = the desktop values. */
+    editLayer: PlatformVariant | null;
+    /** What the viewport shows: the base overlaid by the applied layers. */
+    effective: Record<string, unknown>;
+  }
+
   export interface EntityInfo {
     id: string;
     name: string;
@@ -40,7 +60,18 @@ declare module "editor" {
     childIds: string[];
     tags: string[];
     transform: { position: number[]; rotation: number[]; scale: number[] };
-    components: Array<{ type: string; props: Record<string, unknown> }>;
+    /**
+     * `props` are the EFFECTIVE values (what the viewport shows under the
+     * editor's platform preview). When a per-platform config is applied,
+     * `baseProps` carries the desktop values that would be saved and
+     * `platformLayers` names the applied cascade.
+     */
+    components: Array<{
+      type: string;
+      props: Record<string, unknown>;
+      baseProps?: Record<string, unknown>;
+      platformLayers?: PlatformVariant[];
+    }>;
   }
 
   export interface ComponentTypeInfo {
@@ -601,7 +632,31 @@ declare module "editor" {
       types(): ComponentTypeInfo[];
       add(id: string, type: string, props?: Record<string, unknown>): EntityInfo;
       remove(id: string, type: string): EntityInfo;
-      setProp(id: string, type: string, key: string, value: unknown): EntityInfo;
+      /**
+       * `variant` says which of the component's per-platform configs the
+       * write lands in: omit it for the desktop value, name a set
+       * ("mobile" — any phone; "portrait" / "landscape" — on top of mobile,
+       * by how the phone is held) to write that set, or "current" for the
+       * set the editor's platform preview is editing. Keys a set does not
+       * name inherit from below; the runtime cascades the active sets over
+       * the desktop values. See `Editor.platform`.
+       */
+      setProp(id: string, type: string, key: string, value: unknown, variant?: PlatformVariantArg): EntityInfo;
+      /** The desktop values, each override set, the applied layers and the effective values. */
+      variants(id: string, type: string): ComponentVariantsInfo;
+      /** Add or replace one per-platform config (`props` = the keys that differ; `{}` = an empty set), or remove it with `null`. */
+      setVariant(id: string, type: string, variant: PlatformVariant, props: Record<string, unknown> | null): EntityInfo;
+      /** Drop one key from a per-platform config so it inherits again. */
+      clearVariantProp(id: string, type: string, variant: PlatformVariant, key: string): EntityInfo;
+    };
+
+    /**
+     * The editor's platform preview: which per-platform component configs the
+     * viewport shows and an unqualified `components.setProp` edits.
+     */
+    platform: {
+      get(): Promise<{ target: PlatformTarget; platform: { platform: "desktop" | "mobile"; orientation: "portrait" | "landscape" | null }; layers: PlatformVariant[] }>;
+      set(target: PlatformTarget): Promise<{ target: PlatformTarget; layers: PlatformVariant[] }>;
     };
 
     selection: {

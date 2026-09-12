@@ -231,3 +231,39 @@ test("the sync-compute bypass invokes createComputePipeline with the device as t
   backend.createComputePipeline(pipeline, []);
   assert.equal(backend.get(pipeline).pipeline?.__sync, true, "sync create must land a pipeline on the same stack");
 });
+
+// ── 2026-09-11: a node released before its pipeline lands is never replayed ──
+import { releaseComputeNodes } from "../src/modules/gi/releaseCompute.js";
+
+test("a released node is dropped from the replay; a live one still replays at its size", async () => {
+  const { backend, device } = makeHarness();
+  // A pipeline that LANDS: the replay path is the settle handler.
+  let land = null;
+  device.createComputePipelineAsync = () => new Promise((resolve) => { land = resolve; });
+  const replayed = [];
+  const renderer = { backend, compute(node, size) { replayed.push([node.__giPassName, size]); } };
+  installAsyncComputePipelines(renderer);
+
+  const pipeline = { id: 9 };
+  backend.createComputePipeline(pipeline, []);
+  const live = { __giPassName: "src:gather#0" };
+  const retired = { __giPassName: "cloth arena step" };
+  // Both dispatched while the pipeline is pending → both queued for replay.
+  backend.compute({}, live, [], pipeline, [2, 1, 1]);
+  backend.compute({}, retired, [], pipeline, [4, 1, 1]);
+  // The arena grows a generation and releases its old kernel meanwhile.
+  releaseComputeNodes(renderer, [retired]);
+  assert.equal(retired.__giReleased, true, "release marks the node even on a renderer without caches");
+
+  land({ __gpu: true });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(replayed, [["src:gather#0", [2, 1, 1]]], "the live node replays at its size; the released one never does");
+
+  // A node already released when it is turned away is not even queued.
+  const pending = { id: 10 };
+  backend.createComputePipeline(pending, []);
+  const gone = { __giPassName: "old", __giReleased: true };
+  backend.compute({}, gone, [], pending, [1, 1, 1]);
+  assert.equal(backend.get(pending).giReplayNodes?.size ?? 0, 0);
+});

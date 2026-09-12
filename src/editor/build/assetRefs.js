@@ -193,4 +193,23 @@ export function rewriteComponentAssets(
       }
     }
   }
+
+  // Per-platform override sets (`props.variants`, componentVariants.js) hold
+  // the same prop shapes as the base props — a mobile variant of a script
+  // component carries its own `scripts` slot list, a variant of a sprite its
+  // own texture. They are walked with exactly the rules above, after the
+  // base, or the build ships the base slots rewritten while the phone's
+  // variant still points at `C:\Users\…\CharacterCamera.ts` — a 404 and no
+  // instances, which reached the user as "the character controller stopped
+  // working on mobile" (2026-09-12). A set never carries `variants` itself,
+  // so this recurses one level only.
+  if (props.variants && typeof props.variants === "object" && !Array.isArray(props.variants)) {
+    for (const set of Object.values(props.variants)) {
+      if (!set || typeof set !== "object" || Array.isArray(set)) continue;
+      const { variants: _nested, ...overrides } = set;
+      const shim = { type: component.type, props: overrides };
+      rewriteComponentAssets(shim, { getSchema, claim, claimDoc, add, rewritePrefab });
+      Object.assign(set, shim.props);
+    }
+  }
 }

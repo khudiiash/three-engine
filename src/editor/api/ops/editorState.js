@@ -237,6 +237,46 @@ defineOp({
   },
 });
 
+// ---- platform preview -------------------------------------------------------
+
+defineOp({
+  name: "platform.get",
+  readOnly: true,
+  description:
+    "The editor's platform preview target — which of a component's per-platform configs the viewport shows and edits: 'desktop' (the base values), 'mobile' (the shared phone set alone), 'portrait' or 'landscape' (mobile + that orientation's set). Also returns the resolved engine platform and the layer cascade it applies.",
+  params: {},
+  async run() {
+    const { getPlatformTarget } = await import("../../store/platformStore.js");
+    return {
+      target: getPlatformTarget(),
+      platform: { ...engine.platform },
+      layers: [...engine.platformLayers],
+    };
+  },
+});
+
+defineOp({
+  name: "platform.set",
+  description:
+    "Switch the editor's platform preview: every component with a matching config shows those values, and a component.setProp made without an explicit `variant` lands in the config this target selects (the topmost one the component has). Not undoable and not saved — it is a view, like the camera.",
+  params: {
+    target: {
+      type: "string",
+      required: true,
+      enum: ["desktop", "mobile", "portrait", "landscape"],
+      description: "'desktop', 'mobile', 'portrait' or 'landscape'.",
+    },
+  },
+  async run({ target }) {
+    const { setPlatformTarget, getPlatformTarget } = await import("../../store/platformStore.js");
+    if (!["desktop", "mobile", "portrait", "landscape"].includes(target)) {
+      throw new Error(`Unknown platform target "${target}". Use desktop, mobile, portrait or landscape.`);
+    }
+    setPlatformTarget(target);
+    return { target: getPlatformTarget(), layers: [...engine.platformLayers] };
+  },
+});
+
 // ---- scene / project --------------------------------------------------------
 
 defineOp({
@@ -314,7 +354,7 @@ defineOp({
       type: "object",
       required: true,
       description:
-        "Any of: editor{autosaveSeconds,accent,snapTranslate,snapRotateDeg,snapScale,gridSize,gridDivisions,showGrid,watchProject,keybindings,layers,playLayers,ambientGlowSpread,ambientGlowIntensity}, scripts{hotReload,reloadIntervalMs}, rendering{pixelRatioCap}, game{title,saveId,saveVersion}, physics{layers,matrix,autoCollidersEnabled}. Sections are merged, so one key does not wipe its siblings.",
+        "Any of: editor{autosaveSeconds,accent,snapTranslate,snapRotateDeg,snapScale,gridSize,gridDivisions,showGrid,watchProject,keybindings,layers,playLayers,ambientGlowSpread,ambientGlowIntensity}, scripts{hotReload,reloadIntervalMs}, game{title,saveId,saveVersion}, physics{layers,matrix,autoCollidersEnabled}. Sections are merged, so one key does not wipe its siblings.",
     },
   },
   async run({ patch }) {

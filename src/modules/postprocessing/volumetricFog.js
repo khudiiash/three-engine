@@ -1,4 +1,5 @@
 import * as THREE from "three/webgpu";
+import { isPortableDevice } from "../../engine/sceneSettings.js";
 import * as TSL from "three/tsl";
 import { generateCloudNoise } from "./cloudNoise.js";
 
@@ -458,6 +459,18 @@ export function volumetricFog({ colorNode, depthNode, camera, params = {}, light
    * the whole point — it is what stops a foreground silhouette from dragging
    * background fog across its edge.
    */
+  // ── THE UPSAMPLE'S RADIUS IS A DEVICE POLICY (2026-09-11) ──────────────
+  // 5×5 is 25 fog taps + 25 depth taps + 25 view-position reconstructions per
+  // FULL-RES pixel: on the user's iPhone this composite read 6 ms of a 45 ms
+  // frame (`?hud=1`), the single largest render pass after the scene itself.
+  // A portable device takes the 3×3 kernel (9 taps — the same sigma, the same
+  // depth test, edges hold; the smoothing reach shrinks by one low-res texel).
+  // `__postJbuRadius` pins either way (2 = full kernel on a phone, 1 = the
+  // phone kernel on a desktop, for a look check).
+  const jbuPin = Number(globalThis.__postJbuRadius);
+  const jbuRadius = Number.isFinite(jbuPin) && jbuPin >= 0
+    ? Math.min(3, Math.round(jbuPin))
+    : (isPortableDevice() ? 1 : 2);
   const jointBilateralUpsampling = TSL.Fn(() => {
     const centerCoord = TSL.screenUV;
 
@@ -475,8 +488,8 @@ export function volumetricFog({ colorNode, depthNode, camera, params = {}, light
     const sumColor = TSL.vec4(0.0).toVar();
     const sumWeight = TSL.float(0.0).toVar();
 
-    for (let y = -2; y <= 2; y++) {
-      for (let x = -2; x <= 2; x++) {
+    for (let y = -jbuRadius; y <= jbuRadius; y++) {
+      for (let x = -jbuRadius; x <= jbuRadius; x++) {
         const offset = TSL.vec2(TSL.float(x), TSL.float(y));
         const spatialDistSq = offset.x.mul(offset.x).add(offset.y.mul(offset.y));
         const spatialWeight = TSL.exp(spatialDistSq.mul(spatialSigmaFactor));

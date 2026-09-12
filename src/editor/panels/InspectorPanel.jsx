@@ -6,7 +6,7 @@ import { splitGeometryIslandsWithPrompt, canSplitEntity } from "../geometrySplit
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
-  X, Plus, Crosshair, Eye, EyeOff, ScanEye, Package, ChevronRight, ChevronUp, ChevronDown, Sparkles, Link, Link2Off, Search, Pencil, ExternalLink, PanelsTopLeft, Waypoints, Layers2, FilePlus, Axis3d, Play, Pin, Lock, Check, RotateCcw, GitFork, PackageOpen, Power, PencilRuler, PencilOff, Hammer, PersonStanding } from "../icons/index.jsx";
+  X, Plus, Crosshair, Eye, EyeOff, ScanEye, Package, ChevronRight, ChevronUp, ChevronDown, Sparkles, Link, Link2Off, Search, Pencil, ExternalLink, PanelsTopLeft, Waypoints, Layers2, FilePlus, Axis3d, Play, Pin, Lock, Check, RotateCcw, GitFork, PackageOpen, Power, PencilRuler, PencilOff, Hammer, PersonStanding, Monitor, Smartphone, RectangleVertical, RectangleHorizontal, Undo2 } from "../icons/index.jsx";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { getComponentClass, getComponentTypes, getModuleDefinition } from "../../engine/index.js";
@@ -19,7 +19,12 @@ import {
   AddComponentCommand,
   RemoveComponentCommand,
   SetComponentPropCommand,
+  SetComponentVariantCommand,
+  ClearComponentVariantPropCommand,
+  editLayerOf,
 } from "../commands/componentCommands.js";
+import { usePlatformStore, PLATFORM_TARGET_LABELS } from "../store/platformStore.js";
+import { PLATFORM_TARGETS, VARIANT_KEYS } from "../../engine/componentVariants.js";
 import { openPanel } from "../EditorShell.jsx";
 import { engine } from "../engineInstance.js";
 import { AssetField } from "../fields/AssetField.jsx";
@@ -1983,8 +1988,87 @@ function allInspectorTypes(entityId) {
   return ["transform", ...Object.keys(useSceneStore.getState().entities[entityId]?.components ?? {})];
 }
 
+/**
+ * ── PER-PLATFORM CONFIGS: the toggles (2026-09-11) ────────────────────────
+ * One segmented control per component section: Desktop · Mobile · Portrait ·
+ * Landscape. A segment is LIT when the component carries that config set,
+ * and HIGHLIGHTED when it is the layer an edit lands in right now (the
+ * editor's preview target resolved against the sets this component has —
+ * `editLayerOf`). Clicking a segment makes it the preview target for the
+ * WHOLE editor (store/platformStore.js explains why there is one target,
+ * not one per component) and, for a set the component does not have yet,
+ * creates it (undoable) so the next edit lands there. Removing a set is in
+ * the section's context menu.
+ */
+const PLATFORM_TARGET_ICONS = {
+  desktop: Monitor,
+  mobile: Smartphone,
+  portrait: RectangleVertical,
+  landscape: RectangleHorizontal,
+};
+
+function PlatformToggles({ entityId, type, component, editLayer }) {
+  const target = usePlatformStore((s) => s.target);
+  const setTarget = usePlatformStore((s) => s.setTarget);
+  const variants = component?.props?.variants ?? null;
+  const hasAny = !!variants;
+  const editing = editLayer ?? "desktop";
+  const choose = (name) => {
+    if (!component) return;
+    if (name !== "desktop" && !variants?.[name]) {
+      commandBus.execute(new SetComponentVariantCommand(entityId, type, name, {}));
+    }
+    setTarget(name);
+  };
+  return (
+    <span
+      className={`platform-toggle${hasAny ? " has-configs" : ""}`}
+      title="Per-platform configs: which values this component uses on desktop, on a phone, and per orientation"
+    >
+      {PLATFORM_TARGETS.map((name) => {
+        const Icon = PLATFORM_TARGET_ICONS[name];
+        const has = name === "desktop" || !!variants?.[name];
+        const isEditing = editing === name;
+        const isTarget = target === name;
+        const label = PLATFORM_TARGET_LABELS[name];
+        const hint = name === "desktop"
+          ? "Desktop — the base values every platform starts from"
+          : has
+            ? `${label} config — click to preview and edit it${name === "mobile" ? " (shared by both orientations)" : ""}`
+            : `No ${label.toLowerCase()} config — click to add one${name === "mobile" ? " (shared by both orientations)" : ""}`;
+        return (
+          <button
+            key={name}
+            type="button"
+            className={`platform-seg${has ? " has" : ""}${isEditing ? " editing" : ""}${isTarget ? " target" : ""}`}
+            title={hint}
+            aria-pressed={isEditing}
+            onClick={(event) => {
+              event.stopPropagation();
+              choose(name);
+            }}
+          >
+            <Icon size={11} />
+          </button>
+        );
+      })}
+    </span>
+  );
+}
+
+/** Rows the inspector renders for a component, with an "overridden here" marker. */
+function overriddenKeysOf(component, editLayer) {
+  const set = editLayer ? component?.props?.variants?.[editLayer] : null;
+  return set ? new Set(Object.keys(set)) : null;
+}
+
 function ComponentSection({ entityId, type, props }) {
   const cls = getComponentClass(type);
+  // Which per-platform config the rows below show and edit — see
+  // PlatformToggles. Re-read on every render: both the target and the
+  // component's sets change under us, and the section already re-renders on
+  // "component-changed" for this entity+type.
+  const platformTarget = usePlatformStore((s) => s.target);
   // Schema rows tagged with a module (`descriptor.module`) only exist while
   // that module is installed — this is the live mirror of engine.modules.
   const enabledModules = useModulesStore((s) => s.enabled);
@@ -2005,7 +2089,20 @@ function ComponentSection({ entityId, type, props }) {
     return engine.on("component-changed", onChange);
   }, [entityId, type]);
   const component = engine.getEntity(entityId)?.getComponent(type);
-  const enabled = component ? component.enabled !== false : props.enabled !== false;
+  const editLayer = component ? editLayerOf(component, platformTarget) : null;
+  const overriddenKeys = overriddenKeysOf(component, editLayer);
+  // ⚠ `props.enabled`, NOT the composed `component.enabled` getter (fixed
+  // 2026-09-11). That getter folds in `editorEnabled` — it returns false when
+  // "Pause While Editing" is on and the editor is stopped (Component.js:350) —
+  // and `editorEnabled` has its OWN toggle immediately to the right of this
+  // one. Reading the composed value made the two controls contradict each
+  // other: pausing a component in the editor showed its ENABLED eye as off
+  // even though it was never disabled globally, and because `toggleEnabled`
+  // writes `!enabled`, the next click then wrote the value it already had.
+  // The `viewOnly` toggle below DOES read its composed value on purpose — but
+  // that one composes with the ENTITY's flag, which has no competing control
+  // in this row.
+  const enabled = component ? component.props.enabled !== false : props.enabled !== false;
   // viewOnly: per-component OR entity-wide. Reading both keeps the toggle
   // showing the user's effective intent — if the entity toggle is on, this
   // component is gated even when its own prop is off (and vice versa).
@@ -2036,10 +2133,32 @@ function ComponentSection({ entityId, type, props }) {
         label,
       ),
     );
+  // Per-platform config sets: add the ones missing, remove the ones present.
+  // Adding also switches the editor's preview to that platform, exactly as
+  // the header toggle does; removing an applied set restores the base values
+  // in the viewport (undoable).
+  const platformItems = component
+    ? VARIANT_KEYS.map((name) =>
+        component.props.variants?.[name]
+          ? {
+              label: `Remove ${PLATFORM_TARGET_LABELS[name]} Config`,
+              action: () => commandBus.execute(new SetComponentVariantCommand(entityId, type, name, null)),
+            }
+          : {
+              label: `Add ${PLATFORM_TARGET_LABELS[name]} Config`,
+              action: () => {
+                commandBus.execute(new SetComponentVariantCommand(entityId, type, name, {}));
+                usePlatformStore.getState().setTarget(name);
+              },
+            },
+      )
+    : [];
   const menuItems = [
     { label: enabled ? "Disable Component" : "Enable Component", action: toggleEnabled },
     { label: editorEnabled ? "Pause While Editing" : "Run While Editing", action: toggleEditorEnabled },
     { label: viewOnly ? "Clear View-Only" : "Set View-Only", action: toggleViewOnly },
+    { separator: true },
+    ...platformItems,
     { separator: true },
     {
       label: "Copy Component Values",
@@ -2119,6 +2238,7 @@ function ComponentSection({ entityId, type, props }) {
         onToggle={toggleCollapsed}
         title={<><Icon size={13} style={{ color }} />{cls.label}</>}
       >
+        <PlatformToggles entityId={entityId} type={type} component={component} editLayer={editLayer} />
         <span className="section-actions">
           <button
             className={`icon-btn ${viewOnly ? "active-toggle" : ""}`}
@@ -2175,9 +2295,29 @@ function ComponentSection({ entityId, type, props }) {
             if (type === "ik" && descriptor.key === "tipBone") return false;
             return true;
           });
+          // A row whose key the edit layer's set names is marked (and can be
+          // reverted to inherit from the layer below / the desktop value);
+          // the value shown is the effective one, which under the editor's
+          // preview IS this layer's — the engine applied it into props.
           const renderField = (descriptor) => (
-            <div className="field-row" key={descriptor.key}>
-              <span className="field-label">{descriptor.label}</span>
+            <div
+              className={`field-row${overriddenKeys?.has(descriptor.key) ? " platform-overridden" : ""}`}
+              key={descriptor.key}
+              title={overriddenKeys?.has(descriptor.key) ? `Overridden in the ${PLATFORM_TARGET_LABELS[editLayer]} config` : undefined}
+            >
+              <span className="field-label">
+                {descriptor.label}
+                {overriddenKeys?.has(descriptor.key) && (
+                  <button
+                    type="button"
+                    className="icon-btn platform-revert"
+                    title={`Revert to the inherited value (drop it from the ${PLATFORM_TARGET_LABELS[editLayer]} config)`}
+                    onClick={() => commandBus.execute(new ClearComponentVariantPropCommand(entityId, type, editLayer, descriptor.key))}
+                  >
+                    <Undo2 size={10} />
+                  </button>
+                )}
+              </span>
               <PropField
                 descriptor={descriptor}
                 value={props[descriptor.key]}
@@ -2496,7 +2636,9 @@ function MultiComponentSection({ entities, type }) {
   }, [type, entityIds.join("|")]);
 
   const liveComponents = entityIds.map((id) => engine.getEntity(id)?.getComponent(type)).filter(Boolean);
-  const enabledValues = liveComponents.map((component) => component.enabled !== false);
+  // `props.enabled`, not the composed getter — same reason as the single-entity
+  // header above: the getter folds in `editorEnabled`, which owns its own row.
+  const enabledValues = liveComponents.map((component) => component.props.enabled !== false);
   const viewOnlyValues = liveComponents.map((component) => !!component.props.viewOnly);
   const batchProps = (key, value, label = `Set ${key} on ${entities.length} entities`) => {
     const commands = entityIds.map((id) => new SetComponentPropCommand(id, type, key, value));

@@ -35,6 +35,7 @@ import {
 } from "./clothArenaPack.js";
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
 import { resolveClothWind, sceneWind } from "./clothWind.js";
+import { clothGiProxyCorners } from "./clothGiProxy.js";
 import { ParticleColliderField } from "../particleColliders.js";
 import { ClothMeshColliderField } from "../clothMeshColliders.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
@@ -839,8 +840,19 @@ export function createClothMember(component, { plane, props, material }) {
   mesh.userData.vfxSimulation = "cloth";
   mesh.userData.noBatch = true; mesh.userData.noMerge = true;
   mesh.frustumCulled = false; mesh.castShadow = props.castShadow !== false; mesh.receiveShadow = props.receiveShadow !== false;
-  // GI samples a deformed lattice on its own grid; a mesh cloth has none.
+  // ⭐ GI SAMPLES A DEFORMED LATTICE ON ITS OWN GRID — AND A MESH CLOTH GETS
+  // ONE TOO (2026-09-11). A plane cloth hands over its n×n sheet; a modelled
+  // curtain hands over 81 rest-pose vertices picked to span it
+  // (`clothGiProxy.js`), and the GPU proxy builder is the same for both.
+  //
+  // Leaving this unset — which the mesh path did — is not "GI treats it as
+  // ordinary geometry". It is GI not seeing the cloth AT ALL: the source mesh
+  // is skipped for `clothHidden` and this one for `vfxSimulation`, so an
+  // authored curtain occluded no bounce and bled no colour onto the floor
+  // while an identical one with Cloth switched off bled plenty.
+  const proxyCorners = render ? null : clothGiProxyCorners(positionAttribute.array, total);
   if (render) mesh.userData.giGpuGrid = { positionAttribute, resolution };
+  else if (proxyCorners) mesh.userData.giGpuGrid = { positionAttribute, corners: proxyCorners };
 
   const member = arena.add(component, {
     topology, analysis, geometry, mesh, entityId: component.entity?.id ?? null, props, resolution,

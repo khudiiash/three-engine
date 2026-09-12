@@ -42,8 +42,33 @@ try {
       }
     }
   }
+  // A MESH CLOTH: no lattice at all, just 81 vertex indices. Scrambled on
+  // purpose - an implementation that quietly fell back to grid arithmetic
+  // would still pass a table that happened to be in order.
+  {
+    const count=512,attribute=new THREE.StorageBufferAttribute(count,3);
+    const source=storage(attribute,'vec3',count),bits=instancedArray(GPU_GRID_BVH_WORDS+16,'uint');
+    const i=instanceIndex.toInt();
+    const seed=Fn(()=>source.element(i).assign(vec3(i.toFloat().mul(.37).sin(),i.toFloat().mul(.11).cos(),i.toFloat().mul(.05))))().compute(count);
+    const corners=Uint32Array.from({length:81},(_,k)=>(k*97+13)%count);
+    const packed=createGpuGridBvh({bits,absStart:16,positionAttribute:attribute,corners});
+    await renderer.computeAsync([seed,packed.compute]);
+    const raw=await renderer.getArrayBufferAsync(bits.value),floats=new Float32Array(raw);
+    for(let tri=0;tri<128;tri++) {
+      const cell=Math.floor(tri/2),x=cell%8,y=Math.floor(cell/8);
+      const coords=tri%2?[[x+1,y],[x,y+1],[x+1,y+1]]:[[x,y],[x,y+1],[x+1,y]];
+      for(let vertex=0;vertex<3;vertex++) {
+        const v=corners[coords[vertex][1]*9+coords[vertex][0]];
+        const expected=[Math.sin(v*.37),Math.cos(v*.11),v*.05];
+        for(let axis=0;axis<3;axis++) {
+          const value=floats[16+28+tri*9+vertex*3+axis];
+          assert(Math.abs(value-expected[axis])<.00005,`Corner table mismatch ${tri}/${vertex}/${axis}: ${value} vs ${expected[axis]}`);
+        }
+      }
+    }
+  }
   await renderer.backend.device.queue.onSubmittedWorkDone();assert(!errors.length,errors.join('\n'));
-  globalThis.__GI_SMOKE_RESULT__={pass:true};console.log('GI-SMOKE PASS gpu-grid-bvh: both arities, low/high resolution, moving GPU source, conservative bounds');renderer.dispose();
+  globalThis.__GI_SMOKE_RESULT__={pass:true};console.log('GI-SMOKE PASS gpu-grid-bvh: both arities, low/high resolution, moving GPU source, conservative bounds, mesh-cloth corner table');renderer.dispose();
 }catch(error){console.error(error);globalThis.__GI_SMOKE_RESULT__={pass:false,error:String(error)};}
 </script>
 

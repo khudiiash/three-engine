@@ -41,3 +41,40 @@ test("a hold keeps an unfocused viewport drawing, but never a hidden one", () =>
     false,
   );
 });
+
+test("an unfocused editor WINDOW stops the viewport, panel focus notwithstanding", () => {
+  // The reported case: the viewport's own dock group is still the active one
+  // and the window is not `document.hidden` — it is simply behind Chrome while
+  // the user measures an exported build on the same GPU.
+  assert.equal(
+    shouldSuspendViewport({ visible: true, focused: true, appFocused: false, freeze: true }),
+    true,
+  );
+  // Play mode is exempt from PANEL focus but not from the window being in the
+  // background: a game nobody has in the foreground is not being watched.
+  assert.equal(
+    shouldSuspendViewport({ playing: true, visible: true, focused: true, appFocused: false, freeze: true }),
+    true,
+  );
+  assert.equal(
+    shouldSuspendViewport({ playing: true, visible: true, focused: false, appFocused: true, freeze: true }),
+    false,
+  );
+  // The preference still governs it — turning the toggle off keeps drawing.
+  assert.equal(
+    shouldSuspendViewport({ visible: true, focused: true, appFocused: false, freeze: false }),
+    false,
+  );
+  // A hold still wins: the profiler deliberately measures a viewport whose
+  // window may not hold focus.
+  assert.equal(
+    shouldSuspendViewport({ visible: true, focused: true, appFocused: false, freeze: true, held: true }),
+    false,
+  );
+  // Absent (an older caller that never passed it) must mean "focused", so
+  // every existing decision is unchanged.
+  assert.equal(
+    shouldSuspendViewport({ visible: true, focused: true, freeze: true }),
+    false,
+  );
+});
